@@ -57,6 +57,7 @@ def log(func):
 
     return wrapper
 
+
 def aipsno_from_project(projectname: str):
     """Follows a personal way to get an AIPS no from EVN experiments which is:
     for XXAAAB (e.g. EM123C), it takes the numeric part (123) and the epoch is

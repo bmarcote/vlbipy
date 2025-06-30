@@ -25,9 +25,11 @@ from rich import print as rprint
 # import blessed
 import casatasks
 from casatools import table as tb
-from casa_pipeline.casavlbitools import fitsidi
-from casa_pipeline.casa_pipeline import check_antab_idi
-from .. import casa_pipeline as capi
+from .casavlbitools import fitsidi
+from . import check_antab_idi
+# from .project import Project
+from . import tools
+# from .. import casa_pipeline as capi
 
 
 # Because as far as I know CASA folks do not have a straight away to get this simple information
@@ -94,9 +96,9 @@ class ObsEpoch(object):
         """Returns the Modifyed Julian Day (MJD) relative to the start of the observation.
         """
         if self.starttime is not None:
-            return float(capi.tools.date2mjd(self.starttime))
+            return float(tools.date2mjd(self.starttime))
         elif self.epoch is not None:
-            return float(capi.tools.date2mjd(dt.datetime(*self.epoch.timetuple()[:6])))
+            return float(tools.date2mjd(dt.datetime(*self.epoch.timetuple()[:6])))
 
         return None
 
@@ -680,7 +682,7 @@ class Importing(object):
     into a MS. Each function would conduct the necessary steps to get a properly prepared MS file.
     """
 
-    def __init__(self, ms: capi.Project):
+    def __init__(self, ms: Project):
         self._ms = ms
 
     def lba_fits(self, fitsfile: str):
@@ -724,22 +726,22 @@ class Importing(object):
                    f"{expname.upper()}_{obsdate}/fits -A '{expname.lower()}*'"]
 
         try:
-            capi.tools.shell_command("wget", params)
-            capi.tools.shell_command("md5sum", ["-c", f"{expname.lower()}.checksum"])
+            tools.shell_command("wget", params)
+            tools.shell_command("md5sum", ["-c", f"{expname.lower()}.checksum"])
             # TODO: verify here that all files are OK!
-            capi.tools.shell_command("wget",
+            tools.shell_command("wget",
                                      [f"http://archive.jive.nl/exp/{expname.upper()}_{obsdate}/" \
                                       f"pipe/{expname.lower()}.antab.gz"])
-            capi.tools.shell_command("gunzip", [f"{expname.lower()}.antab.gz"])
+            tools.shell_command("gunzip", [f"{expname.lower()}.antab.gz"])
             # TODO: if ERROR 404: Not Found, then go for the _1, _2,...
-            capi.tools.shell_command("wget",
+            tools.shell_command("wget",
                                      [f"http://archive.jive.nl/exp/{expname.upper()}_{obsdate}/" \
                                       f"pipe/{expname.lower()}.uvflg"])
             # TODO: this only if I need AIPS
-            capi.tools.shell_command("wget",
+            tools.shell_command("wget",
                                      [f"http://archive.jive.nl/exp/{expname.upper()}_{obsdate}/" \
                                       f"pipe/{expname.lower()}.tasav.FITS.gz"])
-            capi.tools.shell_command("gunzip", [f"{expname.lower()}.tasav.FITS.gz"])
+            tools.shell_command("gunzip", [f"{expname.lower()}.tasav.FITS.gz"])
         except ValueError as err:
             rprint(f"[bold red]ERROR: you may require credentials to download the data[/bold red]")
             rprint(f"[red]{err}[/red]")
@@ -831,7 +833,7 @@ class Importing(object):
             if not os.path.isfile(a_fitsidi):
                 raise FileNotFoundError(f"The file {a_fitsidi} could not be found.")
 
-        if capi.tools.space_available(self._ms.cwd) <= u.Quantity(1.55*3, u.kbit)* \
+        if tools.space_available(self._ms.cwd) <= u.Quantity(1.55*3, u.kbit)* \
                     int(subprocess.run(f"du -sc {' '.join(fitsidifiles)}", shell=True,
                                        capture_output=True).stdout.decode().split()[-2]):
             rprint("\n\n[bold red]There is no enough space in the computer to create " \

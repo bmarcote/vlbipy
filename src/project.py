@@ -28,7 +28,21 @@ from rich import progress
 import casatasks
 from casatools import msmetadata as msmd
 from casatools import table as tb
-from .. import casa_pipeline as capi
+from . import tools
+from .obsdata import ObsEpoch as ObsEpoch
+from .obsdata import Stokes as Stokes
+from .obsdata import Source as Source
+from .obsdata import Sources as Sources
+from .obsdata import SourceType as SourceType
+from .obsdata import Antenna as Antenna
+from .obsdata import Antennas as Antennas
+from .obsdata import FreqSetup as FreqSetup
+from .project import Project as Project
+from .evn import calibration as evn_calibration
+from .flagging import Flagging
+from .plotting import Plotting
+from .imaging import Imaging
+# # TOOD: same for GMRT
 
 
 
@@ -87,13 +101,13 @@ class Project(object):
     #                   f"({type(new_uvfitsfile)}).")
 
     @property
-    def time(self) -> capi.ObsEpoch:
+    def time(self) -> ObsEpoch:
         """Returns an ObsEpoch object containing the times associated to the observation.
         """
         return self._time
 
     @property
-    def antennas(self) -> capi.Antennas:
+    def antennas(self) -> Antennas:
         """Returns an Antennas object containing all antennas related to the given observation.
         """
         return self._antennas
@@ -116,14 +130,14 @@ class Project(object):
             self._refant = copy.deepcopy(antennas)
 
     @property
-    def freqsetup(self) -> Union[capi.FreqSetup, None]:
+    def freqsetup(self) -> Union[FreqSetup, None]:
         """Returns a FreqSetup object (if defined) containing the frequency information of
         the observation data.
         """
         return self._freqsetup
 
     @property
-    def sources(self) -> capi.Sources:
+    def sources(self) -> Sources:
         """Returns a Sources object containing the information of all sources scheduled
         in the observation.
         """
@@ -175,28 +189,28 @@ class Project(object):
 
     @property
     def calibrate(self):
-    # def calibrate(self) -> capi.evn_calibration.Calibration:
+    # def calibrate(self) -> evn_calibration.Calibration:
         #TODO: there will be more possibilities
         # likely to do a parent class called Calibration?
         return self._calibration
 
     @property
-    def flag(self) -> capi.flagging.Flagging:
+    def flag(self) -> flagging.Flagging:
     # def flag(self):
         return self._flagging
 
     @property
-    def plot(self) -> capi.plotting.Plotting:
+    def plot(self) -> plotting.Plotting:
     # def plot(self):
         return self._plotting
 
     @property
-    def image(self) -> capi.imaging.Imaging:
+    def image(self) -> imaging.Imaging:
     # def image(self):
         return self._imaging
 
     @property
-    def importdata(self) -> capi.obsdata.Importing:
+    def importdata(self) -> obsdata.Importing:
     # def importdata(self):
         #TODO: importing should also be a sub-class (observatory dependend)
         return self._importing
@@ -256,7 +270,7 @@ class Project(object):
 
         self._scipackage = sci_package
         self.logger.debug(f"The package {sci_package} will be used for data reduction.")
-        if (self._scipackage == 'AIPS') and (not capi.tools.aips_exists()):
+        if (self._scipackage == 'AIPS') and (not tools.aips_exists()):
             rprint("\n[bold red]AIPS is set to be used, but no AIPS environment found[/bold red]")
             rprint("[red]Did you run the AIPS LOGIN.SH (or CSH) script?[/red]")
             raise OSError("No AIPS environment is found but AIPS will be used.")
@@ -282,9 +296,9 @@ class Project(object):
             self._args = {}
 
         if 'epoch' in self.params:
-            self._time = capi.ObsEpoch(dt.datetime.strptime(str(self.params['epoch']), "%y%m%d"))
+            self._time = ObsEpoch(dt.datetime.strptime(str(self.params['epoch']), "%y%m%d"))
         else:
-            self._time = capi.ObsEpoch(None)
+            self._time = ObsEpoch(None)
 
         self._msfile = self.cwd / Path(f"{self.projectname}.ms")
         self._uvfitsfile = self.cwd / self.msfile.name.replace('.ms', '.uvfits')
@@ -292,23 +306,23 @@ class Project(object):
         self._logdir = self.cwd / 'log'
         self._caldir = self.cwd / 'caltables'
         self._outdir = self.cwd / 'results'
-        self._sources = capi.Sources()
-        self._antennas = capi.Antennas()
+        self._sources = Sources()
+        self._antennas = Antennas()
         self._splits: dict[str, list] = defaultdict(list)
         self._freqsetup = None
         self._last_step = None
 
         if 'sources' in self._args:
             for a_src in self._args['sources']['target']:
-                self._sources.add(capi.Source(name=a_src, sourcetype=capi.SourceType.target,
+                self._sources.add(Source(name=a_src, sourcetype=SourceType.target,
                                               coordinates=None))
 
             for a_src in self._args['sources']['phaseref']:
-                self._sources.add(capi.Source(name=a_src, sourcetype=capi.SourceType.calibrator,
+                self._sources.add(Source(name=a_src, sourcetype=SourceType.calibrator,
                                               coordinates=None))
 
             for a_src in self._args['sources']['fringefinder']:
-                self._sources.add(capi.Source(name=a_src, sourcetype=capi.SourceType.fringefinder,
+                self._sources.add(Source(name=a_src, sourcetype=SourceType.fringefinder,
                                               coordinates=None))
 
         for a_dir in (self.cwd, self.logdir, self.caldir, self.outdir):
@@ -337,17 +351,17 @@ class Project(object):
 
         # TODO: differentiate as function of the observatory
         if self.observatory.lower() == 'evn':
-            self._calibration = capi.evn_calibration.Calibration(self, self.caldir)
+            self._calibration = evn_calibration.Calibration(self, self.caldir)
         elif (self.observatory.lower() == 'gmrt'):
             raise NotImplementedError("Data reduction for GMRT has not been implemented yet.")
         else:
             raise NotImplementedError(f"Data reduction for {self.observatory} " \
                                       "has not been implemented yet.")
 
-        self._importing = capi.obsdata.Importing(self)
-        self._flagging = capi.flagging.Flagging(self)
-        self._plotting = capi.plotting.Plotting(self)
-        self._imaging = capi.imaging.Imaging(self)
+        self._importing = obsdata.Importing(self)
+        self._flagging = flagging.Flagging(self)
+        self._plotting = plotting.Plotting(self)
+        self._imaging = imaging.Imaging(self)
         # # self._last_step = None
         if self.msfile.exists():
             self.get_metadata_from_ms()
@@ -372,10 +386,10 @@ class Project(object):
             return ValueError(f"The MS file {self.msfile} could not be openned.")
 
         try:
-            self._antennas = capi.Antennas()
+            self._antennas = Antennas()
             antenna_names = m.antennanames()
             for ant_name in antenna_names:
-                ant = capi.Antenna(name=ant_name, observed=False)
+                ant = Antenna(name=ant_name, observed=False)
                 self.antennas.add(ant)
 
             spw_names = range(m.nspw())
@@ -386,27 +400,27 @@ class Project(object):
                 rprint("[yellow]WARNING: the observatory name in MS does not match the one "
                        f"provided in the project ({self.observatory} vs {telescope_name}).[/yellow]")
 
-            self._sources = capi.Sources()
+            self._sources = Sources()
             src_names = m.fieldnames()
             src_coords = [m.phasecenter(s) for s in range(len(src_names)) ]
             for a_name, a_coord in zip(src_names, src_coords):
                 try:
                     if a_name in self.params['sources']['target']:
-                        a_type = capi.SourceType.target
+                        a_type = SourceType.target
                     elif a_name in self.params['sources']['phaseref']:
-                        a_type = capi.SourceType.calibrator
+                        a_type = SourceType.calibrator
                     elif a_name in self.params['sources']['fringefinder']:
-                        a_type = capi.SourceType.fringefinder
+                        a_type = SourceType.fringefinder
                     else:
-                        a_type = capi.SourceType.other
+                        a_type = SourceType.other
                 except KeyError:
                     rprint("[bold yellow]-- No source type information has been " \
                            "found --[bold yellow]")
                     rprint("You better define manually or through the inputs which sources " \
                            "are target/calibrator/etc.")
-                    a_type = capi.SourceType.other
+                    a_type = SourceType.other
 
-                self.sources.append(capi.Source(a_name, a_type,
+                self.sources.append(Source(a_name, a_type,
                                                 coord.SkyCoord(ra=a_coord['m0']['value'],
                                                                dec=a_coord['m1']['value'],
                                                                unit=(a_coord['m0']['unit'],
@@ -414,26 +428,26 @@ class Project(object):
                                                                equinox=a_coord['refer'])))
 
             timerange = m.timerangeforobs(0)
-            self._time = capi.ObsEpoch(
-                    start_datetime=capi.tools.mjd2date(timerange['begin']['m0']['value']),
-                    end_datetime=capi.tools.mjd2date(timerange['end']['m0']['value']))
+            self._time = ObsEpoch(
+                    start_datetime=tools.mjd2date(timerange['begin']['m0']['value']),
+                    end_datetime=tools.mjd2date(timerange['end']['m0']['value']))
 
             mean_freq = (m.meanfreq(spw_names[-1]) + m.meanfreq(0)) / 2.0
-            self._freqsetup = capi.FreqSetup(m.nchan(0), m.nspw(), mean_freq,
+            self._freqsetup = FreqSetup(m.nchan(0), m.nspw(), mean_freq,
                                              m.bandwidths()[0])
 
             nrows = int(m.nrows())
 
             # To be able  to get the parallel hands, either circular or linear
-            corr_order = [capi.Stokes(i) for i in m.corrtypesforpol(0)]
+            corr_order = [Stokes(i) for i in m.corrtypesforpol(0)]
             corr_pos = []
             try:
-                corr_pos.append(corr_order.index(capi.Stokes.RR))
-                corr_pos.append(corr_order.index(capi.Stokes.LL))
+                corr_pos.append(corr_order.index(Stokes.RR))
+                corr_pos.append(corr_order.index(Stokes.LL))
             except ValueError:
                 try:
-                    corr_pos.append(corr_order.index(capi.Stokes.XX))
-                    corr_pos.append(corr_order.index(capi.Stokes.YY))
+                    corr_pos.append(corr_order.index(Stokes.XX))
+                    corr_pos.append(corr_order.index(Stokes.YY))
                 except ValueError:
                     rprint("[bold red]The associated MS does not have neither circular nor " \
                            "linear-based polarization information[/bold red]")
@@ -462,7 +476,7 @@ class Project(object):
             start_time = time.time()
             with progress.Progress() as progress_bar:
                 task = progress_bar.add_task("[yellow]Reading MS...", total=nrows)
-                for (start, nrow) in capi.tools.chunkert(0, nrows, chunks):
+                for (start, nrow) in tools.chunkert(0, nrows, chunks):
                     ants1 = m.getcol('ANTENNA1', startrow=start, nrow=nrow)
                     ants2 = m.getcol('ANTENNA2', startrow=start, nrow=nrow)
                     spws = m.getcol('DATA_DESC_ID', startrow=start, nrow=nrow)
