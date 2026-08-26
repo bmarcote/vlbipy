@@ -1,4 +1,9 @@
 # Self-Calibration
 
-Provides iterative self-calibration loops using phase-only and amplitude+phase gain calibration, with imaging between iterations. Supports both CASA tclean and external Difmap for the imaging step.
+!!! warning "Not implemented for CASA"
 
+    `obs.selfcal` runs an iterative phase / amplitude+phase self-calibration
+    loop, but today only the dummy backend implements the imaging step it
+    depends on. See [Status](../usage/status.md).
+
+::: vlbipy.namespaces.SelfcalNamespace

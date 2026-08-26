@@ -11,34 +11,35 @@ vlbipy is a Python package for reducing [Very Long Baseline Interferometry (VLBI
 VLBI data reduction has traditionally required deep familiarity with observatory-specific data formats, calibration procedures, and software ecosystems. Each VLBI network delivers data in slightly different formats and requires different preparation steps before the core calibration can begin. vlbipy abstracts these differences behind a common interface:
 
 - **Observatory-agnostic**: A single pipeline handles EVN, VLBA, and LBA data. Observatory-specific steps (data download, ANTAB handling, flag file parsing) are handled transparently.
-- **Backend-agnostic**: Choose between CASA (`casatools`/`casatasks`) and AIPS (`ParselTongue`) at runtime. The same pipeline logic drives both backends through abstract interfaces.
-- **Scriptable and reproducible**: Run the full 15-step pipeline from a single TOML configuration file and CLI command, or drive each step interactively from Python.
-- **Modular**: Each pipeline step is a standalone function. Skip steps, restart from a checkpoint, or replace individual steps with custom logic.
+- **Backend-agnostic**: Choose between CASA (`casatools`/`casatasks`), AIPS (`ParselTongue`), or a lazy dask-ms reader at runtime, through abstract interfaces. Only CASA is implemented today; AIPS is a stub.
+- **Scriptable and reproducible**: Run the full pipeline from a single TOML configuration file and CLI command, or drive each step interactively from Python — both operate on the same `VLBIObs` object.
+- **Modular**: Each stage is a callable namespace (`import_data`, `calibrate`, `flag`, `plot`, `export`, ...). Run the default chain, call one step, or resume from where a previous run stopped.
+
+!!! warning "Work in progress"
+
+    The calibration chain runs end to end and produces calibrated, per-source
+    data on the CASA backend. Imaging and self-calibration are not implemented
+    yet. See [Status](usage/status.md) for the full inventory.
 
 ## Quick Start
 
 ```bash
-# Install with CASA backend
+# Install with the CASA backend
 pip install "vlbipy[casa]"
 
-# Run full pipeline from a TOML input file
-vlbipy run --config my_project.toml
+# Run the full pipeline
+vlbipy pipeline -p EG078B -n EVN -t J1234+5678 --phasecal J1230+5600 --fringe-finder 3C345
 
-# Or specify parameters on the command line
-vlbipy -p EG078B -n EVN --backend CASA -t J1234+5678 -pcal J1230+5600 -ff 3C345
+# Or from a TOML config file
+vlbipy pipeline -p EG078B --config my_project.toml
 ```
 
 ```python
-from vlbipy import Project
-from vlbipy.pipeline import run_pipeline
+from vlbipy import VLBIObs
 
-project = Project(
-    project_code="EG078B",
-    observatory="EVN",
-    backend="CASA",
-    input_file="my_project.toml",
-)
-run_pipeline(project)
+obs = VLBIObs("EG078B", network="EVN",
+              target="J1234+5678", phasecal="J1230+5600", fringe_finder="3C345")
+obs.run()
 ```
 
 ## Supported Observatories

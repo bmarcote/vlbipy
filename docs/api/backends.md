@@ -16,4 +16,6 @@ Abstract base classes defining the backend-agnostic interface. Every backend (CA
 
 ::: vlbipy.backends.base.FlagOps
 
+::: vlbipy.backends.base.PlotOps
+
 ::: vlbipy.backends.base.ImagingOps

@@ -35,7 +35,7 @@ nav = [
     ]},
     { "API Reference" = [
         { "Project" = "api/project.md" },
-        { "Pipeline" = "api/pipeline.md" },
+        { "Namespaces" = "api/pipeline.md" },
         { "Models" = "api/models.md" },
         { "Configuration" = "api/config.md" },
         { "Backends" = "api/backends.md" },

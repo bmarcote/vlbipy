@@ -251,7 +251,8 @@ Difmap's per-antenna gain corrections).
 
 ### `[selfcal]`
 
-Step 14. See [Pipeline Workflow](pipeline.md#step-14-self-calibration) for details.
+Controls `obs.selfcal`. Not implemented for the CASA backend yet — see
+[Self-Calibration](api/selfcal.md) and [Status](usage/status.md).
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -263,7 +264,9 @@ Step 14. See [Pipeline Workflow](pipeline.md#step-14-self-calibration) for detai
 
 ### `[imaging]`
 
-Step 15. Final imaging uses Briggs weighting with multiple robust values.
+Controls `obs.clean`. Not implemented for the CASA backend yet — see
+[Status](usage/status.md). Final imaging uses Briggs weighting with multiple
+robust values.
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -278,7 +281,7 @@ Step 15. Final imaging uses Briggs weighting with multiple robust values.
 
 ### `[export]`
 
-Step 12. Controls output of `step_apply_and_split`.
+Controls `obs.export.per_source`.
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |

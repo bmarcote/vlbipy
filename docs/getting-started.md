@@ -1,41 +1,39 @@
 # Getting Started
 
-This guide walks you through installing vlbipy and running your first VLBI data reduction pipeline.
+This guide walks you through installing vlbipy and running your first VLBI
+data reduction.
+
+!!! warning "Work in progress"
+
+    The calibration chain runs end to end and produces calibrated, per-source
+    data on the CASA backend. Imaging and self-calibration are not
+    implemented yet. See [Status](usage/status.md) for the full inventory.
 
 ## Prerequisites
 
 - **Python >= 3.12**
-- At least one data reduction backend:
-  - **CASA**: `casatools` and `casatasks` (recommended for most users)
-  - **AIPS**: `parseltongue` (for users with existing AIPS workflows)
+- A data reduction backend — **CASA** (`casatools`/`casatasks`) is the only
+  one implemented today. AIPS (`parseltongue`) exists as an interface but
+  every method is a stub.
 
 ## Installation
 
-### Core package (no backend)
-
-```bash
-pip install vlbipy
-```
-
-This installs the core package without any backend. Useful for inspecting data metadata, generating summaries, or developing custom workflows.
-
-### With CASA backend
+### With the CASA backend (recommended)
 
 ```bash
 pip install "vlbipy[casa]"
 ```
 
-Installs `casatools` and `casatasks` alongside vlbipy. This is the recommended setup for most users.
-
-### With AIPS backend
+### With the dask-ms reader
 
 ```bash
-pip install "vlbipy[aips]"
+pip install "vlbipy[daskms]"
 ```
 
-Installs `parseltongue` for interfacing with AIPS. Requires a working AIPS installation on the system.
+Lazy, distributed-ready access to data already exported to a zarr store —
+a-priori calibration and import only, no full calibration chain.
 
-### Both backends
+### Everything
 
 ```bash
 pip install "vlbipy[all]"
@@ -49,110 +47,104 @@ pip install "vlbipy[dev]"
 
 Includes `pytest` and `ruff` for testing and linting.
 
-## Your First Pipeline Run
+## Your first reduction
 
-### 1. Create a TOML input file
+Everything hangs off one object, `VLBIObs`, driven the same way whether you
+start it from the command line or from Python.
 
-Create a file called `my_project.toml`:
+### 1. From the command line
+
+```bash
+vlbipy pipeline -p rsm07 -n EVN \
+    -t 3C395 --phasecal J1848+3219 --fringe-finder 3C345
+```
+
+This locates or downloads the raw data, imports it, runs the full
+calibration chain, and exports calibrated per-source data. Progress is
+recorded in `<work_dir>/.pipeline_state.json`, so a repeated run resumes
+rather than redoing finished steps:
+
+```bash
+# Re-run the bandpass step and everything after it
+vlbipy pipeline -p rsm07 ... --from-step bandpass
+
+# Forget all progress and start over
+vlbipy pipeline -p rsm07 ... --scratch
+```
+
+Or run stages one at a time — the normal way to drive a reduction
+interactively (see [Command line](usage/cli.md)):
+
+```bash
+vlbipy import -p rsm07 -t 3C395 --phasecal J1848+3219 --fringe-finder 3C345
+vlbipy calibrate -p rsm07 ...
+vlbipy flag -p rsm07 ...
+vlbipy export -p rsm07 ...
+```
+
+### 2. Using a TOML config file
+
+Anything settable on the command line — and much that is not — can go in a
+TOML file instead:
 
 ```toml
 [global]
-project_name = "EG078B"
+project = "rsm07"
 observatory = "EVN"
-backend = "CASA"
-reference_antenna = "EF"
-obsdate = "231015"
+reference_antenna = ["EF"]
 
 [sources]
-target = ["J1234+5678"]
-phasecal = ["J1230+5600"]
-fringefinder = ["3C345", "4C39.25"]
-
-[flagging]
-edge_channels_fraction = 0.05
-outlier_sigma = 5.0
-
-[calibration]
-ionos = true                 # solve the dispersive delay below 6 GHz
-
-[calibration.sbd]
-solint = "inf"
-
-[calibration.bandpass]
-solint = "inf"
-combine = "scan"
+fringe_finders    = ["3C345"]
+phase_calibrators = ["J1848+3219"]
+targets           = ["3C395"]
 
 [calibration.mbd]
-solint = "inf"
-
-[imaging]
-niter = 500
-imsize = [512, 512]
-cell = "0.5mas"
-```
-
-### 2. Run the pipeline
-
-```bash
-vlbipy run --config my_project.toml
-```
-
-This will execute all 15 pipeline steps: from setting up directories, through calibration, to final imaging.
-
-### 3. Control what re-runs
-
-Progress is recorded in `<work_dir>/.pipeline_state.json`, so a repeated run
-picks up where the last one stopped. To redo part of it:
-
-```bash
-# Re-run the bandpass and every step after it
-vlbipy run --config my_project.toml --from-step bandpass
+solint = "30s"        # tighter than the default for a fast-varying atmosphere
+minsnr = 4.0
 ```
 
 ```bash
-# Forget all progress and start over
-vlbipy run --config my_project.toml --scratch
+vlbipy pipeline -p rsm07 --config rsm07.toml
 ```
 
-### 4. View a summary
+Values resolve in three layers, later winning: built-in defaults → your TOML
+→ command-line flags. See [Configuration](configuration.md) for the full
+reference.
 
-```bash
-vlbipy run --config my_project.toml --summary-only
-```
-
-## Using the Python API
-
-For interactive or scripted use:
+### 3. From Python
 
 ```python
-from vlbipy import Project
-from vlbipy.pipeline import run_pipeline
+from vlbipy import VLBIObs
 
-# Create the project
-project = Project(
-    project_code="EG078B",
-    observatory="EVN",
-    backend="CASA",
-    input_file="my_project.toml",
-)
-
-# Full pipeline
-run_pipeline(project)
-
-# Or step-by-step
-from vlbipy import pipeline
-
-pipeline.step_setup(project)
-data_files = pipeline.step_find_data(project)
-data_files = pipeline.step_prepare(project, data_files)
-pipeline.step_import_data(project, data_files)
-pipeline.step_load_metadata(project)
-print(project.summary())
+obs = VLBIObs("rsm07", network="EVN",
+              target="3C395", phasecal="J1848+3219", fringe_finder="3C345")
+obs.run()
+print(obs.summary())
 ```
+
+Or step by step, inspecting each result as you go:
+
+```python
+obs.import_data()
+obs.calibrate.a_priori()
+obs.flag.apriori()
+obs.calibrate.instrumental()
+obs.calibrate.edge_channels()
+obs.calibrate.apply(force=True)
+obs.calibrate.fringefit()
+obs.calibrate.apply(force=True)
+obs.export.per_source()
+```
+
+See [Interactive Python](usage/python.md) for the full walkthrough, including
+inspecting metadata before calibrating and reading the visibilities directly.
 
 ## Next Steps
 
-- [Pipeline Workflow](pipeline.md) — detailed description of each pipeline step
+- [Full pipeline](usage/pipeline.md) — what `run()` does, in order
+- [Command line](usage/cli.md) — driving a reduction stage by stage
+- [Interactive Python](usage/python.md) — the object model, and where files are written
 - [Configuration](configuration.md) — full reference for the TOML configuration file
 - [Observatories](observatories/index.md) — observatory-specific details
 - [Backends](backends/index.md) — backend-specific details
+- [Status](usage/status.md) — what works, what's partial, what's missing

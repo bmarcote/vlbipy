@@ -19,11 +19,10 @@ dependencies = [
     "rich-argparse",
     "tomli; python_version < '3.11'",
     "casatools",
-    "casatasks",
+    "casatasks"
 ]
 
 [project.optional-dependencies]
-casa = ["casatools", "casatasks"]
 daskms = ["dask-ms[xarray,zarr]"]
 aips = ["parseltongue"]
 all = ["casatools", "casatasks", "parseltongue", "dask-ms[xarray,zarr]"]

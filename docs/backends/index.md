@@ -4,58 +4,57 @@ vlbipy separates the **pipeline logic** (what calibration steps to perform) from
 
 ## Architecture
 
-The backend system is built on five abstract base classes defined in `vlbipy.backends.base`:
+The backend system is built on abstract base classes (`BackendComponent`
+subclasses) defined in `vlbipy.backends.base`:
 
 | Interface | Responsibility |
 | --- | --- |
-| `DataBackend` | Read metadata, split sources, export UVFITS |
-| `ImportBackend` | Import FITS-IDI/UVFITS into native format |
-| `CalibrationBackend` | Fringe fitting, bandpass, gain calibration, applycal |
-| `FlaggingBackend` | Flag management (file-based, autocorr, edge, quack, tfcrop, aoflagger) |
-| `ImagingBackend` | CLEAN deconvolution (tclean, wsclean) |
+| `DataOps` | Read metadata, listobs, read visibilities |
+| `CalibrationOps` | A-priori/instrumental/fringe-fit calibration, applycal |
+| `FlagOps` | Flag management (file-based, autocorr, edges, quack, tfcrop, aoflagger, outliers) |
+| `PlotOps` | Backend-side data needed for diagnostic plots |
+| `ImagingOps` | CLEAN deconvolution (tclean, wsclean) |
+| `ExportOps` | Per-source split, UVFITS/MS export, merge |
 
-Each backend (CASA, AIPS) provides concrete implementations of all five interfaces. The `Project` class lazily instantiates the correct backend objects based on the `backend` parameter.
+Each backend (`vlbipy.backends.casa`, `.aips`, `.dask_ms`, `.dummy`)
+implements some or all of these; `backend.capabilities()` reports at runtime
+which operations a given backend actually supports for each interface, so a
+missing one raises a clear error instead of `NotImplementedError` deep in a
+call stack. `vlbipy.backends.get_backend()` looks up and instantiates the
+right one from a name (`"casa"`, `"aips"`, `"dask-ms"`, `"dummy"`); `Observation`
+(one per project inside `VLBIObs`) calls it once at construction time.
+
+Only the CASA backend is implemented in full today. `dask-ms` implements
+import and a-priori calibration for lazy, distributed-ready reads; AIPS is a
+stub — every method raises; `dummy` is an in-memory synthetic backend used
+for tests and examples with no external dependency.
 
 ## Backend Selection
 
-The backend is selected at project creation:
+The backend is selected when `VLBIObs` is constructed:
 
 ```python
 # Via Python API
-project = Project(project_code="EG078B", observatory="EVN", backend="CASA")
+from vlbipy import VLBIObs
+obs = VLBIObs("EG078B", network="EVN", backend="CASA")
 
 # Via CLI
-vlbipy -p EG078B -n EVN --backend CASA
+vlbipy pipeline -p EG078B -n EVN --backend CASA
 ```
 
 ```toml
 # Via TOML configuration
 [global]
-backend = "CASA"
-```
-
-## Lazy Initialization
-
-Backend instances are created on first access, not at project initialization. This means:
-
-- The core vlbipy package can be imported without any backend installed
-- Backend-specific imports happen only when needed
-- You can inspect project metadata and configuration without a backend
-
-```python
-project = Project(project_code="EG078B", observatory="EVN", backend="CASA")
-# No casatools import has happened yet
-
-project.data  # <- CasaDataBackend is created here, casatools imported
+backend = "casa"   # casa (default) | dask-ms | dummy | aips
 ```
 
 ## Adding a New Backend
 
-To add support for a new backend (e.g. a future Python-native correlator):
+To add support for a new backend:
 
-1. Create a new subpackage under `vlbipy/backends/` (e.g. `vlbipy/backends/newbackend/`)
-2. Implement all five abstract interfaces from `vlbipy.backends.base`
-3. Add the backend to the `Backend` enum in `vlbipy.models`
-4. Register it in the `Project._create_*_backend()` factory methods
+1. Add a new module under `vlbipy/backends/` (e.g. `vlbipy/backends/newbackend.py`)
+2. Implement the `BackendComponent` interfaces from `vlbipy.backends.base` it can support
+3. Add the backend's name to `BackendKind` in `vlbipy.models`
+4. Register it in `get_backend()` (`vlbipy/backends/__init__.py`)
 
 See the [API reference](../api/backends.md) for the full interface definitions.

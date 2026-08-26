@@ -77,7 +77,7 @@ Anything settable on the command line — and much that is not — can go in a T
 file:
 
 ```bash
-vlbipy run -c rsm07.toml
+vlbipy run --config rsm07.toml
 ```
 
 ```toml

@@ -1,234 +1,165 @@
 # Pipeline Workflow
 
-The vlbipy pipeline consists of 15 discrete steps that take raw VLBI data from an observatory archive through to calibrated, imaged radio maps. Each step is implemented as a standalone function in `vlbipy.pipeline` that takes a `Project` object and modifies it in place.
+`VLBIObs.run()` chains together the same callable namespaces you can call
+individually — `import_data`, `calibrate`, `flag`, `plot`, `export` — in a
+fixed order. This page is the detailed walkthrough of what each step does
+and why it's ordered the way it is; for the short version see
+[Full pipeline](usage/pipeline.md), and for calling these interactively see
+[Interactive Python](usage/python.md).
 
-## Pipeline Overview
+!!! warning "Work in progress"
 
-```text
-Raw data → Import → Metadata → Flagging → A-priori cal → Plots → SBD/BP/SBD → MBD Fringe fit → Apply & Split → Imaging → Selfcal → Final images
-```
+    Calibration through to per-source calibrated data works end to end on
+    the CASA backend. Imaging and self-calibration are not implemented yet —
+    `run()` skips them with a warning. See [Status](usage/status.md).
 
-| Step | Function | Description |
-| ---: | --- | --- |
-| 1 | `step_setup` | Create project directory structure |
-| 2 | `step_find_data` | Download or locate raw data files |
-| 3 | `step_prepare` | Observatory-specific preparation (e.g. ANTAB append) |
-| 4 | `step_import_data` | Import FITS-IDI into MS (CASA) or UVDATA (AIPS) |
-| 5 | `step_load_metadata` | Read metadata: sources, antennas, scans, frequency setup |
-| 6 | `step_initial_flagging` | A-priori flags, autocorrelations, edge channels, quack |
-| 7 | `step_a_priori_calibration` | System temperature (Tsys) and gain curve calibration |
-| 8 | `step_initial_plots` | Antenna participation and autocorrelation diagnostic plots |
-| 9 | `step_instrumental_corrections` | SBD → Bandpass → refined SBD (combined step) |
-| 10 | `step_global_fringefit` | Multi-band delay (MBD) fringe fitting on all calibrators |
-| 11 | `step_post_cal_flagging` | Post-calibration flagging (tfcrop on corrected data) |
-| 12 | `step_apply_and_split` | Apply all calibration and split individual sources |
-| 13 | `step_initial_imaging` | Initial (dirty) images of all split sources |
-| 14 | `step_selfcal` | Self-calibrate phase calibrator source(s) |
-| 15 | `step_final_imaging` | Final imaging with multiple Briggs robust weightings |
-
-## Running the Pipeline
-
-### Full pipeline
-
-```python
-from vlbipy import Project
-from vlbipy.pipeline import run_pipeline
-
-project = Project(project_code="EG078B", observatory="EVN", backend="CASA", input_file="my_project.toml")
-run_pipeline(project)
-```
-
-### Partial pipeline
-
-```python
-run_pipeline(project, start_step=5, end_step=11)
-```
-
-### Smart resume
-
-By default (`smart=True`), the pipeline detects whether any calibration tables have been modified since the last run (e.g. by manual flagging) and automatically re-runs all downstream steps. To disable this and always re-run all steps in range:
-
-```python
-run_pipeline(project, smart=False)
-```
-
-### Step-by-step
-
-```python
-from vlbipy import pipeline
-
-pipeline.step_setup(project)
-data_files = pipeline.step_find_data(project)
-data_files = pipeline.step_prepare(project, data_files)
-pipeline.step_import_data(project, data_files)
-pipeline.step_load_metadata(project)
-pipeline.step_initial_flagging(project)
-pipeline.step_a_priori_calibration(project)
-pipeline.step_initial_plots(project)
-pipeline.step_instrumental_corrections(project)
-pipeline.step_global_fringefit(project)
-pipeline.step_post_cal_flagging(project)
-splits = pipeline.step_apply_and_split(project)
-pipeline.step_initial_imaging(project, splits)
-selfcal_tables = pipeline.step_selfcal(project, splits)
-pipeline.step_final_imaging(project, splits, selfcal_tables)
-```
-
----
-
-## Step Details
-
-### Step 1: Setup
-
-Creates the standard project directory layout:
+## Overview
 
 ```text
-<working_dir>/
-├── input_data/           # Raw FITS-IDI files and ancillary files
-├── calibration_tables/   # Calibration tables (.tsys, .gc, .sbd, .bpass, .mbd)
-├── plots/
-│   ├── pre/              # Diagnostic plots on uncalibrated data
-│   └── calibrated/       # Diagnostic plots on calibrated data
-├── calibrated_data/      # Split measurement sets per source
-├── images/
-│   └── initial/          # Initial images before selfcal
-└── logs/                 # Pipeline log files
+Raw data → Import → Metadata → A-priori cal → A-priori flags
+    → Instrumental cal (SBD → bandpass → SBD) → Edge-channel flags → Apply
+    → Global fringe fit → Apply → Quack → Outlier flags
+    → Second pass (re-solve on clean data) → Scalar bandpass → Apply
+    → Plots → Export per source → [Imaging — not implemented]
 ```
 
-The `summary.md` file is written to the working directory after step 5.
+Progress is recorded per step in `<work_dir>/.pipeline_state.json`; a step is
+skipped on a repeated run unless `force=True` (`--force` on the CLI) or a
+step later in the chain invalidates it. The calibration chain itself is
+persisted in `<work_dir>/.caltables.json`, so a resumed process solves on top
+of the tables earlier steps produced rather than starting from raw data.
 
-### Step 2: Find Data
+## Step by step
 
-Searches `input_data/`, then the current working directory (moving any found files into `input_data/`). Falls back to automatic download for observatories that support it:
+### `import_data`
 
-- **EVN**: Automatically downloads FITS-IDI, ANTAB, and `.uvflg` files from the [JIVE archive](http://archive.jive.nl/) given a project code and `obsdate`.
-- **VLBA**: Download is not automated — data must be retrieved manually from the [NRAO archive](https://data.nrao.edu/portal/).
-- **LBA**: Experimental automated download from [ATOA](https://atoa.atnf.csiro.au/).
+Locates FITS-IDI files already on disk, or downloads them (EVN: the JIVE
+archive, including `.antab` and `.uvflg`; VLBA/LBA: mostly manual — see
+[Observatories](observatories/index.md)). Imports into the backend's native
+format (a CASA Multi-MS for the CASA backend) and reads metadata: sources,
+antennas, scans, frequency setup.
 
-### Step 3: Observatory-Specific Preparation
+### `calibrate.a_priori`
 
-Pre-import processing that varies by observatory:
+Amplitude calibration from the Tsys and gain-curve data appended to the
+FITS-IDI at import time (`gencal`, plus an EOP table for VLBA/LBA). The Tsys
+table is de-spiked (and optionally smoothed) before it enters the chain, and
+each table is plotted per antenna. Refuses to run if the data has no Tsys /
+gain-curve information to calibrate from.
 
-- **EVN**: Appends Tsys and gain curve data from the ANTAB file into the FITS-IDI file headers using `casavlbitools`.
-- **VLBA**: Pass-through — calibration metadata is embedded in the FITS-IDI headers by the DiFX correlator.
-- **LBA**: Similar to EVN; ANTAB appending is performed if an ANTAB file is found.
+### `flag.apriori`
 
-### Step 4: Import
+Applies the observatory's a-priori flag table (`.uvflg` for EVN/LBA — VLBA's
+equivalent is already inside the FITS-IDI, so `importfitsidi` has applied it
+by the time this runs) and flags the autocorrelations, which carry no
+interferometric information.
 
-Converts raw data files into the backend's native format:
+### `calibrate.select_calibration_data`
 
-- **CASA**: Imports FITS-IDI into a MeasurementSet (`{project}.ms`) using `importfitsidi`.
-- **AIPS**: Loads FITS-IDI into a UVDATA file using `FITLD`.
+Not a pipeline step on its own, but the decision every instrumental step
+below depends on: which antennas and scan(s) to solve the instrumental
+calibration on. A short fringe fit (`calibrate.scan_snr`) surveys every
+calibrator scan; antennas that recorded every subband and were detected
+above `[calibration].detection_snr` (default 7σ) qualify, and scans are then
+chosen so that all of those antennas are covered — using several linked
+scans when no single scan covers the whole array. Falls back from fringe
+finders to phase calibrators to targets if the fringe finders don't yield a
+usable scan.
 
-If the MS already exists, this step is skipped.
+### `calibrate.instrumental`
 
-### Step 5: Load Metadata
+Single-band delay (SBD) → bandpass → SBD again, solved on the antennas and
+scan(s) above:
 
-Reads the imported data to extract:
+1. A first SBD pass gives rough per-antenna delays.
+2. A first fringe fit refines them into a rough multi-band delay.
+3. The bandpass is then solved on data with those delays already removed —
+   otherwise residual delay slopes across each subband get absorbed into the
+   band shape.
+4. Both delays are re-solved (`sbd2`, `mbd2`) *through* the bandpass, as
+   incremental corrections on top of the first pass — the first-pass tables
+   stay in the chain, everything applies together.
 
-- **Source catalog**: Names, coordinates, and roles (target, calibrator, etc.)
-- **Antenna table**: Station names, positions, diameters
-- **Scan list**: Scan numbers, source associations, time ranges, participating antennas
-- **Frequency setup**: Reference frequency, bandwidth, subbands, channels, polarizations
+`calibrate.verify_solutions` then checks that every antenna that recorded a
+subband actually got a solution in it — a silent gap here means that
+antenna/subband is flagged at apply time, shrinking the array without
+telling you.
 
-Writes a `summary.md` to the project directory. Also auto-selects the reference antenna based on observatory-specific priority lists (e.g. Effelsberg first for EVN, Pie Town first for VLBA).
+### `calibrate.edge_channels`
 
-### Step 6: Initial Flagging
+Measures the bandpass roll-off at each subband edge (rather than flagging a
+blind configured fraction) and flags that many channels at both edges of
+every subband, via `flag.edges`.
 
-Applies several layers of flagging to remove known bad data:
+### `calibrate.apply`
 
-1. **A-priori flag file**: Observatory-provided flags (e.g. `.uvflg` for EVN).
-2. **Autocorrelations**: Flagged as they carry no interferometric information.
-3. **Edge channels**: A configurable fraction of channels at each spectral window edge are flagged to remove bandpass roll-off (default: 10% per edge).
-4. **Quack**: The first N seconds of each scan are flagged while antennas settle on source.
+Applies the accumulated calibration chain to every field (or one `field=`).
+Uses a CASA cal library rather than parallel `gaintable`/`interp`/`spwmap`
+lists — see [The cal libraries](usage/index.md#the-cal-libraries) for the
+format.
 
-A flag backup named `before_initial_flagging` is created before any flagging, so the pre-flagging state can be restored with:
+### `calibrate.fringefit`
 
-```python
-project.flag.flag_restore(project.msfile, "before_initial_flagging")
-```
+The global (multi-band delay) fringe fit, on every calibrator. Below
+`[calibration].ionos_max_ghz` (6 GHz by default) it also solves for the
+dispersive (ionospheric) delay, since at those frequencies the residual
+delay is genuinely frequency-dependent; above it, that term is skipped
+(`--no-ionos` disables it unconditionally). The resulting table is tied to
+the phase calibrator(s) (`gainfield`), which is how those fringe solutions
+reach the target at apply time.
 
-### Step 7: A-Priori Calibration
+### `flag.quack`
 
-Generates amplitude calibration tables from metadata appended during step 3:
+Measures each antenna's settling time after a slew and trims it. Uses the
+stretch that is low on *all* of an antenna's baselines, so a station with
+one noisy baseline is under-trimmed rather than over-trimmed.
 
-- **Tsys table** (`{project}.tsys`): Converts correlation coefficients to flux density (Jy) using measured system temperatures.
-- **Gain curve table** (`{project}.gc`): Compensates for elevation-dependent antenna gain variations.
+### `flag.outliers`
 
-Both tables are added to `project.gaintables`.
+Per-baseline robust (median/MAD) outlier flagging on calibrated amplitudes.
 
-### Step 8: Initial Diagnostic Plots
+### `calibrate.second_pass`
 
-Generates diagnostic plots saved to `plots/pre/`:
+Drops every data-derived table (SBD, bandpass, MBD, ...) back to the
+a-priori ones (Tsys, gain curve, EOP — which don't depend on the data) and
+re-solves the whole instrumental + fringe-fit chain on the now-flagged data.
+The first pass's solutions were biased by whatever the flagging steps above
+later removed (band edges, outliers, slewing data); re-solving from a clean
+a-priori baseline avoids inheriting that bias.
 
-- **tplot**: A time-vs-antenna participation grid showing which antennas were present in each scan, color-coded by source.
-- **Autocorrelation spectra**: Amplitude vs. frequency for fringe finder sources, verifying bandpass shapes.
-- **Cross-correlation spectra**: Amplitude vs. frequency on short baselines for fringe finders.
+### `calibrate.scalar_bandpass`
 
-### Step 9: Instrumental Corrections (SBD → Bandpass → SBD)
+Solves one amplitude gain per antenna and subband on the phase calibrator
+(a point source — a resolved fringe finder would have its structure absorbed
+into the antenna gains), levelling the subband amplitudes before the final
+apply.
 
-A combined three-pass calibration step using fringe finder source(s):
+### Diagnostics
 
-1. **SBD pass 1** (`{project}.sbd`): Fringe fitting with `zerorates=True` on the fringe finder scan with the most antenna participation. Measures single-band delays — the constant instrumental delay offset per antenna.
-2. **Bandpass** (`{project}.bpass`): Solves for the frequency-dependent complex gain (amplitude and phase) of each antenna. Typically uses `solint='inf'` and `combine='scan'`.
-3. **SBD pass 2** (`{project}.sbd2`): A refined SBD solution computed after bandpass correction, to remove any residual delay not captured in pass 1.
+`plot.corners`, `plot.spectrum`, `plot.timeseries` (per phase calibrator or
+target), and `plot.radplot` on the calibrated data.
 
-The gain curve table (`gc`) is excluded from the fringe-fit pre-apply if it has missing antennas (to avoid GSL solver crashes).
+### `export.per_source`
 
-### Step 10: Global Fringe Fitting (MBD)
+Splits the calibrated data per source and writes UVFITS alongside each MS —
+the deliverable of the calibration, and the input to imaging/self-cal
+outside vlbipy in the meantime.
 
-The core VLBI calibration step. Solves simultaneously for **residual delays**, **delay rates**, and **phases** across all baselines for fringe finder and phase calibrator sources:
+### Imaging
 
-- Produces the MBD solution table (`{project}.mbd`)
-- Uses `zerorates=False` to solve for fringe rates
-- Solutions for the phase calibrator are interpolated and transferred to the target in step 12
+*Not implemented.* `run()` checks whether the active backend implements
+`image.clean`; if not (true of CASA today), it logs a warning and returns
+without images rather than failing the whole run.
 
-Optionally solves for ionospheric dispersive delay at low frequencies (≤5 GHz) when enabled in config.
+## Campaigns
 
-### Step 11: Post-Calibration Flagging
+Give `VLBIObs` several project codes and every step above fans out across
+them; `merge()` combines the calibrated data before `export.per_source()`.
+See [Full pipeline — Campaigns](usage/pipeline.md#campaigns).
 
-After applying all calibration solutions, runs automated flagging on calibrators:
+## Self-calibration
 
-- **tfcrop**: Time-frequency crop on corrected data, identifying outliers in calibrated visibility amplitudes.
-
-### Step 12: Apply Calibration and Split
-
-Applies the full calibration table chain to all data, then splits individual sources:
-
-- All source types (targets, check sources, phase calibrators, fringe finders) are split
-- Each source is written to `calibrated_data/{project}_{source}.ms`
-- UVFITS files are exported alongside each split MS (configurable via `[export] export_uvfits`)
-
-### Step 13: Initial Imaging
-
-Creates zero-iteration ("dirty") images of all split sources with natural weighting, saved to `images/initial/`. These verify that the calibration has produced coherent fringes before self-calibration.
-
-### Step 14: Self-Calibration
-
-Runs iterative self-calibration on the phase calibrator source(s):
-
-1. **Phase-only rounds** (default: 4): Solve for phase corrections with decreasing solution intervals.
-2. **Amplitude+phase rounds** (default: 5): Solve for amplitude and phase after the phase-only rounds converge.
-
-Self-calibration solutions from the phase calibrator are transferred to targets in step 15. Can be disabled with `[selfcal] enabled = false`.
-
-### Step 15: Final Imaging
-
-Images all sources (targets and check sources) with multiple Briggs robust weighting values:
-
-- Default robust values: `[-2, -1, 0, 1, 2]`
-- Applies selfcal solutions from step 14 to targets before imaging
-- Images are saved to `images/{project}_{source}_r{robust}.image`
-- FITS and PNG exports are produced when enabled in config
-
-## Smart Pipeline Mode
-
-The pipeline tracks calibration table file timestamps in a `pipeline_state.json` file in the project directory. When a table is modified (e.g. after manual flagging or re-calibration), all downstream steps are automatically invalidated and re-run. This means you can:
-
-1. Run the full pipeline
-2. Inspect the results and manually edit a calibration table
-3. Re-run with `run_pipeline(project)` — only the steps after the modified table are re-executed
-
-## Self-Calibration (Module)
-
-Self-calibration can also be invoked directly via `vlbipy.selfcal.selfcal_loop` for custom workflows outside the main pipeline. See the [Self-Calibration API reference](api/selfcal.md) for details.
+`obs.selfcal.phase()` / `obs.selfcal.ampphase()` exist on the object model
+today but only run on the dummy backend — see the
+[Self-Calibration API reference](api/selfcal.md) and
+[Status](usage/status.md).
