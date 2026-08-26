@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools >= 68.0", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vlbipy"
+version = "0.2.0"
+description = "Backend-agnostic VLBI data reduction suite (API-first)"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+authors = [{name = "Benito Marcote", email = "marcote@jive.eu"}]
+dependencies = [
+    "numpy",
+    "matplotlib",
+    "astropy",
+    "loguru",
+    "rich",
+    "rich-argparse",
+    "tomli; python_version < '3.11'",
+    "casatools",
+    "casatasks",
+]
+
+[project.optional-dependencies]
+casa = ["casatools", "casatasks"]
+daskms = ["dask-ms[xarray,zarr]"]
+aips = ["parseltongue"]
+all = ["casatools", "casatasks", "parseltongue", "dask-ms[xarray,zarr]"]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+vlbipy = "vlbipy.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+vlbipy = ["templates/*.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

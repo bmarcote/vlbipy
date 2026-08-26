@@ -1,0 +1,112 @@
+# vlbipy documentation — Zensical configuration
+
+[project]
+site_name = "vlbipy"
+site_url = "https://bmarcote.github.io/vlbipy/"
+site_description = "Backend-agnostic VLBI data calibration and imaging pipeline"
+site_author = "Benito Marcote"
+repo_url = "https://github.com/bmarcote/vlbipy"
+repo_name = "bmarcote/vlbipy"
+
+# Navigation
+nav = [
+    { Home = "index.md" },
+    { "Getting Started" = "getting-started.md" },
+    { Usage = [
+        { "Overview" = "usage/index.md" },
+        { "Full pipeline" = "usage/pipeline.md" },
+        { "Command line" = "usage/cli.md" },
+        { "Interactive Python" = "usage/python.md" },
+        { "Status" = "usage/status.md" },
+    ]},
+    { "Scientific Background" = "science.md" },
+    { "Pipeline Workflow" = "pipeline.md" },
+    { "Configuration" = "configuration.md" },
+    { Observatories = [
+        { "Overview" = "observatories/index.md" },
+        { "EVN" = "observatories/evn.md" },
+        { "VLBA" = "observatories/vlba.md" },
+        { "LBA" = "observatories/lba.md" },
+    ]},
+    { Backends = [
+        { "Overview" = "backends/index.md" },
+        { "CASA" = "backends/casa.md" },
+        { "AIPS" = "backends/aips.md" },
+    ]},
+    { "API Reference" = [
+        { "Project" = "api/project.md" },
+        { "Pipeline" = "api/pipeline.md" },
+        { "Models" = "api/models.md" },
+        { "Configuration" = "api/config.md" },
+        { "Backends" = "api/backends.md" },
+        { "Observatories" = "api/observatories.md" },
+        { "Diagnostics" = "api/diagnostics.md" },
+        { "Plotting" = "api/plotting.md" },
+        { "Self-Calibration" = "api/selfcal.md" },
+        { "CLI" = "api/cli.md" },
+        { "Tools" = "api/tools.md" },
+    ]},
+]
+
+# Theme
+[project.theme]
+language = "en"
+features = [
+    "content.code.annotate",
+    "content.code.copy",
+    "content.footnote.tooltips",
+    "navigation.footer",
+    "navigation.indexes",
+    "navigation.instant",
+    "navigation.instant.prefetch",
+    "navigation.path",
+    "navigation.sections",
+    "navigation.tabs",
+    "navigation.top",
+    "navigation.tracking",
+    "search.highlight",
+    "toc.follow",
+]
+
+[[project.theme.palette]]
+scheme = "default"
+primary = "indigo"
+accent = "deep purple"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+scheme = "slate"
+primary = "indigo"
+accent = "deep purple"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to light mode"
+
+[project.theme.font]
+text = "Roboto"
+code = "Roboto Mono"
+
+[project.theme.icon]
+repo = "fontawesome/brands/github"
+
+# Plugins
+[project.plugins.mkdocstrings.handlers.python]
+inventories = ["https://docs.python.org/3/objects.inv"]
+paths = ["src"]
+
+[project.plugins.mkdocstrings.handlers.python.options]
+docstring_style = "google"
+inherited_members = true
+show_source = false
+show_root_heading = true
+show_root_full_path = false
+members_order = "source"
+
+# Markdown extensions
+[project.markdown_extensions.toc]
+permalink = true
+
+# Social links
+[[project.extra.social]]
+icon = "fontawesome/brands/github"
+link = "https://github.com/bmarcote/vlbipy"

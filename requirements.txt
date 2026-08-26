@@ -1,6 +1,0 @@
-numpy
-scipy
-natsort
-astropy
-rich
-blessed

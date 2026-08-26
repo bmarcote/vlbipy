@@ -1,0 +1,120 @@
+# vlbipy default configuration.
+# Three-layer cascade: these defaults -> user TOML/dict -> constructor/CLI overrides.
+# Later layers win.
+
+[global]
+project = ""
+observatory = "EVN"          # EVN | VLBA | LBA
+backend = "casa"             # casa (default) | dask-ms | dummy | aips (later)
+mode = "continuum"          # continuum | spectral-line | pulsar-binning | multi-phase-center
+reference_antenna = []       # preferred refant(s); auto-ranked if empty
+work_dir = ""               # working directory; empty = cwd
+
+[sources]
+fringe_finders = []
+phase_calibrators = []
+targets = []
+check_sources = []
+polarization_calibrators = []
+
+# Calibrator -> target phase-referencing map.
+# Key = target name, value = calibrator name or list of calibrator names.
+# Example:
+#   "3C286"     = "J1048+7143"
+#   "R20181030" = ["J1027+7428", "J1048+7143"]
+[phase_referencing]
+
+[import]
+scan_gap = 15                # seconds; gap defining a new scan boundary
+mms = true                   # partition the imported MS into a Multi-MS (parallel I/O)
+obsdate = ""                 # YYMMDD; empty = auto-resolve (FITS-IDI RDATE or archive index)
+username = ""                # archive credentials for proprietary data (empty = public)
+password = ""
+replace_tsys = false         # overwrite Tsys/GC tables in the FITS-IDI even if already present
+reset_existing = true        # clearcal + unflag an existing MS so a previous attempt's state
+                             # does not carry over (flags otherwise only accumulate)
+unflag_existing = true       # part of the reset: clear all flags (re-applied by flag.apriori)
+backup_flags = true          # save a restorable flag version before unflagging
+keep_ms = false              # dask-ms backend: keep the intermediate MS after the zarr conversion
+
+[flagging]
+quack_interval = 0           # seconds; only used when the backend cannot measure it
+quack_sigma = 2.0            # MADs below the baseline's scan median that count as off-source
+quack_max_seconds = 50.0    # never trim more than this from a scan start
+flag_autocorrelations = true
+edge_channels_fraction = 0.05 # fraction of each subband flagged on each edge
+aoflagger_strategy = "default"
+outlier_sigma = 5.0          # robust-sigma cut for per-baseline outlier flagging
+
+[calibration]
+parang = true                # parallactic-angle correction in all cal steps
+refant_snr_select = true     # data-driven SNR-based reference-antenna selection
+eop_file = ""                # usno_finals.erp path for EOP corrections (VLBA/LBA); empty = auto-download
+snr_channel_fraction = 0.7   # central fraction of each subband used by the per-scan SNR survey
+ionos = true                 # solve the dispersive delay in the fringe fit below
+                             # ionos_max_ghz; false disables it at any frequency
+ionos_max_ghz = 6.0          # the ionosphere matters below this observing frequency
+snr_max_scans = 24           # cap on scans fringe-fitted by the survey (0 = all);
+                             # it only needs relative SNR, so a sample suffices
+smooth_tsys = true           # de-spike the Tsys table after gencal
+tsys_outlier_sigma = 6.0     # MAD sigmas beyond which a Tsys solution is an outlier
+tsys_smooth_passes = 3       # maximum de-spiking passes
+detection_snr = 7.0          # fringe SNR above which an antenna counts as detected
+require_all_subbands = true  # only calibrate on antennas that recorded the whole band
+edge_outlier_sigma = 6.0     # MAD sigmas defining the flat interior of a subband
+max_edge_fraction = 0.25     # never trim more than this fraction from either subband edge
+
+# Every key in a [calibration.*] section is passed straight through to the backend
+# function of the same name, so any parameter it accepts can be tuned here.
+[calibration.sbd]
+solint = "inf"
+minsnr = 10.0
+channel_fraction = 0.7       # central channels used (edges are not yet bandpass-corrected)
+zerorates = true             # instrumental delay is constant in time: do not fit a rate
+
+[calibration.bandpass]
+solint = "inf"
+combine = "scan"
+minsnr = 3.0
+solnorm = true               # normalise: keep the band shape, not the flux scale
+corrdepflags = true
+bandtype = 'B'
+
+[calibration.scalar_bandpass]
+solint = "inf"               # one amplitude per antenna and subband for the whole run
+combine = "scan"
+minsnr = 3.0
+solnorm = true               # keep the a-priori flux scale; level the subbands only
+
+[calibration.mbd]
+solint = "inf"
+combine = "spw"              # pool the subbands for sensitivity (needs an spw map at apply)
+minsnr = 5.0
+zerorates = false            # atmospheric residuals vary in time: fit the rate
+
+[calibration.tsys_smooth]
+window = 5                   # running-median window, in solutions, used to de-spike Tsys
+
+[calibration.snr_survey]
+minsnr = 0.0                 # keep every solution so weak antennas still appear in the survey
+
+[selfcal]
+enabled = true
+phase_rounds = 4
+ampphase_rounds = 2
+convergence_threshold = 0.05 # minimum fractional dynamic-range improvement
+
+[imaging]
+weighting = "briggs"
+robust = [-2, -1, 0, 1, 2]
+niter = 4000
+threshold_sigma = 3.0
+produce_fits = true
+produce_png = true
+
+[export]
+split_per_source = true
+export_uvfits = true
+time_average = ""            # e.g. "4s"; empty = none
+channel_average = -1         # -1 = one channel per subband (continuum); 1 = keep all
+radplot_time_bin = 10.0      # seconds averaged per point in the uv-distance plots

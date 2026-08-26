@@ -1,0 +1,1883 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Backend-agnostic VLBI data calibration and imaging pipeline">
+      
+      
+        <meta name="author" content="Benito Marcote">
+      
+      
+        <link rel="canonical" href="https://bmarcote.github.io/vlbipy/ISSUES/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="zensical-0.0.23">
+    
+    
+      
+        <title>vlbipy — Epic Backlog - vlbipy</title>
+      
+    
+    
+      
+        
+      
+      <link rel="stylesheet" href="../assets/stylesheets/modern/main.1e989742.min.css">
+      
+        
+          
+        
+        <link rel="stylesheet" href="../assets/stylesheets/modern/palette.dfe2e883.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,500,500i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,t)=>(e<<5)-e+t.charCodeAt(0)),0),__md_get=(e,t=localStorage,a=__md_scope)=>JSON.parse(t.getItem(a.pathname+"."+e)),__md_set=(e,t,a=localStorage,_=__md_scope)=>{try{a.setItem(_.pathname+"."+e,JSON.stringify(t))}catch(e){}},document.documentElement.setAttribute("data-platform",navigator.platform)</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="deep-purple">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#vlbipy-epic-backlog" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="./.." title="vlbipy" class="md-header__button md-logo" aria-label="vlbipy" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-book-open" viewBox="0 0 24 24"><path d="M12 7v14M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-menu" viewBox="0 0 24 24"><path d="M4 5h16M4 12h16M4 19h16"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            vlbipy
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              vlbipy — Epic Backlog
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="none" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="deep-purple"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="none" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="deep-purple"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-moon" viewBox="0 0 24 24"><path d="M20.985 12.486a9 9 0 1 1-9.473-9.472c.405-.022.617.46.402.803a6 6 0 0 0 8.268 8.268c.344-.215.825-.004.803.401"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-search" viewBox="0 0 24 24"><path d="m21 21-4.34-4.34"/><circle cx="11" cy="11" r="8"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog" aria-label="Search">
+  <button type="button" class="md-search__button">
+    Search
+  </button>
+</div>
+      
+    
+    <div class="md-header__source">
+      
+        <a href="https://github.com/bmarcote/vlbipy" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path fill="currentColor" d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    bmarcote/vlbipy
+  </div>
+</a>
+      
+    </div>
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+            
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="./.." class="md-tabs__link">
+        
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../getting-started/" class="md-tabs__link">
+        
+  
+  Getting Started
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../usage/" class="md-tabs__link">
+          
+  
+  Usage
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../science/" class="md-tabs__link">
+        
+  
+  Scientific Background
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../pipeline/" class="md-tabs__link">
+        
+  
+  Pipeline Workflow
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../configuration/" class="md-tabs__link">
+        
+  
+  Configuration
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../observatories/" class="md-tabs__link">
+          
+  
+  Observatories
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../backends/" class="md-tabs__link">
+          
+  
+  Backends
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../api/project/" class="md-tabs__link">
+          
+  
+  API Reference
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ul>
+  </div>
+</nav>
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="./.." title="vlbipy" class="md-nav__button md-logo" aria-label="vlbipy" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-book-open" viewBox="0 0 24 24"><path d="M12 7v14M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z"/></svg>
+
+    </a>
+    vlbipy
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/bmarcote/vlbipy" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path fill="currentColor" d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    bmarcote/vlbipy
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="./.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../usage/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Usage
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_3" id="__nav_3_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Usage
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../usage/pipeline/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Full pipeline
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../usage/cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Command line
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../usage/python/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Interactive Python
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../usage/status/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Status
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../science/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Scientific Background
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../pipeline/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Pipeline Workflow
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../configuration/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../observatories/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observatories
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_7" id="__nav_7_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_7">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Observatories
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../observatories/evn/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    EVN
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../observatories/vlba/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    VLBA
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../observatories/lba/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    LBA
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_8" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../backends/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Backends
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_8" id="__nav_8_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_8">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Backends
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../backends/casa/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CASA
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../backends/aips/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    AIPS
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_9" >
+        
+          
+          <label class="md-nav__link" for="__nav_9" id="__nav_9_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    API Reference
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_9_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_9">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    API Reference
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/project/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Project
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/pipeline/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Pipeline
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/models/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Models
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/config/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/backends/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Backends
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/observatories/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Observatories
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/diagnostics/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/plotting/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Plotting
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/selfcal/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Self-Calibration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/tools/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Tools
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+<nav class="md-nav md-nav--secondary" aria-label="On this page">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      On this page
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#overview" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Overview
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+                
+
+
+
+  
+
+
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+  
+  
+
+
+<h1 id="vlbipy-epic-backlog">vlbipy — Epic Backlog<a class="headerlink" href="#vlbipy-epic-backlog" title="Permanent link">&para;</a></h1>
+<p>Epic-level breakdown of <a href=".././PRD/"><code>PRD.md</code></a>, spanning the full roadmap (Phases 0–7).
+Each <code>##</code> heading is one epic (a self-contained chunk of work), intentionally kept
+coarse-grained; fine-grained tasks are expected to be split out per epic when work
+begins. Every epic is written to be copy-pasteable into GitHub Issues / Linear later.</p>
+<p><strong>How to use:</strong> implement top-to-bottom by priority. <strong>Phase 0 is the active target</strong>
+(the playable dummy API); Phases 1–7 are sequenced but not yet scheduled.</p>
+<p><strong>Legend</strong> — Priority: <code>P0</code> = now, <code>P1</code> = next, <code>P2</code> = later, <code>P3</code> = future.
+Status: <code>todo</code> unless noted.</p>
+<h2 id="overview">Overview<a class="headerlink" href="#overview" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>Epic</th>
+<th>Phase</th>
+<th>Priority</th>
+<th>Depends on</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>E0.1</td>
+<td>Package foundation &amp; domain models</td>
+<td>0</td>
+<td>P0</td>
+<td>—</td>
+</tr>
+<tr>
+<td>E0.2</td>
+<td>Core objects &amp; callable namespaces</td>
+<td>0</td>
+<td>P0</td>
+<td>E0.1</td>
+</tr>
+<tr>
+<td>E0.3</td>
+<td>DummyBackend &amp; observatory stubs</td>
+<td>0</td>
+<td>P0</td>
+<td>E0.1</td>
+</tr>
+<tr>
+<td>E0.4</td>
+<td>Config, state, logging &amp; errors</td>
+<td>0</td>
+<td>P0</td>
+<td>E0.1</td>
+</tr>
+<tr>
+<td>E0.5</td>
+<td>Contract tests &amp; example validation</td>
+<td>0</td>
+<td>P0</td>
+<td>E0.2, E0.3, E0.4</td>
+</tr>
+<tr>
+<td>E1</td>
+<td>CASA backend — single-epoch EVN continuum</td>
+<td>1</td>
+<td>P1</td>
+<td>E0.*</td>
+</tr>
+<tr>
+<td>E2</td>
+<td>CLI, dashboard &amp; notebook export</td>
+<td>2</td>
+<td>P2</td>
+<td>E1</td>
+</tr>
+<tr>
+<td>E3</td>
+<td>Multi-epoch campaign science</td>
+<td>3</td>
+<td>P2</td>
+<td>E1</td>
+</tr>
+<tr>
+<td>E4</td>
+<td>VLBA/LBA automatic downloads</td>
+<td>4</td>
+<td>P2</td>
+<td>E1</td>
+</tr>
+<tr>
+<td>E5</td>
+<td>Spectral-line &amp; multi-phase-center/pulsar modes</td>
+<td>5</td>
+<td>P3</td>
+<td>E1</td>
+</tr>
+<tr>
+<td>E6</td>
+<td>Polarization calibration</td>
+<td>6</td>
+<td>P3</td>
+<td>E1</td>
+</tr>
+<tr>
+<td>E7</td>
+<td>Containerization</td>
+<td>7</td>
+<td>P3</td>
+<td>E1, E3</td>
+</tr>
+<tr>
+<td>E8</td>
+<td>Additional backends (AIPS, eht-imager, Difmap)</td>
+<td>any</td>
+<td>P3</td>
+<td>E0.3</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h1 id="phase-0-playable-dummy-api-active-target">Phase 0 — Playable Dummy API (active target)<a class="headerlink" href="#phase-0-playable-dummy-api-active-target" title="Permanent link">&para;</a></h1>
+<p>Goal: a fresh <code>src/vlbipy</code> package exposing the <strong>complete public API</strong> backed by a
+<code>DummyBackend</code> (in-memory + logging only, <strong>no files written</strong>), so the API can be
+exercised, tested, and iterated on before any real backend exists. PRD §2.1, §6, §10.</p>
+<h2 id="e01-package-foundation-domain-models">E0.1 — Package foundation &amp; domain models<a class="headerlink" href="#e01-package-foundation-domain-models" title="Permanent link">&para;</a></h2>
+<p><strong>Phase 0 · P0 · depends: —</strong></p>
+<p>Stand up the fresh package skeleton and all backend-independent data types.</p>
+<p><strong>Scope</strong>
+- New <code>src/vlbipy</code> package (import name unchanged); <code>pyproject.toml</code>; <code>__init__.py</code>
+  exporting <code>VLBIObs</code>, <code>load_config</code>, <code>__version__</code> (plus <code>Observation</code> and result
+  types for power users / type hints).
+- <code>models.py</code>: <code>Antenna</code>, <code>FreqSetup</code>, <code>Scan</code>, <code>ObsMetadata</code>, <code>CalTable</code>,
+  <code>QualityMetrics</code>, and enums (<code>Stokes</code>, <code>Observatory</code>, <code>Backend</code>, <code>Mode</code>).
+- <code>sources.py</code>: <code>Source</code>, <code>SourceType</code>, <code>SourceSet</code> (role accessors <code>target</code>/<code>targets</code>/
+  <code>phase_calibrators</code>/<code>fringe_finders</code>/<code>check_sources</code>/<code>polarization_calibrators</code>/
+  <code>calibrators</code>, name lookup, iteration), phase-referencing resolution, empty-role
+  fallback (fringe finder → phase cal → target).
+- <code>results.py</code>: <code>Image</code>, <code>ImageSet</code>, <code>SelfcalResult</code> and their methods
+  (<code>export_fits</code>, <code>preview</code>, <code>best</code>, <code>by_robust</code>, <code>export_all</code>).</p>
+<p><strong>Acceptance criteria</strong>
+- All dataclasses import, construct, and round-trip (de)serialize with no CASA/backend imports.
+- <code>SourceSet</code> resolves roles and phase-ref maps; ambiguous <code>.target</code> behavior matches the
+  decision recorded in PRD §13 (Open Questions).</p>
+<p><strong>PRD refs:</strong> §6.1, §6.4, §6.6, §8, §9.</p>
+<h2 id="e02-core-objects-callable-namespaces">E0.2 — Core objects &amp; callable namespaces<a class="headerlink" href="#e02-core-objects-callable-namespaces" title="Permanent link">&para;</a></h2>
+<p><strong>Phase 0 · P0 · depends: E0.1</strong></p>
+<p>Implement the user-facing objects and the callable-namespace machinery.</p>
+<p><strong>Scope</strong>
+- <code>vlbiobs.py</code>: <code>VLBIObs</code> — construction (single code or list), config resolution,
+  observation fan-out, <code>merge()</code>, <code>run()</code>, aggregate state, <code>observations</code>, <code>__getitem__</code>,
+  <code>map()</code>.
+- <code>observation.py</code>: <code>Observation</code> — per-project unit holding backend/observatory refs,
+  resolved metadata, per-project state.
+- <code>namespaces/</code>: one module each for <code>import_data</code>, <code>calibrate</code>, <code>flag</code>, <code>plot</code>, <code>clean</code>,
+  <code>selfcal</code>, <code>export</code>. Each is a <strong>callable</strong> whose <code>__call__</code> runs the default and whose
+  methods run explicit variants (e.g. <code>clean.wsclean</code> / <code>clean.tclean</code>,
+  <code>calibrate.a_priori/initial_calibration/bandpass/fringefit/phase_reference/apply</code>).
+  Namespaces translate intent into <code>Backend</code> calls only — no CASA imports.
+- Top-level methods: <code>summary()</code>/<code>inspect()</code>, <code>report()</code>, <code>reset()</code>/<code>clean_state()</code>.</p>
+<p><strong>Acceptance criteria</strong>
+- Single- and multi-project construction works; campaign-level calls delegate to each
+  <code>Observation</code>; <code>merge()</code> is a logged no-op for one project.
+- Every namespace default and variant is callable and returns the documented object types
+  (<code>clean</code> scalar robust → <code>Image</code>, list → <code>ImageSet</code>; <code>selfcal</code> → <code>SelfcalResult</code>).</p>
+<p><strong>PRD refs:</strong> §6.1–6.7.</p>
+<h2 id="e03-dummybackend-observatory-stubs">E0.3 — DummyBackend &amp; observatory stubs<a class="headerlink" href="#e03-dummybackend-observatory-stubs" title="Permanent link">&para;</a></h2>
+<p><strong>Phase 0 · P0 · depends: E0.1</strong></p>
+<p>Provide the only backend for this milestone plus observatory handler stubs.</p>
+<p><strong>Scope</strong>
+- <code>backends/base.py</code>: single cohesive <code>Backend</code> interface (import, metadata read,
+  a-priori cal, fringefit, bandpass, gaincal, applycal, flag ops, clean/wsclean/tclean,
+  split, export_uvfits).
+- <code>backends/dummy.py</code>: <code>DummyBackend</code> — writes no files; logs each op with resolved
+  parameters and data selection; returns synthetic <code>CalTable</code>/<code>Image</code>/<code>ImageSet</code>/
+  <code>QualityMetrics</code>; synthesizes configurable fake array/sources/scans/freq setup; mutates
+  in-memory state.
+- <code>observatories/base.py</code> + <code>evn.py</code>/<code>vlba.py</code>/<code>lba.py</code>: <code>ObservatoryHandler</code> interface and
+  stub handlers (EVN = auto-download-capable; VLBA/LBA = clear manual-download guidance;
+  dummy "found" files so <code>import_data</code> completes).</p>
+<p><strong>Acceptance criteria</strong>
+- The full API runs end-to-end with <code>backend="dummy"</code> and no external software/data/files.
+- Backend is never exposed to users (no public attribute returns a backend instance).</p>
+<p><strong>PRD refs:</strong> §6.9, §6.10.</p>
+<h2 id="e04-config-state-logging-errors">E0.4 — Config, state, logging &amp; errors<a class="headerlink" href="#e04-config-state-logging-errors" title="Permanent link">&para;</a></h2>
+<p><strong>Phase 0 · P0 · depends: E0.1</strong></p>
+<p>The cross-cutting infrastructure the API relies on.</p>
+<p><strong>Scope</strong>
+- <code>config.py</code>: three-layer TOML cascade (defaults → user file → constructor/CLI overrides);
+  constructor-kwarg ↔ config-key mirroring; role and <code>[phase_referencing]</code> parsing.
+- <code>templates/defaults.toml</code>: carried forward from the old package and extended with a
+  <code>[phase_referencing]</code> section and <code>backend = "dummy"</code> default.
+- <code>state.py</code>: per-observation step/state record, smart-skip decisions, <code>force=</code>,
+  downstream invalidation; in dummy mode it <strong>logs decisions</strong> (e.g. <code>would skip: bandpass</code>).
+- <code>logging_utils.py</code>: structured <code>INFO</code>/<code>WARNING</code>/<code>ERROR</code>/<code>DEBUG</code>; <strong>orange</strong> warnings,
+  <strong>red bold</strong> errors; anomaly surfacing + end-of-run warning summary.
+- <code>errors.py</code>: <code>VlbipyError</code>, <code>ConfigError</code>, <code>SourceNotFoundError</code>, <code>BackendError</code>,
+  <code>StepError</code> (records step/params/selection).</p>
+<p><strong>Acceptance criteria</strong>
+- Override precedence verified (CLI/kwargs &gt; user TOML &gt; defaults).
+- Smart-skip / force / invalidation decisions are observable via logs; failed steps are
+  marked failed in state, never silently skipped.</p>
+<p><strong>PRD refs:</strong> §6.2, §6.8, §6.11.</p>
+<h2 id="e05-contract-tests-example-validation">E0.5 — Contract tests &amp; example validation<a class="headerlink" href="#e05-contract-tests-example-validation" title="Permanent link">&para;</a></h2>
+<p><strong>Phase 0 · P0 · depends: E0.2, E0.3, E0.4</strong></p>
+<p>Freeze the public API behavior with tests that need no CASA and no data.</p>
+<p><strong>Scope</strong>
+- Contract suite against <code>DummyBackend</code>: construct <code>VLBIObs</code> (single + multi-project);
+  call every namespace default and variant; assert returned types/shapes; assert role
+  resolution + empty-role fallback; assert <code>merge()</code> no-op vs combine; assert
+  smart-skip/<code>force</code>/invalidation are logged; assert ops log resolved parameters.
+- Pure-Python unit tests: config cascade/precedence, source-role &amp; phase-ref parsing,
+  state transitions, model (de)serialization.
+- Example-coverage test: the Pre-PRD example (PRD §7.1) runs end-to-end without error.</p>
+<p><strong>Acceptance criteria</strong>
+- <code>pytest</code> green in a CASA-free environment; the §7.1 example is a passing test.</p>
+<p><strong>PRD refs:</strong> §10.</p>
+<hr />
+<h1 id="phases-17-real-backends-advanced-modes-sequenced-not-yet-scheduled">Phases 1–7 — Real backends &amp; advanced modes (sequenced, not yet scheduled)<a class="headerlink" href="#phases-17-real-backends-advanced-modes-sequenced-not-yet-scheduled" title="Permanent link">&para;</a></h1>
+<h2 id="e1-casa-backend-single-epoch-evn-continuum">E1 — CASA backend: single-epoch EVN continuum<a class="headerlink" href="#e1-casa-backend-single-epoch-evn-continuum" title="Permanent link">&para;</a></h2>
+<p><strong>Phase 1 · P1 · depends: E0.</strong>*</p>
+<p>Implement <code>Backend</code> for CASA behind the frozen interface and deliver a real end-to-end
+EVN continuum reduction, validated against <code>rsm07</code>.</p>
+<p><strong>Scope</strong>
+- Import: FITS-IDI → MS, per-source split, Dask-friendly I/O; skip-if-exists.
+- A-priori: Tsys (+ outlier filtering/smoothing), gain curve, TEC (freq-gated), EOP/ACCOR
+  where applicable; warn on antennas missing Tsys where they have data.
+- Main calibration chain: SBD → bandpass → refined SBD → global MBD (smoothed), with
+  data-driven refant-by-SNR selection, SBD/bandpass scan selection by fringe SNR, and MBD
+  solint optimization (port validated logic from the old package <strong>behind the interface</strong>).
+- Post-cal flagging (edge channels; AOFlagger/tfcrop on calibrators only) + scalar
+  amplitude normalization + second calibration pass.
+- Phase referencing (time-interpolated calibrator solutions, derived spwmap) + self-cal
+  loop (phase → amp+phase, convergence via dynamic-range improvement, bad-round discard).
+- Imaging: WSClean default with tclean fallback; auto cell/imsize/weighting from geometry;
+  robust sweep; wide-FOV search for uncertain target positions; image products
+  (clean/residual/psf/model, FITS, PNG, stats).
+- Split/export (per-source MS + UVFITS, averaging + smearing-loss warning); real working
+  directory layout; real state (mtime/checksum); HTML + JSON report with anomaly summary.</p>
+<p><strong>Acceptance criteria</strong>
+- End-to-end <code>rsm07</code> reduction produces calibrated data + images + report; the public API
+  and CLI one-liner are unchanged from Phase 0.</p>
+<p><strong>PRD refs:</strong> §2.1, §6.3.1, §11 (Phase 1), §14 (porting notes).</p>
+<h2 id="e2-cli-dashboard-notebook-export">E2 — CLI, dashboard &amp; notebook export<a class="headerlink" href="#e2-cli-dashboard-notebook-export" title="Permanent link">&para;</a></h2>
+<p><strong>Phase 2 · P2 · depends: E1</strong></p>
+<p>Deliver the non-Python surfaces as thin wrappers over <code>VLBIObs</code>.</p>
+<p><strong>Scope</strong>
+- CLI (<code>vlbipy</code>): flags → <code>VLBIObs</code> construction → <code>.run()</code>; modes <code>--summary-only</code>,
+  <code>--dashboard</code>, <code>--from-step/--to-step/--step</code>, <code>--force</code>, <code>--clean</code>, <code>--no-smart</code>,
+  <code>--verbose</code>. No logic beyond argument translation.
+- Dashboard (<code>vlbipy --dashboard -p PROJECT</code>): reads the same <code>VLBIObs</code> state/products;
+  interactive flagging + live smart re-runs; calibrated-data and results tabs.
+- Notebook export: generate <code>{project}_reduction.ipynb</code> reproducing the reduction.</p>
+<p><strong>Acceptance criteria</strong>
+- CLI one-liner equals the documented Python one-liner; dashboard renders real products.</p>
+<p><strong>PRD refs:</strong> §5, §6.12, §11 (Phase 2).</p>
+<h2 id="e3-multi-epoch-campaign-science">E3 — Multi-epoch campaign science<a class="headerlink" href="#e3-multi-epoch-campaign-science" title="Permanent link">&para;</a></h2>
+<p><strong>Phase 3 · P2 · depends: E1</strong></p>
+<p>Make <code>merge()</code> scientifically real and add astrometry reporting.</p>
+<p><strong>Scope</strong>
+- Real cross-epoch, per-source concatenation (with frequency/uv alignment handling).
+- Joint self-cal across epochs; apply combined model back to each epoch.
+- Check-source astrometric offset measurement (mas) and proper-motion/parallax reporting.</p>
+<p><strong>Acceptance criteria</strong>
+- A multi-project <code>VLBIObs</code> calibrates per epoch, merges, and images the combined data;
+  astrometric metrics appear in the report.</p>
+<p><strong>PRD refs:</strong> §6.7, §11 (Phase 3); resolves the merge-semantics Open Question (§13).</p>
+<h2 id="e4-vlbalba-automatic-downloads">E4 — VLBA/LBA automatic downloads<a class="headerlink" href="#e4-vlbalba-automatic-downloads" title="Permanent link">&para;</a></h2>
+<p><strong>Phase 4 · P2 · depends: E1</strong></p>
+<p>Replace manual-download guidance with real archive integration.</p>
+<p><strong>Scope</strong>
+- <code>data.nrao.edu</code> (VLBA) and ATOA (LBA) download flows in the respective
+  <code>ObservatoryHandler</code>s, including <code>.antab</code>/<code>.uvflg</code> retrieval.</p>
+<p><strong>Acceptance criteria</strong>
+- VLBA/LBA <code>import_data()</code> fetches data automatically where the archive allows; clear,
+  actionable messaging otherwise.</p>
+<p><strong>PRD refs:</strong> §6.10, §11 (Phase 4).</p>
+<h2 id="e5-spectral-line-multi-phase-centerpulsar-binning-modes">E5 — Spectral-line &amp; multi-phase-center/pulsar-binning modes<a class="headerlink" href="#e5-spectral-line-multi-phase-centerpulsar-binning-modes" title="Permanent link">&para;</a></h2>
+<p><strong>Phase 5 · P3 · depends: E1</strong></p>
+<p>Support non-continuum observing modes.</p>
+<p><strong>Scope</strong>
+- Channel-dependent calibration; spectral cube production + cube plotting.
+- Detection/handling of multiple correlation passes (multi-phase-center, pulsar binning).
+- S/X frequency splitting (e.g. ~2.3 GHz vs ~8.7 GHz) prior to imaging.</p>
+<p><strong>Acceptance criteria</strong>
+- <code>mode="spectral-line"</code> / <code>"multi-phase-center"</code> / <code>"pulsar-binning"</code> produce the
+  corresponding products through the same API.</p>
+<p><strong>PRD refs:</strong> §11 (Phase 5).</p>
+<h2 id="e6-polarization-calibration">E6 — Polarization calibration<a class="headerlink" href="#e6-polarization-calibration" title="Permanent link">&para;</a></h2>
+<p><strong>Phase 6 · P3 · depends: E1</strong></p>
+<p>Add full polarization calibration.</p>
+<p><strong>Scope</strong>
+- RL delay, RL phase (<code>polcal</code>), D-terms, applied between global fringe fit and final split;
+  wire the <code>polarization_calibrators</code> role.</p>
+<p><strong>Acceptance criteria</strong>
+- Polarization products validated against a known polarized calibrator.</p>
+<p><strong>PRD refs:</strong> §11 (Phase 6).</p>
+<h2 id="e7-containerization">E7 — Containerization<a class="headerlink" href="#e7-containerization" title="Permanent link">&para;</a></h2>
+<p><strong>Phase 7 · P3 · depends: E1, E3</strong></p>
+<p>Package <code>vlbipy</code> for reproducible deployment.</p>
+<p><strong>Scope</strong>
+- Singularity/Apptainer image bundling <code>vlbipy</code> + backends (<code>oxkat</code> as reference model only).</p>
+<p><strong>Acceptance criteria</strong>
+- A container runs a full reduction reproducibly from a project code.</p>
+<p><strong>PRD refs:</strong> §11 (Phase 7).</p>
+<h2 id="e8-additional-backends-aips-eht-imager-difmap">E8 — Additional backends (AIPS, eht-imager, Difmap)<a class="headerlink" href="#e8-additional-backends-aips-eht-imager-difmap" title="Permanent link">&para;</a></h2>
+<p><strong>Any phase · P3 · depends: E0.3</strong></p>
+<p>Prove the <code>Backend</code> interface generalizes beyond CASA/WSClean.</p>
+<p><strong>Scope</strong>
+- Additional <code>Backend</code> implementations (AIPS calibration; eht-imager imaging; Difmap
+  export), each selectable via <code>backend=</code> with no API-surface changes.</p>
+<p><strong>Acceptance criteria</strong>
+- At least one additional backend produces valid products through the unchanged API.</p>
+<p><strong>PRD refs:</strong> §6.9, §11 (backend expansion).</p>
+<hr />
+<h2 id="open-decisions-from-prd-13-resolve-as-the-relevant-epics-start">Open decisions (from PRD §13) — resolve as the relevant epics start<a class="headerlink" href="#open-decisions-from-prd-13-resolve-as-the-relevant-epics-start" title="Permanent link">&para;</a></h2>
+<ul>
+<li><code>obs.sources.target</code> when multiple targets exist — proposed: <code>.target</code> raises if
+  ambiguous, <code>.targets</code> is the plural accessor. <em>(E0.1)</em></li>
+<li>Campaign concurrency primitive (threads/processes/Dask; CASA is not thread-safe) —
+  design fan-out now, pick executor in Phase 1. <em>(E0.2 shape, E1 executor)</em></li>
+<li>Merge semantics detail (per-source cross-epoch concatenation, freq/uv alignment). <em>(E3)</em></li>
+<li>Default imager = WSClean with tclean fallback — confirm across networks/modes. <em>(E1)</em></li>
+<li><code>VLBIObs</code> naming semantics (campaign named for a single observation) — documented
+  convention. <em>(E0.2)</em></li>
+<li>Namespace verb naming — snake_case standard; confirm any aliases (e.g. <code>importdata</code>). <em>(E0.2)</em></li>
+</ul>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-circle-arrow-up" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="m16 12-4-4-4 4M12 16V8"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://zensical.org/" target="_blank" rel="noopener">
+      Zensical
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/bmarcote/vlbipy" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path fill="currentColor" d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      
+      <script id="__config" type="application/json">{"annotate":null,"base":"..","features":["content.code.annotate","content.code.copy","content.footnote.tooltips","navigation.footer","navigation.indexes","navigation.instant","navigation.instant.prefetch","navigation.path","navigation.sections","navigation.tabs","navigation.top","navigation.tracking","search.highlight","toc.follow"],"search":"../assets/javascripts/workers/search.e2d2d235.min.js","tags":null,"translations":{"clipboard.copied":"Copied to clipboard","clipboard.copy":"Copy to clipboard","search.result.more.one":"1 more on this page","search.result.more.other":"# more on this page","search.result.none":"No matching documents","search.result.one":"1 matching document","search.result.other":"# matching documents","search.result.placeholder":"Type to start searching","search.result.term.missing":"Missing","select.version":"Select version"},"version":null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.5fcf0de6.min.js"></script>
+      
+    
+  </body>
+</html>
