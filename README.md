@@ -1,8 +1,8 @@
 # vlbipy
 
-Backend-agnostic VLBI data calibration and imaging pipeline.
+Backend-agnostic VLBI data calibration and imaging pipeline. **Under development and far from being usable**
 
-Supports **EVN**, **VLBA**, and **LBA** observatories with **CASA** or **AIPS** (ParselTongue) backends, selectable at runtime.
+Aims to support **EVN**, **VLBA**, and **LBA** observations with different backends like **CASA** or **AIPS** (via ParselTongue), or others, selectable at runtime. Starting with just CASA and external MS-related tools.
 
 ## Installation
 
@@ -32,7 +32,7 @@ vlbipy -i my_project.toml
 vlbipy -p EG078B -n EVN --backend CASA -t J1234+5678 -pcal J1230+5600 -ff 3C345
 
 # Summary only
-vlbipy -p EG078B -n EVN --summary-only
+vlbipy -p EG078B --summary-only
 
 # Run specific steps
 vlbipy -i my_project.toml --start-step 5 --end-step 11
@@ -42,20 +42,15 @@ vlbipy -i my_project.toml --start-step 5 --end-step 11
 
 ```python
 from vlbipy import Project
-from vlbipy.pipeline import run_pipeline
+from vlbipy import pipeline
 
-project = Project(
-    project_code="EG078B",
-    observatory="EVN",
-    backend="CASA",
-    input_file="my_project.toml",
-)
+project = Project(project_code="EG078B", observatory="EVN",
+    backend="CASA", input_file="my_project.toml")
 
 # Full pipeline
-run_pipeline(project)
+pipeline.run_pipeline(project)
 
 # Or step-by-step
-from vlbipy import pipeline
 pipeline.step_setup(project)
 pipeline.step_load_metadata(project)
 print(project.summary())
@@ -110,7 +105,6 @@ vlbipy/
 │   └── lba.py         # LBA specifics
 ├── diagnostics.py     # Summary reports, data checks
 ├── plotting.py        # Diagnostic plots
-├── selfcal.py         # Self-calibration loops
 └── templates/         # Default and example TOML configs
 ```
 
