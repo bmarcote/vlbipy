@@ -1,2 +1,2 @@
 zensical
-mkdocstrings
+mkdocstrings[python]
