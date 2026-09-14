@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Optional, Union
 
 from ..diagnostics import write_summary
-from ..errors import StepError
+from ..errors import BackendError, StepError
 from ..logging_utils import get_logger, warnings
 from ..models import CalTable
 from ..results import Image, ImageSet, SelfcalResult
@@ -342,6 +342,19 @@ class CalibrateNamespace(Namespace):
         from ..selection import select_antennas, select_calibration_scans
 
         obs = self._obs
+        # Decide the antenna/scan set once — on the first (cleanest) pass — and reuse it for
+        # every later pass. Re-surveying on the progressively flagged data of a second/third
+        # pass lets the detectable set shrink (e.g. 8 -> 6 -> 2 antennas on a sparse fringe
+        # finder), and applycal (calflagstrict) then flags every antenna the shrunken solution
+        # no longer covers — silently deleting good antennas. The calibratable array is a
+        # property of the observation, not something a later pass should re-litigate on
+        # dirtier data.
+        if obs.cal_selection is not None:
+            antennas, scans = obs.cal_selection
+            logger.info("select_calibration_data: reusing the instrumental selection fixed on the "
+                        "first pass — {} antenna(s) {} on scan(s) {} (not re-surveying the now-flagged "
+                        "data)", len(antennas), ",".join(antennas), scans)
+            return antennas, scans
         cal_cfg = obs.config.get("calibration", {})
         threshold = min_snr if min_snr is not None else cal_cfg.get("detection_snr", 7.0)
         # Survey one source group at a time, in the order the calibration falls back
@@ -363,6 +376,10 @@ class CalibrateNamespace(Namespace):
                 continue
             scans = select_calibration_scans(survey, antennas, min_snr=threshold, sources=names)
             if scans:
+                obs.set_cal_selection(antennas, scans)
+                logger.info("select_calibration_data: fixed the instrumental selection for the whole "
+                            "run — {} antenna(s) {} on scan(s) {}; every pass solves on this set",
+                            len(antennas), ",".join(antennas), scans)
                 return antennas, scans
         raise StepError(f"{self._code}: no scan on {', '.join(attempted) or 'any source'} detects "
                         f"a full-band antenna above {threshold:g} sigma; cannot solve the "
@@ -378,6 +395,10 @@ class CalibrateNamespace(Namespace):
         if scans is None:
             antennas, scans = self.select_calibration_data()
         cal_cfg = obs.config.get("calibration", {})
+        # Drop a table this same step produced before: re-running (e.g. a resumed process,
+        # or calling instrumental() again) would otherwise pass the *old* table as one of
+        # this solve's own on-the-fly priors while it is being overwritten at the same path.
+        obs.drop_gaintables({step})
         # The whole [calibration.sbd] section is forwarded: its keys are the backend
         # function's parameters, so any of them can be tuned without a code change.
         settings = {"channel_fraction": cal_cfg.get("snr_channel_fraction", 0.8)}
@@ -398,13 +419,43 @@ class CalibrateNamespace(Namespace):
             return obs._table("bpass")
         if scans is None:
             antennas, scans = self.select_calibration_data()
+        obs.drop_gaintables({"bandpass"})
         bp_cfg = dict(obs.config.get("calibration", {}).get("bandpass", {}))
-        table = self._backend.calibrate.bandpass(
-            self._code, obs.calibrator_field, ",".join(antennas or []) or obs.refant,
-            scans=scans, gaintable=list(obs.gaintables), metadata=obs.metadata, **bp_cfg)
+        try:
+            table = self._backend.calibrate.bandpass(
+                self._code, obs.calibrator_field, ",".join(antennas or []) or obs.refant,
+                scans=scans, gaintable=list(obs.gaintables), metadata=obs.metadata, **bp_cfg)
+        except BackendError as exc:
+            # A re-solve on already-flagged data can fail when the fringe finder has
+            # too few unflagged antennas left (common with a single, sparse FF on a
+            # third pass). The band shape is stable across passes, so fall back to the
+            # bandpass the earlier pass solved rather than aborting the whole run.
+            fallback = self._existing_table("bpass", interp="nearest,nearest")
+            if fallback is None:
+                raise
+            warnings.warn(f"{self._code}: bandpass re-solve failed ({exc}); keeping the "
+                          "previous bandpass table")
+            table = fallback
         obs.add_gaintable(table, "bandpass")
         obs._state.mark_complete("bandpass", outputs=["bpass"])
         return table
+
+    def _existing_table(self, cal_type: str, interp: str = "nearest") -> Optional[CalTable]:
+        """Return a calibration table already on disk for ``cal_type``, or None.
+
+        Used as the fallback when a re-solve cannot proceed: the backend leaves the
+        previous (successfully-solved) table in place, and this rebuilds a CalTable
+        pointing at it so it stays in the apply chain. The file name follows the
+        backend convention ``<code>.<cal_type>``.
+        """
+        caldir = getattr(self._backend, "caldir", None)
+        if caldir is None:
+            return None
+        path = caldir() / f"{self._code}.{cal_type}"
+        if not path.is_dir():
+            return None
+        return CalTable(cal_type=cal_type, path=str(path), field=self._obs.calibrator_field,
+                        interp=interp)
 
     def instrumental(self, *, force: bool = False, plot: bool = True) -> list[CalTable]:
         """Full instrumental calibration: SBD, MBD, bandpass, then SBD and MBD again.
@@ -456,7 +507,7 @@ class CalibrateNamespace(Namespace):
         """Decide whether the fringe fit should also solve the dispersive delay.
 
         The ionosphere delays low frequencies more than high ones, so below
-        ``[calibration].ionos_max_ghz`` (6 GHz by default) the residual delay is
+        ``[calibration].ionos_max_ghz`` (8 GHz by default) the residual delay is
         genuinely dispersive and fitting a single non-dispersive delay leaves a
         frequency-dependent phase behind. Above that the effect is negligible
         and the extra free parameter only costs SNR.
@@ -469,7 +520,7 @@ class CalibrateNamespace(Namespace):
             logger.info("fringefit: dispersive delay disabled ([calibration].ionos is false)")
             return False
         freq_ghz = obs.metadata.freq_setup.freq_ghz if obs.metadata else 0.0
-        threshold = float(cal_cfg.get("ionos_max_ghz", 6.0))
+        threshold = float(cal_cfg.get("ionos_max_ghz", 8.0))
         if not freq_ghz:
             return False
         dispersive = freq_ghz < threshold
@@ -479,39 +530,8 @@ class CalibrateNamespace(Namespace):
                     "will" if dispersive else "will not")
         return dispersive
 
-    def edge_channels(self, *, table: Optional[CalTable] = None, flag: bool = True,
-                      force: bool = False) -> dict:
-        """Measure the subband edge roll-off from the bandpass and flag those channels.
-
-        Replaces a blind ``[flagging].edge_channels_fraction`` guess with the
-        roll-off actually present in the data, then flags the same number of
-        channels at both edges of every subband.
-        """
-        obs = self._obs
-        if not obs._state.should_run("edge_channels", force=force):
-            return {}
-        table = table or obs._table("bpass")
-        if table is None:
-            raise StepError(f"{self._code}: no bandpass table; run calibrate.instrumental() first")
-        if not self._backend.supports("calibrate", "measure_edge_channels"):
-            logger.info("edge_channels: backend {} cannot measure the band edges; skipping",
-                        self._backend.kind)
-            return {}
-        cal_cfg = obs.config.get("calibration", {})
-        measurement = self._backend.calibrate.measure_edge_channels(
-            self._code, table, threshold=cal_cfg.get("edge_outlier_sigma", 6.0),
-            max_edge_fraction=cal_cfg.get("max_edge_fraction", 0.25))
-        n_edge = measurement["n_edge"]
-        if flag and n_edge > 0:
-            measurement["flagged_fraction_of_data"] = obs.flag.edges(
-                edge_channels=n_edge, n_channels=measurement["n_channels"], force=True)
-        elif not n_edge:
-            logger.info("edge_channels: the subbands are flat to the edges; nothing to flag")
-        obs.plot.bandpass_profile(measurement)
-        obs._state.mark_complete("edge_channels", outputs=[f"edge={n_edge}"])
-        return measurement
-
-    def second_pass(self, *, force: bool = False, plot: bool = True) -> list[CalTable]:
+    def second_pass(self, *, force: bool = False, plot: bool = True,
+                    step: str = "second_pass") -> list[CalTable]:
         """Re-solve the instrumental and fringe calibration on the now-flagged data.
 
         The first solutions were derived from data that still contained whatever
@@ -519,22 +539,49 @@ class CalibrateNamespace(Namespace):
         data — so those points biased them. Re-solving from the a-priori tables
         (Tsys / gain curve / EOP, which do not depend on the data) gives cleaner
         solutions. The data-derived tables are replaced, not stacked.
+
+        Parameters
+        ----------
+        step : str
+            State name recorded for this pass (``"second_pass"``; the pipeline
+            uses ``"third_pass"`` for the re-solve after reweighting).
         """
         obs = self._obs
-        if not obs._state.should_run("second_pass", force=force):
+        if not obs._state.should_run(step, force=force):
             return obs.gaintables
         keep = {"tsys", "gc", "eop"}
         dropped = [t.cal_type for t in obs.gaintables if t.cal_type not in keep]
         obs.set_gaintables([t for t in obs.gaintables if t.cal_type in keep])
-        logger.info("second pass: re-deriving {} from the a-priori tables on the flagged "
-                    "data", ", ".join(dropped) or "nothing")
+        logger.info("{}: re-deriving {} from the a-priori tables on the flagged data",
+                    step.replace("_", " "), ", ".join(dropped) or "nothing")
         obs._snr_surveys.clear()
-        for step in ("scan_snr", "initial_calibration", "bandpass", "fringefit",
-                     "initial_calibration_sbd2", "fringefit_mbd2"):
-            obs._state.invalidate_downstream(step, [step])
+        for name in ("scan_snr", "initial_calibration", "bandpass", "fringefit",
+                     "initial_calibration_sbd2", "fringefit_mbd2", "scalar_bandpass"):
+            obs._state.invalidate_downstream(name, [name])
         self.instrumental(force=True, plot=plot)
-        obs._state.mark_complete("second_pass", outputs=[t.cal_type for t in obs.gaintables])
+        obs._state.mark_complete(step, outputs=[t.cal_type for t in obs.gaintables])
         return obs.gaintables
+
+    def reweight(self, *, force: bool = False, **kwargs) -> dict:
+        """Recompute the visibility weights from the calibrated data (``statwt``).
+
+        Run after the full chain has been applied. The new weights expose bad
+        data that hid until now (anomalously high or low weights), so the
+        pipeline follows this with another outlier flag and a full re-solve of
+        the calibration (``second_pass(step="third_pass")``).
+        """
+        obs = self._obs
+        if not obs._state.should_run("reweight", force=force):
+            return {}
+        if not self._backend.supports("calibrate", "reweight"):
+            logger.info("reweight: backend {} does not implement it; skipping", self._backend.kind)
+            return {}
+        cfg = dict(obs.config.get("calibration", {}).get("reweight", {}))
+        cfg.pop("enabled", None)
+        cfg.update(kwargs)
+        report = self._backend.calibrate.reweight(self._code, **cfg)
+        obs._state.mark_complete("reweight", outputs=[f"mean={report.get('mean')}"])
+        return report
 
     def scalar_bandpass(self, *, force: bool = False, plot: bool = True) -> Optional[CalTable]:
         """Solve one amplitude gain per antenna and subband, levelling the subbands."""
@@ -545,13 +592,28 @@ class CalibrateNamespace(Namespace):
             logger.info("scalar_bandpass: backend {} does not implement it; skipping",
                         self._backend.kind)
             return None
+        obs.drop_gaintables({"scalar_bandpass"})
         cfg = dict(obs.config.get("calibration", {}).get("scalar_bandpass", {}))
         # Solve on the phase calibrator: gaincal assumes a point source, so a resolved
         # fringe finder would have its structure absorbed into the antenna gains.
         compact = obs.sources.phase_calibrators or obs.sources.calibrators
-        table = self._backend.calibrate.scalar_bandpass(
-            self._code, ",".join(s.name for s in compact) or obs.calibrator_field,
-            obs.refant, gaintable=list(obs.gaintables), metadata=obs.metadata, **cfg)
+        try:
+            table = self._backend.calibrate.scalar_bandpass(
+                self._code, ",".join(s.name for s in compact) or obs.calibrator_field,
+                obs.refant, gaintable=list(obs.gaintables), metadata=obs.metadata, **cfg)
+        except BackendError as exc:
+            # Optional subband levelling: a re-solve on heavily-flagged data can fail. Keep
+            # the previous pass's table if there is one; otherwise skip it rather than abort
+            # the whole run — the calibration is still valid without the levelling.
+            fallback = self._existing_table("scalar_bp")
+            if fallback is None:
+                warnings.warn(f"{self._code}: scalar bandpass could not be solved ({exc}) and "
+                              "no earlier table exists; continuing without subband levelling")
+                obs._state.mark_complete("scalar_bandpass", outputs=[])
+                return None
+            warnings.warn(f"{self._code}: scalar bandpass re-solve failed ({exc}); keeping the "
+                          "previous scalar bandpass table")
+            table = fallback
         obs.add_gaintable(table, "scalar_bandpass")
         if plot:
             obs.plot.caltable(table)
@@ -586,6 +648,7 @@ class CalibrateNamespace(Namespace):
             return obs._table(suffix)
         cals = obs.sources.calibrators or obs.sources.targets
         field = ",".join(s.name for s in cals)
+        obs.drop_gaintables({step})
         cal_cfg = obs.config.get("calibration", {})
         mbd_cfg = dict(cal_cfg.get("mbd", {}))
         mbd_cfg.setdefault("dispersive", self._solve_dispersive(cal_cfg))
@@ -661,11 +724,10 @@ class FlagNamespace(Namespace):
     """Flagging operations. Auto-flaggers run on calibrators only, never targets."""
 
     def __call__(self, *, force: bool = False) -> None:
-        """Run the default flag chain: autocorr, edges, quack, auto-flagger."""
-        self.autocorr(force=force)
-        self.edges(force=force)
+        """Run the pre-calibration flag chain: a-priori flags + autocorr, quack, initial auto-flag."""
+        self.apriori(force=force)
         self.quack(force=force)
-        self.aoflagger(force=force)
+        self.initial(force=force)
 
     def _run(self, kind: str, *, field: str = "", force: bool = False, **kwargs) -> float:
         if not self._obs._state.should_run(f"flag_{kind}", force=force):
@@ -728,6 +790,11 @@ class FlagNamespace(Namespace):
         # AIPS .uvflg needs converting to CASA flag commands against the FITS-IDI files.
         idi_files = handler.find_data_files(self._code, obs.work_dir)
         if not idi_files:
+            # The files may have been imported from elsewhere (import_data(files=...)
+            # pointing outside work_dir) — fall back to what import actually read, rather
+            # than silently dropping the a-priori flags just because work_dir is empty.
+            idi_files = [f for f in obs._state.inputs("import_data") if Path(f).is_file()]
+        if not idi_files:
             warnings.warn(f"{self._code}: {Path(existing).name} found but no FITS-IDI files are "
                           "present to convert it against; a-priori flags not applied")
             return None
@@ -738,52 +805,151 @@ class FlagNamespace(Namespace):
         """Flag autocorrelations."""
         return self._run("autocorr", force=force)
 
-    def edges(self, *, force: bool = False, **kwargs) -> float:
-        """Flag subband edge channels.
+    def edges(self, *, force: bool = False, edge_channels: Optional[int] = None,
+              table: Optional[CalTable] = None, plot: bool = True, **kwargs) -> dict:
+        """Flag the subband edge channels, measuring how many from the bandpass when possible.
 
-        Defaults to the blind ``[flagging].edge_channels_fraction``; pass
-        ``edge_channels=N`` to flag a measured number instead (see
-        ``calibrate.edge_channels()``).
+        Resolution order: an explicit ``edge_channels=N`` wins; otherwise, when a
+        bandpass table exists and the backend can analyse it, the roll-off
+        actually present in the data decides (``[flagging].edge_outlier_sigma``,
+        ``[flagging].max_edge_fraction``); otherwise the blind
+        ``[flagging].edge_channels_fraction`` is used. Every subband gets the
+        same trim: they share a signal path, and a ragged per-subband trim would
+        leave non-uniform channel coverage.
+
+        Returns
+        -------
+        dict
+            ``n_edge``, ``n_channels``, ``method`` (``explicit`` / ``measured`` /
+            ``fraction``), ``flagged_fraction_of_data`` and, when measured, the
+            per-channel profiles.
         """
-        kwargs.setdefault("edge_fraction",
-                          self._obs.config.get("flagging", {}).get("edge_channels_fraction", 0.1))
-        return self._run("edges", force=force, **kwargs)
+        obs = self._obs
+        if not obs._state.should_run("flag_edges", force=force):
+            return {}
+        cfg = obs.config.get("flagging", {})
+        n_channels = int(obs.metadata.freq_setup.n_channels) if obs.metadata else 0
+        table = table or obs._table("bpass")
+        measurement: dict = {}
+        if edge_channels is not None:
+            measurement = {"n_edge": int(edge_channels), "n_channels": n_channels, "method": "explicit"}
+        elif table is not None and self._backend.supports("flag", "measure_edge_channels"):
+            measurement = self._backend.flag.measure_edge_channels(
+                self._code, table, threshold=cfg.get("edge_outlier_sigma", 6.0),
+                max_edge_fraction=cfg.get("max_edge_fraction", 0.25))
+            # The backend may report its own verdict (e.g. "narrowband" when the subbands
+            # are too narrow to have an edge); only label it "measured" when it did not.
+            measurement.setdefault("method", "measured")
+        else:
+            fraction = float(cfg.get("edge_channels_fraction", 0.1))
+            measurement = {"n_edge": int(round(n_channels * fraction)), "n_channels": n_channels,
+                           "method": "fraction", "edge_fraction": fraction}
+            logger.info("flag.edges: no bandpass to measure the roll-off from; flagging {:.0%} of "
+                        "each subband edge", fraction)
+        n_edge = int(measurement.get("n_edge", 0))
+        per_antenna = measurement.get("per_antenna") or {}
+        if n_edge > 0 or any(left or right for left, right in per_antenna.values()):
+            measurement["flagged_fraction_of_data"] = self._backend.flag.run(
+                self._code, "edges", edge_channels=n_edge, n_channels=measurement.get("n_channels", 0),
+                edge_fraction=measurement.get("edge_fraction", 0.0), per_antenna=per_antenna,
+                **kwargs)
+            if measurement["flagged_fraction_of_data"] >= _HIGH_FLAG_FRACTION:
+                warnings.anomaly(f"{self._code}: flag[edges] removed "
+                                 f"{measurement['flagged_fraction_of_data']:.1%} of data")
+        else:
+            measurement["flagged_fraction_of_data"] = 0.0
+            logger.info("flag.edges: the subbands are flat to the edges; nothing to flag")
+        if plot and measurement["method"] == "measured":
+            obs.plot.bandpass_profile(measurement)
+        obs._state.mark_complete("flag_edges", outputs=[f"edge={n_edge}", measurement["method"]])
+        return measurement
 
     def quack(self, *, force: bool = False, per_antenna: Optional[dict] = None,
-              field: str = "", measure: bool = True, **kwargs) -> float:
-        """Flag the settling ramp at the start of each scan, per antenna.
+              interval: Optional[float] = None, field: str = "", column: str = "data",
+              **kwargs) -> float:
+        """Flag the slewing/settling time at the start of every scan, per antenna.
 
-        With ``measure=True`` (the default) the interval is measured from the
-        data for each antenna separately, rather than applying one guessed value
-        to the whole array: how long a station takes to settle on source is a
-        property of that station.
-
-        Run this *after* calibration, so the amplitudes being compared are
-        calibrated ones and the ramp reflects the antenna rather than an
-        uncorrected bandpass.
+        Runs *before* calibration (SKILL step 7) so the instrumental solutions
+        are never fitted on off-source data. Resolution order: ``per_antenna``
+        (``{"EF": 4, ...}`` seconds, default ``[flagging.quack_antennas]``),
+        then a single ``interval`` for the whole array (default
+        ``[flagging].quack_interval``), and only when neither is configured is
+        the ramp measured from the ``column`` data per antenna
+        (``[flagging].quack_sigma``, ``quack_max_seconds``).
         """
         obs = self._obs
         if not obs._state.should_run("flag_quack", force=force):
             return 0.0
-        if not self._backend.supports("flag", "quack"):
-            interval = obs.config.get("flagging", {}).get("quack_interval", 0)
-            return self._run("quack", force=force, interval=interval)
         cfg = obs.config.get("flagging", {})
-        measure_on = (obs.sources.phase_calibrators or obs.sources.calibrators
-                      or obs.sources.targets)
+        per_antenna = per_antenna if per_antenna is not None else dict(cfg.get("quack_antennas", {}) or {})
+        interval = float(interval if interval is not None else cfg.get("quack_interval", 0) or 0)
+        measure_on = (obs.sources.phase_calibrators or obs.sources.calibrators or obs.sources.targets)
+        if per_antenna:
+            logger.info("flag.quack: configured per-antenna intervals {}",
+                        ", ".join(f"{a} {s:g}s" for a, s in sorted(per_antenna.items())))
+        elif interval > 0:
+            logger.info("flag.quack: configured interval {:g} s for every antenna", interval)
+        elif self._backend.supports("flag", "quack"):
+            logger.info("flag.quack: no interval configured; measuring the ramp per antenna "
+                        "on the {} column", column)
+        else:
+            logger.info("flag.quack: no interval configured and backend {} cannot measure it; "
+                        "nothing to flag", self._backend.kind)
         flagged = self._backend.flag.quack(
-            self._code, per_antenna=per_antenna,
-            field=field or ",".join(s.name for s in measure_on),
-            sigma=cfg.get("quack_sigma", 2.0),
-            max_seconds=cfg.get("quack_max_seconds", 120.0),
-            metadata=obs.metadata, **kwargs) if measure else self._run("quack", force=True)
+            self._code, per_antenna=per_antenna or None, interval=interval,
+            field=field or ",".join(s.name for s in measure_on), column=column,
+            sigma=cfg.get("quack_sigma", 2.0), max_seconds=cfg.get("quack_max_seconds", 120.0),
+            metadata=obs.metadata, **kwargs)
+        if flagged >= _HIGH_FLAG_FRACTION:
+            warnings.anomaly(f"{self._code}: flag[quack] removed {flagged:.1%} of data")
         obs._state.mark_complete("flag_quack")
         return flagged
 
-    def tfcrop(self, *, force: bool = False) -> float:
-        """Time-frequency auto-flag on calibrators only."""
-        field = ",".join(s.name for s in self._obs.sources.calibrators)
-        return self._run("tfcrop", field=field, force=force)
+    def tfcrop(self, *, force: bool = False, column: str = "data", field: str = "", **kwargs) -> float:
+        """Time-frequency auto-flag on calibrators only, judged per baseline.
+
+        ``column`` selects the data the statistics are computed on: ``"data"``
+        before calibration, ``"corrected"`` afterwards. Flags are never extended
+        across baselines (``[flagging].tfcrop`` may override cutoffs).
+        """
+        params = dict(self._obs.config.get("flagging", {}).get("tfcrop", {}))
+        params.update(kwargs)
+        field = field or ",".join(s.name for s in self._obs.sources.calibrators)
+        return self._run("tfcrop", field=field, force=force, datacolumn=column, **params)
+
+    def initial(self, *, force: bool = False) -> float:
+        """Initial flagging of the calibrators before any solve (SKILL step 8).
+
+        Only strong outliers are meant to go here — spikes, near-zero
+        amplitudes, clearly bad scans — so the auto-flagger runs on the raw
+        data with the default per-baseline cutoffs. Deep flagging waits until
+        the data are calibrated (see :meth:`outliers`).
+        """
+        return self.tfcrop(force=force, column="data")
+
+    def statistics(self) -> dict:
+        """Flagging statistics: total and per antenna / subband, over observable data only.
+
+        Excludes autocorrelations and never-recorded visibilities (a station
+        absent from a scan, or a subband it did not observe), so a per-antenna
+        fraction reports the data quality rather than the schedule. The result
+        is kept on ``obs.flag_statistics`` and included in :meth:`Observation.report`.
+        """
+        obs = self._obs
+        if not self._backend.supports("flag", "summary"):
+            logger.info("flag.statistics: backend {} cannot count flags; skipping", self._backend.kind)
+            return {}
+        report = self._backend.flag.summary(self._code)
+        obs.flag_statistics = report
+        worst = sorted(report.get("antenna", {}).items(), key=lambda kv: -kv[1]["fraction"])
+        logger.info("flag.statistics: {:.1%} of observable data flagged; per antenna: {}",
+                    report.get("fraction", 0.0),
+                    ", ".join(f"{a} {v['fraction']:.0%}" for a, v in worst))
+        for antenna, values in worst:
+            if values["observable"] and values["fraction"] >= 0.9:
+                warnings.anomaly(f"{self._code}: antenna {antenna} has {values['fraction']:.0%} of its "
+                                 "recorded data flagged")
+        return report
 
     def aoflagger(self, *, force: bool = False) -> float:
         """Run AOFlagger on calibrators only (targets are protected)."""
@@ -791,18 +957,31 @@ class FlagNamespace(Namespace):
         return self._run("aoflagger", field=field, force=force)
 
     def outliers(self, *, field: str = "", threshold: Optional[float] = None,
-                 dry_run: bool = False, force: bool = False, **kwargs) -> dict:
+                 dry_run: bool = False, force: bool = False, step: str = "flag_outliers",
+                 **kwargs) -> dict:
         """Flag points that break their own baseline's smoothness (amplitude-driven).
 
         Run this after the full calibration is applied: on calibrated data each
         baseline should vary smoothly in time and frequency, so what stands out
         is a defect. Judging every baseline against itself keeps legitimately
         bright short spacings (eMERLIN within the EVN) from being flagged away.
+
+        Parameters
+        ----------
+        step : str
+            State name this run is recorded under, so the pipeline can flag
+            outliers more than once (e.g. again after reweighting) and still
+            resume correctly.
         """
         obs = self._obs
-        if not dry_run and not obs._state.should_run("flag_outliers", force=force):
+        if not dry_run and not obs._state.should_run(step, force=force):
             return {}
         cfg = obs.config.get("flagging", {})
+        if not cfg.get("flag_outliers", True):
+            logger.info("outliers: skipped ([flagging].flag_outliers is false)")
+            if not dry_run:
+                obs._state.mark_complete(step)
+            return {}
         report = self._backend.flag.outliers(
             self._code, field=field, dry_run=dry_run, metadata=obs.metadata,
             threshold=threshold if threshold is not None else cfg.get("outlier_sigma", 5.0),
@@ -811,7 +990,7 @@ class FlagNamespace(Namespace):
         if share >= _HIGH_FLAG_FRACTION:
             warnings.anomaly(f"{self._code}: outlier flagging removed {share:.1%} of the data")
         if not dry_run:
-            obs._state.mark_complete("flag_outliers")
+            obs._state.mark_complete(step)
         return report
 
     def from_file(self, path: str, *, force: bool = False) -> float:
@@ -826,9 +1005,54 @@ class FlagNamespace(Namespace):
 class PlotNamespace(Namespace):
     """Diagnostic plotting."""
 
-    def __call__(self) -> list[str]:
-        """Produce the standard diagnostic set."""
-        return [self.tplot(), self.uv_coverage(), self.elevation(), self.amp_vs_time()]
+    def __call__(self, *, column: str = "corrected", label: str = "") -> list[str]:
+        """Produce the standard diagnostic set (see :meth:`diagnostics`)."""
+        return self.diagnostics(column=column, label=label)
+
+    def diagnostics(self, *, column: str = "corrected", label: str = "") -> list[str]:
+        """The standard diagnostic set on one data column (SKILL steps 7 and 15).
+
+        On the raw data (``column="data"``) this shows which antennas actually
+        observed, where signal exists and what needs flagging; on the calibrated
+        data (``"corrected"``) the same plots must show flat phases near zero
+        and stable amplitudes on the calibrators. The set: scan x antenna fringe
+        SNR (tplot), full-Stokes cross-correlation spectra on the fringe-finder
+        scans (raw only), amplitude/phase vs frequency and vs time on baselines
+        to the reference antenna, per-baseline corner plots, amplitude/phase vs
+        uv distance, and the uv coverage (raw only; it does not change).
+
+        Plotting is reporting: a plot that fails is logged as a warning and the
+        rest of the set (and the pipeline) carries on.
+
+        Returns
+        -------
+        list of str
+            Paths of the PNG files written.
+        """
+        obs = self._obs
+        label = label or ("raw" if column == "data" else "calibrated")
+        phase_cals = obs.sources.phase_calibrators or obs.sources.calibrators
+        jobs = [("scan_snr", lambda: self.scan_snr())] if column == "data" else []
+        if column == "data":
+            jobs += [("raw_stokes", lambda: self.raw_stokes()),
+                     ("uv_coverage", lambda: [self.uv_coverage()])]
+        jobs += [("spectrum", lambda: self.spectrum(column=column, label=label)),
+                 ("timeseries", lambda: [p for s in phase_cals for p in
+                                         self.timeseries(field=s.name, column=column, label=f"{label}_{s.name}")]),
+                 ("corners", lambda: self.corners(column=column, label=label)),
+                 ("radplot", lambda: self.radplot(column=column, label=label))]
+        written: list[str] = []
+        for name, job in jobs:
+            if name == "uv_coverage" and not self._backend.supports("plot", "diagnostic"):
+                continue
+            try:
+                result = job()
+            except Exception as exc:  # noqa: BLE001 - a plot must never abort the reduction
+                warnings.warn(f"{self._code}: {label} {name} plot failed ({exc})")
+                continue
+            written.extend(result if isinstance(result, list) else [result])
+        logger.info("plot.diagnostics[{}]: {} plot(s) on the {} column", label, len(written), column)
+        return written
 
     def _plot(self, kind: str, **kwargs) -> str:
         return self._backend.plot.diagnostic(self._code, kind, **kwargs)

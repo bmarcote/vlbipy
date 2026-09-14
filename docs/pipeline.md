@@ -85,11 +85,14 @@ subband actually got a solution in it — a silent gap here means that
 antenna/subband is flagged at apply time, shrinking the array without
 telling you.
 
-### `calibrate.edge_channels`
+### `flag.edges`
 
 Measures the bandpass roll-off at each subband edge (rather than flagging a
 blind configured fraction) and flags that many channels at both edges of
-every subband, via `flag.edges`.
+every subband. Falls back to `[flagging].edge_channels_fraction` when no
+bandpass table exists yet; `edge_channels=N` forces an explicit count.
+Everything about deciding *what* to flag lives in the flag namespace, even
+when the decision is read from a calibration table.
 
 ### `calibrate.apply`
 
@@ -101,7 +104,7 @@ format.
 ### `calibrate.fringefit`
 
 The global (multi-band delay) fringe fit, on every calibrator. Below
-`[calibration].ionos_max_ghz` (6 GHz by default) it also solves for the
+`[calibration].ionos_max_ghz` (8 GHz by default) it also solves for the
 dispersive (ionospheric) delay, since at those frequencies the residual
 delay is genuinely frequency-dependent; above it, that term is skipped
 (`--no-ionos` disables it unconditionally). The resulting table is tied to
@@ -110,13 +113,34 @@ reach the target at apply time.
 
 ### `flag.quack`
 
-Measures each antenna's settling time after a slew and trims it. Uses the
-stretch that is low on *all* of an antenna's baselines, so a station with
-one noisy baseline is under-trimmed rather than over-trimmed.
+Runs *before* any solve, so the instrumental delays are never fitted on
+slewing data. Per-antenna seconds from `[flagging.quack_antennas]` win, then
+`[flagging].quack_interval` for the whole array; only when neither is
+configured is the settling time measured from the raw data per antenna,
+using the stretch that is low on *all* of an antenna's baselines.
+
+### `flag.initial`
+
+Initial auto-flagging of the calibrators (tfcrop, per baseline, flags never
+extended) on the raw data — strong outliers only. Deep flagging waits for
+calibrated data.
 
 ### `flag.outliers`
 
 Per-baseline robust (median/MAD) outlier flagging on calibrated amplitudes.
+
+### `calibrate.reweight`
+
+`statwt` on the calibrated data. The new weights expose bad data that hid
+until now, so the pipeline flags outliers again and re-runs the whole chain
+(`second_pass(step="third_pass")` + `scalar_bandpass`). Disable with
+`[calibration.reweight].enabled = false`.
+
+### `flag.statistics`
+
+Flagged fraction overall and per antenna / subband, counted over observable
+data only (no autocorrelations, no never-recorded visibilities), so an
+antenna at 100% really lost the data it recorded. Included in `report()`.
 
 ### `calibrate.second_pass`
 
@@ -136,8 +160,12 @@ apply.
 
 ### Diagnostics
 
-`plot.corners`, `plot.spectrum`, `plot.timeseries` (per phase calibrator or
-target), and `plot.radplot` on the calibrated data.
+`plot.diagnostics(column=...)` runs the standard set twice: on the raw data
+before any flagging or solve (scan SNR matrix, full-Stokes cross-correlation
+spectra on the fringe-finder scans, spectra and time series on baselines to
+the reference antenna, corner plots, radplot, uv coverage) and again on the
+calibrated data. A failing plot is reported as a warning; it never aborts
+the reduction.
 
 ### `export.per_source`
 

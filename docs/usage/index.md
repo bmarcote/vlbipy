@@ -55,7 +55,7 @@ obs.plot.corner()            # one diagnostic
 |---|---|
 | `obs.import_data` | locate or download raw data, import, read metadata |
 | `obs.calibrate` | a-priori, instrumental, fringe fit, scalar bandpass |
-| `obs.flag` | a-priori flags, autocorrelations, edges, quack, outliers |
+| `obs.flag` | a-priori flags, autocorrelations, quack, initial tfcrop, edges, outliers, statistics |
 | `obs.plot` | every diagnostic plot |
 | `obs.export` | per-source split and UVFITS export |
 | `obs.clean`, `obs.selfcal` | imaging *(not implemented yet)* |

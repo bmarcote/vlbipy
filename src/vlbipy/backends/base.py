@@ -209,6 +209,21 @@ class DataOps(BackendComponent):
         """Return visibilities against uv distance, averaged per subband and in time."""
         raise self._unsupported("read_uvdistance")
 
+    def read_uv_coverage(self, project_code: str, *, field: str = "", **kwargs) -> dict:
+        """Return the sampled (u, v) points per source, in wavelengths.
+
+        Only unflagged cross-correlation rows are included; the conjugate points
+        ``(-u, -v)`` are *not* duplicated (the plot mirrors them). Fields with
+        more than ~200k points are subsampled deterministically (every k-th row).
+
+        Returns
+        -------
+        dict
+            ``fields`` (``{source_name: {"u": list[float], "v": list[float]}}``),
+            ``unit`` (``"Mlambda"``), ``freq_ghz`` (the reference frequency used).
+        """
+        raise self._unsupported("read_uv_coverage")
+
     def read_timeseries(self, project_code: str, *, field: str = "", refant: str = "",
                         column: str = "corrected", max_time_bins: int = 300, **kwargs) -> dict:
         """Return amplitude/phase vs time per baseline, averaged over frequency."""
@@ -292,10 +307,14 @@ class CalibrationOps(BackendComponent):
         """
         raise self._unsupported("scan_snr")
 
-    def measure_edge_channels(self, project_code: str, table: CalTable, *,
-                              threshold: float = 6.0, **kwargs) -> dict:
-        """Measure how many channels roll off at each subband edge, from the bandpass."""
-        raise self._unsupported("measure_edge_channels")
+    def reweight(self, project_code: str, *, column: str = "corrected", **kwargs) -> dict:
+        """Recompute the visibility weights from the scatter of the calibrated data.
+
+        Returns a dict describing the resulting weights (backend-dependent). The
+        pipeline flags anew and re-solves the whole chain after this, because
+        the recomputed weights expose data that looked fine until now.
+        """
+        raise self._unsupported("reweight")
 
     def solution_coverage(self, project_code: str, table: CalTable, metadata=None) -> dict:
         """Return ``{antenna: {subbands with an unflagged solution}}`` for a table."""
@@ -340,12 +359,36 @@ class FlagOps(BackendComponent):
         project_code : str
             Project code.
         kind : str
-            One of ``autocorr``, ``edges``, ``quack``, ``tfcrop``, ``aoflagger``,
-            ``from_file``, ``manual``.
+            One of ``autocorr``, ``edges``, ``quack``, ``tfcrop``, ``rflag``,
+            ``aoflagger``, ``from_file``, ``manual``.
         field : str
             Field selection (empty = all fields).
         """
         raise self._unsupported(f"run[{kind}]")
+
+    def measure_edge_channels(self, project_code: str, table: CalTable, *,
+                              threshold: float = 6.0, max_edge_fraction: float = 0.25,
+                              **kwargs) -> dict:
+        """Measure how many channels roll off at each subband edge, from a bandpass table.
+
+        Returns a dict with at least ``n_edge`` (channels to flag at each edge)
+        and ``n_channels``; the result is what :meth:`edges` flags.
+        """
+        raise self._unsupported("measure_edge_channels")
+
+    def flagged_fraction(self, project_code: str, **kwargs) -> float:
+        """Return the flagged fraction of the observable data (0-1)."""
+        raise self._unsupported("flagged_fraction")
+
+    def summary(self, project_code: str, **kwargs) -> dict:
+        """Return flagging statistics: ``{"flagged", "observable", "fraction", "antenna": {...}, "spw": {...}}``.
+
+        Counts must cover *observable* data only — no autocorrelations and no
+        visibilities that were never recorded (antenna absent from a scan or a
+        subband it did not observe) — so a per-antenna fraction describes data
+        quality rather than the schedule.
+        """
+        raise self._unsupported("summary")
 
     def autocorr(self, project_code: str, **kwargs) -> float:
         """Flag autocorrelations (never used in VLBI imaging)."""
@@ -355,9 +398,20 @@ class FlagOps(BackendComponent):
         """Flag the outer channels of every subband."""
         return self.run(project_code, "edges", edge_fraction=edge_fraction, **kwargs)
 
-    def quack(self, project_code: str, *, interval: float = 0.0, **kwargs) -> float:
-        """Flag the first seconds of every scan."""
-        return self.run(project_code, "quack", interval=interval, **kwargs)
+    def quack(self, project_code: str, *, per_antenna: Optional[dict] = None,
+              interval: float = 0.0, **kwargs) -> float:
+        """Flag the first seconds of every scan.
+
+        ``per_antenna`` (``{antenna: seconds}``) wins over the array-wide
+        ``interval``. Backends that can *measure* the settling ramp override this
+        and fall back to the measurement when neither is given; the default
+        implementation can only apply what it is told and flags nothing otherwise.
+        """
+        per_antenna = dict(per_antenna or {})
+        if not per_antenna and interval and float(interval) > 0:
+            per_antenna = {"": float(interval)}
+        return sum(self.run(project_code, "quack", interval=float(seconds), antenna=antenna)
+                   for antenna, seconds in per_antenna.items())
 
     def tfcrop(self, project_code: str, *, field: str = "", **kwargs) -> float:
         """Time-frequency outlier flagging (calibrators only)."""

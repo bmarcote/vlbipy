@@ -28,21 +28,23 @@ obs.run()
 | Step | What happens |
 |---|---|
 | `import_data` | find or download FITS-IDI, `.antab`, `.uvflg`; import to a Multi-MS; read metadata |
-| `a_priori` | `gencal` Tsys + gain curve (+ EOP for VLBA/LBA); de-spike Tsys |
 | `flag.apriori` | apply the observatory `.uvflg`; flag autocorrelations |
+| `a_priori` | `gencal` Tsys + gain curve (+ EOP for VLBA/LBA); de-spike Tsys |
+| `plot.diagnostics("data")` | raw data: scan SNR, full-Stokes cross-correlations, spectra, time series, corners, radplot, uv coverage |
+| `flag.quack` | trim the slewing time per antenna (`[flagging.quack_antennas]`, `quack_interval`, or measured) |
+| `flag.initial` | tfcrop on the calibrators, per baseline, strong outliers only |
 | `scan_snr` | short fringe fit per scan: SNR per scan, antenna and polarization |
-| `instrumental` | select antennas and scan(s), then SBD → bandpass → SBD again |
-| `edge_channels` | measure the subband roll-off and flag it |
+| `instrumental` | select antennas and scan(s), then SBD → MBD → bandpass → SBD → MBD again |
+| `flag.edges` | measure the subband roll-off from the bandpass and flag it |
 | `apply` | apply the instrumental chain to every field |
-| `fringefit` | global (multi-band delay) fringe fit on the calibrators |
-| `apply` | apply the full chain, transferring the phase calibrator's solutions |
-| `flag.quack` | measure each antenna's slew time and trim it |
-| `flag.outliers` | per-baseline robust outlier flagging |
-| `second_pass` | re-solve SBD → bandpass → SBD2 → MBD on the now-clean data |
+| `flag.outliers` | per-baseline robust outlier flagging on calibrated data |
+| `second_pass` | re-solve the whole chain on the now-clean data |
 | `scalar_bandpass` | one amplitude per antenna and subband, levelling the subbands |
-| `apply` | final calibration |
-| plots | corner, spectrum, time series, radplot |
+| `apply` | full calibration |
+| `reweight` | `statwt` from the calibrated scatter; then `flag.outliers` and a third pass |
+| `plot.diagnostics("corrected")` | the same plots on the calibrated data |
 | `export.per_source` | split per source, export UVFITS |
+| `flag.statistics` | flagged fraction per antenna / subband over observable data; goes into the report |
 
 A representative run on a 2.8 h, 14-antenna EVN dataset (8.3 GB) takes about
 25 minutes, dominated by the two fringe-fitting passes.

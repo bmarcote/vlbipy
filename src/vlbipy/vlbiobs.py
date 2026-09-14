@@ -347,34 +347,39 @@ class VLBIObs:
         for observation in self._observations:
             observation.prepare_run(scratch=scratch, from_step=from_step)
 
-        self.import_data(force=force)
-        self.calibrate.a_priori(force=force)
-        self.flag.apriori(force=force)
-        # Instrumental calibration: antenna/scan selection, SBD -> bandpass -> SBD.
+        # The sequence follows the reduce-vlbi-data procedure step by step.
+        self.import_data(force=force)                                  # steps 1-3
+        self.flag.apriori(force=force)                                 # step 4
+        self.calibrate.a_priori(force=force)                           # steps 5-6 (EOP, Tsys, GC)
+        self.plot.diagnostics(column="data", label="raw")              # step 7
+        self.flag.quack(force=force)                                   # step 7 (slewing)
+        self.flag.initial(force=force)                                 # step 8
+        # Steps 9-11: SBD -> MBD -> bandpass -> SBD -> MBD, then trim the band edges the
+        # bandpass has revealed and put the instrumental chain onto every field.
         self.calibrate.instrumental(force=force)
-        self.calibrate.edge_channels(force=force)
-        self.calibrate.apply(force=True)          # instrumental solutions onto every field
-        # Global fringe fit, then apply the complete chain.
-        self.calibrate.fringefit(force=force)
+        self.flag.edges(force=force)
         self.calibrate.apply(force=True)
-        # Calibrated amplitudes make the settling ramp measurable per antenna.
-        self.flag.quack(force=force)
+        # Step 12: deeper flagging on calibrated data, then re-solve on the cleaner data
+        # and level the subband amplitudes.
         self.flag.outliers(force=force)
-        # Second pass: re-solve everything on the now-flagged data, then level the
-        # subband amplitudes and apply the final chain.
         self.calibrate.second_pass(force=force)
         self.calibrate.scalar_bandpass(force=force)
-        self.calibrate.apply(force=True)
-        self.plot.corners()
-        self.plot.spectrum(label="calibrated")
-        for source in (self.sources.phase_calibrators or self.sources.calibrators):
-            self.plot.timeseries(field=source.name, label=f"calibrated_{source.name}")
-        self.plot.radplot(label="calibrated")
+        self.calibrate.apply(force=True)                               # step 13
+        # Step 14: weights from the calibrated scatter expose more bad data; flag it and
+        # re-run the whole chain from the a-priori tables.
+        if self.config.get("calibration", {}).get("reweight", {}).get("enabled", True):
+            self.calibrate.reweight(force=force)
+            self.flag.outliers(force=force, step="flag_outliers_reweighted")
+            self.calibrate.second_pass(force=force, step="third_pass")
+            self.calibrate.scalar_bandpass(force=force)
+            self.calibrate.apply(force=True)
+        self.plot.diagnostics(column="corrected", label="calibrated")  # step 15
         if len(self._observations) > 1:
             self.merge(force=force)
-        # Calibrated, per-source measurement sets: the deliverable of the calibration.
-        # After merge() for a campaign, so the split covers the combined data.
+        # Step 16: calibrated, per-source measurement sets — the deliverable of the
+        # calibration. After merge() for a campaign, so the split covers the combined data.
         self.export.per_source(force=force)
+        self.flag.statistics()                                         # step 20 (report)
 
         robust = self.config.get("imaging", {}).get("robust", [0])
         images = {}
@@ -382,7 +387,13 @@ class VLBIObs:
         # calibration a long run just produced.
         if self._imaging_target()._backend.supports("image", "clean"):
             for tgt in self.sources.targets:
-                images[tgt.name] = self.clean(target=tgt.name, robust=robust)
+                # Imaging is the last stage and must not throw away the calibration the
+                # run just produced (split MSs and UVFITS are already on disk): a clean
+                # that fails on one target is a warning, not a failed run.
+                try:
+                    images[tgt.name] = self.clean(target=tgt.name, robust=robust)
+                except Exception as exc:  # noqa: BLE001 - imaging failure must not abort the run
+                    warnings.warn(f"imaging {tgt.name} failed: {exc}")
         else:
             logger.warning("imaging skipped: backend {} does not implement image.clean yet",
                            self._imaging_target()._backend.kind)

@@ -11,7 +11,7 @@ subclasses) defined in `vlbipy.backends.base`:
 | --- | --- |
 | `DataOps` | Read metadata, listobs, read visibilities |
 | `CalibrationOps` | A-priori/instrumental/fringe-fit calibration, applycal |
-| `FlagOps` | Flag management (file-based, autocorr, edges, quack, tfcrop, aoflagger, outliers) |
+| `FlagOps` | Flag management (file-based, autocorr, edges incl. their measurement, quack, tfcrop, aoflagger, outliers, statistics) |
 | `PlotOps` | Backend-side data needed for diagnostic plots |
 | `ImagingOps` | CLEAN deconvolution (tclean, wsclean) |
 | `ExportOps` | Per-source split, UVFITS/MS export, merge |

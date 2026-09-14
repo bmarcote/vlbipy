@@ -187,6 +187,82 @@ def test_central_channel_selection():
     assert casa.central_channel_selection(2, 0.8) == "*"     # too few channels to trim
 
 
+def test_central_channel_selection_single_channel_uses_everything():
+    """A one-channel subband has nothing to trim: every solve must still use it."""
+    casa = pytest.importorskip("vlbipy.backends.casa")
+    for fraction in (0.5, 0.7, 0.8, 1.0):
+        assert casa.central_channel_selection(1, fraction) == "*"
+        assert casa.central_channel_selection(3, fraction) == "*"
+
+
+def _flag_ops():
+    """A CasaFlagOps instance for the pure selection logic (no MS or CASA session needed)."""
+    casa = pytest.importorskip("vlbipy.backends.casa")
+    return casa.CasaFlagOps.__new__(casa.CasaFlagOps)
+
+
+def test_edge_spw_selection_symmetric_and_asymmetric():
+    ops = _flag_ops()
+    assert ops._edge_spw_selection("p", n_channels=64, edge_channels=6) == "*:0~5;58~63"
+    # Per-antenna trims are asymmetric: only what that station actually needs.
+    assert ops._edge_spw_selection("p", n_channels=64, left=4, right=2) == "*:0~3;62~63"
+    assert ops._edge_spw_selection("p", n_channels=64, left=0, right=3) == "*:61~63"
+    assert ops._edge_spw_selection("p", n_channels=64, left=2, right=0) == "*:0~1"
+
+
+def test_edge_spw_selection_never_flags_everything():
+    """No trim must yield an empty selection, never one that would match all the data."""
+    ops = _flag_ops()
+    assert ops._edge_spw_selection("p", n_channels=64, left=0, right=0) == ""
+    assert ops._edge_spw_selection("p", n_channels=64, edge_channels=0, edge_fraction=0.0) == ""
+    # Single- and two-channel subbands have no edge that can be trimmed.
+    assert ops._edge_spw_selection("p", n_channels=1, edge_channels=6) == ""
+    assert ops._edge_spw_selection("p", n_channels=1, left=1, right=1) == ""
+    assert ops._edge_spw_selection("p", n_channels=2, edge_fraction=0.1) == ""
+
+
+def test_edge_trim_takes_the_consensus_not_the_widest():
+    """Two of the three indicators must agree before bandwidth is given up."""
+    import numpy as np
+    ops = _flag_ops()
+    rng = np.random.default_rng(7)
+    n = 64
+    # Amplitude rolls off over 4 channels, phase scatter claims 8, the solver claims none.
+    amp = 1.0 + rng.normal(0.0, 0.01, n); amp[:4] = 0.01; amp[-4:] = 0.01
+    phase = 0.05 + rng.normal(0.0, 0.005, n); phase[:8] = 5.0; phase[-8:] = 5.0
+    solved = np.zeros(n)
+    left, right = ops._edge_trim(amp, phase, solved, threshold=6.0, max_trim=16, n_channels=n)
+    assert (left, right) == (4, 4)      # the median vote, not the widest (8)
+
+
+def test_single_channel_subbands_survive_every_channel_decision():
+    """A one-channel spectral window: use the channel everywhere, flag nothing."""
+    from vlbipy.models import FreqSetup
+    casa = pytest.importorskip("vlbipy.backends.casa")
+    from vlbipy.statistics import find_flat_range
+    freq = FreqSetup(ref_freq=1.6e9, n_subbands=4, n_channels=1, channel_width=1.6e7,
+                     polarizations=["RR", "LL"])
+    assert len(freq.frequencies_ghz(0)) == 1          # a usable frequency axis
+    # Every solve uses the single channel...
+    assert casa.central_channel_selection(freq.n_channels, 0.8) == "*"
+    # ...and nothing is ever trimmed away from it.
+    ops = _flag_ops()
+    assert ops._edge_spw_selection("p", n_channels=freq.n_channels, edge_channels=2) == ""
+    assert find_flat_range([1.0], threshold=6.0) == (0, 0)
+
+
+def test_edge_trim_respects_max_trim():
+    import numpy as np
+    ops = _flag_ops()
+    rng = np.random.default_rng(3)
+    n = 32
+    amp = 1.0 + rng.normal(0.0, 0.01, n); amp[:12] = 0.01
+    phase = 0.05 + rng.normal(0.0, 0.005, n); phase[:12] = 5.0
+    solved = np.zeros(n); solved[:12] = 1.0
+    left, _ = ops._edge_trim(amp, phase, solved, threshold=6.0, max_trim=4, n_channels=n)
+    assert left == 4
+
+
 # -- CASA log collection --
 
 def test_collect_casa_logs_moves_and_never_overwrites(tmp_path):

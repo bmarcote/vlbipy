@@ -116,3 +116,22 @@ def test_dummy_plots_are_filed_by_category():
     assert all("/plots/raw/" in p for p in obs.plot.scan_snr())
     assert all("/plots/calibrated/" in p for p in obs.plot.spectrum(column="corrected"))
     assert all("/plots/raw/" in p for p in obs.plot.spectrum(column="data"))
+
+
+def test_plot_uv_coverage_writes_png(tmp_path):
+    """Two fields -> one PNG with a panel each (pure plotting, no CASA)."""
+    from vlbipy.plotting import plot_uv_coverage
+    rng = np.random.default_rng(1)
+    hour_angle = np.linspace(-2.0, 2.0, 200)
+    fields = {}
+    for name, scale in (("3C345", 120.0), ("J1848+3219", 60.0)):
+        u = scale * np.cos(hour_angle) + rng.normal(0, 2, hour_angle.size)
+        v = scale * 0.4 * np.sin(hour_angle) + rng.normal(0, 2, hour_angle.size)
+        fields[name] = {"u": u.tolist(), "v": v.tolist()}
+    data = {"fields": fields, "unit": "Mlambda", "freq_ghz": 4.99}
+    out = plot_uv_coverage(data, str(tmp_path / "uvc.uv_coverage.png"), title="uvc — uv coverage")
+    assert out.endswith("uvc.uv_coverage.png")
+    assert (tmp_path / "uvc.uv_coverage.png").stat().st_size > 1000
+    # nothing to plot -> no file, but the path is still returned
+    empty = plot_uv_coverage({"fields": {}}, str(tmp_path / "none.png"))
+    assert empty.endswith("none.png") and not (tmp_path / "none.png").exists()

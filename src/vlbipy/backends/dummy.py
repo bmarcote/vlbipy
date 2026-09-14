@@ -232,19 +232,10 @@ class DummyCalibrationOps(CalibrationOps):
              channel_fraction=channel_fraction, n_scans=len(selected), n_antennas=len(antennas))
         return survey
 
-    def measure_edge_channels(self, project_code: str, table: CalTable, *,
-                              threshold: float = 6.0, **kwargs) -> dict:
-        """Synthesize a band profile that rolls off over the outer 10% of each subband."""
-        n_chan = 32
-        n_edge = max(1, n_chan // 10)
-        ramp = [min(1.0, (i + 1) / n_edge) for i in range(n_chan // 2)]
-        profile = ramp + ramp[::-1]
-        _log("measure_edge_channels", project=project_code, caltable=table.cal_type,
-             threshold=threshold, n_edge=n_edge)
-        return {"n_edge": n_edge, "first": n_edge, "last": n_chan - 1 - n_edge,
-                "n_channels": n_chan, "amplitude_profile": profile,
-                "phase_profile": [1.0 - v for v in profile],
-                "flagged_fraction": [0.0] * n_chan}
+    def reweight(self, project_code: str, *, column: str = "corrected", **kwargs) -> dict:
+        """Log the statwt that would run and return plausible weight statistics."""
+        _log("reweight", project=project_code, column=column, **kwargs)
+        return {"mean": 1.0, "variance": 0.05}
 
     def smooth(self, project_code: str, table: CalTable, **kwargs) -> CalTable:
         """Return the table unchanged, logging the smoothing that would happen."""
@@ -259,6 +250,35 @@ class DummyCalibrationOps(CalibrationOps):
 
 class DummyFlagOps(FlagOps):
     """Return a deterministic flagged fraction per (project, mode, field)."""
+
+    def measure_edge_channels(self, project_code: str, table: CalTable, *,
+                              threshold: float = 6.0, **kwargs) -> dict:
+        """Synthesize a band profile that rolls off over the outer 10% of each subband."""
+        n_chan = 32
+        n_edge = max(1, n_chan // 10)
+        ramp = [min(1.0, (i + 1) / n_edge) for i in range(n_chan // 2)]
+        profile = ramp + ramp[::-1]
+        _log("measure_edge_channels", project=project_code, caltable=table.cal_type,
+             threshold=threshold, n_edge=n_edge)
+        return {"n_edge": n_edge, "first": n_edge, "last": n_chan - 1 - n_edge,
+                "n_channels": n_chan, "amplitude_profile": profile,
+                "phase_profile": [1.0 - v for v in profile],
+                "flagged_fraction": [0.0] * n_chan}
+
+    def flagged_fraction(self, project_code: str, **kwargs) -> float:
+        """Return a stable synthetic overall flagged fraction."""
+        return round((_seed(project_code, "flagged") % 3000) / 10000.0, 4)
+
+    def summary(self, project_code: str, **kwargs) -> dict:
+        """Return a synthetic per-antenna / per-subband flagging summary."""
+        fraction = self.flagged_fraction(project_code)
+        antennas = ["EF", "WB", "JB", "ON", "MC", "TR"]
+        per_antenna = {name: {"flagged": (i + 1) * 1000, "observable": 10000,
+                              "fraction": round((i + 1) * 0.1, 3)} for i, name in enumerate(antennas)}
+        spw = {i: {"flagged": 1500, "observable": 10000, "fraction": 0.15} for i in range(8)}
+        _log("flag_summary", project=project_code, fraction=fraction)
+        return {"flagged": int(fraction * 100000), "observable": 100000, "fraction": fraction,
+                "antenna": per_antenna, "spw": spw}
 
     def measure_quack(self, project_code: str, *, field: str = "", threshold: float = 0.9,
                       **kwargs) -> dict:

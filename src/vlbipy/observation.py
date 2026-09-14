@@ -27,16 +27,18 @@ logger = get_logger()
 
 #: File holding the calibration chain, so a resumed process can rebuild it.
 CALTABLES_FILENAME = ".caltables.json"
+CAL_SELECTION_FILENAME = ".cal_selection.json"
 
 #: Pipeline steps in execution order. Resuming from a step invalidates it and
 #: everything after it, so this must match the order :meth:`VLBIObs.run` runs them
 #: in and use the same names the steps record themselves under.
 STEP_ORDER = [
     "import_data", "a_priori", "flag_apriori", "flag_from_file", "flag_autocorr",
+    "flag_quack", "flag_tfcrop",
     "scan_snr", "initial_calibration", "fringefit", "bandpass",
-    "initial_calibration_sbd2", "fringefit_mbd2", "edge_channels", "flag_edges",
-    "apply", "flag_quack", "flag_tfcrop", "flag_aoflagger", "flag_outliers",
-    "second_pass", "scalar_bandpass", "split",
+    "initial_calibration_sbd2", "fringefit_mbd2", "flag_edges",
+    "apply", "flag_aoflagger", "flag_outliers",
+    "second_pass", "scalar_bandpass", "reweight", "flag_outliers_reweighted", "third_pass", "split",
 ]
 
 
@@ -80,6 +82,13 @@ class Observation:
         # solve on top of the tables earlier steps produced, not from scratch.
         self.gaintables: list[CalTable] = self._load_gaintables()
         self._snr_surveys: dict = {}   # per-field fringe SNR surveys (see plot/calibrate.scan_snr)
+        self.flag_statistics: dict = {}  # last flag.statistics() result (per antenna / subband)
+        # The instrumental antenna/scan selection is decided once, on the cleanest data
+        # (the first pass), and reused by every later pass. Re-surveying on progressively
+        # flagged data lets the antenna set shrink pass over pass, and applycal
+        # (calflagstrict) then flags every antenna a shrunken solution no longer covers —
+        # which silently deletes good antennas. Persisted so a resumed run keeps it too.
+        self._cal_selection: Optional[tuple[list[str], list[int]]] = self._load_cal_selection()
         self._scratch = False
 
         # Callable operation namespaces.
@@ -126,6 +135,55 @@ class Observation:
         except OSError as exc:
             logger.warning("[{}] could not write {} ({}); a resumed run will re-derive "
                            "the calibration chain", self.project_code, path.name, exc)
+
+    # -- the instrumental antenna/scan selection (decided once, reused every pass) --
+    @property
+    def _cal_selection_path(self) -> Optional[Path]:
+        """Path of the persisted instrumental selection, or ``None`` for in-memory backends."""
+        if not self._backend.requires_data_files:
+            return None
+        return Path(self.work_dir) / CAL_SELECTION_FILENAME
+
+    def _load_cal_selection(self) -> Optional[tuple[list[str], list[int]]]:
+        """Read the persisted (antennas, scans) selection; missing or corrupt yields None."""
+        path = self._cal_selection_path
+        if path is None or not path.is_file():
+            return None
+        try:
+            data = json.loads(path.read_text())
+            return list(data["antennas"]), list(data["scans"])
+        except (json.JSONDecodeError, OSError, KeyError, TypeError) as exc:
+            logger.warning("[{}] could not read {} ({}); the instrumental selection will be "
+                           "re-derived", self.project_code, path.name, exc)
+            return None
+
+    @property
+    def cal_selection(self) -> Optional[tuple[list[str], list[int]]]:
+        """The cached instrumental (antennas, scans) selection, or None if not decided yet."""
+        return self._cal_selection
+
+    def set_cal_selection(self, antennas: list[str], scans: list[int]) -> None:
+        """Fix the instrumental antenna/scan selection for the whole run and persist it."""
+        self._cal_selection = (list(antennas), list(scans))
+        path = self._cal_selection_path
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"antennas": list(antennas), "scans": list(scans)}, indent=2))
+        except OSError as exc:
+            logger.warning("[{}] could not write {} ({}); a resumed run will re-derive the "
+                           "instrumental selection", self.project_code, path.name, exc)
+
+    def clear_cal_selection(self) -> None:
+        """Forget the cached instrumental selection (used by --scratch)."""
+        self._cal_selection = None
+        path = self._cal_selection_path
+        if path is not None and path.is_file():
+            try:
+                path.unlink()
+            except OSError:
+                pass
 
     def add_gaintable(self, table: CalTable, step: str) -> CalTable:
         """Append a table to the apply chain, tagging it with the step that made it."""
@@ -243,6 +301,7 @@ class Observation:
             self._state.reset()
             self.set_gaintables([])
             self._snr_surveys.clear()
+            self.clear_cal_selection()
             self._scratch = True
             return
         if from_step:
@@ -313,6 +372,7 @@ class Observation:
                 "check_sources": [s.name for s in self.sources.check_sources],
             },
             "gaintables": [t.cal_type for t in self.gaintables],
+            "flagging": self.flag_statistics,
             "steps": self._state.as_dict(),
             "warnings": warnings.summary(),
         }
@@ -324,6 +384,7 @@ class Observation:
         self._state.reset()
         self.set_gaintables([])
         self._metadata = None
+        self.flag_statistics = {}
         logger.info("reset observation {}", self.project_code)
 
     def __repr__(self) -> str:

@@ -340,6 +340,68 @@ def plot_radplot(uvdata: dict, plot_dir: Union[str, Path], project_code: str = "
     return outfile
 
 
+def plot_uv_coverage(data: dict, output: str, *, title: str = "", dpi: int = 150) -> str:
+    """Plot the sampled uv plane (u vs v) for each source, one panel per field.
+
+    Each panel shows the sampled points and their conjugates ``(-u, -v)`` with
+    equal aspect; all panels share the same symmetric limits so the coverage of
+    a weak target can be compared directly with that of its calibrators.
+
+    Parameters
+    ----------
+    data : dict
+        Output of the backend's ``read_uv_coverage``.
+    output : str
+        Path of the PNG to write.
+    title : str
+        Figure title (the unit and frequency are appended).
+
+    Returns
+    -------
+    str
+        The written PNG path (``output``).
+    """
+    outfile = Path(output)
+    outfile.parent.mkdir(parents=True, exist_ok=True)
+    fields = data.get("fields") or {}
+    if not fields:
+        logger.warning("no uv points to plot for {}", outfile.name)
+        return str(outfile)
+    unit = data.get("unit", "Mlambda")
+    unit_label = r"M$\lambda$" if unit == "Mlambda" else unit
+    limit = max((np.abs(np.r_[np.asarray(f.get("u", []), dtype=float),
+                             np.asarray(f.get("v", []), dtype=float)]).max(initial=0.0)
+                 for f in fields.values()), default=0.0) * 1.05 or 1.0
+
+    nrows, ncols = subplot_grid(len(fields), max_cols=3)
+    figure, axes = plt.subplots(nrows, ncols, figsize=(3.6 * ncols, 3.6 * nrows), squeeze=False,
+                                layout="constrained")
+    for axis, (name, points) in zip(axes.flat, fields.items()):
+        u, v = np.asarray(points.get("u", []), dtype=float), np.asarray(points.get("v", []), dtype=float)
+        axis.plot(np.r_[u, -u], np.r_[v, -v], ls="none", marker=".", ms=1.0, alpha=0.6,
+                  color=SUBBAND_COLORS[0], rasterized=True)
+        axis.set_xlim(limit, -limit)
+        axis.set_ylim(-limit, limit)
+        axis.set_aspect("equal")
+        axis.set_title(f"{name} ({u.size} pts)", fontsize=9)
+        style_axis(axis)
+        axis.tick_params(labelsize=7)
+    for axis in axes.flat[len(fields):]:
+        axis.set_visible(False)
+    for axis in axes[-1, :]:
+        axis.set_xlabel(f"u ({unit_label})", fontsize=9)
+    for axis in axes[:, 0]:
+        axis.set_ylabel(f"v ({unit_label})", fontsize=9)
+    freq = data.get("freq_ghz")
+    detail = f" at {freq:.2f} GHz" if freq else ""
+    figure.suptitle(f"{title or 'uv coverage'}{detail}", x=0.01, ha="left", fontsize=11,
+                    fontweight="bold")
+    figure.savefig(outfile, dpi=dpi)
+    plt.close(figure)
+    logger.info("uv coverage plot written: {}", outfile)
+    return str(outfile)
+
+
 def plot_baseline_corner(spectra: dict, plot_dir: Union[str, Path], project_code: str = "",
                          quantity: str = "phase", label: str = "", dpi: int = 150) -> Path:
     """Plot a time x frequency dynamic spectrum for every antenna pair, corner-style.
@@ -648,6 +710,14 @@ class CalTablePlotter:
             data["param"] = np.asarray(table.getcol(param_col)).T  # -> (nrows, nchan, npar)
         finally:
             table.close()
+        # Some caltable kinds (e.g. EPowerCurve gain curves) store their parameters
+        # with no channel axis, so getcol returns 2D (npar, nrows) -> (nrows, npar)
+        # after .T. Normalise every param/flag array to 3D (nrows, nchan, npar) so
+        # the plotters can index a channel axis uniformly (they all use [..., 0, ...]).
+        if data["param"].ndim == 2:
+            data["param"] = data["param"][:, np.newaxis, :]
+        if data["flag"].ndim == 2:
+            data["flag"] = data["flag"][:, np.newaxis, :]
         table.open(str(Path(caltable) / "ANTENNA"))
         try:
             data["antenna_names"] = [str(n) for n in table.getcol("NAME")]
