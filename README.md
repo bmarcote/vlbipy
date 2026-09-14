@@ -84,18 +84,19 @@ obs = VLBIObs("rsm07", network="EVN", work_dir="rsm07",
 obs.import_data()
 print(obs.summary())
 
-# A-priori amplitude calibration, then flag the observatory .uvflg + autocorrelations
-obs.calibrate.a_priori()
+# Flag the observatory .uvflg + autocorrelations, then a-priori amplitude calibration
 obs.flag.apriori()
+obs.calibrate.a_priori()
 
-# Instrumental calibration: antenna/scan selection, then SBD -> bandpass -> SBD
+# Look at the raw data, then trim the slewing time and the strong outliers
+obs.plot.diagnostics(column="data")
+obs.flag.quack()                    # [flagging].quack_antennas / quack_interval, or measured
+obs.flag.initial()                  # tfcrop on the calibrators, per baseline
+
+# Instrumental calibration: antenna/scan selection, then SBD -> MBD -> bandpass -> SBD -> MBD
 antennas, scans = obs.calibrate.select_calibration_data()
 obs.calibrate.instrumental()
-obs.calibrate.edge_channels()
-obs.calibrate.apply(force=True)
-
-# Global fringe fit, then apply the full chain
-obs.calibrate.fringefit()
+obs.flag.edges()                    # edge channels measured from the bandpass
 obs.calibrate.apply(force=True)
 
 # Look at what came out
@@ -103,9 +104,14 @@ obs.plot.spectrum(field="3C345", scans=scans)
 obs.plot.caltables()
 [t.cal_type for t in obs.gaintables]   # ['tsys', 'gc', 'bpass', 'sbd2', 'mbd']
 
-# Finish: outlier flagging, per-source export
+# Finish: outlier flagging, re-solve, reweight, per-source export
 obs.flag.outliers()
+obs.calibrate.second_pass()
+obs.calibrate.scalar_bandpass()
+obs.calibrate.apply(force=True)
+obs.calibrate.reweight()            # statwt; then flag + re-solve once more
 obs.export.per_source()
+obs.flag.statistics()
 ```
 
 Namespaces are discoverable — calling one runs its sensible default, and it
@@ -154,17 +160,20 @@ working directory):
 | Namespace call | What happens |
 |---|---|
 | `import_data` | find or download FITS-IDI + `.antab`/`.uvflg`; import to a Multi-MS; read metadata |
-| `calibrate.a_priori` | Tsys + gain curve calibration, de-spiked |
 | `flag.apriori` | observatory `.uvflg` flags + autocorrelations |
-| `calibrate.instrumental` | antenna/scan selection, then SBD -> bandpass -> SBD |
-| `calibrate.edge_channels` | measure and flag the subband roll-off |
-| `calibrate.fringefit` | global (multi-band delay) fringe fit |
-| `flag.quack` | measured per-antenna slew-time trim |
-| `flag.outliers` | per-baseline robust outlier flagging |
+| `calibrate.a_priori` | Tsys + gain curve (+ EOP for VLBA/LBA), de-spiked |
+| `plot.diagnostics(column="data")` | raw data: scan SNR, cross-correlations, spectra, time series, corners, radplot, uv coverage |
+| `flag.quack` | slewing time per antenna (configured, or measured when not) |
+| `flag.initial` | tfcrop on the calibrators, per baseline, strong outliers only |
+| `calibrate.instrumental` | antenna/scan selection, then SBD -> MBD -> bandpass -> SBD -> MBD |
+| `flag.edges` | subband edge channels, measured from the bandpass |
+| `flag.outliers` | per-baseline robust outlier flagging on calibrated data |
 | `calibrate.second_pass` | re-solve the full chain on the now-flagged data |
 | `calibrate.scalar_bandpass` | one amplitude per antenna/subband, levelling the subbands |
-| plots | corner, spectrum, time series, radplot, all calibration tables |
+| `calibrate.reweight` | `statwt`; then `flag.outliers` and a third pass of the chain |
+| `plot.diagnostics(column="corrected")` | the same plots on the calibrated data |
 | `export.per_source` | split per source; UVFITS export |
+| `flag.statistics` | flagged fraction per antenna / subband, over observable data only |
 | imaging | *not implemented yet* (skipped with a warning) |
 
 See [Pipeline Workflow](docs/pipeline.md) for the detail behind each step.

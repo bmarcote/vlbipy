@@ -38,13 +38,28 @@ backup_flags = true          # save a restorable flag version before unflagging
 keep_ms = false              # dask-ms backend: keep the intermediate MS after the zarr conversion
 
 [flagging]
-quack_interval = 0           # seconds; only used when the backend cannot measure it
+# Quack (slewing time at scan start), applied before any solve. Per-antenna values in
+# [flagging.quack_antennas] win; otherwise quack_interval applies to every antenna; when
+# neither is set the ramp is measured from the raw data per antenna.
+quack_interval = 0           # seconds for every antenna (0 = not configured)
 quack_sigma = 2.0            # MADs below the baseline's scan median that count as off-source
-quack_max_seconds = 50.0    # never trim more than this from a scan start
+quack_max_seconds = 50.0     # never trim more than this from a scan start (measured mode)
 flag_autocorrelations = true
-edge_channels_fraction = 0.05 # fraction of each subband flagged on each edge
+# Subband edge channels: measured from the bandpass roll-off when a bandpass table exists,
+# otherwise edge_channels_fraction of each subband is flagged blindly on each edge.
+edge_channels_fraction = 0.05
+edge_outlier_sigma = 6.0     # MAD sigmas defining the flat interior of a subband
+max_edge_fraction = 0.25     # never trim more than this fraction from either subband edge
 aoflagger_strategy = "default"
 outlier_sigma = 5.0          # robust-sigma cut for per-baseline outlier flagging
+
+# Seconds to quack per antenna, e.g. EF = 4. Empty = use quack_interval / measure.
+[flagging.quack_antennas]
+
+# Initial auto-flagging of the calibrators (per baseline; flags are never extended).
+[flagging.tfcrop]
+timecutoff = 4.0
+freqcutoff = 3.0
 
 [calibration]
 parang = true                # parallactic-angle correction in all cal steps
@@ -53,7 +68,7 @@ eop_file = ""                # usno_finals.erp path for EOP corrections (VLBA/LB
 snr_channel_fraction = 0.7   # central fraction of each subband used by the per-scan SNR survey
 ionos = true                 # solve the dispersive delay in the fringe fit below
                              # ionos_max_ghz; false disables it at any frequency
-ionos_max_ghz = 6.0          # the ionosphere matters below this observing frequency
+ionos_max_ghz = 8.0          # the ionosphere matters below this observing frequency
 snr_max_scans = 24           # cap on scans fringe-fitted by the survey (0 = all);
                              # it only needs relative SNR, so a sample suffices
 smooth_tsys = true           # de-spike the Tsys table after gencal
@@ -61,8 +76,6 @@ tsys_outlier_sigma = 6.0     # MAD sigmas beyond which a Tsys solution is an out
 tsys_smooth_passes = 3       # maximum de-spiking passes
 detection_snr = 7.0          # fringe SNR above which an antenna counts as detected
 require_all_subbands = true  # only calibrate on antennas that recorded the whole band
-edge_outlier_sigma = 6.0     # MAD sigmas defining the flat interior of a subband
-max_edge_fraction = 0.25     # never trim more than this fraction from either subband edge
 
 # Every key in a [calibration.*] section is passed straight through to the backend
 # function of the same name, so any parameter it accepts can be tuned here.
@@ -77,8 +90,8 @@ solint = "inf"
 combine = "scan"
 minsnr = 3.0
 solnorm = true               # normalise: keep the band shape, not the flux scale
-corrdepflags = true
 bandtype = 'B'
+fillgaps = 8                 # interpolate over flagged channel gaps up to this width
 
 [calibration.scalar_bandpass]
 solint = "inf"               # one amplitude per antenna and subband for the whole run
@@ -91,6 +104,13 @@ solint = "inf"
 combine = "spw"              # pool the subbands for sensitivity (needs an spw map at apply)
 minsnr = 5.0
 zerorates = false            # atmospheric residuals vary in time: fit the rate
+
+# Reweighting (statwt) after the full chain is applied; the pipeline then flags outliers
+# again and re-solves everything (third pass). Set enabled = false to skip.
+[calibration.reweight]
+enabled = true
+column = "corrected"
+minsamp = 2
 
 [calibration.tsys_smooth]
 window = 5                   # running-median window, in solutions, used to de-spike Tsys

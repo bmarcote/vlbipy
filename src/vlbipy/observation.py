@@ -33,10 +33,11 @@ CALTABLES_FILENAME = ".caltables.json"
 #: in and use the same names the steps record themselves under.
 STEP_ORDER = [
     "import_data", "a_priori", "flag_apriori", "flag_from_file", "flag_autocorr",
+    "flag_quack", "flag_tfcrop",
     "scan_snr", "initial_calibration", "fringefit", "bandpass",
-    "initial_calibration_sbd2", "fringefit_mbd2", "edge_channels", "flag_edges",
-    "apply", "flag_quack", "flag_tfcrop", "flag_aoflagger", "flag_outliers",
-    "second_pass", "scalar_bandpass", "split",
+    "initial_calibration_sbd2", "fringefit_mbd2", "flag_edges",
+    "apply", "flag_aoflagger", "flag_outliers",
+    "second_pass", "scalar_bandpass", "reweight", "flag_outliers_reweighted", "third_pass", "split",
 ]
 
 
@@ -80,6 +81,7 @@ class Observation:
         # solve on top of the tables earlier steps produced, not from scratch.
         self.gaintables: list[CalTable] = self._load_gaintables()
         self._snr_surveys: dict = {}   # per-field fringe SNR surveys (see plot/calibrate.scan_snr)
+        self.flag_statistics: dict = {}  # last flag.statistics() result (per antenna / subband)
         self._scratch = False
 
         # Callable operation namespaces.
@@ -313,6 +315,7 @@ class Observation:
                 "check_sources": [s.name for s in self.sources.check_sources],
             },
             "gaintables": [t.cal_type for t in self.gaintables],
+            "flagging": self.flag_statistics,
             "steps": self._state.as_dict(),
             "warnings": warnings.summary(),
         }
@@ -324,6 +327,7 @@ class Observation:
         self._state.reset()
         self.set_gaintables([])
         self._metadata = None
+        self.flag_statistics = {}
         logger.info("reset observation {}", self.project_code)
 
     def __repr__(self) -> str:

@@ -422,14 +422,22 @@ class CasaDataOps(DataOps):
 
     def get_subband_participation(self, project_code: str,
                                   antenna_names: list[str]) -> dict[str, tuple[int, ...]]:
-        """Return ``{antenna: (subbands with unflagged data, ...)}`` via one TaQL pass.
+        """Return ``{antenna: (subbands with observable data, ...)}`` via one TaQL pass.
 
         Heterogeneous arrays record different subband subsets per antenna. This
-        reads the FLAG column, so it is the expensive part of inspection and is
-        deliberately kept out of :meth:`get_metadata`.
+        reads the FLAG and DATA columns, so it is the expensive part of
+        inspection and is deliberately kept out of :meth:`get_metadata`.
+
+        A subband only counts when it has *unflagged and recorded* data
+        (``DATA != 0``), not merely unflagged rows: an antenna that never
+        correlated a subband still has rows there (zero-filled), and after an
+        unflag (``data.reset_calibration(unflag=True)``, e.g. a ``--scratch``
+        re-run) those rows are indistinguishable from real data by FLAG alone.
+        Counting them as "participation" would let an antenna that structurally
+        never recorded a subband pass a ``require_all_subbands`` selection.
         """
         ms = self.backend.ms_path(project_code)
-        logger.info("inspecting subband participation ({} antennas; reads the FLAG column)",
+        logger.info("inspecting subband participation ({} antennas; reads the FLAG/DATA columns)",
                     len(antenna_names))
         participation: dict[str, set[int]] = {name: set() for name in antenna_names}
         table = self.backend.tools.table()
@@ -440,8 +448,8 @@ class CasaDataOps(DataOps):
             # is split across both columns: query each in turn or the highest-numbered
             # antennas look empty.
             for column in ("ANTENNA1", "ANTENNA2"):
-                query = (f"SELECT {column}, DATA_DESC_ID, gntrue(!FLAG) AS NVALID FROM {ms} "
-                         f"WHERE ANTENNA1 != ANTENNA2 GROUPBY {column}, DATA_DESC_ID")
+                query = (f"SELECT {column}, DATA_DESC_ID, gntrue(!FLAG && DATA != 0) AS NVALID "
+                         f"FROM {ms} WHERE ANTENNA1 != ANTENNA2 GROUPBY {column}, DATA_DESC_ID")
                 try:
                     result = table.taql(query)
                 except RuntimeError as exc:
@@ -463,7 +471,7 @@ class CasaDataOps(DataOps):
         result_map = {name: tuple(sorted(spws)) for name, spws in participation.items()}
         for name, spws in result_map.items():
             if not spws:
-                logger.warning("antenna {} has no unflagged data in any subband", name)
+                logger.warning("antenna {} has no observable data in any subband", name)
         return result_map
 
     def read_spectrum(self, project_code: str, *, field: str = "", scans: Optional[list] = None,
@@ -875,6 +883,70 @@ class CasaDataOps(DataOps):
         return {"uvdist_mlambda": uvdist, "values": points, "polarizations": pol_labels,
                 "field": field, "column": column, "time_bin": time_bin}
 
+    def read_uv_coverage(self, project_code: str, *, field: str = "", max_points: int = 200_000,
+                         metadata: Optional[ObsMetadata] = None) -> dict:
+        """Read the sampled (u, v) points per source, in wavelengths.
+
+        The UVW column is per row and identical across subbands, so only the
+        first data description is read and the metres are converted with a
+        single band-centre frequency (``freq_setup.ref_freq``): the per-subband
+        spread in wavelengths is a few percent and irrelevant for a coverage plot.
+        Autocorrelations and rows flagged entirely are dropped; fields with more
+        than ``max_points`` samples keep every k-th row (deterministic).
+
+        Parameters
+        ----------
+        field : str
+            Comma-separated fields to read; empty means all observed sources.
+        max_points : int
+            Subsampling threshold per field.
+
+        Returns
+        -------
+        dict
+            ``fields`` (``{name: {"u": [...], "v": [...]}}``), ``unit`` (``"Mlambda"``),
+            ``freq_ghz``.
+        """
+        meta = metadata or self.backend.data.get_metadata(project_code, [], "")
+        wanted = [f for f in field.split(",") if f]
+        names = {fid: name for name, fid in meta.source_ids.items()}
+        frequency = float(meta.freq_setup.ref_freq)
+        to_mlambda = frequency / 299792458.0 / 1e6
+
+        ms_tool = self.backend.tools.ms()
+        if not ms_tool.open(str(self.backend.ms_path(project_code))):
+            raise BackendError(f"could not open MS for {project_code}")
+        try:
+            ms_tool.selectinit(datadescid=0)
+            if wanted:
+                ms_tool.select({"field": wanted})
+            try:
+                record = ms_tool.getdata(["uvw", "flag", "flag_row", "antenna1", "antenna2",
+                                          "field_id"])
+            except RuntimeError as exc:
+                raise BackendError(f"{project_code}: could not read uvw: {exc}") from exc
+        finally:
+            ms_tool.close()
+
+        uvw = np.asarray(record.get("uvw", np.empty((3, 0))), dtype=float)
+        fields: dict[str, dict[str, list[float]]] = {}
+        if uvw.size:
+            ant1, ant2 = np.asarray(record["antenna1"]), np.asarray(record["antenna2"])
+            flagged = np.asarray(record["flag_row"], dtype=bool) | np.asarray(
+                record["flag"], dtype=bool).all(axis=(0, 1))
+            keep = (ant1 != ant2) & ~flagged
+            field_ids = np.asarray(record["field_id"])
+            for fid in np.unique(field_ids[keep]):
+                rows = np.flatnonzero(keep & (field_ids == fid))
+                step = max(1, int(np.ceil(rows.size / max_points)))
+                rows = rows[::step]
+                fields[names.get(int(fid), f"field{int(fid)}")] = {
+                    "u": (uvw[0, rows] * to_mlambda).tolist(),
+                    "v": (uvw[1, rows] * to_mlambda).tolist()}
+        logger.info("read_uv_coverage: {} field(s), {} point(s) on {}", len(fields),
+                    sum(len(f["u"]) for f in fields.values()), field or "all fields")
+        return {"fields": fields, "unit": "Mlambda", "freq_ghz": frequency / 1e9}
+
     def check_apriori_data(self, project_code: str) -> dict:
         """Report whether the MS carries usable Tsys and gain-curve information.
 
@@ -1145,8 +1217,8 @@ class CasaCalibrationOps(CalibrationOps):
     def bandpass(self, project_code: str, field: str, refant: str, *,
                  scans: Optional[list] = None, gaintable: Optional[list] = None,
                  solint: str = "inf", combine: str = "scan", minsnr: float = 3.0,
-                 solnorm: bool = True, metadata: Optional[ObsMetadata] = None,
-                 **kwargs) -> CalTable:
+                 solnorm: bool = True, fillgaps: int = 8, bandtype: str = "B",
+                 metadata: Optional[ObsMetadata] = None, **kwargs) -> CalTable:
         """Bandpass calibration on the same scan(s) used for the instrumental delay.
 
         Uses every channel (the point is to measure the band shape, including the
@@ -1160,6 +1232,11 @@ class CasaCalibrationOps(CalibrationOps):
             contribute to one solution.
         solnorm : bool
             Normalise each solution to unit mean amplitude.
+        fillgaps : int
+            Interpolate over flagged channel gaps up to this width (channels), so a
+            few RFI-flagged channels do not punch holes in the band shape.
+        bandtype : str
+            ``"B"`` (per channel) or ``"BPOLY"`` (polynomial).
         """
         meta = metadata or self.backend.data.get_metadata(project_code, [], "")
         table_path = self.backend.caldir() / f"{project_code}.bpass"
@@ -1167,8 +1244,8 @@ class CasaCalibrationOps(CalibrationOps):
             shutil.rmtree(table_path)
         params = {"vis": str(self.backend.ms_path(project_code)), "caltable": str(table_path),
                   "field": field, "solint": solint, "combine": combine, "solnorm": solnorm,
-                  "refant": self.refant_chain(meta, refant), "minsnr": minsnr, "bandtype": "B",
-                  "corrdepflags": True, "parang": True, "fillgaps": 1}
+                  "refant": self.refant_chain(meta, refant), "minsnr": minsnr, "bandtype": bandtype,
+                  "corrdepflags": True, "parang": True, "fillgaps": int(fillgaps)}
         if scans:
             params["scan"] = ",".join(str(s) for s in scans)
         params.update(self._prior_callib(project_code, gaintable, table_path))
@@ -1363,83 +1440,45 @@ class CasaCalibrationOps(CalibrationOps):
         usable = snr[~flags & (snr > 0) & (snr != _REFANT_SNR_SENTINEL)]
         return float(np.median(usable)) if usable.size else 0.0
 
-    def measure_edge_channels(self, project_code: str, table: CalTable, *, threshold: float = 6.0,
-                              max_edge_fraction: float = 0.25, **kwargs) -> dict:
-        """Measure how many channels roll off at each subband edge, from the bandpass table.
+    def reweight(self, project_code: str, *, column: str = "corrected", timebin: str = "",
+                 minsamp: int = 2, flagbackup: bool = True, **kwargs) -> dict:
+        """Recompute the visibility weights from the scatter of the calibrated data (statwt).
 
-        Builds three per-channel profiles across every antenna, subband and
-        polarization — median amplitude, phase scatter, and flagged fraction —
-        and finds the flat interior of each. Subband edges show up as amplitude
-        roll-off, rising phase scatter, or solutions the solver had to flag; the
-        widest trim the three agree on is what needs flagging.
-
-        The same trim is applied to every subband: they share a signal path
-        shape, and a per-subband trim would leave the band with ragged,
-        non-uniform channel coverage.
+        The correlator weights only reflect the nominal integration; after the
+        a-priori and fringe calibration the real per-baseline noise is known from
+        the data itself. Anomalously high or low weights afterwards point at bad
+        data that hid until now, so the pipeline flags again and re-solves after
+        this step.
 
         Parameters
         ----------
-        table : CalTable
-            The bandpass table to analyse.
-        threshold : float
-            Deviation in robust sigmas beyond which an edge channel is rejected.
-        max_edge_fraction : float
-            Never trim more than this fraction of a subband from either edge.
+        column : str
+            Data column the scatter is measured on (``"corrected"`` after applycal).
+        timebin : str
+            Time window per weight estimate (empty = per scan/subband default).
+        minsamp : int
+            Minimum number of unflagged visibilities per estimate.
+        flagbackup : bool
+            Save a flag version first (statwt flags what it cannot weight).
 
         Returns
         -------
         dict
-            ``n_edge`` (channels to flag at each edge), ``first``/``last`` (the
-            flat range), ``n_channels``, and the three profiles.
+            statwt's own report (``mean`` and ``variance`` of the new weights).
         """
-        from ..statistics import find_flat_range, mad_sigma
-
-        handle = self.backend.tools.table()
-        if not handle.open(str(table.path)):
-            raise BackendError(f"could not open bandpass table {table.path}")
+        params = {"vis": str(self.backend.ms_path(project_code)), "datacolumn": column,
+                  "minsamp": int(minsamp), "flagbackup": bool(flagbackup)}
+        if timebin:
+            params["timebin"] = timebin
+        params.update({k: v for k, v in kwargs.items() if v not in (None, "")})
+        logger.info("statwt: {}", " ".join(f"{k}={v!r}" for k, v in params.items() if k != "vis"))
         try:
-            values = np.asarray(handle.getcol("CPARAM"))          # (npol, nchan, nrow)
-            flags = np.asarray(handle.getcol("FLAG")).astype(bool)
-        finally:
-            handle.close()
-        if values.ndim != 3 or values.shape[1] < 8:
-            raise BackendError(f"{project_code}: bandpass table has an unexpected shape "
-                               f"{values.shape}; cannot measure the band edges")
-
-        n_channels = values.shape[1]
-        amplitude = np.abs(values).astype(float)
-        phase = np.angle(values)
-        amplitude[flags] = np.nan
-        phase[flags] = np.nan
-
-        # Collapse polarization and row (= antenna x subband) onto the channel axis.
-        per_channel = amplitude.transpose(1, 0, 2).reshape(n_channels, -1)
-        phase_channel = phase.transpose(1, 0, 2).reshape(n_channels, -1)
-        with np.errstate(invalid="ignore"):
-            amp_profile = np.nanmedian(per_channel, axis=1)
-            phase_profile = np.array([mad_sigma(row[np.isfinite(row)]) for row in phase_channel])
-        flagged_fraction = flags.transpose(1, 0, 2).reshape(n_channels, -1).mean(axis=1)
-
-        amp_range = find_flat_range(amp_profile, threshold=threshold,
-                                    max_edge_fraction=max_edge_fraction)
-        phase_range = find_flat_range(phase_profile, threshold=threshold,
-                                      max_edge_fraction=max_edge_fraction)
-        # Channels the solver itself could not solve are edges too.
-        max_trim = int(n_channels * max_edge_fraction)
-        solved = np.where(flagged_fraction < 0.5)[0]
-        solved_range = ((int(solved[0]), int(solved[-1])) if solved.size
-                        else (0, n_channels - 1))
-        first = max(amp_range[0], phase_range[0], min(solved_range[0], max_trim))
-        last = min(amp_range[1], phase_range[1], max(solved_range[1], n_channels - 1 - max_trim))
-        # One trim for the whole band: use the wider of the two edges.
-        n_edge = min(max_trim, max(first, n_channels - 1 - last))
-        logger.info("edge channels: amplitude flat over {}, phase over {}, solved over {} "
-                    "-> flag {} channel(s) at each edge of all {} subbands",
-                    amp_range, phase_range, solved_range, n_edge, values.shape[0] and "the")
-        return {"n_edge": int(n_edge), "first": int(n_edge), "last": int(n_channels - 1 - n_edge),
-                "n_channels": int(n_channels), "amplitude_profile": amp_profile.tolist(),
-                "phase_profile": phase_profile.tolist(),
-                "flagged_fraction": flagged_fraction.tolist()}
+            result = self.backend.tasks.statwt(**params)
+        except RuntimeError as exc:
+            raise BackendError(f"{project_code}: statwt failed: {exc}") from exc
+        report = dict(result) if isinstance(result, dict) else {"result": result}
+        logger.info("statwt: new weights mean={} variance={}", report.get("mean"), report.get("variance"))
+        return report
 
     def solution_coverage(self, project_code: str, table: CalTable,
                           metadata: Optional[ObsMetadata] = None) -> dict[str, set[int]]:
@@ -1856,10 +1895,14 @@ class CasaFlagOps(FlagOps):
     """Flagging via casatasks.flagdata (plus AOFlagger when it is installed)."""
 
     #: flagdata parameters per mode; ``kind`` -> (mode, extra kwargs).
+    # Auto-flaggers must never extend flags across baselines: VLBI antenna sensitivities
+    # differ by orders of magnitude, so what is an outlier on one baseline is signal
+    # on another. tfcrop/rflag already judge each baseline on its own statistics.
     MODES = {"autocorr": ("manual", {"autocorr": True}),
              "quack": ("quack", {"quackmode": "beg"}),
-             "tfcrop": ("tfcrop", {"datacolumn": "corrected", "timecutoff": 4.0, "freqcutoff": 3.0}),
-             "rflag": ("rflag", {"datacolumn": "corrected"}),
+             "tfcrop": ("tfcrop", {"datacolumn": "data", "timecutoff": 4.0, "freqcutoff": 3.0,
+                                   "extendflags": False}),
+             "rflag": ("rflag", {"datacolumn": "corrected", "extendflags": False}),
              "manual": ("manual", {}),
              "from_file": ("list", {})}
 
@@ -1906,12 +1949,16 @@ class CasaFlagOps(FlagOps):
             params.update(extra)
             if kind == "quack":
                 params["quackinterval"] = float(kwargs.pop("interval", 0.0) or 0.0)
+                if kwargs.get("antenna"):
+                    params["antenna"] = str(kwargs["antenna"])
                 if params["quackinterval"] <= 0.0:
                     logger.info("flag[quack]: interval is 0 s; nothing to do")
                     return
             if kind == "from_file":
                 params["inpfile"] = str(kwargs.pop("flagfile"))
-            if kind == "manual":
+            if kind in ("manual", "tfcrop", "rflag"):
+                # Caller overrides (e.g. datacolumn='corrected' once calibrated, or a
+                # tighter cutoff) win over the mode defaults.
                 params.update({k: v for k, v in kwargs.items() if v not in (None, "")})
         logger.info("flagdata {}", " ".join(f"{k}={v!r}" for k, v in params.items() if k != "vis"))
         try:
@@ -2165,19 +2212,28 @@ class CasaFlagOps(FlagOps):
                 "integration_time": integration}
 
     def quack(self, project_code: str, *, per_antenna: Optional[dict] = None,
-              field: str = "", **kwargs) -> float:
-        """Apply per-antenna quack flagging, measuring the intervals when not given."""
-        measurement = None
-        if per_antenna is None:
-            measurement = self.measure_quack(project_code, field=field, **kwargs)
-            per_antenna = measurement["per_antenna"]
+              interval: float = 0.0, field: str = "", **kwargs) -> float:
+        """Flag the start of every scan, per antenna.
+
+        Resolution order: explicit ``per_antenna`` seconds win; otherwise
+        ``interval`` (> 0) applies one value to the whole array; otherwise the
+        ramp is measured from the data with :meth:`measure_quack`. The
+        interval scope is the whole dataset — quacking only the calibrators would
+        leave the same slewing data in the target.
+        """
+        per_antenna = dict(per_antenna or {})
+        if not per_antenna and interval and float(interval) > 0:
+            per_antenna = {"": float(interval)}
+        if not per_antenna:
+            per_antenna = self.measure_quack(project_code, field=field, **kwargs)["per_antenna"]
         if not per_antenna:
             logger.info("quack: no antenna shows a settling ramp; nothing to flag")
             return 0.0
         before = self.flagged_fraction(project_code)
         ms = str(self.backend.ms_path(project_code))
         for antenna, seconds in sorted(per_antenna.items()):
-            logger.info("quack: flagging the first {:.0f} s of each scan on {}", seconds, antenna)
+            logger.info("quack: flagging the first {:.0f} s of each scan on {}", seconds,
+                        antenna or "all antennas")
             try:
                 self.backend.tasks.flagdata(vis=ms, mode="quack", quackmode="beg",
                                             quackinterval=float(seconds), antenna=str(antenna),
@@ -2188,6 +2244,84 @@ class CasaFlagOps(FlagOps):
         after = self.flagged_fraction(project_code)
         logger.info("quack: {:.2%} newly flagged ({:.1%} -> {:.1%})", after - before, before, after)
         return max(0.0, after - before)
+
+    def measure_edge_channels(self, project_code: str, table: CalTable, *, threshold: float = 6.0,
+                              max_edge_fraction: float = 0.25, **kwargs) -> dict:
+        """Measure how many channels roll off at each subband edge, from the bandpass table.
+
+        Builds three per-channel profiles across every antenna, subband and
+        polarization — median amplitude, phase scatter, and flagged fraction —
+        and finds the flat interior of each. Subband edges show up as amplitude
+        roll-off, rising phase scatter, or solutions the solver had to flag; the
+        widest trim the three agree on is what needs flagging.
+
+        The same trim is applied to every subband: they share a signal path
+        shape, and a per-subband trim would leave the band with ragged,
+        non-uniform channel coverage.
+
+        Parameters
+        ----------
+        table : CalTable
+            The bandpass table to analyse.
+        threshold : float
+            Deviation in robust sigmas beyond which an edge channel is rejected.
+        max_edge_fraction : float
+            Never trim more than this fraction of a subband from either edge.
+
+        Returns
+        -------
+        dict
+            ``n_edge`` (channels to flag at each edge), ``first``/``last`` (the
+            flat range), ``n_channels``, and the three profiles.
+        """
+        from ..statistics import find_flat_range, mad_sigma
+
+        handle = self.backend.tools.table()
+        if not handle.open(str(table.path)):
+            raise BackendError(f"could not open bandpass table {table.path}")
+        try:
+            values = np.asarray(handle.getcol("CPARAM"))          # (npol, nchan, nrow)
+            flags = np.asarray(handle.getcol("FLAG")).astype(bool)
+        finally:
+            handle.close()
+        if values.ndim != 3 or values.shape[1] < 8:
+            raise BackendError(f"{project_code}: bandpass table has an unexpected shape "
+                               f"{values.shape}; cannot measure the band edges")
+
+        n_channels = values.shape[1]
+        amplitude = np.abs(values).astype(float)
+        phase = np.angle(values)
+        amplitude[flags] = np.nan
+        phase[flags] = np.nan
+
+        # Collapse polarization and row (= antenna x subband) onto the channel axis.
+        per_channel = amplitude.transpose(1, 0, 2).reshape(n_channels, -1)
+        phase_channel = phase.transpose(1, 0, 2).reshape(n_channels, -1)
+        with np.errstate(invalid="ignore"):
+            amp_profile = np.nanmedian(per_channel, axis=1)
+            phase_profile = np.array([mad_sigma(row[np.isfinite(row)]) for row in phase_channel])
+        flagged_fraction = flags.transpose(1, 0, 2).reshape(n_channels, -1).mean(axis=1)
+
+        amp_range = find_flat_range(amp_profile, threshold=threshold,
+                                    max_edge_fraction=max_edge_fraction)
+        phase_range = find_flat_range(phase_profile, threshold=threshold,
+                                      max_edge_fraction=max_edge_fraction)
+        # Channels the solver itself could not solve are edges too.
+        max_trim = int(n_channels * max_edge_fraction)
+        solved = np.where(flagged_fraction < 0.5)[0]
+        solved_range = ((int(solved[0]), int(solved[-1])) if solved.size
+                        else (0, n_channels - 1))
+        first = max(amp_range[0], phase_range[0], min(solved_range[0], max_trim))
+        last = min(amp_range[1], phase_range[1], max(solved_range[1], n_channels - 1 - max_trim))
+        # One trim for the whole band: use the wider of the two edges.
+        n_edge = min(max_trim, max(first, n_channels - 1 - last))
+        logger.info("edge channels: amplitude flat over {}, phase over {}, solved over {} "
+                    "-> flag {} channel(s) at each edge of all {} subbands",
+                    amp_range, phase_range, solved_range, n_edge, values.shape[0] and "the")
+        return {"n_edge": int(n_edge), "first": int(n_edge), "last": int(n_channels - 1 - n_edge),
+                "n_channels": int(n_channels), "amplitude_profile": amp_profile.tolist(),
+                "phase_profile": phase_profile.tolist(),
+                "flagged_fraction": flagged_fraction.tolist()}
 
     def _edge_spw_selection(self, project_code: str, *, edge_fraction: float = 0.1,
                             n_channels: int = 0, edge_channels: int = 0, **kwargs) -> str:
@@ -2496,6 +2630,18 @@ class CasaPlotOps(PlotOps):
                                                    time_bin=time_bin, metadata=metadata)
         return str(plot_radplot(uvdata, self.plot_dir(self.category_for_column(column)),
                                 project_code, label=label))
+
+    def diagnostic(self, project_code: str, kind: str, *, field: str = "", label: str = "",
+                   metadata: Optional[ObsMetadata] = None, **kwargs) -> str:
+        """Produce one diagnostic plot; only ``uv_coverage`` (u vs v per source) is implemented."""
+        if kind != "uv_coverage":
+            raise self._unsupported(f"diagnostic[{kind}]", "only uv_coverage is implemented")
+        from ..plotting import plot_uv_coverage
+        data = self.backend.data.read_uv_coverage(project_code, field=field, metadata=metadata)
+        suffix = f".{label}" if label else ""
+        outfile = self.plot_dir("raw") / f"{project_code}{suffix}.uv_coverage.png"
+        logger.info("uv coverage plot: {} field(s) -> {}", len(data.get("fields") or {}), outfile)
+        return plot_uv_coverage(data, str(outfile), title=f"{project_code} — uv coverage")
 
     def timeseries(self, project_code: str, *, field: str = "", refant: str = "",
                    column: str = "corrected", label: str = "",

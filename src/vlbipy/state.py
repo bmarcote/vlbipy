@@ -147,6 +147,10 @@ class StepState:
         """Return the recorded status of a step, or ``None`` if unknown."""
         return self._steps.get(step, {}).get("status")
 
+    def inputs(self, step: str) -> list[str]:
+        """Return the input paths recorded for a step (empty if unknown/none)."""
+        return list(self._steps.get(step, {}).get("inputs", []))
+
     def completed(self) -> list[str]:
         """Return the names of the steps recorded as done."""
         return [name for name, entry in self._steps.items() if entry.get("status") == "done"]

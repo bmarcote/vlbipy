@@ -96,11 +96,21 @@ def test_step_order_matches_the_names_steps_record():
     from vlbipy.observation import STEP_ORDER
     assert len(STEP_ORDER) == len(set(STEP_ORDER))
     for name in ("import_data", "a_priori", "flag_apriori", "flag_from_file", "flag_autocorr",
-                 "scan_snr", "initial_calibration", "fringefit", "bandpass",
-                 "initial_calibration_sbd2", "fringefit_mbd2", "edge_channels", "flag_edges",
-                 "apply", "flag_quack", "flag_outliers", "second_pass", "scalar_bandpass",
-                 "split"):
+                 "flag_quack", "flag_tfcrop", "scan_snr", "initial_calibration", "fringefit",
+                 "bandpass", "initial_calibration_sbd2", "fringefit_mbd2", "flag_edges",
+                 "apply", "flag_outliers", "second_pass", "scalar_bandpass", "reweight",
+                 "flag_outliers_reweighted", "third_pass", "split"):
         assert name in STEP_ORDER, name
+    assert "edge_channels" not in STEP_ORDER    # folded into flag_edges (flagging, not calibration)
+    # Quack and the initial auto-flag happen before any solve (SKILL steps 7-8).
+    assert STEP_ORDER.index("flag_quack") < STEP_ORDER.index("flag_tfcrop") \
+        < STEP_ORDER.index("initial_calibration")
     # SBD is solved before the bandpass, and the bandpass before the refined SBD.
     assert STEP_ORDER.index("initial_calibration") < STEP_ORDER.index("fringefit") \
         < STEP_ORDER.index("bandpass") < STEP_ORDER.index("initial_calibration_sbd2")
+    # Edge channels are measured from the bandpass, so they are flagged after it.
+    assert STEP_ORDER.index("bandpass") < STEP_ORDER.index("flag_edges") < STEP_ORDER.index("apply")
+    # Reweighting comes after the second pass and triggers a third one.
+    assert STEP_ORDER.index("second_pass") < STEP_ORDER.index("reweight") \
+        < STEP_ORDER.index("flag_outliers_reweighted") < STEP_ORDER.index("third_pass") \
+        < STEP_ORDER.index("split")

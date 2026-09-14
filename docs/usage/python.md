@@ -49,7 +49,7 @@ obs.flag.apriori()                  # .uvflg + autocorrelations
 
 antennas, scans = obs["rsm07"].calibrate.select_calibration_data()
 obs.calibrate.instrumental()        # SBD -> bandpass -> SBD, on that selection
-obs.calibrate.edge_channels()       # measure and flag the band edges
+obs.flag.edges()                    # band edges, measured from the bandpass
 obs.calibrate.apply(force=True)
 obs.calibrate.fringefit()           # global fringe fit
 obs.calibrate.apply(force=True)
@@ -84,9 +84,11 @@ spec["spectra"]["JB"].shape          # (n_spw, n_chan, n_pol)
 
 ```python
 obs.flag.outliers(dry_run=True)     # measure before committing
-obs.flag.quack()                    # per-antenna slew time, measured
+obs.flag.quack()                    # slewing time (configured or measured); normally run before the solves
 obs.calibrate.second_pass()         # re-solve on the clean data
 obs.calibrate.scalar_bandpass()     # level the subbands
+obs.calibrate.reweight()            # statwt; then flag again and re-solve
+obs.flag.statistics()               # per-antenna flagged fractions
 obs.calibrate.apply(force=True)
 obs.export.per_source()             # per-source MS + UVFITS
 ```

@@ -83,6 +83,65 @@ def test_flag_returns_fraction():
     assert isinstance(frac, float) and 0.0 <= frac <= 1.0
 
 
+def test_flagging_lives_in_the_flag_namespace_not_calibrate():
+    """Edge channels, quack, statistics are flagging; statwt is calibration."""
+    obs = make_single()
+    for name in ("edges", "quack", "initial", "tfcrop", "statistics", "apriori", "outliers"):
+        assert name in obs.flag.operations(), name
+    assert "edge_channels" not in obs.calibrate.operations()
+    assert "reweight" in obs.calibrate.operations()
+    from vlbipy.backends.base import CalibrationOps, FlagOps
+    assert hasattr(FlagOps, "measure_edge_channels") and not hasattr(CalibrationOps, "measure_edge_channels")
+    assert hasattr(FlagOps, "summary") and hasattr(CalibrationOps, "reweight")
+
+
+def test_flag_edges_measures_from_the_bandpass_when_available():
+    obs = make_single()
+    obs.import_data()
+    blind = obs.flag.edges()                       # no bandpass yet: blind fraction
+    assert blind["method"] == "fraction" and blind["n_edge"] >= 0
+    obs.calibrate.a_priori()
+    obs.calibrate.instrumental()
+    measured = obs.flag.edges(force=True)
+    assert measured["method"] == "measured" and measured["n_edge"] > 0
+    explicit = obs.flag.edges(force=True, edge_channels=3)
+    assert explicit["method"] == "explicit" and explicit["n_edge"] == 3
+
+
+def test_flag_quack_prefers_configured_intervals(monkeypatch):
+    obs = VLBIObs(project="RSM07", network="EVN", backend="dummy", target="3C286",
+                  fringe_finder="3C345", flagging={"quack_antennas": {"EF": 4.0}})
+    obs.import_data()
+    seen = {}
+    backend = obs["RSM07"]._backend
+    original = backend.flag.quack
+
+    def spy(code, **kwargs):
+        seen.update(kwargs)
+        return original(code, **kwargs)
+
+    monkeypatch.setattr(backend.flag, "quack", spy)
+    obs.flag.quack()
+    assert seen["per_antenna"] == {"EF": 4.0} and seen["column"] == "data"
+
+
+def test_flag_statistics_land_in_the_report():
+    obs = make_single()
+    obs.import_data()
+    stats = obs.flag.statistics()
+    assert "antenna" in stats and 0.0 <= stats["fraction"] <= 1.0
+    assert obs.report()[0]["flagging"] == stats
+
+
+def test_reweight_is_a_calibration_step_and_resumes():
+    obs = make_single()
+    obs.import_data()
+    first = obs.calibrate.reweight()
+    assert "mean" in first
+    assert obs.calibrate.reweight() == {}          # already done: skipped
+    assert obs["RSM07"].state.as_dict()["reweight"]["status"] == "done"
+
+
 # -- imaging --
 
 def test_clean_scalar_returns_image():

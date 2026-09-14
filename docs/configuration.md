@@ -43,7 +43,7 @@ tfcrop_freqcutoff = 4.5
 [calibration]
 parang = true                # Apply parallactic angle correction throughout
 ionos = true                 # Solve the dispersive delay below ionos_max_ghz
-ionos_max_ghz = 6.0          # The ionosphere matters below this observing frequency
+ionos_max_ghz = 8.0          # The ionosphere matters below this observing frequency
 detection_snr = 7.0          # Fringe SNR above which an antenna counts as detected
 
 [calibration.sbd]
@@ -125,7 +125,9 @@ Source names must exactly match those in the data file. Both the new-style keys 
 | --- | --- | --- | --- |
 | `flag_autocorrelations` | bool | `true` | Flag autocorrelation data |
 | `edge_channels_fraction` | float | `0.05` | Fraction of channels flagged on each subband edge (used only when the edges are not measured) |
-| `quack_interval` | float | `0` | Seconds to flag at the start of each scan; only used when the backend cannot measure the slew itself |
+| `quack_interval` | float | `0` | Seconds to flag at the start of every scan for every antenna; `[flagging.quack_antennas]` (`EF = 4`) overrides per antenna; when neither is set the slew is measured from the data |
+| `edge_outlier_sigma` | float | `6.0` | MAD sigmas defining the flat interior of a subband when measuring the edges |
+| `max_edge_fraction` | float | `0.25` | Never trim more than this fraction from either subband edge |
 | `quack_sigma` | float | `2.0` | MADs below the baseline's scan median that count as off-source when measuring the slew |
 | `quack_max_seconds` | float | `50.0` | Never trim more than this from a scan start |
 | `outlier_sigma` | float | `5.0` | Robust-sigma cut for per-baseline outlier flagging |
@@ -144,7 +146,7 @@ Settings shared by every calibration step.
 | `refant_snr_select` | bool | `true` | Rank reference antennas from the measured fringe SNR rather than the static preference list |
 | `eop_file` | string | `""` | `usno_finals.erp` path for EOP corrections (VLBA/LBA); empty auto-downloads |
 | `ionos` | bool | `true` | Solve the dispersive (ionospheric) delay in the fringe fit below `ionos_max_ghz`. Set to `false` (or pass `--no-ionos`) to never solve it. |
-| `ionos_max_ghz` | float | `6.0` | Observing frequency below which the ionosphere matters enough to fit |
+| `ionos_max_ghz` | float | `8.0` | Observing frequency below which the ionosphere matters enough to fit |
 | `snr_channel_fraction` | float | `0.7` | Central fraction of each subband used by the per-scan SNR survey |
 | `snr_max_scans` | int | `24` | Cap on scans fringe-fitted by the survey (`0` = all); it only needs relative SNR |
 | `smooth_tsys` | bool | `true` | De-spike the Tsys table after `gencal` |
@@ -152,8 +154,6 @@ Settings shared by every calibration step.
 | `tsys_smooth_passes` | int | `3` | Maximum de-spiking passes |
 | `detection_snr` | float | `7.0` | Fringe SNR above which an antenna counts as detected |
 | `require_all_subbands` | bool | `true` | Only calibrate on antennas that recorded the whole band |
-| `edge_outlier_sigma` | float | `6.0` | MAD sigmas defining the flat interior of a subband |
-| `max_edge_fraction` | float | `0.25` | Never trim more than this fraction from either subband edge |
 
 !!! note "Passing anything the backend accepts"
     Every key in a `[calibration.*]` section below is forwarded verbatim to the
