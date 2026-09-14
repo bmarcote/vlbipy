@@ -837,9 +837,13 @@ class FlagNamespace(Namespace):
             measurement = self._backend.flag.measure_edge_channels(
                 self._code, table, threshold=cfg.get("edge_outlier_sigma", 6.0),
                 max_edge_fraction=cfg.get("max_edge_fraction", 0.25))
+<<<<<<< HEAD
             # The backend may report its own verdict (e.g. "narrowband" when the subbands
             # are too narrow to have an edge); only label it "measured" when it did not.
             measurement.setdefault("method", "measured")
+=======
+            measurement["method"] = "measured"
+>>>>>>> 3d467fbda62fa9048214d37fc420e3a66193b1b4
         else:
             fraction = float(cfg.get("edge_channels_fraction", 0.1))
             measurement = {"n_edge": int(round(n_channels * fraction)), "n_channels": n_channels,
@@ -847,12 +851,19 @@ class FlagNamespace(Namespace):
             logger.info("flag.edges: no bandpass to measure the roll-off from; flagging {:.0%} of "
                         "each subband edge", fraction)
         n_edge = int(measurement.get("n_edge", 0))
+<<<<<<< HEAD
         per_antenna = measurement.get("per_antenna") or {}
         if n_edge > 0 or any(left or right for left, right in per_antenna.values()):
             measurement["flagged_fraction_of_data"] = self._backend.flag.run(
                 self._code, "edges", edge_channels=n_edge, n_channels=measurement.get("n_channels", 0),
                 edge_fraction=measurement.get("edge_fraction", 0.0), per_antenna=per_antenna,
                 **kwargs)
+=======
+        if n_edge > 0:
+            measurement["flagged_fraction_of_data"] = self._backend.flag.run(
+                self._code, "edges", edge_channels=n_edge, n_channels=measurement.get("n_channels", 0),
+                edge_fraction=measurement.get("edge_fraction", 0.0), **kwargs)
+>>>>>>> 3d467fbda62fa9048214d37fc420e3a66193b1b4
             if measurement["flagged_fraction_of_data"] >= _HIGH_FLAG_FRACTION:
                 warnings.anomaly(f"{self._code}: flag[edges] removed "
                                  f"{measurement['flagged_fraction_of_data']:.1%} of data")

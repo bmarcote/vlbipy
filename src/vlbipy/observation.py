@@ -83,12 +83,15 @@ class Observation:
         self.gaintables: list[CalTable] = self._load_gaintables()
         self._snr_surveys: dict = {}   # per-field fringe SNR surveys (see plot/calibrate.scan_snr)
         self.flag_statistics: dict = {}  # last flag.statistics() result (per antenna / subband)
+<<<<<<< HEAD
         # The instrumental antenna/scan selection is decided once, on the cleanest data
         # (the first pass), and reused by every later pass. Re-surveying on progressively
         # flagged data lets the antenna set shrink pass over pass, and applycal
         # (calflagstrict) then flags every antenna a shrunken solution no longer covers —
         # which silently deletes good antennas. Persisted so a resumed run keeps it too.
         self._cal_selection: Optional[tuple[list[str], list[int]]] = self._load_cal_selection()
+=======
+>>>>>>> 3d467fbda62fa9048214d37fc420e3a66193b1b4
         self._scratch = False
 
         # Callable operation namespaces.

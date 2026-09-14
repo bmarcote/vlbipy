@@ -6,3 +6,4 @@ src/vlbipy.egg-info
 vlbipy.code-workspace
 test
 site/
+rsm07_run
