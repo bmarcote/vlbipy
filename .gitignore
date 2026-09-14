@@ -7,3 +7,4 @@ vlbipy.code-workspace
 test
 site/
 rsm07_run
+uv.lock
