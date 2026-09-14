@@ -2392,7 +2392,6 @@ class CasaFlagOps(FlagOps):
         roll-off, rising phase scatter, or solutions the solver had to flag; the
         widest trim the three agree on is what needs flagging.
 
-<<<<<<< HEAD
         The same trim is applied to every subband of an antenna: they share a
         signal path shape, and a per-subband trim would leave the band with
         ragged, non-uniform channel coverage. Each *antenna* is measured
@@ -2400,11 +2399,6 @@ class CasaFlagOps(FlagOps):
         where their band stops being usable, and trimming the whole array to the
         worst one throws away bandwidth the others recorded perfectly well —
         bandwidth the target image needs.
-=======
-        The same trim is applied to every subband: they share a signal path
-        shape, and a per-subband trim would leave the band with ragged,
-        non-uniform channel coverage.
->>>>>>> 3d467fbda62fa9048214d37fc420e3a66193b1b4
 
         Parameters
         ----------
@@ -2418,14 +2412,9 @@ class CasaFlagOps(FlagOps):
         Returns
         -------
         dict
-<<<<<<< HEAD
             ``n_edge`` (widest array-wide trim), ``first``/``last`` (the flat
             range), ``n_channels``, ``per_antenna`` (``{name: (left, right)}``)
             and the three profiles.
-=======
-            ``n_edge`` (channels to flag at each edge), ``first``/``last`` (the
-            flat range), ``n_channels``, and the three profiles.
->>>>>>> 3d467fbda62fa9048214d37fc420e3a66193b1b4
         """
         from ..statistics import find_flat_range, mad_sigma
 
@@ -2435,7 +2424,6 @@ class CasaFlagOps(FlagOps):
         try:
             values = np.asarray(handle.getcol("CPARAM"))          # (npol, nchan, nrow)
             flags = np.asarray(handle.getcol("FLAG")).astype(bool)
-<<<<<<< HEAD
             antenna_ids = np.asarray(handle.getcol("ANTENNA1"))
         finally:
             handle.close()
@@ -2452,20 +2440,10 @@ class CasaFlagOps(FlagOps):
                     "n_channels": int(n_channels), "per_antenna": {}, "method": "narrowband",
                     "amplitude_profile": [], "phase_profile": [], "flagged_fraction": []}
 
-=======
-        finally:
-            handle.close()
-        if values.ndim != 3 or values.shape[1] < 8:
-            raise BackendError(f"{project_code}: bandpass table has an unexpected shape "
-                               f"{values.shape}; cannot measure the band edges")
-
-        n_channels = values.shape[1]
->>>>>>> 3d467fbda62fa9048214d37fc420e3a66193b1b4
         amplitude = np.abs(values).astype(float)
         phase = np.angle(values)
         amplitude[flags] = np.nan
         phase[flags] = np.nan
-<<<<<<< HEAD
         names_handle = self.backend.tools.table()
         antenna_names: list[str] = []
         if names_handle.open(str(Path(table.path) / "ANTENNA")):
@@ -2473,8 +2451,6 @@ class CasaFlagOps(FlagOps):
                 antenna_names = [str(n) for n in names_handle.getcol("NAME")]
             finally:
                 names_handle.close()
-=======
->>>>>>> 3d467fbda62fa9048214d37fc420e3a66193b1b4
 
         # Collapse polarization and row (= antenna x subband) onto the channel axis.
         per_channel = amplitude.transpose(1, 0, 2).reshape(n_channels, -1)
@@ -2484,7 +2460,6 @@ class CasaFlagOps(FlagOps):
             phase_profile = np.array([mad_sigma(row[np.isfinite(row)]) for row in phase_channel])
         flagged_fraction = flags.transpose(1, 0, 2).reshape(n_channels, -1).mean(axis=1)
 
-<<<<<<< HEAD
         max_trim = int(n_channels * max_edge_fraction)
         overall = self._edge_trim(amp_profile, phase_profile, flagged_fraction,
                                   threshold=threshold, max_trim=max_trim, n_channels=n_channels)
@@ -2563,29 +2538,6 @@ class CasaFlagOps(FlagOps):
                          n_channels - 1 - solved_range[1]))
         return (int(min(max(lefts[1], 0), max_trim)), int(min(max(rights[1], 0), max_trim)))
 
-=======
-        amp_range = find_flat_range(amp_profile, threshold=threshold,
-                                    max_edge_fraction=max_edge_fraction)
-        phase_range = find_flat_range(phase_profile, threshold=threshold,
-                                      max_edge_fraction=max_edge_fraction)
-        # Channels the solver itself could not solve are edges too.
-        max_trim = int(n_channels * max_edge_fraction)
-        solved = np.where(flagged_fraction < 0.5)[0]
-        solved_range = ((int(solved[0]), int(solved[-1])) if solved.size
-                        else (0, n_channels - 1))
-        first = max(amp_range[0], phase_range[0], min(solved_range[0], max_trim))
-        last = min(amp_range[1], phase_range[1], max(solved_range[1], n_channels - 1 - max_trim))
-        # One trim for the whole band: use the wider of the two edges.
-        n_edge = min(max_trim, max(first, n_channels - 1 - last))
-        logger.info("edge channels: amplitude flat over {}, phase over {}, solved over {} "
-                    "-> flag {} channel(s) at each edge of all {} subbands",
-                    amp_range, phase_range, solved_range, n_edge, values.shape[0] and "the")
-        return {"n_edge": int(n_edge), "first": int(n_edge), "last": int(n_channels - 1 - n_edge),
-                "n_channels": int(n_channels), "amplitude_profile": amp_profile.tolist(),
-                "phase_profile": phase_profile.tolist(),
-                "flagged_fraction": flagged_fraction.tolist()}
-
->>>>>>> 3d467fbda62fa9048214d37fc420e3a66193b1b4
     def _edge_spw_selection(self, project_code: str, *, edge_fraction: float = 0.1,
                             n_channels: int = 0, edge_channels: int = 0,
                             left: int = -1, right: int = -1, **kwargs) -> str:
