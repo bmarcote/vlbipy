@@ -4,13 +4,13 @@
 renders per-antenna diagnostic figures. It dispatches on the table's ``VisCal``
 keyword, so the same class serves every present and future caltable:
 
-* ``B TSYS``       -> Tsys vs time, one subplot per antenna, color per subband
+* ``B TSYS``       -> Tsys vs time, one subplot per antenna, color per polarization
 * ``EPowerCurve``  -> gain-curve polynomial vs elevation, one subplot per antenna
 * ``Fringe Jones`` -> phase / delay / rate vs time (one PNG each), per antenna
 * ``G/B Jones``    -> amplitude and phase of the (complex) gains vs time/channel
 
-Style: fixed-order Okabe-Ito subband colors (colorblind-validated), polarization
-as linestyle (secondary encoding), recessive grids, shared axes per figure.
+Style: fixed colors always encode polarization; subbands use line style or marker
+shape as a secondary encoding, with recessive grids and shared axes per figure.
 """
 from __future__ import annotations
 
@@ -102,14 +102,49 @@ def evaluate_gain_curve(coefficients, elevation_deg) -> np.ndarray:
     return sum(c * elevation_deg ** k for k, c in enumerate(coefficients))
 
 
+def _parallel_hand_mean(values: np.ndarray, pol_labels: list) -> np.ndarray:
+    """Average the parallel-hand columns of ``(n, n_pol)`` values into a Stokes-I-like series."""
+    values = np.asarray(values)
+    if values.ndim < 2:
+        return values
+    parallel = [p for p in range(values.shape[1])
+                if p >= len(pol_labels) or str(pol_labels[p]).upper() in ("RR", "LL", "XX", "YY")]
+    return np.nanmean(values[:, parallel or list(range(values.shape[1]))], axis=1)
+
+
+def _stacked_pair(figure, cell, height_ratios=(2, 1)):
+    """Split a gridspec cell into a gapless amplitude (top) / phase (bottom) pair sharing x.
+
+    Returns ``(amp_axis, phase_axis)``.
+    """
+    inner = cell.subgridspec(2, 1, height_ratios=list(height_ratios), hspace=0)
+    amp_axis = figure.add_subplot(inner[0])
+    phase_axis = figure.add_subplot(inner[1], sharex=amp_axis)
+    return amp_axis, phase_axis
+
+
+def _style_stacked_pair(amp_axis, phase_axis, *, phase_ylim: tuple = (-180.0, 180.0),
+                        fontsize: int = 8, amp_label: str = "amplitude",
+                        phase_label: str = "phase (deg)") -> None:
+    """Label and frame an amplitude/phase pair; the top panel loses its x tick labels."""
+    phase_axis.set_ylim(*phase_ylim)
+    phase_axis.set_yticks([-180, 0, 180])
+    phase_axis.set_ylabel(phase_label, fontsize=fontsize)
+    phase_axis.tick_params(labelsize=fontsize)
+    amp_axis.set_ylabel(amp_label, fontsize=fontsize)
+    amp_axis.tick_params(labelbottom=False, labelsize=fontsize)
+    for axis in (amp_axis, phase_axis):
+        style_axis(axis)
+
+
 def plot_baseline_panels(panels: list, plot_dir: Union[str, Path], project_code: str, *,
                          pol_labels: list, x_label: str, title: str, outfile_stem: str,
                          phase_ylim: tuple = (-180.0, 180.0), dpi: int = 150) -> Path:
     """Render one figure of per-baseline amplitude+phase panels.
 
-    Each baseline gets a stacked pair of axes sharing an x axis: phase on top in
-    the upper third drawn as dots, amplitude below across the lower two thirds
-    drawn as lines. Amplitude and phase belong together — a feature is only
+    Each baseline gets a stacked pair of axes sharing an x axis with no gap:
+    amplitude on top across the upper two thirds, phase below in the lower
+    third drawn as dots. Amplitude and phase belong together — a feature is only
     interpretable when you can see whether it appears in both — and the split
     heights reflect that phase is bounded while amplitude carries the dynamic
     range. Phase as dots avoids the vertical streaks that lines draw across
@@ -144,12 +179,12 @@ def plot_baseline_panels(panels: list, plot_dir: Union[str, Path], project_code:
     nrows, ncols = subplot_grid(len(panels))
     figure = plt.figure(figsize=(3.7 * ncols, 3.0 * nrows), layout="constrained")
     outer = figure.add_gridspec(nrows, ncols)
+    x_values = [np.asarray(x, dtype=float) for _, segments in panels for x, _ in segments]
+    finite_x = np.concatenate([x[np.isfinite(x)] for x in x_values if np.isfinite(x).any()]) if any(
+        np.isfinite(x).any() for x in x_values) else np.array([])
+    shared_xlim = (float(finite_x.min()), float(finite_x.max())) if finite_x.size else None
     for index, (panel_title, segments) in enumerate(panels):
-        # Phase over the top third, amplitude over the bottom two thirds.
-        inner = outer[index // ncols, index % ncols].subgridspec(2, 1, height_ratios=[1, 2],
-                                                                hspace=0.05)
-        phase_axis = figure.add_subplot(inner[0])
-        amp_axis = figure.add_subplot(inner[1], sharex=phase_axis)
+        amp_axis, phase_axis = _stacked_pair(figure, outer[index // ncols, index % ncols])
         for segment, (x, values) in enumerate(segments):
             x = np.asarray(x, dtype=float)
             values = np.asarray(values)
@@ -162,17 +197,12 @@ def plot_baseline_panels(panels: list, plot_dir: Union[str, Path], project_code:
                 amp_axis.plot(x[:len(column)], np.abs(column), ls="none", marker=".",
                               ms=2.0, color=color,
                               label=name if segment == 0 else None)
-        phase_axis.set_ylim(*phase_ylim)
-        phase_axis.set_yticks([-180, 0, 180])
-        phase_axis.tick_params(labelbottom=False, labelsize=7)
-        phase_axis.set_ylabel("phase", fontsize=7)
-        phase_axis.set_title(panel_title, fontsize=10, fontweight="bold", loc="left")
-        amp_axis.set_ylabel("amplitude", fontsize=7)
-        amp_axis.tick_params(labelsize=7)
+        _style_stacked_pair(amp_axis, phase_axis, phase_ylim=phase_ylim, fontsize=7)
+        if shared_xlim and shared_xlim[0] < shared_xlim[1]:
+            phase_axis.set_xlim(*shared_xlim)
+        amp_axis.set_title(panel_title, fontsize=10, fontweight="bold", loc="left")
         if index // ncols == nrows - 1:
-            amp_axis.set_xlabel(x_label, fontsize=8)
-        for axis in (phase_axis, amp_axis):
-            style_axis(axis)
+            phase_axis.set_xlabel(x_label, fontsize=8)
 
     handles = [Line2D([], [], color=polarization_color(name, i), lw=2, label=name)
                for i, name in enumerate(pol_labels)]
@@ -270,8 +300,8 @@ def plot_radplot(uvdata: dict, plot_dir: Union[str, Path], project_code: str = "
                  label: str = "", dpi: int = 150) -> Path:
     """Plot amplitude and phase against uv distance for one source (a "radplot").
 
-    Same stacked layout as the other baseline plots — phase in the upper third,
-    amplitude across the lower two thirds, fixed color per polarization — but as
+    Same stacked layout as the other baseline plots — amplitude across the upper
+    two thirds, phase in the lower third, fixed color per polarization — but as
     a scatter, since uv distance orders points by baseline length rather than
     forming a series to join.
 
@@ -283,7 +313,9 @@ def plot_radplot(uvdata: dict, plot_dir: Union[str, Path], project_code: str = "
     Parameters
     ----------
     uvdata : dict
-        Output of the backend's ``read_uvdistance``.
+        Output of the backend's ``read_uvdistance``. An optional ``"model"`` entry
+        ``{"uvdist_mlambda", "values"}`` is drawn as a black Stokes-I-like line
+        (mean of the parallel hands) over both panels.
     label : str
         Extra tag for the file name.
 
@@ -306,9 +338,7 @@ def plot_radplot(uvdata: dict, plot_dir: Union[str, Path], project_code: str = "
     pol_labels = uvdata.get("polarizations") or ["P1", "P2"]
 
     figure = plt.figure(figsize=(7.5, 5.5), layout="constrained")
-    grid = figure.add_gridspec(2, 1, height_ratios=[1, 2], hspace=0.05)
-    phase_axis = figure.add_subplot(grid[0])
-    amp_axis = figure.add_subplot(grid[1], sharex=phase_axis)
+    amp_axis, phase_axis = _stacked_pair(figure, figure.add_gridspec(1, 1)[0])
     for pol in range(values.shape[1] if values.ndim > 1 else 1):
         column = values[:, pol] if values.ndim > 1 else values
         name = pol_labels[pol] if pol < len(pol_labels) else f"P{pol + 1}"
@@ -318,17 +348,20 @@ def plot_radplot(uvdata: dict, plot_dir: Union[str, Path], project_code: str = "
                         marker=".", ms=1.8, alpha=0.5, color=color)
         amp_axis.plot(uvdist[finite], np.abs(column[finite]), ls="none", marker=".", ms=1.8,
                       alpha=0.5, color=color, label=name)
-    phase_axis.set_ylim(-180, 180)
-    phase_axis.set_yticks([-180, 0, 180])
-    phase_axis.tick_params(labelbottom=False, labelsize=8)
-    phase_axis.set_ylabel("phase (deg)", fontsize=9)
-    amp_axis.set_ylabel("amplitude", fontsize=9)
-    amp_axis.set_xlabel(r"uv distance (M$\lambda$)", fontsize=9)
-    amp_axis.set_ylim(bottom=0.0)
-    for axis in (phase_axis, amp_axis):
-        style_axis(axis)
     handles = [Line2D([], [], color=polarization_color(name, i), lw=0, marker="o", ms=5,
                       label=name) for i, name in enumerate(pol_labels)]
+    model = uvdata.get("model") or {}
+    model_uv = np.asarray(model.get("uvdist_mlambda", []), dtype=float)
+    model_values = np.asarray(model.get("values", []))
+    if model_uv.size and model_values.size:
+        stokes = _parallel_hand_mean(model_values, pol_labels)
+        order = np.argsort(model_uv)
+        amp_axis.plot(model_uv[order], np.abs(stokes)[order], color="black", lw=1.2, label="model")
+        phase_axis.plot(model_uv[order], np.degrees(np.angle(stokes))[order], color="black", lw=0.6)
+        handles.append(Line2D([], [], color="black", lw=1.2, label="model"))
+    _style_stacked_pair(amp_axis, phase_axis, fontsize=8)
+    phase_axis.set_xlabel(r"uv distance (M$\lambda$)", fontsize=9)
+    amp_axis.set_ylim(bottom=0.0)
     figure.legend(handles=handles, loc="outside upper right", ncols=len(handles),
                   frameon=False, fontsize=8)
     figure.suptitle(f"{project_code} — {field}: amplitude and phase vs uv distance\n"
@@ -511,6 +544,11 @@ def plot_bandpass_profile(measurement: dict, plot_dir: Union[str, Path], project
     channels selected for flagging shaded. This is the evidence for how many
     edge channels were trimmed, so a user can see whether the cut was right.
 
+    When the measurement carries a per-antenna breakdown (``"antennas"``:
+    ``{ant: {"amplitude_profile", "phase_profile", "n_edge"}}``) one amplitude
+    panel per antenna is drawn instead, each with its own edge cut shaded, since
+    a single dish with a narrower usable band is what decides the trim.
+
     Parameters
     ----------
     measurement : dict
@@ -531,28 +569,395 @@ def plot_bandpass_profile(measurement: dict, plot_dir: Union[str, Path], project
     plot_dir.mkdir(parents=True, exist_ok=True)
     outfile = plot_dir / f"{project_code}.bandpass_profile.png"
     channels = np.arange(int(measurement["n_channels"]))
-    panels = (("amplitude_profile", "median |B|", POL_COLORS[0]),
-              ("phase_profile", "phase scatter (rad)", POL_COLORS[1]),
-              ("flagged_fraction", "flagged fraction", "0.35"))
-    figure, axes = plt.subplots(3, 1, figsize=(7.5, 6.0), sharex=True, layout="constrained")
-    n_edge = int(measurement["n_edge"])
-    for axis, (key, label, color) in zip(axes, panels):
-        values = np.asarray(measurement.get(key, []), dtype=float)
-        if values.size == channels.size:
-            axis.plot(channels, values, ls="none", marker=".", ms=3, color=color)
-        axis.set_ylabel(label, fontsize=9)
-        style_axis(axis)
-        if n_edge > 0:  # shade what gets flagged
-            axis.axvspan(-0.5, n_edge - 0.5, color="#D55E00", alpha=0.15, lw=0)
-            axis.axvspan(channels.size - n_edge - 0.5, channels.size - 0.5,
-                         color="#D55E00", alpha=0.15, lw=0)
-    axes[-1].set_xlabel("channel", fontsize=9)
-    axes[0].set_title(f"{project_code} — subband response; shaded = flagged "
-                      f"({n_edge} channel(s) each edge)", fontsize=10, loc="left")
+    n_edge = measurement.get("n_edge", 0)
+    edge_text = (f"{n_edge[0]}/{n_edge[1]}" if isinstance(n_edge, (tuple, list)) else str(int(n_edge)))
+    antennas = measurement.get("antennas") or {}
+    if antennas:
+        nrows, ncols = subplot_grid(len(antennas))
+        figure, axes = plt.subplots(nrows, ncols, figsize=(3.4 * ncols, 2.4 * nrows), sharex=True,
+                                    squeeze=False, layout="constrained")
+        for axis, (name, entry) in zip(axes.flat, antennas.items()):
+            values = np.asarray(entry.get("amplitude_profile", []), dtype=float)
+            if values.size == channels.size:
+                axis.plot(channels, values, ls="none", marker=".", ms=3, color=POL_COLORS[0])
+            _shade_edges(axis, channels.size, entry.get("n_edge", n_edge))
+            axis.set_title(name, fontsize=10, fontweight="bold", loc="left")
+            axis.set_ylabel("median |B|", fontsize=8)
+            axis.tick_params(labelsize=7)
+            style_axis(axis)
+        for axis in axes.flat[len(antennas):]:
+            axis.set_visible(False)
+        for axis in axes[-1, :]:
+            axis.set_xlabel("channel", fontsize=9)
+        figure.suptitle(f"{project_code} — subband response per antenna; shaded = flagged "
+                        f"({edge_text} channel(s) each edge)", x=0.01, ha="left", fontsize=11,
+                        fontweight="bold")
+    else:
+        panels = (("amplitude_profile", "median |B|", POL_COLORS[0]),
+                  ("phase_profile", "phase scatter (rad)", POL_COLORS[1]),
+                  ("flagged_fraction", "flagged fraction", "0.35"))
+        figure, axes = plt.subplots(3, 1, figsize=(7.5, 6.0), sharex=True, layout="constrained")
+        for axis, (key, label, color) in zip(axes, panels):
+            values = np.asarray(measurement.get(key, []), dtype=float)
+            if values.size == channels.size:
+                axis.plot(channels, values, ls="none", marker=".", ms=3, color=color)
+            axis.set_ylabel(label, fontsize=9)
+            style_axis(axis)
+            _shade_edges(axis, channels.size, n_edge)
+        axes[-1].set_xlabel("channel", fontsize=9)
+        axes[0].set_title(f"{project_code} — subband response; shaded = flagged "
+                          f"({edge_text} channel(s) each edge)", fontsize=10, loc="left")
     figure.savefig(outfile, dpi=dpi)
     plt.close(figure)
     logger.info("bandpass profile written: {}", outfile)
     return outfile
+
+
+def _shade_edges(axis, n_channels: int, n_edge) -> None:
+    """Shade the ``n_edge`` (int or ``(low, high)``) channels flagged at each subband edge."""
+    low, high = (int(n_edge[0]), int(n_edge[1])) if isinstance(n_edge, (tuple, list)) \
+        else (int(n_edge or 0), int(n_edge or 0))
+    if low > 0:
+        axis.axvspan(-0.5, low - 0.5, color="#D55E00", alpha=0.15, lw=0)
+    if high > 0:
+        axis.axvspan(n_channels - high - 0.5, n_channels - 0.5, color="#D55E00", alpha=0.15, lw=0)
+
+
+def plot_autocorr_spectrum(spectrum: dict, plot_dir: Union[str, Path], project_code: str = "",
+                           label: str = "", dpi: int = 150) -> str:
+    """Plot autocorrelation amplitude vs frequency, one subplot per antenna.
+
+    Autocorrelations show each antenna's own bandpass shape and any RFI or
+    dead subband without the extra uncertainty of a fringe. Colour always encodes
+    polarization; all subbands share one solid line and tile the frequency axis.
+
+    Parameters
+    ----------
+    spectrum : dict
+        Keys ``antennas``, ``spectra`` ({ant: (n_spw, n_chan, n_pol)}), ``n_spw``,
+        ``n_channels``, ``polarizations``, ``frequencies_ghz`` (per-subband arrays or
+        ``None`` for channel index), ``scans``, ``field``, ``column``.
+    label : str
+        Extra tag for the file name.
+
+    Returns
+    -------
+    str
+        The written PNG path ``{code}[.{label}].autocorr.png``.
+    """
+    plot_dir = Path(plot_dir)
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    suffix = f".{label}" if label else ""
+    outfile = plot_dir / f"{project_code}{suffix}.autocorr.png"
+    antennas = spectrum.get("antennas") or []
+    if not antennas:
+        logger.warning("no autocorrelations to plot for {}", project_code)
+        return str(outfile)
+    n_spw, n_chan = int(spectrum["n_spw"]), int(spectrum["n_channels"])
+    pol_labels = spectrum.get("polarizations") or ["P1", "P2"]
+    frequencies = spectrum.get("frequencies_ghz") or [np.arange(n_chan) for _ in range(n_spw)]
+    x_label = "frequency (GHz)" if spectrum.get("frequencies_ghz") else "channel"
+
+    nrows, ncols = subplot_grid(len(antennas))
+    figure, axes = plt.subplots(nrows, ncols, figsize=(3.6 * ncols, 2.6 * nrows), sharex=True,
+                                squeeze=False, layout="constrained")
+    for axis, antenna in zip(axes.flat, antennas):
+        values = np.asarray(spectrum["spectra"][antenna])
+        for spw in range(min(n_spw, values.shape[0])):
+            x = np.asarray(frequencies[spw], dtype=float)
+            for pol in range(values.shape[2] if values.ndim > 2 else 1):
+                amp = np.abs(values[spw, :, pol] if values.ndim > 2 else values[spw]).astype(float)
+                amp[~np.isfinite(amp) | (amp == 0)] = np.nan
+                name = pol_labels[pol] if pol < len(pol_labels) else f"P{pol + 1}"
+                axis.plot(x[:amp.size], amp[:x.size], color=polarization_color(name, pol),
+                          ls="-", lw=0.9)
+        axis.set_title(antenna, fontsize=10, fontweight="bold", loc="left")
+        axis.set_ylabel("amplitude", fontsize=8)
+        axis.tick_params(labelsize=7)
+        style_axis(axis)
+    for axis in axes.flat[len(antennas):]:
+        axis.set_visible(False)
+    for axis in axes[-1, :]:
+        axis.set_xlabel(x_label, fontsize=9)
+    handles = [Line2D([], [], color=polarization_color(name, p), lw=2,
+                       label=str(name)) for p, name in enumerate(pol_labels)]
+    figure.legend(handles=handles, loc="outside upper right", ncols=min(len(handles), 8),
+                  frameon=False, fontsize=8)
+    scans = spectrum.get("scans") or []
+    scan_text = "scan" if len(scans) == 1 else "scans"
+    figure.suptitle(f"{spectrum.get('field', '')} autocorrelations {scan_text} "
+                    f"{', '.join(str(s) for s in scans)} ({spectrum.get('column', '')})",
+                    x=0.01, ha="left", fontsize=11, fontweight="bold")
+    figure.savefig(outfile, dpi=dpi)
+    plt.close(figure)
+    logger.info("autocorrelation plot written: {}", outfile)
+    return str(outfile)
+
+
+def _bin_lightcurve(times: np.ndarray, vis_sum: np.ndarray, n_vis: np.ndarray, scans: np.ndarray,
+                    width_sec: float) -> tuple[np.ndarray, np.ndarray]:
+    """Coherently average integrations into bins of ``width_sec`` within each scan.
+
+    ``0`` keeps the native integrations and ``-1`` averages each whole scan.
+    Returns ``(bin_times, amplitudes)`` with amplitude ``|sum(vis_sum)| / sum(n_vis)``.
+    """
+    if width_sec == 0:
+        keys = np.arange(times.size)
+    elif width_sec < 0:
+        keys = scans
+    else:
+        keys = np.empty(times.size, dtype=np.int64)
+        for scan in np.unique(scans):
+            rows = scans == scan
+            keys[rows] = scan * 10 ** 6 + ((times[rows] - times[rows].min()) // width_sec).astype(np.int64)
+    _, index, inverse = np.unique(keys, return_index=True, return_inverse=True)
+    summed = np.zeros(index.size, dtype=complex)
+    np.add.at(summed, inverse, vis_sum)
+    counts = np.zeros(index.size)
+    np.add.at(counts, inverse, n_vis)
+    bin_times = np.zeros(index.size)
+    np.add.at(bin_times, inverse, times * n_vis)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return bin_times / counts, np.abs(summed) / counts
+
+
+def plot_total_lightcurve(data: dict, plot_dir: Union[str, Path], project_code: str = "",
+                          label: str = "", averaging_sec: tuple = (0, 30, 120, -1),
+                          dpi: int = 150) -> str:
+    """Plot the coherently averaged total visibility amplitude vs time, per source.
+
+    One row per source sharing the time axis. Each averaging scale is drawn as
+    its own series so variability shows up as structure that survives the longer
+    averages while noise averages down.
+
+    Parameters
+    ----------
+    data : dict
+        ``{"sources": {name: {"times", "vis_sum", "n_vis", "scans"}}, "column", "time_start"}``
+        with times in MJD seconds, ``vis_sum`` the coherent sum over all baselines,
+        channels and parallel hands per integration and ``n_vis`` the matching count.
+    averaging_sec : tuple
+        Scales to draw: ``0`` native integrations, positive seconds within-scan bins,
+        ``-1`` one point per scan.
+
+    Returns
+    -------
+    str
+        The written PNG path ``{code}[.{label}].lightcurve.png``.
+    """
+    plot_dir = Path(plot_dir)
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    suffix = f".{label}" if label else ""
+    outfile = plot_dir / f"{project_code}{suffix}.lightcurve.png"
+    sources = data.get("sources") or {}
+    if not sources:
+        logger.warning("no visibilities for a lightcurve of {}", project_code)
+        return str(outfile)
+    time_start = float(data.get("time_start") or min(np.min(s["times"]) for s in sources.values()))
+    scale_names = {0: "native", -1: "per scan"}
+
+    figure, axes = plt.subplots(len(sources), 1, figsize=(8.0, 2.4 * len(sources) + 0.8), sharex=True,
+                                sharey=True, squeeze=False, layout="constrained")
+    plotted: list[np.ndarray] = []
+    for axis, (name, entry) in zip(axes[:, 0], sources.items()):
+        times = np.asarray(entry["times"], dtype=float)
+        vis_sum = np.asarray(entry["vis_sum"], dtype=complex)
+        n_vis = np.asarray(entry["n_vis"], dtype=float)
+        scans = np.asarray(entry.get("scans", np.zeros(times.size)), dtype=np.int64)
+        for k, width in enumerate(averaging_sec):
+            if times.size == 0:
+                break
+            bin_times, amp = _bin_lightcurve(times, vis_sum, n_vis, scans, float(width))
+            color = SUBBAND_COLORS[k % len(SUBBAND_COLORS)]
+            style = ({"ls": "none", "marker": ".", "ms": 2.5, "alpha": 0.5} if width == 0
+                     else {"ls": "-", "marker": "o", "ms": 3.5, "lw": 0.8})
+            axis.plot((bin_times - time_start) / 3600.0, amp, color=color,
+                      label=scale_names.get(width, f"{width:g} s"), **style)
+            plotted.append(np.asarray(amp, dtype=float))
+        axis.set_title(name, fontsize=10, fontweight="bold", loc="left")
+        axis.set_ylabel("amplitude", fontsize=8)
+        axis.tick_params(labelsize=7)
+        style_axis(axis)
+    # One amplitude range for every source, from zero: the panels are then directly comparable.
+    # The top is the 99.9th percentile of everything drawn, so one noise spike does not set it.
+    values = np.concatenate(plotted) if plotted else np.zeros(0)
+    values = values[np.isfinite(values)]
+    top = float(np.percentile(values, 99.9)) * 1.05 if values.size else 0.0
+    axes[0, 0].set_ylim(0.0, top if top > 0.0 else 1.0)
+    axes[-1, 0].set_xlabel("time (hours from start)", fontsize=9)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    figure.legend(handles=handles, labels=labels, loc="outside upper right", ncols=len(handles) or 1,
+                  frameon=False, fontsize=8)
+    figure.suptitle(f"{project_code} — total coherent amplitude vs time ({data.get('column', '')} data)",
+                    x=0.01, ha="left", fontsize=11, fontweight="bold")
+    figure.savefig(outfile, dpi=dpi)
+    plt.close(figure)
+    logger.info("lightcurve written: {}", outfile)
+    return str(outfile)
+
+
+def plot_subband_phase_jumps(data: dict, plot_dir: Union[str, Path], project_code: str = "",
+                             label: str = "", dpi: int = 150) -> str:
+    """Plot the residual phase offset of every subband vs the first one, per calibrator scan.
+
+    One panel per baseline to the reference antenna; x is time, y the phase of
+    each subband relative to the lowest subband with data in that scan
+    (wrapped to +-180 deg). After a correct single-band delay these offsets
+    are flat around zero; a step or a drift is an instrumental phase jump the
+    calibration did not remove. Polarizations are drawn with different markers.
+
+    Parameters
+    ----------
+    data : dict
+        ``read_subband_phases`` output: ``antennas``, ``phases``
+        (``{antenna: (n_scan, n_spw, n_pol)}`` degrees), ``scans``, ``polarizations``.
+
+    Returns
+    -------
+    str
+        The written PNG path ``{code}[.{label}].subband_phases.png``.
+    """
+    plot_dir = Path(plot_dir)
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    suffix = f".{label}" if label else ""
+    outfile = plot_dir / f"{project_code}{suffix}.subband_phases.png"
+    antennas = list(data.get("antennas") or [])
+    scans = data.get("scans") or []
+    if not antennas or not scans:
+        logger.warning("no subband phases to plot for {}", project_code)
+        return str(outfile)
+    times = np.asarray([s["time"] for s in scans], dtype=float)
+    hours = (times - times.min()) / 3600.0
+    sources = sorted({s["source"] for s in scans})
+    pol_markers = ("o", "s", "^", "v")
+    n_rows, n_cols = subplot_grid(len(antennas), max_cols=4)
+    figure, axes = plt.subplots(n_rows, n_cols, figsize=(4.0 * n_cols, 2.6 * n_rows + 0.8), squeeze=False,
+                                sharex=True, sharey=True, layout="constrained")
+    for axis, antenna in zip(axes.ravel(), antennas):
+        phases = np.asarray(data["phases"][antenna], dtype=float)         # (n_scan, n_spw, n_pol)
+        for scan_idx in range(phases.shape[0]):
+            finite = np.where(np.isfinite(phases[scan_idx]).any(axis=1))[0]
+            if finite.size < 2:
+                continue
+            reference = phases[scan_idx, finite[0], :]
+            for spw in finite[1:]:
+                offset = (phases[scan_idx, spw, :] - reference + 180.0) % 360.0 - 180.0
+                for pol in range(phases.shape[2]):
+                    if np.isfinite(offset[pol]):
+                        axis.plot(hours[scan_idx], offset[pol], marker=pol_markers[pol % len(pol_markers)],
+                                  ms=3.5, ls="none", color=SUBBAND_COLORS[spw % len(SUBBAND_COLORS)],
+                                  mfc="none" if pol else None, mew=0.8)
+        axis.axhline(0.0, color="0.4", lw=0.6)
+        axis.set_ylim(-180, 180)
+        axis.set_yticks([-180, -90, 0, 90, 180])
+        axis.set_title(f"{data.get('refant', '')}-{antenna}", fontsize=10, fontweight="bold", loc="left")
+        axis.tick_params(labelsize=7)
+        style_axis(axis)
+    for axis in axes.ravel()[len(antennas):]:
+        axis.set_visible(False)
+    for axis in axes[-1]:
+        axis.set_xlabel("time (hours from first calibrator scan)", fontsize=8)
+    for axis in axes[:, 0]:
+        axis.set_ylabel("phase - first subband (deg)", fontsize=8)
+    handles = [plt.Line2D([], [], color=SUBBAND_COLORS[s % len(SUBBAND_COLORS)], lw=2, label=f"subband {s}")
+               for s in range(1, int(data.get("n_spw") or 1))]
+    handles += [plt.Line2D([], [], color="0.3", marker=pol_markers[p % len(pol_markers)], ls="none",
+                           mfc="none" if p else None, label=pol) for p, pol in enumerate(data.get("polarizations") or [])]
+    figure.legend(handles=handles, loc="outside upper right", ncols=len(handles) or 1, frameon=False, fontsize=8)
+    figure.suptitle(f"{project_code} — subband phase offsets per scan on {', '.join(sources)} "
+                    f"({data.get('column', '')} data)", x=0.01, ha="left", fontsize=11, fontweight="bold")
+    figure.savefig(outfile, dpi=dpi)
+    plt.close(figure)
+    logger.info("subband phase-jump plot written: {}", outfile)
+    return str(outfile)
+
+
+#: Half-width of the image preview in synthesised beams (when the FITS header carries BMAJ).
+IMAGE_ZOOM_BEAMS = 40.0
+
+
+def _read_image_plane(fits_path: Union[str, Path]) -> tuple[np.ndarray, float]:
+    """Return the first 2D plane of a FITS image (in mJy/beam) and its pixel size in mas.
+
+    When the header has a restoring beam the plane is cut to +-IMAGE_ZOOM_BEAMS
+    beams around the peak, so a VLBI source is visible in a wide field.
+    """
+    from astropy.io import fits
+    with fits.open(str(fits_path)) as hdul:
+        header, plane = hdul[0].header, np.squeeze(np.asarray(hdul[0].data, dtype=float))
+    while plane.ndim > 2:
+        plane = plane[0]
+    unit = str(header.get("BUNIT", "Jy/beam")).lower()
+    scale = 1.0 if unit.startswith("mjy") else 1e3
+    pixel_mas = abs(float(header.get("CDELT1", header.get("CDELT2", 1.0)))) * 3.6e6
+    bmaj_mas = float(header.get("BMAJ", 0.0)) * 3.6e6
+    if bmaj_mas > 0 and pixel_mas > 0:
+        half = int(round(IMAGE_ZOOM_BEAMS * bmaj_mas / pixel_mas))
+        ny, nx = plane.shape
+        if 2 * half < min(nx, ny):
+            finite = np.where(np.isfinite(plane), plane, -np.inf)
+            iy, ix = np.unravel_index(int(np.argmax(finite)), plane.shape)
+            y0, x0 = min(max(iy - half, 0), ny - 2 * half), min(max(ix - half, 0), nx - 2 * half)
+            plane = plane[y0:y0 + 2 * half, x0:x0 + 2 * half]
+    return plane * scale, pixel_mas
+
+
+def plot_image_grid(images: dict, plot_dir: Union[str, Path], project_code: str = "",
+                    dpi: int = 150) -> list[str]:
+    """Plot the FITS images of each source side by side, one panel per robust weighting.
+
+    A linear stretch clipped to ``[-3 rms, peak]`` keeps the noise floor visible
+    while the colour scale stays anchored on the source; rms is the MAD-based
+    scatter of the outer 20 % border, which is source-free for a centred target.
+
+    Parameters
+    ----------
+    images : dict
+        ``{source_name: {robust: fits_path}}``.
+
+    Returns
+    -------
+    list of str
+        One PNG per source, ``{code}.images.{source}.png``.
+    """
+    plot_dir = Path(plot_dir)
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for source, by_robust in (images or {}).items():
+        entries = sorted(((float(r), p) for r, p in by_robust.items() if Path(p).exists()),
+                         key=lambda item: item[0])
+        if not entries:
+            logger.warning("no images to plot for {}", source)
+            continue
+        figure, axes = plt.subplots(1, len(entries), figsize=(4.2 * len(entries), 4.2), squeeze=False,
+                                    layout="constrained")
+        for axis, (robust, path) in zip(axes[0], entries):
+            plane, pixel_mas = _read_image_plane(path)
+            ny, nx = plane.shape
+            border = np.ones(plane.shape, dtype=bool)
+            border[int(0.2 * ny):ny - int(0.2 * ny), int(0.2 * nx):nx - int(0.2 * nx)] = False
+            noise = plane[border & np.isfinite(plane)]
+            rms = float(1.4826 * np.median(np.abs(noise - np.median(noise)))) if noise.size else 0.0
+            peak = float(np.nanmax(plane)) if np.isfinite(plane).any() else 0.0
+            extent = (nx / 2 * pixel_mas, -nx / 2 * pixel_mas, -ny / 2 * pixel_mas, ny / 2 * pixel_mas)
+            image = axis.imshow(plane, origin="lower", cmap="inferno", extent=extent,
+                                vmin=-3 * rms, vmax=peak if peak > -3 * rms else -3 * rms + 1e-9,
+                                interpolation="nearest")
+            figure.colorbar(image, ax=axis, fraction=0.046, pad=0.02).set_label("mJy/beam", fontsize=8)
+            axis.set_title(f"robust {robust:g}  peak {peak:.2f} mJy/beam  rms {rms:.3f} mJy/beam",
+                           fontsize=8)
+            axis.set_xlabel("relative RA (mas)", fontsize=8)
+            axis.set_ylabel("relative Dec (mas)", fontsize=8)
+            axis.tick_params(labelsize=7)
+            style_axis(axis, grid=False)
+        figure.suptitle(f"{project_code} — {source}", x=0.01, ha="left", fontsize=11, fontweight="bold")
+        safe = str(source).replace(",", "_").replace("/", "_")
+        outfile = plot_dir / f"{project_code}.images.{safe}.png"
+        figure.savefig(outfile, dpi=dpi)
+        plt.close(figure)
+        logger.info("image grid written: {}", outfile)
+        written.append(str(outfile))
+    return written
 
 
 class ScanSNRPlotter:
@@ -842,8 +1247,14 @@ class CalTablePlotter:
         return self._finish(fig, self._pol_legend_handles(n_pol), f"{stem} — gain curve", outfile)
 
     def _plot_fringe(self, data: dict, outfile: Path, stem: str) -> list[Path]:
-        """Fringe solutions: phase, delay, rate vs time (one PNG each), color per pol (R/L)."""
+        """Fringe solutions in phase, delay, rate order.
+
+        SBD is a frequency-dependent instrumental solution, so its x axis is the
+        subband centre frequency (or subband index when frequencies are unavailable).
+        MBD remains a time-series solution.
+        """
         n_pol = data["param"].shape[2] // len(_FRINGE_PARAMS)
+        is_sbd = str(stem).lower().startswith("sbd")
         times = np.array([mjdsec2datetime(t) for t in data["time"]])
         written = []
         for param_index, (tag, ylabel) in enumerate(_FRINGE_PARAMS[:3]):  # skip disp by default
@@ -862,58 +1273,85 @@ class CalTablePlotter:
                         elif tag == "rate":
                             values = values * 1e12  # stored as s/s
                         # First pol drawn bigger underneath: both stay visible when values coincide.
-                        axis.plot(times[rows][order], values, lw=0.0, marker=".",
+                        if is_sbd:
+                            frequencies = np.asarray(self.frequencies.get(int(spw), []), dtype=float)
+                            x_value = float(np.nanmean(frequencies)) if frequencies.size else float(spw)
+                            x = np.full(values.shape, x_value)
+                        else:
+                            x = times[rows][order]
+                        axis.plot(x, values, lw=0.0, marker=".",
                                   ms=4.0 if pol == 0 else 2.0,
                                   color=POL_COLORS[pol % len(POL_COLORS)])
-                axis.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+                if is_sbd:
+                    axis.set_xlabel("frequency (GHz)" if self.frequencies else "subband", fontsize=8)
+                else:
+                    axis.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
                 axis.set_ylabel(ylabel, fontsize=8)
             out = outfile.with_suffix(f".{tag}.png")
             written.append(self._finish(fig, self._pol_legend_handles(n_pol), f"{stem} — {tag}", out))
         return written
 
+    def _freq_axis(self, spw: int, count: int) -> np.ndarray:
+        """Sky frequency of a subband's channels, falling back to channel index."""
+        freqs = (self.frequencies or {}).get(spw)
+        if freqs is not None and len(freqs) >= count:
+            return np.asarray(freqs[:count], dtype=float)
+        return np.arange(count, dtype=float)
+
     def _plot_gains(self, data: dict, outfile: Path, stem: str) -> list[Path]:
-        """Complex gains (G/B Jones): amplitude and phase, vs time (or frequency if nchan > 1)."""
+        """Complex gains (G/B Jones): bandpass tables (nchan > 1) get one combined PNG with an
+        amplitude/phase pair per antenna vs frequency; single-channel (scalar) gains get the
+        amplitude vs time only."""
+        if data["param"].shape[1] > 1:
+            return [self._plot_bandpass(data, outfile, stem)]
         n_pol = data["param"].shape[2]
-        n_chan = data["param"].shape[1]
-        bandpass = n_chan > 1
         times = np.array([mjdsec2datetime(t) for t in data["time"]])
-        written = []
+        fig, axis_of = self._antenna_figure(data["antenna"], data["antenna_names"])
+        for antenna_id, axis in axis_of.items():
+            for spw in np.unique(data["spw"]):
+                rows = np.where((data["antenna"] == antenna_id) & (data["spw"] == spw))[0]
+                order = np.argsort(data["time"][rows])
+                for pol in range(n_pol):
+                    values = np.abs(data["param"][rows, 0, pol]).astype(float)
+                    values[data["flag"][rows, 0, pol]] = np.nan
+                    axis.plot(times[rows][order], values[order], ls="none", ms=2, marker=".",
+                              color=POL_COLORS[pol % len(POL_COLORS)])
+            axis.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+            axis.set_ylabel("amplitude", fontsize=8)
+        out = outfile.with_suffix(".amp.png")
+        return [self._finish(fig, self._pol_legend_handles(n_pol), f"{stem} — amplitude", out)]
 
-        def freq_axis(spw: int, count: int) -> np.ndarray:
-            """Sky frequency of a subband's channels, falling back to channel index."""
-            freqs = (self.frequencies or {}).get(spw)
-            if freqs is not None and len(freqs) >= count:
-                return np.asarray(freqs[:count], dtype=float)
-            return np.arange(count, dtype=float)
-
-        for tag, transform, ylabel in (("amp", np.abs, "amplitude"),
-                                       ("phase", lambda v: np.degrees(np.angle(v)), "phase (deg)")):
-            fig, axis_of = self._antenna_figure(data["antenna"], data["antenna_names"])
-            for antenna_id, axis in axis_of.items():
-                for spw in np.unique(data["spw"]):
-                    rows = np.where((data["antenna"] == antenna_id) & (data["spw"] == spw))[0]
-                    color = SUBBAND_COLORS[int(spw) % len(SUBBAND_COLORS)]
-                    for pol in range(n_pol):
-                        pol_color = POL_COLORS[pol % len(POL_COLORS)]
-                        if bandpass:
-                            x = freq_axis(int(spw), n_chan)
-                            for row in rows:  # one curve per solution, x = sky frequency
-                                values = transform(data["param"][row, :, pol]).astype(float)
-                                values[data["flag"][row, :, pol]] = np.nan
-                                axis.plot(x, values, ls="none", marker=".", ms=2,
-                                          color=pol_color)
-                        else:
-                            order = np.argsort(data["time"][rows])
-                            values = transform(data["param"][rows, 0, pol]).astype(float)
-                            values[data["flag"][rows, 0, pol]] = np.nan
-                            axis.plot(times[rows][order], values[order], ls="none", ms=2,
-                                      marker=".", color=pol_color)
-                if bandpass:
-                    axis.set_xlabel("frequency (GHz)", fontsize=8)
-                else:
-                    axis.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-                axis.set_ylabel(ylabel, fontsize=8)
-            handles = self._pol_legend_handles(n_pol)
-            out = outfile.with_suffix(f".{tag}.png")
-            written.append(self._finish(fig, handles, f"{stem} — {ylabel}", out))
-        return written
+    def _plot_bandpass(self, data: dict, outfile: Path, stem: str) -> Path:
+        """Bandpass amplitude (top) and phase (bottom) vs frequency, one gapless pair per antenna."""
+        n_pol, n_chan = data["param"].shape[2], data["param"].shape[1]
+        present = sorted(int(a) for a in np.unique(data["antenna"]))
+        names = data["antenna_names"]
+        nrows, ncols = subplot_grid(len(present))
+        fig = plt.figure(figsize=(3.6 * ncols, 3.0 * nrows), layout="constrained")
+        outer = fig.add_gridspec(nrows, ncols)
+        for index, antenna_id in enumerate(present):
+            amp_axis, phase_axis = _stacked_pair(fig, outer[index // ncols, index % ncols])
+            for spw in np.unique(data["spw"]):
+                rows = np.where((data["antenna"] == antenna_id) & (data["spw"] == spw))[0]
+                x = self._freq_axis(int(spw), n_chan)
+                for pol in range(n_pol):
+                    for row in rows:
+                        values = data["param"][row, :, pol].astype(complex)
+                        values[data["flag"][row, :, pol]] = np.nan
+                        amp_axis.plot(x, np.abs(values), ls="none", marker=".", ms=2,
+                                      color=POL_COLORS[pol % len(POL_COLORS)])
+                        phase_axis.plot(x, np.degrees(np.angle(values)), ls="none", marker=".", ms=2,
+                                        color=POL_COLORS[pol % len(POL_COLORS)])
+            _style_stacked_pair(amp_axis, phase_axis, fontsize=7)
+            name = names[antenna_id] if antenna_id < len(names) else f"#{antenna_id}"
+            amp_axis.set_title(name, fontsize=10, fontweight="bold", loc="left")
+            if index // ncols == nrows - 1:
+                phase_axis.set_xlabel("frequency (GHz)" if self.frequencies else "channel", fontsize=8)
+        fig.legend(handles=self._pol_legend_handles(n_pol), loc="outside upper right",
+                   ncols=min(n_pol, 6), frameon=False, fontsize=8)
+        fig.suptitle(f"{stem} — bandpass amplitude and phase", x=0.01, ha="left", fontsize=12,
+                     fontweight="bold")
+        fig.savefig(outfile, dpi=self.dpi)
+        plt.close(fig)
+        logger.info("caltable plot written: {}", outfile)
+        return outfile

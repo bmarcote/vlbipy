@@ -25,7 +25,10 @@ dependencies = [
 [project.optional-dependencies]
 daskms = ["dask-ms[xarray,zarr]"]
 aips = ["parseltongue"]
-all = ["casatools", "casatasks", "parseltongue", "dask-ms[xarray,zarr]"]
+difmap = ["difmapy"]
+notebook = ["nbformat", "ipykernel", "jupyterlab", "ipywidgets", "plotly", "anywidget"]
+all = ["casatools", "casatasks", "parseltongue", "dask-ms[xarray,zarr]", "difmapy",
+       "nbformat", "ipykernel", "jupyterlab", "ipywidgets", "plotly", "anywidget"]
 dev = ["pytest", "ruff"]
 
 [project.scripts]

@@ -9,12 +9,14 @@ observation.
 """
 # from __future__ import annotations
 import functools
+import json
 from pathlib import Path
 from typing import Iterator, Optional, Union
 from .errors import ConfigError
 from .config import _deep_merge, kwargs_to_overrides, load_config
 from .logging_utils import get_logger, warnings
 from .observation import Observation
+from .results import ImageSet
 
 logger = get_logger()
 
@@ -134,7 +136,32 @@ class VLBIObs:
             self._observations.append(Observation(code, self.config, work_dir=obs_work))
 
         self._merged: Optional[Observation] = None
+        self._save_project(codes, base_work)
         logger.info(f"VLBIObs {', '.join(codes)}")
+
+    #: File that lets a later process (the notebook, ``vlbipy report``) rebuild this object.
+    PROJECT_FILENAME = ".project.json"
+
+    def _save_project(self, codes: list[str], base_work) -> None:
+        """Persist the project codes and the fully-merged configuration next to the products."""
+        if not self._observations or not self._observations[0]._backend.requires_data_files:
+            return
+        root = Path(base_work) if base_work else Path(self._observations[0].work_dir)
+        if len(codes) > 1 and not base_work:
+            root = Path(self._observations[0].work_dir).parent
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            (root / self.PROJECT_FILENAME).write_text(json.dumps(
+                {"projects": codes, "config": self.config, "work_dir": str(root)}, indent=2, default=str))
+        except OSError as exc:
+            logger.warning("could not write {}: {}", root / self.PROJECT_FILENAME, exc)
+
+    @classmethod
+    def load(cls, work_dir) -> "VLBIObs":
+        """Rebuild a VLBIObs from the ``.project.json`` a previous process left in ``work_dir``."""
+        root = Path(work_dir)
+        data = json.loads((root / cls.PROJECT_FILENAME).read_text())
+        return cls(data["projects"], config=data["config"], work_dir=data.get("work_dir") or str(root))
 
     def _reject_unknown_overrides(self, overrides: dict) -> None:
         """Fail on a keyword that matches no configuration section.
@@ -349,9 +376,10 @@ class VLBIObs:
 
         # The sequence follows the reduce-vlbi-data procedure step by step.
         self.import_data(force=force)                                  # steps 1-3
+        self.notebook()                                                # first notebook: what is there so far
         self.flag.apriori(force=force)                                 # step 4
         self.calibrate.a_priori(force=force)                           # steps 5-6 (EOP, Tsys, GC)
-        self.plot.diagnostics(column="data", label="raw")              # step 7
+        self.plot.diagnostics(column="data", label="raw", force=force)  # step 7
         self.flag.quack(force=force)                                   # step 7 (slewing)
         self.flag.initial(force=force)                                 # step 8
         # Steps 9-11: SBD -> MBD -> bandpass -> SBD -> MBD, then trim the band edges the
@@ -373,6 +401,7 @@ class VLBIObs:
             self.calibrate.second_pass(force=force, step="third_pass")
             self.calibrate.scalar_bandpass(force=force)
             self.calibrate.apply(force=True)
+        self._survey_all_sources()                                      # final calibrated SNR coverage
         self.plot.diagnostics(column="corrected", label="calibrated")  # step 15
         if len(self._observations) > 1:
             self.merge(force=force)
@@ -381,23 +410,9 @@ class VLBIObs:
         self.export.per_source(force=force)
         self.flag.statistics()                                         # step 20 (report)
 
-        robust = self.config.get("imaging", {}).get("robust", [0])
-        images = {}
-        # Imaging is optional: a backend without it must not throw away the
-        # calibration a long run just produced.
-        if self._imaging_target()._backend.supports("image", "clean"):
-            for tgt in self.sources.targets:
-                # Imaging is the last stage and must not throw away the calibration the
-                # run just produced (split MSs and UVFITS are already on disk): a clean
-                # that fails on one target is a warning, not a failed run.
-                try:
-                    images[tgt.name] = self.clean(target=tgt.name, robust=robust)
-                except Exception as exc:  # noqa: BLE001 - imaging failure must not abort the run
-                    warnings.warn(f"imaging {tgt.name} failed: {exc}")
-        else:
-            logger.warning("imaging skipped: backend {} does not implement image.clean yet",
-                           self._imaging_target()._backend.kind)
-
+        self._selfcal_all(force=force)                                 # step 17a (difmapy)
+        images = self._image_all(force=force)                          # step 17b
+        self._final_plots()                                            # step 18
         self.report()
         summary = warnings.summary()
         if summary:
@@ -406,6 +421,98 @@ class VLBIObs:
                 logger.warning("  - {}", item)
 
         return images
+
+    def _survey_all_sources(self) -> None:
+        """Measure final per-scan SNR on every observed source without changing solve selection."""
+        for obs in self._observations:
+            names = list(obs.metadata.source_names) if obs.metadata else []
+            if not names:
+                continue
+            selection = ",".join(names)
+            saved_selection = obs.cal_selection
+            saved_stages = obs.cal_stages
+            try:
+                obs.calibrate.scan_snr(field=selection, force=True, max_scans=0)
+            except Exception as exc:  # noqa: BLE001 - final diagnostics must not abort calibration
+                warnings.warn(f"{obs.project_code}: all-source calibrated SNR survey failed ({exc})")
+            finally:
+                # scan_snr should not alter this, but make the invariant explicit: the
+                # comprehensive report survey must never replace instrumental choices.
+                if obs.cal_selection != saved_selection:
+                    if saved_selection is None:
+                        obs.clear_cal_selection()
+                    else:
+                        obs.set_cal_selection(*saved_selection, stages=saved_stages)
+
+    def imaging_sources(self) -> list[str]:
+        """Return the sources the pipeline images: ``[imaging].sources`` = ``"all"`` or ``"targets"``.
+
+        ``"all"`` is every declared source that has data (calibrators included);
+        sources declared in the config but absent from the metadata are skipped.
+        """
+        obs = self._imaging_target()
+        which = str(self.config.get("imaging", {}).get("sources", "all")).lower()
+        names = [s.name for s in self.sources.targets] if which == "targets" else list(self.sources.names)
+        if obs.metadata is not None and obs.metadata.source_names:
+            names = [n for n in names if n in set(obs.metadata.source_names)]
+        return names
+
+    def _selfcal_all(self, *, force: bool = False) -> dict:
+        """Self-calibrate the calibrators with difmapy and transfer the gains (``selfcal.run_all``).
+
+        A failure here is a warning recorded as a failed ``selfcal`` step: the
+        CASA calibration and the split products already exist and are still
+        worth imaging.
+        """
+        obs = self._imaging_target()
+        try:
+            return obs.selfcal.run_all(force=force)
+        except Exception as exc:  # noqa: BLE001 - self-cal must not abort the run
+            obs._state.mark_failed("selfcal", str(exc))
+            warnings.warn(f"{obs.project_code}: self-calibration stage failed: {exc}")
+            return {}
+
+    def _image_all(self, *, force: bool = False) -> dict:
+        """Image every source of :meth:`imaging_sources` at the configured robust values.
+
+        Imaging is the last stage and must not throw away the calibration the
+        run just produced (split MSs and UVFITS are already on disk): a clean that
+        fails on one source is a warning recorded as a failed ``clean_<source>``
+        step, not a failed run. A backend without imaging skips the step.
+        """
+        obs = self._imaging_target()
+        images: dict = {}
+        difmap_imager = (str(self.config.get("imaging", {}).get("imager", obs.clean.default_imager)) == "difmap"
+                         and obs._backend.requires_data_files)
+        if not difmap_imager and not obs._backend.supports("image", "clean"):
+            logger.warning("imaging skipped: backend {} does not implement image.clean", obs._backend.kind)
+            return images
+        robust = self.config.get("imaging", {}).get("robust", [-2, 0, 2])
+        for name in self.imaging_sources():
+            if name in obs._selfcal_results and obs._selfcal_results[name].images:
+                images[name] = ImageSet(obs._selfcal_results[name].images)   # imaged in its difmapy session
+                obs._state.mark_complete(f"clean_{name}", outputs=[i.paths.get("fits", "") for i in images[name]])
+                continue
+            if not obs._state.should_run(f"clean_{name}", force=force):
+                continue
+            try:
+                images[name] = self.clean(target=name, robust=robust)
+            except Exception as exc:  # noqa: BLE001 - imaging failure must not abort the run
+                obs._state.mark_failed(f"clean_{name}", str(exc))
+                warnings.warn(f"imaging {name} failed: {exc}")
+        return images
+
+    def _final_plots(self) -> list[str]:
+        """Produce the final-data plot set (``plot.final_data``), recorded as the ``final_plots`` step."""
+        obs = self._imaging_target()
+        try:
+            written = obs.plot.final_data()
+        except Exception as exc:  # noqa: BLE001 - plotting must never abort the run
+            obs._state.mark_failed("final_plots", str(exc))
+            warnings.warn(f"{obs.project_code}: final-data plots failed: {exc}")
+            return []
+        obs._state.mark_complete("final_plots", outputs=written)
+        return written
 
     def reset(self) -> None:
         """Clear state on every observation and drop any merge."""
@@ -420,6 +527,10 @@ class VLBIObs:
         """Return the scan/field listing(s) of the imported data (per observation)."""
         results = [o.listobs(listfile=listfile) for o in self._observations]
         return results[0] if len(results) == 1 else results
+
+    def notebook(self) -> list[str]:
+        """Write the interactive reduction notebook of every observation (see :mod:`vlbipy.notebook`)."""
+        return [o.notebook() for o in self._observations]
 
     def report(self) -> list[dict]:
         """Return per-observation report dicts (no files written in dummy mode)."""

@@ -28,13 +28,15 @@ logger = get_logger()
 #: File holding the calibration chain, so a resumed process can rebuild it.
 CALTABLES_FILENAME = ".caltables.json"
 CAL_SELECTION_FILENAME = ".cal_selection.json"
+#: Cached observation metadata, so reporting works without reopening the data.
+METADATA_FILENAME = ".metadata.json"
 
 #: Pipeline steps in execution order. Resuming from a step invalidates it and
 #: everything after it, so this must match the order :meth:`VLBIObs.run` runs them
 #: in and use the same names the steps record themselves under.
 STEP_ORDER = [
     "import_data", "a_priori", "flag_apriori", "flag_from_file", "flag_autocorr",
-    "flag_quack", "flag_tfcrop",
+    "plot_raw", "flag_quack", "flag_tfcrop",
     "scan_snr", "initial_calibration", "fringefit", "bandpass",
     "initial_calibration_sbd2", "fringefit_mbd2", "flag_edges",
     "apply", "flag_aoflagger", "flag_outliers",
@@ -83,11 +85,13 @@ class Observation:
         self.gaintables: list[CalTable] = self._load_gaintables()
         self._snr_surveys: dict = {}   # per-field fringe SNR surveys (see plot/calibrate.scan_snr)
         self.flag_statistics: dict = {}  # last flag.statistics() result (per antenna / subband)
+        self._selfcal_results: dict = {}  # source -> SelfcalResult of the difmapy stage
         # The instrumental antenna/scan selection is decided once, on the cleanest data
         # (the first pass), and reused by every later pass. Re-surveying on progressively
         # flagged data lets the antenna set shrink pass over pass, and applycal
         # (calflagstrict) then flags every antenna a shrunken solution no longer covers —
         # which silently deletes good antennas. Persisted so a resumed run keeps it too.
+        self._cal_stages: list[dict] = []
         self._cal_selection: Optional[tuple[list[str], list[int]]] = self._load_cal_selection()
         self._scratch = False
 
@@ -119,6 +123,14 @@ class Observation:
             logger.warning("[{}] could not read {} ({}); the calibration chain starts empty",
                            self.project_code, path.name, exc)
             return []
+        # The chain stores absolute paths; a project directory that was moved (or whose
+        # caltables live under the current work dir) still resolves by file name.
+        caldir = Path(self.work_dir) / "caltables"
+        for table in tables:
+            if not Path(table.path).exists():
+                local = caldir / Path(table.path).name
+                if local.exists():
+                    table.path = str(local)
         if tables:
             logger.info("[{}] calibration chain: {}", self.project_code,
                         " -> ".join(t.cal_type for t in tables))
@@ -151,6 +163,7 @@ class Observation:
             return None
         try:
             data = json.loads(path.read_text())
+            self._cal_stages = [dict(s) for s in data.get("stages", [])]
             return list(data["antennas"]), list(data["scans"])
         except (json.JSONDecodeError, OSError, KeyError, TypeError) as exc:
             logger.warning("[{}] could not read {} ({}); the instrumental selection will be "
@@ -162,15 +175,22 @@ class Observation:
         """The cached instrumental (antennas, scans) selection, or None if not decided yet."""
         return self._cal_selection
 
-    def set_cal_selection(self, antennas: list[str], scans: list[int]) -> None:
-        """Fix the instrumental antenna/scan selection for the whole run and persist it."""
+    @property
+    def cal_stages(self) -> list[dict]:
+        """The single-band-delay stage plan (``[{"scan", "antennas", "refant"}, ...]``), empty if undecided."""
+        return list(self._cal_stages)
+
+    def set_cal_selection(self, antennas: list[str], scans: list[int], stages: Optional[list[dict]] = None) -> None:
+        """Fix the instrumental antenna/scan selection (and SBD stage plan) for the whole run and persist it."""
         self._cal_selection = (list(antennas), list(scans))
+        self._cal_stages = [dict(s) for s in stages or []]
         path = self._cal_selection_path
         if path is None:
             return
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps({"antennas": list(antennas), "scans": list(scans)}, indent=2))
+            path.write_text(json.dumps({"antennas": list(antennas), "scans": list(scans),
+                                        "stages": self._cal_stages}, indent=2))
         except OSError as exc:
             logger.warning("[{}] could not write {} ({}); a resumed run will re-derive the "
                            "instrumental selection", self.project_code, path.name, exc)
@@ -178,6 +198,7 @@ class Observation:
     def clear_cal_selection(self) -> None:
         """Forget the cached instrumental selection (used by --scratch)."""
         self._cal_selection = None
+        self._cal_stages = []
         path = self._cal_selection_path
         if path is not None and path.is_file():
             try:
@@ -210,8 +231,29 @@ class Observation:
     # -- read-only accessors --
     @property
     def metadata(self) -> Optional[ObsMetadata]:
-        """Observation metadata (populated by :meth:`import_data`)."""
+        """Observation metadata (populated by :meth:`import_data`).
+
+        Falls back to the persisted ``.metadata.json`` when the metadata has not
+        been loaded in this process, so reporting works without the measurement set.
+        """
+        if self._metadata is None:
+            self._metadata = self._load_metadata_cache()
         return self._metadata
+
+    def _load_metadata_cache(self) -> Optional[ObsMetadata]:
+        """Read ``.metadata.json``; ``None`` for in-memory backends or a missing/corrupt file."""
+        if not self._backend.requires_data_files:
+            return None
+        path = Path(self.work_dir) / METADATA_FILENAME
+        if not path.is_file():
+            return None
+        try:
+            metadata = ObsMetadata.from_dict(json.loads(path.read_text()))
+        except Exception as exc:  # noqa: BLE001 - a cache only; regenerate by re-importing
+            logger.warning("[{}] could not read {}: {}", self.project_code, path, exc)
+            return None
+        logger.debug("[{}] metadata loaded from {}", self.project_code, path)
+        return metadata
 
     @property
     def antennas(self) -> dict:
@@ -376,8 +418,27 @@ class Observation:
             "steps": self._state.as_dict(),
             "warnings": warnings.summary(),
         }
-        logger.info("report: {} (would write report.html + report.json)", self.project_code)
+        if self._backend.requires_data_files:
+            try:
+                from .dashboard import build_dashboard
+                rep["dashboard"] = str(build_dashboard(self))
+            except Exception as exc:  # noqa: BLE001 - the report must never abort the run
+                warnings.warn(f"{self.project_code}: dashboard failed: {exc}")
+            rep["notebook"] = self.notebook()
+        logger.info("report: {} ({} step(s), {} gaintable(s))", self.project_code,
+                    len(rep["steps"]), len(rep["gaintables"]))
         return rep
+
+    def notebook(self, path: Optional[str] = None) -> str:
+        """Write the interactive reduction notebook (``<work_dir>/<code>.ipynb``); "" when unavailable."""
+        if not self._backend.requires_data_files:
+            return ""
+        try:
+            from .notebook import write_notebook
+            return str(write_notebook(self, path))
+        except Exception as exc:  # noqa: BLE001 - nbformat missing or a render problem must not abort a run
+            warnings.warn(f"{self.project_code}: notebook not written ({exc})")
+            return ""
 
     def reset(self) -> None:
         """Clear step state, calibration tables, and loaded metadata."""

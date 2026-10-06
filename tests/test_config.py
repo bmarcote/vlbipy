@@ -9,8 +9,9 @@ def test_defaults_loaded():
     cfg = load_config()
     assert cfg["global"]["backend"] == "casa"
     assert cfg["global"]["observatory"] == "EVN"
-    assert cfg["imaging"]["robust"] == [-2, -1, 0, 1, 2]
+    assert cfg["imaging"]["robust"] == [-2, 0, 2]
     assert "phase_referencing" in cfg
+    assert cfg["calibration"]["callib"] is False
 
 
 def test_dict_override_merges_deeply():
@@ -18,7 +19,7 @@ def test_dict_override_merges_deeply():
     assert cfg["global"]["observatory"] == "VLBA"
     # untouched keys survive the deep merge
     assert cfg["global"]["backend"] == "casa"
-    assert cfg["imaging"]["robust"] == [-2, -1, 0, 1, 2]
+    assert cfg["imaging"]["robust"] == [-2, 0, 2]
 
 
 def test_overrides_win_over_user_config():

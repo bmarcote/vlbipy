@@ -160,6 +160,14 @@ def test_evn_resolve_obsdate_from_idi(idi_dir):
     assert evn.resolve_obsdate(PROJECT, str(idi_dir)) == "240301"
 
 
+def test_evn_resolve_obsdate_falls_back_to_experiment_page(tmp_path, monkeypatch):
+    """Old experiments are absent from the recent-only catalog; the per-experiment page is used."""
+    pages = {"https://archive.jive.eu/scripts/listarch.php": '<a href="arch.php?exp=ZZ999_260101">x</a>',
+             "https://archive.jive.eu/scripts/arch.php?exp=EM163": '<a href="/exp/EM163_220609/">EM163_220609</a>'}
+    monkeypatch.setattr(tools, "fetch_url_text", lambda url, *a, **k: pages[url])
+    assert EVNObservatory().resolve_obsdate("em163", str(tmp_path)) == "220609"
+
+
 def test_evn_antab_and_flag_lookup(tmp_path):
     evn = EVNObservatory()
     assert evn.get_antab_file(PROJECT, str(tmp_path)) is None

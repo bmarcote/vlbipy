@@ -28,6 +28,8 @@ logger = get_logger()
 EVN_ARCHIVE_URL = "https://archive.jive.eu/exp"
 #: Archive catalog page listing every experiment as ``arch.php?exp=<CODE>_<YYMMDD>`` links.
 EVN_ARCHIVE_INDEX_URL = "https://archive.jive.eu/scripts/listarch.php"
+#: Per-experiment archive page (works for any experiment, unlike the catalog above, which only lists recent ones).
+EVN_ARCHIVE_EXP_URL = "https://archive.jive.eu/scripts/arch.php?exp={code}"
 
 
 def _import_casavlbitools():
@@ -73,8 +75,10 @@ class EVNObservatory(ObservatoryHandler):
         if files:
             return fitsidi.get_obs_date(files[0]).strftime("%y%m%d")
         logger.info("resolving obsdate of {} from the EVN archive catalog...", project_code)
-        index = tools.fetch_url_text(EVN_ARCHIVE_INDEX_URL)
-        dates = re.findall(rf"exp={re.escape(project_code.upper())}_(\d{{6}})", index)
+        pattern = rf"{re.escape(project_code.upper())}_(\d{{6}})"
+        dates = re.findall(rf"exp={pattern}", tools.fetch_url_text(EVN_ARCHIVE_INDEX_URL))
+        if not dates:  # the catalog only lists recent experiments: ask the per-experiment page
+            dates = re.findall(pattern, tools.fetch_url_text(EVN_ARCHIVE_EXP_URL.format(code=project_code.upper())))
         if dates:
             if len(set(dates)) > 1:
                 logger.warning("multiple archive entries for {}: {}; using the latest",

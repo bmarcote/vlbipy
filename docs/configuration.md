@@ -35,6 +35,9 @@ scan_gap = 15                # Seconds gap threshold for defining new scans in i
 flag_autocorrelations = true
 edge_channels_fraction = 0.05 # Fallback if the subband edges cannot be measured
 outlier_sigma = 5.0          # Robust-sigma cut for per-baseline outlier flagging
+outlier_gross_departure = 0.25      # On a baseline with too many outliers, still flag bins this far off
+outlier_gross_max_fraction = 0.35   # ... unless they are more than this share of the baseline
+bandpass_min_gain = 0.5      # Flag channels whose bandpass is flagged or below this
 aoflagger_strategy = "default"
 tfcrop_winsize = 3
 tfcrop_timecutoff = 4.5
@@ -77,6 +80,9 @@ robust = [-2, -1, 0, 1, 2]  # Briggs robust values to image at
 pixels_per_beam = 10         # Used to auto-compute cell size if not set
 niter = 4000                 # CLEAN iterations
 threshold_sigma = 3.0        # CLEAN threshold in units of image RMS
+search_fov = 1000.0          # mas; dirty map searched for each source before imaging (0 = off)
+search_sigma = 10.0          # a peak counts as the source only above this many rms
+recentre_min_beams = 10.0    # re-centre only when it is further than this many beams from the centre
 deconvolver = "hogbom"
 produce_fits = true
 produce_png = true
@@ -84,8 +90,10 @@ produce_png = true
 [export]
 split_per_source = true
 export_uvfits = true
-time_average = ""            # No time averaging by default
-channel_average = 1          # Channels per output subband (1 = average all)
+time_average = "10s"         # Time averaging of the per-source split / UVFITS
+channel_average = -1         # Calibrators: -1 = one channel per subband, N = average N, 1 = keep all
+target_channel_average = 4   # The same for the target(s)
+average_targets = true       # false = split the target(s) at full resolution
 ```
 
 ## Section Reference
@@ -131,6 +139,9 @@ Source names must exactly match those in the data file. Both the new-style keys 
 | `quack_sigma` | float | `2.0` | MADs below the baseline's scan median that count as off-source when measuring the slew |
 | `quack_max_seconds` | float | `50.0` | Never trim more than this from a scan start |
 | `outlier_sigma` | float | `5.0` | Robust-sigma cut for per-baseline outlier flagging |
+| `outlier_gross_departure` | float | `0.25` | A baseline with more outliers than the sigma cut can be trusted on (over 10%) still loses the time bins further than this fraction from its local level |
+| `outlier_gross_max_fraction` | float | `0.35` | ... unless those bins are more than this share of the baseline, which is then left untouched and reported |
+| `bandpass_min_gain` | float | `0.5` | After the bandpass, channels whose solution is flagged or whose amplitude (subband median = 1) is below this are flagged per antenna and subband |
 | `aoflagger_strategy` | string | `"default"` | AOFlagger strategy file name |
 | `tfcrop_winsize` | int | `3` | Window size for the tfcrop auto-flagger |
 | `tfcrop_timecutoff` | float | `4.5` | Sigma cutoff along time axis |
@@ -276,6 +287,9 @@ robust values.
 | `niter` | int | `4000` | Number of CLEAN deconvolution iterations |
 | `threshold_sigma` | float | `3.0` | CLEAN threshold in units of the estimated image RMS |
 | `deconvolver` | string | `"hogbom"` | CLEAN deconvolution algorithm (`hogbom`, `clark`, `multiscale`) |
+| `search_fov` | float | `1000.0` | Width (mas) of the dirty map searched for each source before difmapy images or self-calibrates it. `0` disables the search. |
+| `search_sigma` | float | `10.0` | A peak in that map counts as the source only above this many rms. |
+| `recentre_min_beams` | float | `10.0` | The phase centre is moved onto a detected peak only when it lies further than this many synthesized beams from the centre, i.e. when the regular map could miss it. Applies to targets and calibrators alike. |
 | `produce_fits` | bool | `true` | Export CLEAN images as FITS files |
 | `produce_png` | bool | `true` | Export CLEAN images as PNG thumbnails |
 
@@ -287,8 +301,10 @@ Controls `obs.export.per_source`.
 | --- | --- | --- | --- |
 | `split_per_source` | bool | `true` | Write each source to its own MS file |
 | `export_uvfits` | bool | `true` | Export a UVFITS file alongside each split MS |
-| `time_average` | string | `""` | Time averaging interval (e.g. `"10s"`). Empty = no averaging. |
-| `channel_average` | int | `1` | Channels per output subband. `1` = average all channels within each subband. |
+| `time_average` | string | `"10s"` | Time averaging interval of the split and UVFITS. Empty = no averaging. |
+| `channel_average` | int | `-1` | Channel averaging of calibrators and check sources. `-1` = one channel per subband; `N` = average N channels (a subband with fewer is left as is); `1` = keep all. |
+| `target_channel_average` | int | `4` | The same for the target(s). |
+| `average_targets` | bool | `true` | `false` splits the target(s) at full time and frequency resolution; calibrators and check sources are always averaged. |
 
 ## CLI Parameter Mapping
 
@@ -302,6 +318,7 @@ CLI arguments override the corresponding TOML parameters:
 | `-t` / `--target` | `[sources] targets` |
 | `-pcal` / `--phasecal` | `[sources] phase_calibrators` |
 | `-ff` / `--fringe-finder` | `[sources] fringe_finders` |
+| `--check-source` | `[sources] check_sources` |
 | `--pwd` | `[global] pwd` |
 | `--no-ionos` | `[calibration] ionos = false` |
 | `--from-step` | *(run control, no TOML equivalent)* |

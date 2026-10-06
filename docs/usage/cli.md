@@ -4,7 +4,7 @@ The CLI runs one stage at a time, so you can inspect the products before going
 on. Every subcommand takes the same project and source arguments.
 
 ```bash
-vlbipy <command> -p <project> [-t TARGET] [--phasecal NAME] [--fringe-finder NAME]
+vlbipy <command> -p <project> [-t TARGET] [--phasecal NAME] [--fringe-finder NAME] [--check-source NAME]
 ```
 
 | Command | Purpose |

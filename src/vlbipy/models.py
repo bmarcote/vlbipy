@@ -105,6 +105,20 @@ class Antenna:
     mount: str = ""
     n_scans: int = 0
 
+    def to_dict(self) -> dict:
+        """Serialise to plain JSON types."""
+        return {"name": self.name, "fullname": self.fullname, "diameter": self.diameter,
+                "position": list(self.position), "observed": self.observed,
+                "subbands": list(self.subbands), "mount": self.mount, "n_scans": self.n_scans}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Antenna":
+        """Rebuild from :meth:`to_dict` output."""
+        return cls(name=data["name"], fullname=data.get("fullname", ""), diameter=data.get("diameter", 0.0),
+                   position=tuple(data.get("position", (0.0, 0.0, 0.0))), observed=data.get("observed", False),
+                   subbands=tuple(data.get("subbands", ())), mount=data.get("mount", ""),
+                   n_scans=data.get("n_scans", 0))
+
     def __str__(self) -> str:
         return self.name
 
@@ -171,6 +185,21 @@ class FreqSetup:
         return [(start + s * span + c * self.channel_width) / 1e9
                 for s in subbands for c in range(n_chan)]
 
+    def to_dict(self) -> dict:
+        """Serialise to plain JSON types."""
+        return {"ref_freq": self.ref_freq, "total_bandwidth": self.total_bandwidth,
+                "n_subbands": self.n_subbands, "n_channels": self.n_channels,
+                "channel_width": self.channel_width, "channel_freqs": self.channel_freqs,
+                "polarizations": [int(p) for p in self.polarizations]}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "FreqSetup":
+        """Rebuild from :meth:`to_dict` output."""
+        return cls(ref_freq=data.get("ref_freq", 0.0), total_bandwidth=data.get("total_bandwidth", 0.0),
+                   n_subbands=data.get("n_subbands", 0), n_channels=data.get("n_channels", 0),
+                   channel_width=data.get("channel_width", 0.0), channel_freqs=data.get("channel_freqs", []),
+                   polarizations=[Stokes(p) for p in data.get("polarizations", [])])
+
 
 @dataclass
 class Scan:
@@ -204,6 +233,21 @@ class Scan:
     def duration_sec(self) -> float:
         """Scan duration in seconds."""
         return self.time_end - self.time_start
+
+    def to_dict(self) -> dict:
+        """Serialise to plain JSON types."""
+        return {"scan_number": self.scan_number, "source": self.source, "time_start": self.time_start,
+                "time_end": self.time_end, "antennas": list(self.antennas),
+                "integration_time": self.integration_time, "subbands": list(self.subbands)}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Scan":
+        """Rebuild from :meth:`to_dict` output."""
+        return cls(scan_number=data["scan_number"], source=data.get("source", ""),
+                   time_start=data.get("time_start", 0.0), time_end=data.get("time_end", 0.0),
+                   antennas=list(data.get("antennas", [])),
+                   integration_time=data.get("integration_time", 0.0),
+                   subbands=tuple(data.get("subbands", ())))
 
 
 @dataclass
@@ -270,6 +314,10 @@ class CalTable:
         gain curve the weights should track each antenna's real sensitivity,
         which matters on a heterogeneous VLBI array. False leaves the weights as
         imported.
+    apply_to : str
+        Comma-separated fields the table is applied *to* (cal-library ``field=``
+        selector). Empty = every field. Self-calibration tables use this: the
+        phase calibrator's solutions go to the targets and check sources only.
     """
 
     cal_type: str
@@ -281,19 +329,20 @@ class CalTable:
     snr: float = 0.0
     step: str = ""
     calwt: bool = True
+    apply_to: str = ""
 
     def to_dict(self) -> dict:
         """Return a JSON-serializable dict of every field."""
         return {"cal_type": self.cal_type, "path": self.path, "field": self.field,
                 "gainfield": self.gainfield, "interp": self.interp,
                 "spwmap": list(self.spwmap), "snr": self.snr, "step": self.step,
-                "calwt": self.calwt}
+                "calwt": self.calwt, "apply_to": self.apply_to}
 
     @classmethod
     def from_dict(cls, data: dict) -> "CalTable":
         """Rebuild a table from :meth:`to_dict` output, ignoring unknown keys."""
         known = {"cal_type", "path", "field", "gainfield", "interp", "spwmap", "snr",
-                 "step", "calwt"}
+                 "step", "calwt", "apply_to"}
         return cls(**{k: v for k, v in data.items() if k in known})
 
     def __str__(self) -> str:
@@ -387,6 +436,21 @@ class ScanSNRSurvey:
     def refant_names(self) -> list[str]:
         """Reference antenna(s) used, as a list (the solve may fall back between scans)."""
         return [name for name in str(self.refant).split(",") if name]
+
+    def per_scan_antenna(self) -> dict[int, dict[str, Optional[float]]]:
+        """Return ``{scan_number: {antenna: median SNR over polarizations}}`` (``None`` when absent)."""
+        result: dict[int, dict[str, Optional[float]]] = {}
+        for row, scan in enumerate(self.scan_numbers):
+            per_antenna: dict[str, Optional[float]] = {}
+            for col, antenna in enumerate(self.antennas):
+                values = sorted(v for v in (self.snr[p][row][col] for p in self.polarizations) if v == v)
+                if not values:
+                    per_antenna[antenna] = None
+                    continue
+                mid = len(values) // 2
+                per_antenna[antenna] = values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2.0
+            result[int(scan)] = per_antenna
+        return result
 
     def dead_antennas(self, threshold: float = 3.0) -> list[str]:
         """Return antennas whose median SNR is below ``threshold`` (or entirely absent).
@@ -525,3 +589,28 @@ class ObsMetadata:
     def antenna_scan_matrix(self) -> dict[str, list[bool]]:
         """Return ``{antenna: [participated_in_scan_0, ...]}`` over all scans."""
         return {name: [name in scan.antennas for scan in self.scans] for name in self.antennas}
+
+    def to_dict(self) -> dict:
+        """Serialise to plain JSON types (the SNR survey reloads from its caltable instead)."""
+        return {"project_code": self.project_code,
+                "obs_date": self.obs_date.isoformat() if self.obs_date else None,
+                "time_range": list(self.time_range),
+                "antennas": {name: a.to_dict() for name, a in self.antennas.items()},
+                "scans": [s.to_dict() for s in self.scans],
+                "freq_setup": self.freq_setup.to_dict(), "source_names": list(self.source_names),
+                "source_coords": {k: list(v) for k, v in self.source_coords.items()},
+                "source_ids": dict(self.source_ids)}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ObsMetadata":
+        """Rebuild from :meth:`to_dict` output."""
+        obs_date = data.get("obs_date")
+        return cls(project_code=data.get("project_code", ""),
+                   obs_date=dt.date.fromisoformat(obs_date) if obs_date else None,
+                   time_range=tuple(data.get("time_range", (0.0, 0.0))),
+                   antennas={n: Antenna.from_dict(a) for n, a in data.get("antennas", {}).items()},
+                   scans=[Scan.from_dict(s) for s in data.get("scans", [])],
+                   freq_setup=FreqSetup.from_dict(data.get("freq_setup", {})),
+                   source_names=list(data.get("source_names", [])),
+                   source_coords={k: tuple(v) for k, v in data.get("source_coords", {}).items()},
+                   source_ids={k: int(v) for k, v in data.get("source_ids", {}).items()})

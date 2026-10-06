@@ -1,41 +1,25 @@
-"""Observatory-handler registry for vlbipy."""
+"""Observatory-handler registry for vlbipy.
+
+Observatories are selected by name via :func:`get_observatory_handler`.
+Built-in networks (EVN, VLBA, LBA) are registered lazily; third-party
+observatories are discovered via entry points (``vlbipy.observatories``),
+:func:`register_observatory`, or ``module:qualname`` references.
+See :mod:`vlbipy.registry` for details.
+"""
 from __future__ import annotations
 
 from ..errors import ConfigError
+from ..registry import (  # noqa: F401
+    get_observatory_handler,
+    list_observatories,
+    register_observatory,
+)
 from .base import ObservatoryHandler
 from .evn import EVNObservatory
 from .lba import LBAObservatory
 from .vlba import VLBAObservatory
 
-_HANDLERS = {
-    "EVN": EVNObservatory,
-    "VLBA": VLBAObservatory,
-    "LBA": LBAObservatory,
-}
-
-
-def get_observatory_handler(name: str) -> ObservatoryHandler:
-    """Return the handler for a network name.
-
-    Parameters
-    ----------
-    name : str
-        ``"EVN"``, ``"VLBA"`` or ``"LBA"`` (case-insensitive).
-
-    Returns
-    -------
-    ObservatoryHandler
-
-    Raises
-    ------
-    ConfigError
-        If the network is unknown.
-    """
-    cls = _HANDLERS.get(str(name).upper())
-    if cls is None:
-        raise ConfigError(f"unknown observatory {name!r} (available: {', '.join(_HANDLERS)})")
-    return cls()
-
 
 __all__ = ["ObservatoryHandler", "get_observatory_handler",
+           "register_observatory", "list_observatories",
            "EVNObservatory", "VLBAObservatory", "LBAObservatory"]

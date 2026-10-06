@@ -7,10 +7,14 @@ fact.
 """
 
 class BackendError(Exception):
-    """Raised when configuration is missing, unreadable, or invalid."""
+    """Raised when a backend cannot be instantiated or is misconfigured."""
 
 class ConfigError(Exception):
     """Raised when configuration is missing, unreadable, or invalid."""
+
+
+class PluginError(Exception):
+    """Raised when a plugin cannot be loaded, is invalid, or conflicts with an existing registration."""
 
 
 class SourceNotFoundError(Exception):

@@ -6,9 +6,8 @@ decides the quality of everything downstream. Both choices are made from the
 per-scan fringe SNR survey (:class:`~vlbipy.models.ScanSNRSurvey`) plus the
 subband participation recorded in the metadata:
 
-* :func:`select_antennas` keeps antennas that recorded the whole frequency range
-  and detected fringes, ranked by SNR (the approach used by the Avica pipeline,
-  simplified to the two criteria that actually drive the result).
+* :func:`select_antennas` keeps antennas that detected fringes, ranked by SNR
+  (partial-band antennas included: their solutions cover the subbands they have).
 * :func:`select_calibration_scans` finds the scan where every selected antenna
   was detected, or — when no single scan covers the array — the smallest set of
   scans that does, with at least one antenna shared between them so the separate
@@ -56,13 +55,13 @@ def rank_reference_antennas(metadata: ObsMetadata, requested: str = "") -> list[
 
 
 def select_antennas(survey: ScanSNRSurvey, metadata: ObsMetadata, *,
-                    min_snr: float = DEFAULT_MIN_SNR, require_all_subbands: bool = True,
-                    max_antennas: int = 0) -> list[str]:
+                    min_snr: float = DEFAULT_MIN_SNR, max_antennas: int = 0) -> list[str]:
     """Return the antennas usable for instrumental calibration, best first.
 
-    An antenna qualifies when it recorded every subband (so its solutions cover
-    the full band) and its median fringe SNR clears ``min_snr``. The survivors
-    are ordered by median SNR, so the caller can take the head of the list as the
+    An antenna qualifies when its median fringe SNR clears ``min_snr``. Antennas
+    that recorded only some subbands are kept — heterogeneous arrays are common
+    and their solutions simply cover the subbands they have. The survivors are
+    ordered by median SNR, so the caller can take the head of the list as the
     reference-antenna preference.
 
     Parameters
@@ -73,10 +72,6 @@ def select_antennas(survey: ScanSNRSurvey, metadata: ObsMetadata, *,
         Observation metadata; supplies subband participation per antenna.
     min_snr : float
         Minimum median fringe SNR for an antenna to be considered detected.
-    require_all_subbands : bool
-        Require the antenna to have data in every subband. Turn this off for
-        arrays that are heterogeneous by design, at the cost of solutions that
-        do not span the band.
     max_antennas : int
         Keep at most this many antennas (0 = no limit).
 
@@ -85,7 +80,6 @@ def select_antennas(survey: ScanSNRSurvey, metadata: ObsMetadata, *,
     list of str
         Antenna names ordered by decreasing median SNR (empty if none qualify).
     """
-    n_subbands = metadata.freq_setup.n_subbands
     # The reference antenna has no SNR of its own (its solutions are the sentinel it
     # is referenced against), so ranking alone would drop the one antenna every other
     # solution is tied to. It is detected by definition: put it first.
@@ -95,13 +89,10 @@ def select_antennas(survey: ScanSNRSurvey, metadata: ObsMetadata, *,
     selected: list[str] = []
     rejected: list[str] = []
     for name, median_snr in ranked:
-        antenna = metadata.antennas.get(name)
-        subbands = antenna.subbands if antenna else ()
+        if name not in metadata.antennas:
+            continue
         if median_snr < min_snr:
             rejected.append(f"{name} (SNR {median_snr:.0f} < {min_snr:.0f})")
-            continue
-        if require_all_subbands and n_subbands and subbands and len(subbands) < n_subbands:
-            rejected.append(f"{name} ({len(subbands)}/{n_subbands} subbands)")
             continue
         selected.append(name)
     if max_antennas and len(selected) > max_antennas:
@@ -144,16 +135,24 @@ def detected_antennas_per_scan(survey: ScanSNRSurvey, antennas: list[str],
     return detected
 
 
-def select_calibration_scans(survey: ScanSNRSurvey, antennas: list[str], *,
-                             min_snr: float = DEFAULT_MIN_SNR,
-                             sources: list[str] | None = None) -> list[int]:
-    """Return the scan(s) to solve the instrumental delay and bandpass on.
+def _antenna_priority(survey: ScanSNRSurvey) -> list[str]:
+    """Antennas best-first: the survey's reference antenna(s), then by median fringe SNR."""
+    ordered = list(survey.refant_names)
+    ordered += [name for name, _ in survey.rank_antennas() if name not in ordered]
+    return ordered
 
-    Prefers a single scan in which every antenna in ``antennas`` was detected. If
-    no such scan exists, builds the smallest covering set greedily, requiring
-    each added scan to share at least one antenna with the scans already chosen:
-    that shared antenna is what lets solutions from different scans be referred
-    to a common phase, without which they cannot be combined.
+
+def plan_sbd_stages(survey: ScanSNRSurvey, antennas: list[str], *, min_snr: float = DEFAULT_MIN_SNR,
+                    sources: list[str] | None = None, metadata: ObsMetadata | None = None) -> list[dict]:
+    """Plan the single-band-delay solve as a chain of single-scan stages.
+
+    The instrumental delay is constant in time, so it must come from *one*
+    scan: several scans give several independent solutions whose phases are
+    not continuous once applied. Stage 1 is the best scan detecting the most
+    antennas (ideally all of them). Only when antennas remain uncovered are
+    further scans added, each detecting at least one already-solved antenna
+    that becomes that stage's reference, so its solutions can be re-based onto
+    the first stage's reference. As few scans as possible are used.
 
     Parameters
     ----------
@@ -165,60 +164,75 @@ def select_calibration_scans(survey: ScanSNRSurvey, antennas: list[str], *,
         Detection threshold.
     sources : list of str, optional
         Restrict to scans on these sources (e.g. the fringe finders).
+    metadata : ObsMetadata, optional
+        When given, an antenna only counts as detected in a scan it took part in
+        (the survey marks its reference antenna detected wherever any solution exists).
 
     Returns
     -------
-    list of int
-        Scan numbers, best first. Empty when nothing is detected at all.
+    list of dict
+        ``[{"scan": int, "antennas": [solved here], "refant": str}, ...]`` in
+        solve order. Empty when nothing is detected at all.
     """
     if not antennas:
         return []
     detected = detected_antennas_per_scan(survey, antennas, min_snr)
+    if metadata is not None:
+        present = {scan.scan_number: set(scan.antennas) for scan in metadata.scans}
+        detected = {scan: ants & present.get(scan, ants) for scan, ants in detected.items()}
     if sources:
         allowed = {scan for scan, source in zip(survey.scan_numbers, survey.scan_sources)
                    if source in sources}
         detected = {scan: ants for scan, ants in detected.items() if scan in allowed}
+    detected = {scan: ants for scan, ants in detected.items() if ants}
     if not detected:
         return []
     required = set(antennas)
-    quality = {scan: survey.median_snr(scan_number=scan) for scan in detected}
+    priority = _antenna_priority(survey)
 
     def score(scan: int) -> float:
-        value = quality.get(scan, float("nan"))
+        value = survey.median_snr(scan_number=scan)
         return value if value == value else 0.0
 
-    complete = [scan for scan, found in detected.items() if required <= found]
-    if complete:
-        best = max(complete, key=score)
-        logger.info("scan selection: scan {} has all {} antennas detected (median SNR {:.0f})",
-                    best, len(required), score(best))
-        return [best]
+    def best_of(names: set[str]) -> str:
+        return next((n for n in priority if n in names), sorted(names)[0])
 
-    # No single scan covers the array: greedily cover it, keeping the scans linked.
-    chosen: list[int] = []
+    stages: list[dict] = []
     covered: set[str] = set()
     remaining = dict(detected)
-    while remaining:
-        if not chosen:
+    while remaining and not required <= covered:
+        if not stages:
             candidates = remaining
         else:
-            # Only scans sharing an antenna with what is already covered can be tied in.
+            # Only a scan detecting an already-solved antenna can be tied to the chain.
             candidates = {scan: found for scan, found in remaining.items() if found & covered}
             if not candidates:
                 break
         best = max(candidates, key=lambda s: (len(candidates[s] - covered), score(s)))
         gained = candidates[best] - covered
-        if not gained and chosen:
+        if not gained:
             break
-        chosen.append(best)
-        covered |= candidates[best]
+        refant = best_of(candidates[best] if not stages else candidates[best] & covered)
+        stages.append({"scan": best, "antennas": sorted(gained, key=priority.index), "refant": refant})
+        covered |= gained
         remaining.pop(best)
-        if required <= covered:
-            break
+
+    if len(stages) == 1:
+        logger.info("scan selection: scan {} detects all {} antennas (median SNR {:.0f}); single-stage SBD",
+                    stages[0]["scan"], len(required), score(stages[0]["scan"]))
+    else:
+        logger.info("scan selection: no single scan covers the array; SBD in {} stage(s): {}", len(stages),
+                    "; ".join(f"scan {s['scan']} ({','.join(s['antennas'])}; ref {s['refant']})" for s in stages))
     missing = sorted(required - covered)
-    logger.info("scan selection: no single scan covers the array; using {} scan(s) {} "
-                "covering {}/{} antennas", len(chosen), chosen, len(covered & required), len(required))
     if missing:
         logger.warning("scan selection: no scan detects {} above {:.0f} sigma; they will have no "
                        "instrumental-delay solution", ", ".join(missing), min_snr)
-    return chosen
+    return stages
+
+
+def select_calibration_scans(survey: ScanSNRSurvey, antennas: list[str], *,
+                             min_snr: float = DEFAULT_MIN_SNR, sources: list[str] | None = None,
+                             metadata: ObsMetadata | None = None) -> list[int]:
+    """Return the scan numbers of :func:`plan_sbd_stages`, in solve order."""
+    return [stage["scan"] for stage in plan_sbd_stages(survey, antennas, min_snr=min_snr, sources=sources,
+                                                       metadata=metadata)]

@@ -4,11 +4,14 @@
 
 [global]
 project = ""
-observatory = "EVN"          # EVN | VLBA | LBA
-backend = "casa"             # casa (default) | dask-ms | dummy | aips (later)
+observatory = "EVN"          # EVN | VLBA | LBA (or any registered/plugin observatory)
+backend = "casa"             # casa (default) | casa-fast (numpy fringe fits) | dask-ms | dummy | aips | plugin
 mode = "continuum"          # continuum | spectral-line | pulsar-binning | multi-phase-center
 reference_antenna = []       # preferred refant(s); auto-ranked if empty
 work_dir = ""               # working directory; empty = cwd
+plugins = []                 # dotted module paths loaded before backend/observatory
+                             # resolution (e.g. ["mypkg.vlbipy_plugin"]); each module's
+                             # top-level code may call register_backend / register_observatory
 
 [sources]
 fringe_finders = []
@@ -57,6 +60,11 @@ flag_outliers = true         # post-calibration per-baseline spike/drop flagging
                              # on the instrumental-calibration scan cost the next pass whole
                              # antennas. RFI is already handled by tfcrop/aoflagger.
 outlier_sigma = 5.0          # robust-sigma cut for per-baseline outlier flagging
+outlier_gross_departure = 0.25  # a baseline with too many outliers to trust the sigma cut still loses the
+                             # time bins further than this fraction from its local level ...
+outlier_gross_max_fraction = 0.35  # ... unless they are more than this share of the baseline
+bandpass_min_gain = 0.5      # channels whose bandpass solution is flagged or below this (subband median = 1)
+                             # are flagged per antenna and subband after the bandpass
 
 # Seconds to quack per antenna, e.g. EF = 4. Empty = use quack_interval / measure.
 [flagging.quack_antennas]
@@ -81,7 +89,8 @@ smooth_tsys = true           # de-spike the Tsys table after gencal
 tsys_outlier_sigma = 6.0     # MAD sigmas beyond which a Tsys solution is an outlier
 tsys_smooth_passes = 3       # maximum de-spiking passes
 detection_snr = 7.0          # fringe SNR above which an antenna counts as detected
-require_all_subbands = true  # only calibrate on antennas that recorded the whole band
+callib = false               # use CASA cal-library files; false uses explicit parallel
+                             # gaintable/gainfield/interp/spwmap/calwt parameters
 
 # Every key in a [calibration.*] section is passed straight through to the backend
 # function of the same name, so any parameter it accepts can be tuned here.
@@ -130,22 +139,41 @@ window = 5                   # running-median window, in solutions, used to de-s
 minsnr = 0.0                 # keep every solution so weak antennas still appear in the survey
 
 [selfcal]
+# Self-calibration with difmapy (see vlbipy.backends.difmap): one circular Gaussian modelfit, a
+# phase-only ladder from long to short solution intervals, then the Bayesian gscale for the
+# station amplitudes. Fringe finder first (amplitudes -> every field), then the phase
+# calibrator (amplitudes + phases -> itself, the targets and the check sources).
 enabled = true
-phase_rounds = 4
-ampphase_rounds = 2
-convergence_threshold = 0.05 # minimum fractional dynamic-range improvement
+solints = []                 # phase ladder; empty = 30min, 10min, 5min, scan (+ 2min for scans > 5 min)
+min_improvement = 0.002      # a step must lower the weighted chi-squared by this fraction (0.2%)
+max_bad_fraction = 0.25      # ... and fail in at most this fraction of its solution bins
+bayes_models = ["clean", "gauss1", "gauss2", "gauss3"]  # source models weighed by bayes_gscale
+prior_sigma = 0.1            # width of the prior on log-amplitude corrections (10%)
+workers = 0                  # threads for bayes_gscale (0 = difmapy's default)
 
 [imaging]
+imager = "difmap"            # "difmap" (difmapy CLEAN on the per-source split) | "tclean"
 weighting = "briggs"
-robust = [-2, -1, 0, 1, 2]
+clean_gain = 0.05            # difmapy CLEAN loop gain
+robust = [-2, 0, 2]          # one image per robust value, shown side by side in the PNG preview
 niter = 4000
-threshold_sigma = 3.0
+threshold_sigma = 3.0        # clean stops when the residual peak drops below this many rms
+search_fov = 1000.0          # mas; width of the dirty map searched for each source before imaging (0 = off)
+search_sigma = 10.0          # a peak counts as the source only above this many rms
+recentre_min_beams = 10.0    # ... and the map is re-centred on it only when it lies further than this many
+                             # synthesized beams from the phase centre (closer, the regular map already holds it)
+sources = "all"              # "all" (targets + calibrators) | "targets"
 produce_fits = true
 produce_png = true
 
 [export]
 split_per_source = true
 export_uvfits = true
-time_average = ""            # e.g. "4s"; empty = none
-channel_average = -1         # -1 = one channel per subband (continuum); 1 = keep all
+time_average = "10s"         # time averaging of the per-source split / UVFITS; empty = none
+channel_average = -1         # calibrators and check sources: -1 = one channel per subband; N = average
+                             # N channels (a subband with fewer is left as is); 1 = keep all
+target_channel_average = 4   # the same for the target(s), which may sit off the phase centre
+average_targets = true       # false = split the target(s) at full time and frequency resolution
 radplot_time_bin = 10.0      # seconds averaged per point in the uv-distance plots
+lightcurve_averaging = [0, 30, 120, -1]  # averaging scales (s) in the total light curve:
+                             # 0 = native integrations, -1 = one point per scan

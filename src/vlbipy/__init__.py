@@ -15,13 +15,14 @@ reduction through callable namespaces. In this milestone all work runs on an
 in-memory ``dummy`` backend (no CASA, no files). See ``docs/PRD.md``.
 """
 from .config import load_config
-from .errors import BackendError, ConfigError, SourceNotFoundError, StepError
+from .errors import BackendError, ConfigError, PluginError, SourceNotFoundError, StepError
 from .fitsidi import find_fitsidi_files, inspect_fitsidi
 from .logging_utils import configure_logging
 from .models import (Antenna, BackendKind, CalTable, FreqSetup, Mode, ObsMetadata,
                      Observatory, QualityMetrics, Scan, SourceType, Stokes)
 from .observation import Observation
 from .plotting import CalTablePlotter
+from .registry import register_backend, register_observatory  # noqa: F401
 from .results import Image, ImageSet, SelfcalResult
 from .sources import Source, SourceSet
 from .vlbiobs import VLBIObs
@@ -34,9 +35,10 @@ __version__ = "0.2.0"
 __all__ = [
     "VLBIObs", "Observation", "load_config", "configure_logging",
     "inspect_fitsidi", "find_fitsidi_files", "get_backend", "CalTablePlotter",
+    "register_backend", "register_observatory",
     "Source", "SourceSet", "Image", "ImageSet", "SelfcalResult",
     "Antenna", "FreqSetup", "Scan", "ObsMetadata", "CalTable", "QualityMetrics",
     "Stokes", "Observatory", "BackendKind", "Mode", "SourceType",
-    "ConfigError", "SourceNotFoundError", "BackendError", "StepError",
+    "ConfigError", "SourceNotFoundError", "BackendError", "PluginError", "StepError",
     "__version__",
 ]

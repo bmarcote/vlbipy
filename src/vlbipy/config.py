@@ -45,6 +45,10 @@ def _deep_merge(base: dict, override: dict) -> dict:
 def load_config(config: ConfigLike = None, overrides: Optional[dict] = None) -> dict:
     """Load the fully-merged vlbipy configuration.
 
+    After merging, any ``[global].plugins`` list is imported via
+    :func:`~vlbipy.registry.load_plugins` so that plugin modules can register
+    their backends and observatories before name resolution.
+
     Parameters
     ----------
     config : str or pathlib.Path or dict or None
@@ -74,6 +78,11 @@ def load_config(config: ConfigLike = None, overrides: Optional[dict] = None) -> 
         raise ConfigError(f"unsupported config type: {type(config)!r}")
     if overrides:
         merged = _deep_merge(merged, overrides)
+    # Import plugin modules so their registrations happen before name lookup.
+    plugins = merged.get("global", {}).get("plugins", [])
+    if plugins:
+        from .registry import load_plugins
+        load_plugins(plugins)
     return merged
 
 

@@ -4,6 +4,37 @@ An :class:`ObservatoryHandler` owns everything that differs between VLBI network
 auto-download capability, a-priori file formats (``.antab``/``.uvflg``), and which
 correlator-specific corrections (EOP, ACCOR, ionospheric TEC) apply. The core API
 selects a handler from the ``network`` argument and never special-cases arrays.
+
+How to add an observatory plugin
+================================
+
+Subclass :class:`ObservatoryHandler`, set the class attributes and override the
+methods that apply to your network. Then register it using any of:
+
+* **Entry point** (recommended for published packages)::
+
+      # pyproject.toml of your package
+      [project.entry-points."vlbipy.observatories"]
+      MYNET = "mypkg.observatory:MyObservatory"
+
+* **Programmatic registration**::
+
+      from vlbipy.registry import register_observatory
+      register_observatory("MYNET", MyObservatory)
+
+* **Config import bridge**::
+
+      [global]
+      plugins = ["mypkg.vlbipy_plugin"]
+      observatory = "MYNET"
+
+* **Direct reference**::
+
+      [global]
+      observatory = "mypkg.observatory:MyObservatory"
+
+If your package also provides a backend, register both from the same plugin
+module — see :mod:`vlbipy.backends.template` for the backend contract.
 """
 from __future__ import annotations
 

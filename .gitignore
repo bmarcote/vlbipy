@@ -8,3 +8,5 @@ test
 site/
 rsm07_run
 uv.lock
+build
+.gitignore

@@ -322,8 +322,33 @@ def test_write_callib_declares_each_table(tmp_path):
     assert "fldmap" not in lines[0]
 
 
-def test_prior_callib_writes_one_file_per_solve(tmp_path):
-    """Each solve declares its priors in a file named after the table it produces."""
+def test_prior_callib_returns_explicit_params_by_default(tmp_path):
+    """By default prior tables are passed as aligned parallel parameter lists."""
+    pytest.importorskip("casatools")
+    from pathlib import Path as P
+
+    from vlbipy.backends.casa import CasaBackend
+    from vlbipy.models import CalTable
+
+    backend = CasaBackend(work_dir=str(tmp_path))
+    priors = [
+        CalTable("tsys", path="/c/rsm07.tsys", interp="nearest"),
+        CalTable("bpass", path="/c/rsm07.bpass", interp="nearest,nearest", calwt=False),
+    ]
+    params = backend.calibrate._prior_callib("rsm07", priors, P("/c/rsm07.mbd"), field="3C286")
+    assert "docallib" not in params
+    assert params["gaintable"] == ["/c/rsm07.tsys", "/c/rsm07.bpass"]
+    assert params["gainfield"] == ["", ""]  # field-independent/no fldmap for solves
+    assert params["interp"] == ["nearest", "nearest,nearest"]
+    assert params["spwmap"] == [[], []]
+    # Solving tasks do not accept calwt.
+    assert "calwt" not in params
+    # No priors means no apply parameters: the solve runs on raw data.
+    assert backend.calibrate._prior_callib("rsm07", [], P("/c/rsm07.sbd")) == {}
+
+
+def test_prior_callib_callib_path_writes_one_file_per_solve(tmp_path):
+    """Optional callib=True writes one cal-library file per solve, named after the table."""
     pytest.importorskip("casatools")
     from pathlib import Path as P
 
@@ -332,13 +357,37 @@ def test_prior_callib_writes_one_file_per_solve(tmp_path):
 
     backend = CasaBackend(work_dir=str(tmp_path))
     priors = [CalTable("tsys", path="/c/rsm07.tsys", interp="nearest")]
-    params = backend.calibrate._prior_callib("rsm07", priors, P("/c/rsm07.mbd"))
+    params = backend.calibrate._prior_callib("rsm07", priors, P("/c/rsm07.mbd"),
+                                                field="3C286", callib=True)
     assert params["docallib"] is True
     written = P(params["callib"])
     assert written.is_file() and written.name == "rsm07.mbd.txt"
     assert "rsm07.tsys" in written.read_text()
-    # No priors means no cal library and no docallib: the solve runs on raw data.
-    assert backend.calibrate._prior_callib("rsm07", [], P("/c/rsm07.sbd")) == {}
+
+
+def test_write_callib_resolves_per_field_for_phase_referencing(tmp_path):
+    """Callib mode resolves fldmap per field: nearest for self, phasecal for target."""
+    pytest.importorskip("casatools")
+    from vlbipy.backends.casa import CasaBackend
+    from vlbipy.models import CalTable
+
+    backend = CasaBackend(work_dir=str(tmp_path))
+    tables = [
+        CalTable("tsys", path="/c/x.tsys", interp="nearest", field=""),
+        CalTable("mbd", path="/c/x.mbd", interp="linear",
+                 field="3C286,J1048+7143", gainfield="J1048+7143"),
+    ]
+    target_lines = [ln for ln in backend.calibrate.write_callib("p", tables, field="R20181030")
+                    .read_text().splitlines() if not ln.startswith("#")]
+    # Target field uses the stored phase-calibrator mapping on the MBD table.
+    assert "fldmap='J1048+7143'" in target_lines[1]
+    # Field-independent table carries no fldmap.
+    assert "fldmap" not in target_lines[0]
+
+    self_lines = [ln for ln in backend.calibrate.write_callib("p", tables, field="3C286")
+                  .read_text().splitlines() if not ln.startswith("#")]
+    # A field contained in the table uses its own (nearest) solutions.
+    assert "fldmap='nearest'" in self_lines[1]
 
 
 def test_write_callib_honours_calwt_per_table(tmp_path):
@@ -358,3 +407,197 @@ def test_write_callib_honours_calwt_per_table(tmp_path):
     # It survives the round-trip through the persisted chain.
     assert CalTable.from_dict(CalTable("mbd", calwt=False).to_dict()).calwt is False
     assert CalTable.from_dict({"cal_type": "tsys"}).calwt is True
+
+
+def _cal_ops():
+    """A CasaCalibrationOps instance for pure helper logic tests."""
+    casa = pytest.importorskip("vlbipy.backends.casa")
+    return casa.CasaCalibrationOps.__new__(casa.CasaCalibrationOps)
+
+
+def test_resolve_table_gainfield_respects_field_independence_and_self_solve():
+    """Field-independent tables stay empty; self-solved fields use nearest."""
+    ops = _cal_ops()
+    tsys = CalTable("tsys", path="/c/x.tsys", field="3C286,J1048+7143")
+    mbd = CalTable("mbd", path="/c/x.mbd", field="3C286,J1048+7143",
+                   gainfield="J1048+7143")
+
+    assert ops._resolve_table_gainfield(tsys, "3C286") == ""
+    assert ops._resolve_table_gainfield(tsys, "") == ""
+    assert ops._resolve_table_gainfield(mbd, "3C286") == "nearest"
+    assert ops._resolve_table_gainfield(mbd, "J1048+7143") == "nearest"
+    # A target/non-solved field uses the stored phase-calibrator mapping.
+    assert ops._resolve_table_gainfield(mbd, "R20181030") == "J1048+7143"
+    # Empty apply field falls back to the table's stored mapping.
+    assert ops._resolve_table_gainfield(mbd, "") == "J1048+7143"
+
+
+def test_compile_apply_params_explicit_lists_aligned():
+    """Explicit params preserve list alignment and per-table values."""
+    ops = _cal_ops()
+    tables = [
+        CalTable("tsys", path="/c/x.tsys", interp="nearest", field="3C286"),
+        CalTable("mbd", path="/c/x.mbd", interp="linear", field="3C286",
+                 gainfield="J1048+7143", spwmap=[0, 0, 0, 0], calwt=False),
+    ]
+    params = ops._compile_apply_params("p", tables, "R20181030", include_calwt=True)
+    assert params["gaintable"] == ["/c/x.tsys", "/c/x.mbd"]
+    assert params["gainfield"] == ["", "J1048+7143"]  # mbd target uses phase cal
+    assert params["interp"] == ["nearest", "linear"]
+    assert params["spwmap"] == [[], [0, 0, 0, 0]]
+    assert params["calwt"] == [True, False]
+    assert "docallib" not in params
+
+
+def test_compile_apply_params_omits_calwt_for_solve():
+    """Solving tasks do not accept calwt; the helper leaves it out."""
+    ops = _cal_ops()
+    tables = [CalTable("tsys", path="/c/x.tsys", interp="nearest", field="")]
+    params = ops._compile_apply_params("p", tables, "3C286", include_calwt=False)
+    assert "calwt" not in params
+    assert params["gaintable"] == ["/c/x.tsys"]
+
+
+def test_compile_apply_params_callib_returns_docallib():
+    """Optional callib mode writes a cal-library file and returns docallib/callib."""
+    ops = _cal_ops()
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        ops._backend = type("B", (), {"work_dir": __import__("pathlib").Path(tmp)})()
+        tables = [CalTable("tsys", path="/c/x.tsys", interp="nearest", field="")]
+        params = ops._compile_apply_params("p", tables, "3C286", callib=True,
+                                           filename="callibs/solve.txt")
+        assert params == {"docallib": True, "callib": __import__("os").path.join(tmp, "callibs", "solve.txt")}
+
+
+def test_apply_loops_over_observed_sources_when_field_is_empty(tmp_path):
+    """apply(field='') calls applycal once per observed source field."""
+    casa = pytest.importorskip("vlbipy.backends.casa")
+    from vlbipy.models import CalTable, ObsMetadata, Scan
+
+    class FakeBackend:
+        def __init__(self, scans):
+            self.work_dir = tmp_path
+            self.data = self
+            self.tasks = self
+            self.scans = scans
+            self.calls = []
+
+        def ms_path(self, code):
+            return self.work_dir / f"{code}.ms"
+
+        def caldir(self):
+            return self.work_dir / "caltables"
+
+        def get_metadata(self, *args, **kwargs):
+            return ObsMetadata(project_code="p", scans=self.scans)
+
+        def applycal(self, **kwargs):
+            self.calls.append(kwargs)
+
+    ops = casa.CasaCalibrationOps.__new__(casa.CasaCalibrationOps)
+    ops._backend = FakeBackend([
+        Scan(scan_number=1, source="3C286", time_start=0.0, time_end=100.0),
+        Scan(scan_number=2, source="R20181030", time_start=100.0, time_end=200.0),
+    ])
+    (tmp_path / "p.ms").mkdir()
+    caldir = tmp_path / "caltables"
+    caldir.mkdir()
+    tsys = CalTable("tsys", path=str(caldir / "x.tsys"), interp="nearest", field="")
+    mbd = CalTable("mbd", path=str(caldir / "x.mbd"), interp="linear",
+                   field="3C286", gainfield="3C286")
+    for table in (tsys, mbd):
+        (caldir / table.path).mkdir()
+
+    ops.apply("p", "", [tsys, mbd], callib=False)
+    assert len(ops.backend.calls) == 2
+    fields = [c["field"] for c in ops.backend.calls]
+    assert sorted(fields) == ["3C286", "R20181030"]
+    # calibrators use nearest, targets use the stored mapping.
+    calibrator_call = next(c for c in ops.backend.calls if c["field"] == "3C286")
+    assert calibrator_call["gainfield"] == ["", "nearest"]
+    target_call = next(c for c in ops.backend.calls if c["field"] == "R20181030")
+    assert target_call["gainfield"] == ["", "3C286"]
+    # applycal always receives calwt; explicit mode has no docallib.
+    for call in ops.backend.calls:
+        assert call["calwt"] == [True, True]
+        assert "docallib" not in call
+
+
+def test_self_solved_field_takes_its_own_scan_solution():
+    """A field corrected with its own solutions uses them 'nearest' in time, not interpolated.
+
+    Linear interpolation between scans of the same field flags an antenna with a single
+    good solution there (EM163: HH and IB on the one fringe-finder scan with every antenna).
+    """
+    ops = _cal_ops()
+    mbd = CalTable("mbd", path="/c/x.mbd", interp="linear,linear", field="3C286,J1048+7143",
+                   gainfield="J1048+7143", spwmap=[0, 0, 0, 0], calwt=False)
+    own = ops._compile_apply_params("p", [mbd], "3C286")
+    assert (own["gainfield"], own["interp"]) == (["nearest"], ["nearest,linear"])
+    target = ops._compile_apply_params("p", [mbd], "R20181030")
+    assert (target["gainfield"], target["interp"]) == (["J1048+7143"], ["linear,linear"])
+
+
+def test_tables_for_field_respects_apply_to():
+    """A table restricted with apply_to must not be applied to other fields."""
+    from vlbipy.backends.casa import CasaCalibrationOps
+    from vlbipy.models import CalTable
+    everywhere = CalTable(cal_type="selfamp_FF", path="ff.G", field="FF")
+    restricted = CalTable(cal_type="selfphase_PC", path="pc.G", field="PC", apply_to="PC,TARGET,CHECK")
+    pick = CasaCalibrationOps._tables_for_field
+    assert [t.cal_type for t in pick([everywhere, restricted], "FF")] == ["selfamp_FF"]
+    assert [t.cal_type for t in pick([everywhere, restricted], "TARGET")] == ["selfamp_FF", "selfphase_PC"]
+    assert len(pick([everywhere, restricted], "")) == 2
+
+
+def _casa_ops_without_backend(cls):
+    """An ops object with no backend, for the pure-numpy helpers."""
+    return cls.__new__(cls)
+
+
+def test_spike_departures_reports_bins_and_their_size():
+    from vlbipy.backends.casa import CasaFlagOps
+    import numpy as np
+    rng = np.random.default_rng(3)
+    amplitude = 1.0 + 0.01 * rng.standard_normal((80, 16))
+    amplitude[[10, 40]] *= 0.5                       # two dropouts of 50%
+    ops = _casa_ops_without_backend(CasaFlagOps)
+    bins, relative = ops._spike_departures(amplitude, np.isfinite(amplitude), 5.0, 9)
+    assert set(bins) == {10, 40}
+    assert relative.shape == (80,) and abs(relative[10] + 0.5) < 0.05
+    assert list(ops._spike_bins(amplitude, np.isfinite(amplitude), 5.0, 9)) == list(bins)
+
+
+def test_scalar_bandpass_is_normalised_per_antenna(tmp_path, monkeypatch):
+    """Each antenna's subbands are levelled around 1; only a subband a factor 2 off is flagged."""
+    import numpy as np
+    from vlbipy.backends.casa import CasaCalibrationOps
+
+    class FakeTable:
+        store = {"CPARAM": None, "FLAG": None, "ANTENNA1": None, "SPECTRAL_WINDOW_ID": None}
+
+        def open(self, path, nomodify=True):
+            return True
+
+        def getcol(self, name):
+            return FakeTable.store[name].copy()
+
+        def putcol(self, name, value):
+            FakeTable.store[name] = np.array(value)
+
+        def close(self):
+            pass
+
+    antennas = np.repeat([0, 1], 4)                                   # two antennas, four subbands each
+    amplitude = np.array([0.40, 0.44, 0.36, 0.40, 1.2, 1.3, 1.25, 0.3])
+    FakeTable.store.update(CPARAM=np.tile(amplitude.astype(complex), (2, 1, 1)), FLAG=np.zeros((2, 1, 8), bool),
+                           ANTENNA1=antennas, SPECTRAL_WINDOW_ID=np.tile(np.arange(4), 2))
+    ops = CasaCalibrationOps.__new__(CasaCalibrationOps)
+    ops._backend = type("B", (), {"tools": type("T", (), {"table": staticmethod(FakeTable)})()})()
+    monkeypatch.setattr(ops, "_table_antenna_names", lambda path: ["AA", "BB"])
+    dropped = ops._normalise_per_antenna(tmp_path, max_factor=2.0)
+    gains, flags = np.abs(FakeTable.store["CPARAM"][0, 0]), FakeTable.store["FLAG"][0, 0]
+    assert np.allclose(gains[:4], [1.0, 1.1, 0.9, 1.0])               # antenna level 0.40 removed, steps kept
+    assert not flags[:7].any() and flags[7]                            # 0.3 against ~1.22 is a factor 4: flagged
+    assert dropped == ["BB spw 3 pol 0", "BB spw 3 pol 1"]

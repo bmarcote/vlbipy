@@ -135,6 +135,63 @@ class DummyDataOps(DataOps):
         _log("get_subband_participation", project=project_code, n_antennas=len(antenna_names))
         return {name: tuple(range(8)) for name in antenna_names}
 
+    def read_autocorr_spectrum(self, project_code: str, *, field: str = "", scans: Optional[list] = None,
+                               column: str = "data", metadata=None, **kwargs) -> dict:
+        """Fabricate flat-ish autocorrelation amplitude spectra, one per antenna in the selection."""
+        meta = metadata or self.get_metadata(project_code, [f for f in field.split(",") if f], "EVN")
+        wanted = set(int(s) for s in scans) if scans else None
+        selected = [s for s in meta.scans if (wanted is None or s.scan_number in wanted)
+                    and (not field or s.source in field.split(","))]
+        antennas = sorted({a for s in selected for a in s.antennas}, key=list(meta.antennas).index)
+        n_spw, n_chan = meta.freq_setup.n_subbands, meta.freq_setup.n_channels
+        pols = [p.name for p in meta.freq_setup.polarizations if p.name in ("RR", "LL", "XX", "YY")]
+        spectra = {}
+        for index, antenna in enumerate(antennas):
+            ramp = [1.0 - 0.3 * abs(c - n_chan / 2) / (n_chan / 2) for c in range(n_chan)]
+            spectra[antenna] = [[[ramp[c] * (10.0 + index + 0.5 * p) for p in range(len(pols))]
+                                 for c in range(n_chan)] for _ in range(n_spw)]
+        _log("read_autocorr_spectrum", project=project_code, field=field, scans=scans, column=column,
+             n_antennas=len(antennas))
+        return {"antennas": antennas, "spectra": spectra, "n_spw": n_spw, "n_channels": n_chan,
+                "polarizations": pols, "frequencies_ghz": [meta.freq_setup.frequencies_ghz(s) for s in range(n_spw)],
+                "scans": list(scans or []), "field": field, "column": column}
+
+    def read_subband_phases(self, project_code: str, *, fields: list[str], refant: str,
+                            column: str = "corrected", metadata=None, **kwargs) -> dict:
+        """Fabricate flat (zero-offset) subband phases per calibrator scan and antenna."""
+        import numpy as np
+        meta = metadata or self.get_metadata(project_code, list(fields), "EVN")
+        scans = [s for s in meta.scans if s.source in set(fields)]
+        antennas = [a for a in meta.antennas if a != refant]
+        n_spw, n_pol = meta.freq_setup.n_subbands, 2
+        phases = {a: np.zeros((len(scans), n_spw, n_pol)) for a in antennas}
+        _log("read_subband_phases", project=project_code, fields=",".join(fields), refant=refant, column=column)
+        return {"antennas": antennas, "phases": phases, "refant": refant, "polarizations": ["RR", "LL"],
+                "scans": [{"scan": s.scan_number, "source": s.source, "time": 0.5 * (s.time_start + s.time_end)}
+                          for s in scans], "n_spw": n_spw, "column": column, "fields": list(fields)}
+
+    def read_total_visibility(self, project_code: str, *, fields: Optional[list[str]] = None,
+                              column: str = "corrected", metadata=None, **kwargs) -> dict:
+        """Fabricate a constant-flux light curve per source, one sample per integration."""
+        meta = metadata or self.get_metadata(project_code, list(fields or []), "EVN")
+        wanted = list(fields or meta.source_names)
+        sources: dict[str, dict[str, list]] = {}
+        for scan in meta.scans:
+            if scan.source not in wanted:
+                continue
+            entry = sources.setdefault(scan.source, {"times": [], "vis_sum": [], "n_vis": [], "scans": []})
+            n_baselines = len(scan.antennas) * (len(scan.antennas) - 1) // 2
+            n_vis = n_baselines * meta.freq_setup.n_subbands * meta.freq_setup.n_channels * 2
+            flux = 0.5 + (_seed(project_code, scan.source) % 100) / 50.0
+            step = max(scan.integration_time, 1.0)
+            for k in range(int(scan.duration_sec // step)):
+                entry["times"].append(scan.time_start + k * step)
+                entry["vis_sum"].append(complex(flux * n_vis, 0.0))
+                entry["n_vis"].append(n_vis)
+                entry["scans"].append(scan.scan_number)
+        _log("read_total_visibility", project=project_code, fields=",".join(wanted), column=column)
+        return {"sources": sources, "column": column, "time_start": meta.time_range[0]}
+
     def listobs(self, project_code: str, listfile: Optional[str] = None) -> dict:
         """Return a synthetic scan listing matching :meth:`get_metadata` (no file written)."""
         meta = self.get_metadata(project_code, [], "EVN")
@@ -278,7 +335,10 @@ class DummyFlagOps(FlagOps):
         spw = {i: {"flagged": 1500, "observable": 10000, "fraction": 0.15} for i in range(8)}
         _log("flag_summary", project=project_code, fraction=fraction)
         return {"flagged": int(fraction * 100000), "observable": 100000, "fraction": fraction,
-                "antenna": per_antenna, "spw": spw}
+                "antenna": per_antenna, "spw": spw,
+                "excluding_dead": {"flagged": int(fraction * 100000),
+                                   "observable": 100000, "fraction": fraction,
+                                   "excluded_antennas": []}}
 
     def measure_quack(self, project_code: str, *, field: str = "", threshold: float = 0.9,
                       **kwargs) -> dict:
@@ -402,13 +462,42 @@ class DummyPlotOps(PlotOps):
              outputs=",".join(paths))
         return paths
 
+    def autocorr(self, project_code: str, *, field: str = "", scans: Optional[list] = None,
+                 column: str = "data", label: str = "", **kwargs) -> str:
+        """Return the path a real autocorrelation-spectrum plot would be written to."""
+        tag = f".{label}" if label else ""
+        path = _synthetic_path(self.plot_dir(self.category_for_column(column)),
+                               f"{project_code}{tag}.autocorr.png")
+        _log("plot[autocorr]", project=project_code, field=field, scans=scans, column=column, output=path)
+        return path
+
     def radplot(self, project_code: str, *, field: str = "", column: str = "corrected",
-                time_bin: float = 10.0, label: str = "", **kwargs) -> str:
+                time_bin: float = 10.0, label: str = "", with_model: bool = False, **kwargs) -> str:
         """Return the path a real radplot would be written to."""
         tag = f".{label}" if label else ""
         path = _synthetic_path(self.plot_dir(self.category_for_column(column)),
                                f"{project_code}{tag}.radplot.{field or 'source'}.png")
-        _log("plot[radplot]", project=project_code, field=field, time_bin=time_bin, output=path)
+        _log("plot[radplot]", project=project_code, field=field, time_bin=time_bin, with_model=with_model,
+             output=path)
+        return path
+
+    def lightcurve(self, project_code: str, *, fields: Optional[list[str]] = None,
+                   column: str = "corrected", label: str = "", averaging_sec=None, **kwargs) -> str:
+        """Return the path a real total-amplitude light curve would be written to."""
+        tag = f".{label}" if label else ""
+        path = _synthetic_path(self.plot_dir(self.category_for_column(column)),
+                               f"{project_code}{tag}.lightcurve.png")
+        _log("plot[lightcurve]", project=project_code, fields=",".join(fields or []), column=column,
+             averaging_sec=averaging_sec, output=path)
+        return path
+
+    def subband_phases(self, project_code: str, *, fields: list[str], refant: str, column: str = "corrected",
+                       label: str = "", **kwargs) -> str:
+        """Return the path a real subband phase-jump plot would be written to."""
+        tag = f".{label}" if label else ""
+        path = _synthetic_path(self.plot_dir(self.category_for_column(column)),
+                               f"{project_code}{tag}.subband_phases.png")
+        _log("plot[subband_phases]", project=project_code, fields=",".join(fields), refant=refant, output=path)
         return path
 
     def timeseries(self, project_code: str, *, field: str = "", refant: str = "",
@@ -435,6 +524,13 @@ class DummyPlotOps(PlotOps):
         _log("plot[bandpass_profile]", project=project_code, output=path,
              n_edge=measurement.get("n_edge"))
         return path
+
+    def image_grid(self, project_code: str, images: dict, **kwargs) -> list[str]:
+        """Return one synthetic PNG path per source of the image grid."""
+        paths = [_synthetic_path(self.work_dir, "images", f"{project_code}.images.{source}.png")
+                 for source in images]
+        _log("plot[image_grid]", project=project_code, sources=",".join(images), outputs=",".join(paths))
+        return paths
 
     def scan_snr(self, project_code: str, survey: Optional[ScanSNRSurvey] = None,
                  **kwargs) -> list[str]:

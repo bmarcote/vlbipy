@@ -161,7 +161,9 @@ def test_clean_list_returns_imageset():
 def test_clean_wsclean_and_tclean_variants():
     obs = make_single()
     obs.import_data()
-    assert isinstance(obs.clean.wsclean(target="3C286"), Image)
+    # No robust given -> the configured sweep ([imaging].robust, three values by default).
+    sweep = obs.clean.wsclean(target="3C286")
+    assert isinstance(sweep, ImageSet) and [im.robust for im in sweep] == [-2.0, 0.0, 2.0]
     assert isinstance(obs.clean.tclean(target="3C286", robust=1), Image)
 
 
@@ -285,3 +287,20 @@ def test_vlbiobs_attributes_are_keyed_by_project_for_a_campaign():
     assert set(obs.antennas) == {"p1", "p2"}
     assert all(v is not None for v in obs.frequency.values())
     assert obs.per_project("observatory") == {"p1": "EVN", "p2": "EVN"}
+
+
+# -- export averaging --
+
+def test_export_averaging_defaults_apply_to_every_source():
+    obs = VLBIObs(project="RSM07", network="EVN", backend="dummy", target="3C286", phasecal="J1048+7143",
+                  fringe_finder="3C345", check_source="J1058+8114")["RSM07"]
+    assert obs.export.averaging("3C286") == ("10s", 4)                 # target: 4 channels
+    for name in ("J1048+7143", "3C345", "J1058+8114"):                 # calibrators: one channel per subband
+        assert obs.export.averaging(name) == ("10s", -1)
+
+
+def test_export_averaging_can_leave_the_target_at_full_resolution():
+    obs = VLBIObs(project="RSM07", network="EVN", backend="dummy", target="3C286", phasecal="J1048+7143",
+                  export={"average_targets": False})["RSM07"]
+    assert obs.export.averaging("3C286") == ("", 1)
+    assert obs.export.averaging("J1048+7143") == ("10s", -1)

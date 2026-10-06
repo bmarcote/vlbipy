@@ -204,10 +204,50 @@ class DataOps(BackendComponent):
         """Return time-averaged spectra on baselines to the reference antenna."""
         raise self._unsupported("read_spectrum")
 
+    def read_autocorr_spectrum(self, project_code: str, *, field: str = "", scans: Optional[list] = None,
+                               column: str = "data", **kwargs) -> dict:
+        """Return time-averaged autocorrelation amplitude spectra per antenna (parallel hands).
+
+        Returns
+        -------
+        dict
+            ``antennas``, ``spectra`` (``{antenna: (n_spw, n_chan, n_pol)}``), ``n_spw``,
+            ``n_channels``, ``polarizations``, ``frequencies_ghz``, ``scans``, ``field``, ``column``.
+        """
+        raise self._unsupported("read_autocorr_spectrum")
+
     def read_uvdistance(self, project_code: str, *, field: str = "", column: str = "corrected",
-                        time_bin: float = 10.0, **kwargs) -> dict:
-        """Return visibilities against uv distance, averaged per subband and in time."""
+                        time_bin: float = 10.0, with_model: bool = False, **kwargs) -> dict:
+        """Return visibilities against uv distance, averaged per subband and in time.
+
+        With ``with_model`` the MODEL_DATA column, when present, is binned the same
+        way and returned under ``model`` (``{"uvdist_mlambda", "values"}``).
+        """
         raise self._unsupported("read_uvdistance")
+
+    def read_total_visibility(self, project_code: str, *, fields: Optional[list[str]] = None,
+                              column: str = "corrected", **kwargs) -> dict:
+        """Return, per field and integration, the coherent sum of every unflagged cross-correlation.
+
+        Returns
+        -------
+        dict
+            ``sources`` (``{name: {"times", "vis_sum", "n_vis", "scans"}}``), ``column``,
+            ``time_start``.
+        """
+        raise self._unsupported("read_total_visibility")
+
+    def read_subband_phases(self, project_code: str, *, fields: list[str], refant: str,
+                            column: str = "corrected", **kwargs) -> dict:
+        """Return the time-averaged phase of every subband per scan and baseline to ``refant``.
+
+        Returns
+        -------
+        dict
+            ``antennas``, ``phases`` (``{antenna: (n_scan, n_spw, n_pol)}`` degrees), ``scans``
+            (``[{"scan", "source", "time"}]``), ``polarizations``, ``n_spw``, ``refant``, ``column``.
+        """
+        raise self._unsupported("read_subband_phases")
 
     def read_uv_coverage(self, project_code: str, *, field: str = "", **kwargs) -> dict:
         """Return the sampled (u, v) points per source, in wavelengths.
@@ -224,9 +264,10 @@ class DataOps(BackendComponent):
         """
         raise self._unsupported("read_uv_coverage")
 
-    def read_timeseries(self, project_code: str, *, field: str = "", refant: str = "",
-                        column: str = "corrected", max_time_bins: int = 300, **kwargs) -> dict:
-        """Return amplitude/phase vs time per baseline, averaged over frequency."""
+    def read_timeseries(self, project_code: str, *, field: str = "", scans: Optional[list] = None,
+                        refant: str = "", column: str = "corrected", max_time_bins: int = 300,
+                        **kwargs) -> dict:
+        """Return amplitude/phase vs time per baseline, optionally restricted to exact scans."""
         raise self._unsupported("read_timeseries")
 
     def read_dynamic_spectra(self, project_code: str, *, field: str = "",
@@ -325,18 +366,21 @@ class CalibrationOps(BackendComponent):
         raise self._unsupported("smooth")
 
     def apply(self, project_code: str, field: str, tables: list[CalTable], **kwargs) -> None:
-        """Apply the accumulated calibration tables to a field."""
+        """Apply the accumulated calibration tables to a field.
+
+        Backends should default to explicit parallel ``gaintable``/
+        ``gainfield``/``interp``/``spwmap``/``calwt`` parameters and only use a
+        cal-library file when ``callib=True`` is passed.
+        """
         raise self._unsupported("apply")
 
     def write_callib(self, project_code: str, tables: list[CalTable], **kwargs) -> "Path":
         """Write the list of tables to apply, in order, and return the file's path.
 
-        Every point where calibration is applied — the apply step and the
-        on-the-fly priors of each solve — should go through this rather than
-        assembling parallel table/interpolation/mapping lists, so what was
-        applied stays a readable artefact next to the data. Backends whose
-        toolkit has no equivalent may leave this unimplemented; the pipeline
-        only requires it for provenance, not for correctness.
+        The cal-library form is used when ``callib=True`` is requested; the
+        default mode assembles explicit parallel lists directly.  This helper
+        stays available for provenance and for callers that explicitly opt in.
+        Backends whose toolkit has no equivalent may leave this unimplemented.
         """
         raise self._unsupported("write_callib")
 
@@ -535,15 +579,31 @@ class PlotOps(BackendComponent):
         """Plot amplitude/phase vs channel of the (calibrated) data, one panel per baseline."""
         raise self._unsupported("spectrum")
 
+    def autocorr(self, project_code: str, *, field: str = "", scans: Optional[list] = None,
+                 column: str = "data", label: str = "", **kwargs) -> str:
+        """Plot the autocorrelation amplitude spectra, one panel per antenna."""
+        raise self._unsupported("autocorr")
+
     def radplot(self, project_code: str, *, field: str = "", column: str = "corrected",
-                time_bin: float = 10.0, label: str = "", **kwargs) -> str:
-        """Plot amplitude and phase vs uv distance for one source."""
+                time_bin: float = 10.0, label: str = "", with_model: bool = False, **kwargs) -> str:
+        """Plot amplitude and phase vs uv distance for one source (optionally with the model)."""
         raise self._unsupported("radplot")
 
-    def timeseries(self, project_code: str, *, field: str = "", refant: str = "",
-                   column: str = "corrected", label: str = "", **kwargs) -> list[str]:
-        """Plot amplitude/phase vs time per baseline, in the stacked two-panel layout."""
+    def lightcurve(self, project_code: str, *, fields: Optional[list[str]] = None,
+                   column: str = "corrected", label: str = "", averaging_sec=None, **kwargs) -> str:
+        """Plot the coherently summed total visibility amplitude vs time, one row per source."""
+        raise self._unsupported("lightcurve")
+
+    def timeseries(self, project_code: str, *, field: str = "", scans: Optional[list] = None,
+                   refant: str = "", column: str = "corrected", label: str = "",
+                   **kwargs) -> list[str]:
+        """Plot amplitude/phase vs time per baseline for an optional scan selection."""
         raise self._unsupported("timeseries")
+
+    def subband_phases(self, project_code: str, *, fields: list[str], refant: str, column: str = "corrected",
+                       label: str = "", **kwargs) -> str:
+        """Plot the residual per-scan phase offsets between subbands on baselines to ``refant``."""
+        raise self._unsupported("subband_phases")
 
     def baseline_corner(self, project_code: str, *, field: str = "", column: str = "corrected",
                         quantity: str = "phase", **kwargs) -> str:
@@ -553,6 +613,10 @@ class PlotOps(BackendComponent):
     def bandpass_profile(self, project_code: str, measurement: dict, **kwargs) -> str:
         """Plot the per-channel amplitude / phase-scatter / flagged profile of the band."""
         raise self._unsupported("bandpass_profile")
+
+    def image_grid(self, project_code: str, images: dict, **kwargs) -> list[str]:
+        """Plot FITS images side by side per source (``{source: {robust: fits_path}}``); one PNG per source."""
+        raise self._unsupported("image_grid")
 
 
 class ExportOps(BackendComponent):
