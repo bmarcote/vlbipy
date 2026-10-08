@@ -230,6 +230,7 @@ src/vlbipy/
 ├── models.py             # Data model (Antenna, Source, FreqSetup, Scan, CalTable, ...)
 ├── config.py             # Three-layer TOML config loading
 ├── cli.py                 # CLI entry point (one subcommand per stage)
+├── _version.py            # __version__, read from pyproject.toml (never hard-coded)
 ├── sources.py             # SourceSet: roles, phase referencing
 ├── state.py               # Persisted step state (resume / --from-step / --scratch)
 ├── plotting.py            # Diagnostic plots

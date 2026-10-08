@@ -159,6 +159,41 @@ def test_list_steps_with_project_shows_recorded_status(tmp_path, capsys):
     assert "Pipeline steps of TS01" in out and "import_data" in out and "--from-step" in out
 
 
+def test_version_option_prints_the_pyproject_version(capsys):
+    """`vlbipy --version` prints the version written in pyproject.toml (and nothing is hard-coded)."""
+    import tomllib
+    from pathlib import Path
+    import vlbipy
+    with (Path(__file__).resolve().parents[1] / "pyproject.toml").open("rb") as handle:
+        declared = tomllib.load(handle)["project"]["version"]
+    with pytest.raises(SystemExit) as stop:
+        main(["--version"])
+    assert stop.value.code == 0
+    assert capsys.readouterr().out.strip() == f"vlbipy {declared}"
+    assert vlbipy.__version__ == declared
+
+
+def test_version_is_read_from_pyproject_with_metadata_fallback(tmp_path):
+    """The version follows pyproject.toml at once; without one the installed metadata answers."""
+    from importlib import metadata
+    from vlbipy._version import UNKNOWN_VERSION, pyproject_version, read_version
+    ours = tmp_path / "pyproject.toml"
+    ours.write_text('[project]\nname = "vlbipy"\nversion = "9.8.7"\n')
+    assert pyproject_version(ours) == "9.8.7" and read_version(ours) == "9.8.7"
+    try:
+        installed = metadata.version("vlbipy")
+    except metadata.PackageNotFoundError:
+        installed = UNKNOWN_VERSION
+    other = tmp_path / "other.toml"
+    other.write_text('[project]\nname = "something-else"\nversion = "1.0"\n')
+    broken = tmp_path / "broken.toml"
+    broken.write_text("[project\nname = ")
+    dynamic = tmp_path / "dynamic.toml"
+    dynamic.write_text('[project]\nname = "vlbipy"\ndynamic = ["version"]\n')
+    for path in (other, broken, dynamic, tmp_path / "missing.toml"):
+        assert pyproject_version(path) == "" and read_version(path) == installed
+
+
 def _dummy_config(tmp_path) -> str:
     """Write a config pointing the working directory at ``tmp_path``; returns its path."""
     path = tmp_path / "cfg.toml"

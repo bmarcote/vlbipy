@@ -24,6 +24,7 @@ from typing import Optional
 
 from rich_argparse import RawDescriptionRichHelpFormatter, RichHelpFormatter
 
+from ._version import __version__
 from .logging_utils import configure_logging, get_logger
 from .models import CalTable
 from .registry import get_backend
@@ -156,6 +157,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="Backend-agnostic VLBI data reduction suite (API-first).",
         formatter_class=RawDescriptionRichHelpFormatter,
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}",
+                        help="Show the vlbipy version (from pyproject.toml) and exit")
     sub = parser.add_subparsers(dest="command", required=True, metavar="{" + ",".join(COMMANDS) + "}")
 
     p_pipe = sub.add_parser(
@@ -632,7 +635,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     """
     argv = list(sys.argv[1:] if argv is None else argv)
     # Default form: `vlbipy -p CODE ...` (no subcommand) is treated as `vlbipy pipeline ...`.
-    if argv and argv[0].startswith("-") and argv[0] not in ("-h", "--help"):
+    if argv and argv[0].startswith("-") and argv[0] not in ("-h", "--help", "--version"):
         argv.insert(0, "pipeline")
 
     # `--list-steps` needs no project: without one, print the plain list before -p is required.

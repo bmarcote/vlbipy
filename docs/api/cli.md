@@ -24,6 +24,9 @@ vlbipy export -p rsm07 ...
 # Summary only
 vlbipy summary -p rsm07
 
+# Installed version (the one written in pyproject.toml)
+vlbipy --version
+
 # Control what re-runs
 vlbipy pipeline -p rsm07 --from-step bandpass   # redo that step and everything after
 vlbipy pipeline -p rsm07 --scratch              # forget all progress and start over

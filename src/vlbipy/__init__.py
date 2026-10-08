@@ -14,6 +14,7 @@ Public entry point::
 reduction through callable namespaces. In this milestone all work runs on an
 in-memory ``dummy`` backend (no CASA, no files). See ``docs/PRD.md``.
 """
+from ._version import __version__
 from .config import load_config
 from .errors import BackendError, ConfigError, PluginError, SourceNotFoundError, StepError
 from .fitsidi import find_fitsidi_files, inspect_fitsidi
@@ -29,8 +30,6 @@ from .vlbiobs import VLBIObs
 
 # Explicitly import backends so they're available
 from .backends import get_backend  # noqa: F401
-
-__version__ = "0.2.0"
 
 __all__ = [
     "VLBIObs", "Observation", "load_config", "configure_logging",

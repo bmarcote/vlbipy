@@ -16,6 +16,9 @@ vlbipy <command> -p <project> [-t TARGET] [--phasecal NAME] [--fringe-finder NAM
 | `plot` | produce diagnostic plots |
 | `export` | split per source and export |
 
+`vlbipy --version` prints the installed version, which is the `version` written
+in `pyproject.toml`.
+
 ## A worked reduction
 
 ```bash
