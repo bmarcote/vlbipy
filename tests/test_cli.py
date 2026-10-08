@@ -140,3 +140,27 @@ def test_existing_project_plot_path_is_unchanged():
 def test_check_source_option_is_parsed():
     args = parse(["pipeline", "-p", "RSM07", "-t", "3C286", "--check-source", "J1048+7143"])
     assert args.check_source == ["J1048+7143"]
+
+
+def test_list_steps_without_project_prints_every_step(capsys):
+    """`vlbipy pipeline --list-steps` needs no project and lists the steps in execution order."""
+    from vlbipy.observation import STEP_ORDER
+    assert main(["pipeline", "--list-steps"]) == 0
+    assert main(["--list-steps"]) == 0                      # the default subcommand is the pipeline
+    listed = [line.split()[1] for line in capsys.readouterr().out.splitlines() if line[:3].strip().isdigit()]
+    assert listed == STEP_ORDER * 2
+
+
+def test_list_steps_with_project_shows_recorded_status(tmp_path, capsys):
+    """With -p the listing carries the status recorded for each step of that project."""
+    assert main(["pipeline", "-p", "TS01", "--backend", "dummy", "--target", "SRC", "--list-steps",
+                 "--config", _dummy_config(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "Pipeline steps of TS01" in out and "import_data" in out and "--from-step" in out
+
+
+def _dummy_config(tmp_path) -> str:
+    """Write a config pointing the working directory at ``tmp_path``; returns its path."""
+    path = tmp_path / "cfg.toml"
+    path.write_text(f'[global]\nwork_dir = "{tmp_path}"\n')
+    return str(path)

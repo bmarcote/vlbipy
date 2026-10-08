@@ -263,6 +263,86 @@ def write_fringe_table(path, ms_path, *, times, field_ids, spw_ids, antenna_ids,
     return path
 
 
+def write_jones_table(path, ms_path, *, viscal, times, field_ids, spw_ids, antenna_ids, scan_numbers,
+                      cparam, flag, snr, paramerr=None, intervals=None, refant_ids=None, spw_chan_freq=None,
+                      spw_chan_width=None):
+    """Write standard CASA B/G Jones table rows from complex antenna solutions.
+
+    ``cparam``, ``flag`` and ``snr`` use row-major ``(nrow, nchan, npol)`` arrays.
+    A per-channel (B Jones) table copies the MS spectral-window grid verbatim. A
+    channel-averaged (G Jones) table must describe one channel per subband or CASA
+    aborts reading it: pass ``spw_chan_freq`` / ``spw_chan_width`` (one value per
+    MS subband: the mean frequency and total width of the averaged channels).
+    ``refant_ids`` fills ANTENNA2 with the reference antenna of each row, as CASA
+    does (-1 when omitted).
+    """
+    import casatools
+
+    path, ms_path = Path(path).absolute(), Path(ms_path).absolute()
+    values = np.asarray(cparam, dtype=np.complex64)
+    nrow = int(np.asarray(times).size)
+    if values.ndim != 3 or values.shape[0] != nrow:
+        raise ValueError(f"cparam must have shape (nrow, nchan, npol), got {values.shape}")
+    nchan, npol = values.shape[1:]
+    flags = np.asarray(flag, dtype=bool)
+    snrs = np.asarray(snr, dtype=np.float32)
+    errors = np.zeros(values.shape, dtype=np.float32) if paramerr is None else np.asarray(paramerr, dtype=np.float32)
+    if flags.shape != values.shape or snrs.shape != values.shape or errors.shape != values.shape:
+        raise ValueError("flag, snr and paramerr must match cparam shape")
+    if (spw_chan_freq is None) != (spw_chan_width is None):
+        raise ValueError("spw_chan_freq and spw_chan_width must be given together")
+    vectors = {
+        "TIME": _as_row_array("times", times, nrow, np.float64),
+        "FIELD_ID": _as_row_array("field_ids", field_ids, nrow, np.int32),
+        "SPECTRAL_WINDOW_ID": _as_row_array("spw_ids", spw_ids, nrow, np.int32),
+        "ANTENNA1": _as_row_array("antenna_ids", antenna_ids, nrow, np.int32),
+        "ANTENNA2": (np.full(nrow, -1, dtype=np.int32) if refant_ids is None else
+                     _as_row_array("refant_ids", refant_ids, nrow, np.int32)),
+        "INTERVAL": (np.zeros(nrow, dtype=np.float64) if intervals is None else
+                     _as_row_array("intervals", intervals, nrow, np.float64)),
+        "SCAN_NUMBER": _as_row_array("scan_numbers", scan_numbers, nrow, np.int32),
+        "OBSERVATION_ID": np.zeros(nrow, dtype=np.int32),
+    }
+    desc = {"TIME": _scalar_column("double", keywords=_epoch_keywords(), option=5),
+            "FIELD_ID": _scalar_column("int", option=5), "SPECTRAL_WINDOW_ID": _scalar_column("int", option=5),
+            "ANTENNA1": _scalar_column("int", option=5), "ANTENNA2": _scalar_column("int", option=5),
+            "INTERVAL": _scalar_column("double", keywords={"QuantumUnits": np.array(["s"])}, option=5),
+            "SCAN_NUMBER": _scalar_column("int", option=5), "OBSERVATION_ID": _scalar_column("int", option=5),
+            "CPARAM": _array_column("complex", ndim=2, shape=[npol, nchan]),
+            "PARAMERR": _array_column("float", ndim=2, shape=[npol, nchan]),
+            "FLAG": _array_column("boolean", ndim=2, shape=[npol, nchan]),
+            "SNR": _array_column("float", ndim=2, shape=[npol, nchan]),
+            "WEIGHT": _array_column("float", ndim=2, shape=[npol, nchan])}
+    columns = list(desc)
+    if path.exists():
+        shutil.rmtree(path)
+    tb = casatools.table()
+    tb.create(str(path), desc, dminfo=_dminfo(columns))
+    tb.addrows(nrow)
+    for name, column in vectors.items():
+        tb.putcol(name, column)
+    for name, column in (("CPARAM", values), ("PARAMERR", errors), ("FLAG", flags), ("SNR", snrs),
+                         ("WEIGHT", np.where(flags, 0.0, 1.0).astype(np.float32))):
+        tb.putcol(name, np.asfortranarray(column.transpose(2, 1, 0)))
+    tb.putinfo({"type": "Calibration", "subType": viscal, "readme": ""})
+    for key, value in {"ParType": "Complex", "MSName": ms_path.name, "VisCal": viscal,
+                       "PolBasis": "unknown", "CASA_Version": "vlbipy"}.items():
+        tb.putkeyword(key, value)
+    tb.close()
+
+    subtables = {name: _copy_subtable(ms_path, name, path) for name in ("OBSERVATION", "ANTENNA", "FIELD")}
+    if spw_chan_freq is None:
+        subtables["SPECTRAL_WINDOW"] = _copy_subtable(ms_path, "SPECTRAL_WINDOW", path)
+    else:
+        subtables["SPECTRAL_WINDOW"] = _write_spectral_window(path, ms_path, spw_chan_freq, spw_chan_width)
+    subtables["HISTORY"] = _write_history_table(path)
+    tb.open(str(path), nomodify=False)
+    for name, sub_path in subtables.items():
+        tb.putkeyword(name, f"Table: {sub_path}")
+    tb.close()
+    return path
+
+
 def read_fringe_table(path) -> dict:
     """Read a fringe caltable written by CASA or `write_fringe_table`.
 

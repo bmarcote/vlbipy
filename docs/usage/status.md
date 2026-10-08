@@ -24,6 +24,9 @@ antennas, 4 × 64 channels) on the CASA backend unless noted.
 | Export | per-source measurement sets and Difmap-ready UVFITS |
 | Diagnostics | spectrum, time series, per-baseline corner, radplot, all calibration tables |
 | Global fringe fit | dispersive (ionospheric) delay solved below 6 GHz; `--no-ionos` to disable |
+| LBA (DiFX) | `<CODE>.FITS` + `.antab` + `.uvflg` found beside the working directory; Tsys / gain curves appended in place; ACCOR and EOP corrections; tested on V589 (4 epochs, 8.4 GHz, dask-ms backend) |
+| Polarization-aware instrumental calibration | an antenna with one dead polarization, or one that appears only in other scans, keeps what it has |
+| Campaigns | per-epoch calibration, joint phase-calibrator model, per-epoch refinement, combined images (`combine()`) |
 | Bookkeeping | persistent step state and calibration chain, resume / `--from-step` / `--scratch`, run log |
 
 ## Not implemented
@@ -31,12 +34,12 @@ antennas, 4 × 64 channels) on the CASA backend unless noted.
 - **Imaging** — `image.clean` is not written for CASA. `run()` skips it with a
   warning rather than failing.
 - **Self-calibration** — the loop exists on the dummy backend only.
-- **Multi-epoch combination** beyond `merge()`.
 - **Spectral line, multi-phase-centre, pulsar binning** modes.
 - **Polarization calibration** (RL delay, RL phase, D-terms).
 - **AIPS backend** — component interfaces exist; every method is a stub.
 - **VLBA / LBA automatic download** — manual-download instructions only. The
-  rest of the VLBA/LBA path (ACCOR, EOP) is written but untested on real data.
+  VLBA path (ACCOR, EOP) shares the DiFX code tested on LBA data but has not been
+  run on VLBA data.
 - **Dashboard and Jupyter notebook generation.**
 
 ## Known limitations
@@ -56,11 +59,14 @@ antennas, 4 × 64 channels) on the CASA backend unless noted.
 
 | | CASA | dask-ms | AIPS | dummy |
 |---|---|---|---|---|
-| Import & metadata | yes | reads a zarr store | stub | synthetic |
-| Calibration | yes | a-priori only | stub | synthetic |
-| Flagging | yes | — | stub | synthetic |
-| Imaging | — | — | stub | synthetic |
-| Export | yes | — | stub | synthetic |
+| Import & metadata | yes | via CASA; lazy data access: yes (MS or zarr store) | stub | synthetic |
+| Calibration | yes | fringe fit, bandpass, gain, applycal: yes (numpy, parallel); the rest via CASA | stub | synthetic |
+| Flagging | yes | via CASA | stub | synthetic |
+| Imaging | — | yes (difmapy, always) | stub | synthetic |
+| Export | yes | via CASA | stub | synthetic |
+
+`dask-ms` is the CASA backend with the calibration engine replaced; see
+[Backends](../backends/index.md#the-dask-ms-backend).
 
 `backend.capabilities()` reports this at runtime for whatever you have
 installed.

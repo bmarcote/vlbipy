@@ -179,3 +179,112 @@ def find_flat_range(profile: np.ndarray, *, threshold: float = 6.0,
     while (n_channels - 1 - last) < max_trim and deviates(last):
         last -= 1
     return (first, last)
+
+
+def normalised_baseline_amplitude(amplitude: np.ndarray, scan_index: np.ndarray, *,
+                                  window: int = 5) -> tuple[np.ndarray, np.ndarray]:
+    """Divide every baseline's amplitude by its own level, scan by scan.
+
+    The level of a baseline in a scan is the median over ``window`` scans (centred
+    on it) of the scan medians: one bad scan, or a scan that is bad for most of
+    its length, does not set its own reference.
+
+    Parameters
+    ----------
+    amplitude : numpy.ndarray
+        ``(n_antenna, n_antenna, n_time)`` amplitudes, symmetric, ``nan`` where there is no data.
+    scan_index : numpy.ndarray
+        Scan number of every time sample.
+    window : int
+        Number of scans the level is taken over.
+
+    Returns
+    -------
+    (ratio, scatter)
+        ``ratio`` has the shape of ``amplitude`` (1 = the baseline's level); ``scatter`` is the
+        robust relative scatter of each baseline over the whole track, ``(n_antenna, n_antenna)``.
+    """
+    import warnings
+    scans = np.unique(scan_index)
+    ratio = np.full(amplitude.shape, np.nan)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)           # all-nan slices: baselines without data
+        medians = np.stack([np.nanmedian(amplitude[:, :, scan_index == s], axis=2) for s in scans], axis=2)
+        half = max(1, int(window)) // 2
+        for k, scan in enumerate(scans):
+            level = np.nanmedian(medians[:, :, max(0, k - half):k + half + 1], axis=2)
+            level = np.where(level > 0, level, np.nan)
+            ratio[:, :, scan_index == scan] = amplitude[:, :, scan_index == scan] / level[:, :, np.newaxis]
+        centre = np.nanmedian(ratio, axis=2, keepdims=True)
+        scatter = 1.4826 * np.nanmedian(np.abs(ratio - centre), axis=2)
+    return ratio, scatter
+
+
+def antenna_on_source_fraction(ratio: np.ndarray, usable: np.ndarray, *, iterations: int = 30,
+                               prior: float = 0.05) -> tuple[np.ndarray, np.ndarray]:
+    """Split normalised baseline amplitudes into one factor per antenna and time sample.
+
+    Solves ``ratio[i, j, t] ~ g[i, t] * g[j, t]`` for every time sample at once:
+    an antenna that is off source (still slewing, a dropout) pulls *all* its
+    baselines down together and comes out with a small ``g``, while the antennas
+    it is correlated with keep theirs near 1. This is what tells "this antenna
+    is late" from "its partner is late", which no per-baseline cut can.
+
+    ``prior`` is a weak pull towards 1 that keeps the solution defined when an
+    antenna has no partner on source. A group of antennas that are all off
+    together still comes out low, and so does an antenna whose every partner is
+    off - none of its baselines is usable at that moment anyway.
+
+    Parameters
+    ----------
+    ratio : numpy.ndarray
+        ``(n_antenna, n_antenna, n_time)``, symmetric, 1 = the baseline's own level, ``nan`` = no data.
+    usable : numpy.ndarray
+        ``(n_antenna, n_antenna)`` boolean: baselines steady enough to be trusted.
+
+    Returns
+    -------
+    (gains, n_baselines)
+        ``gains`` ``(n_antenna, n_time)`` and the number of usable baselines with
+        data each one rests on.
+    """
+    weight = (np.isfinite(ratio) & usable[:, :, np.newaxis]).astype(float)
+    values = np.where(weight > 0, np.clip(np.nan_to_num(ratio), 0.0, 3.0), 0.0)
+    gains = np.ones((ratio.shape[0], ratio.shape[2]))
+    for _ in range(int(iterations)):
+        numerator = np.einsum("ijt,jt->it", weight * values, gains) + prior
+        denominator = np.einsum("ijt,jt->it", weight, gains ** 2) + prior
+        gains = np.clip(0.5 * (gains + numerator / denominator), 0.0, 3.0)
+    return gains, weight.sum(axis=1).astype(int)
+
+
+def detect_off_source(amplitude: np.ndarray, scan_index: np.ndarray, *, level: float = 0.8,
+                      max_scatter: float = 0.3, min_baselines: int = 2) -> dict:
+    """Find the time samples at which an antenna was not on source, from calibrated amplitudes.
+
+    Parameters
+    ----------
+    amplitude : numpy.ndarray
+        ``(n_antenna, n_antenna, n_time)`` calibrated amplitudes of one bright
+        source (channel-averaged), symmetric, ``nan`` where flagged.
+    scan_index : numpy.ndarray
+        Scan number of every time sample.
+    level : float
+        An antenna counts as off source when its factor (see
+        :func:`antenna_on_source_fraction`) is below this.
+    max_scatter : float
+        Baselines whose relative scatter exceeds this are too noisy to vote.
+    min_baselines : int
+        Samples resting on fewer usable baselines are left undecided.
+
+    Returns
+    -------
+    dict
+        ``off`` and ``judged`` ``(n_antenna, n_time)`` booleans, ``gains``, and
+        ``usable`` ``(n_antenna, n_antenna)``.
+    """
+    ratio, scatter = normalised_baseline_amplitude(amplitude, scan_index)
+    usable = np.isfinite(scatter) & (scatter < max_scatter)
+    gains, n_baselines = antenna_on_source_fraction(ratio, usable)
+    judged = n_baselines >= int(min_baselines)
+    return {"off": judged & (gains < level), "judged": judged, "gains": gains, "usable": usable}

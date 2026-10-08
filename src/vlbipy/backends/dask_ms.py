@@ -1,10 +1,27 @@
-"""Dask-MS backend: the observation as lazy dask-ms datasets backed by a zarr store.
+"""Dask-MS backend: the CASA pipeline with the calibration engine replaced by fast numpy solvers.
 
-Importing with this backend produces, next to the measurement set, a *dask-ms
-zarr store* (``<code>.zarr``) holding the full MS content (main table partitioned
-by FIELD_ID/DATA_DESC_ID, plus all subtables). After conversion every operation
-(metadata, ``get_data``) reads only the zarr store: lazy, chunked, and free of
-any CASA/casacore dependency.
+The measurement set stays the single source of truth. CASA still imports, flags
+and exports it; what changes is every step that used to dominate the run time:
+
+* fringe fitting (single-band delay, multi-band delay, the per-scan SNR survey),
+* bandpass and gain solves,
+* the application of the calibration (``applycal``),
+* imaging, which always runs in difmapy on the per-source splits (``imager =
+  "difmap"`` on the backend): a request for tclean or WSClean is redirected.
+
+Those read and write the measurement set directly, in parallel worker processes,
+through :mod:`vlbipy.solvers` (``fringefit_task``, ``gain_task``, ``apply_task``),
+and write ordinary CASA calibration tables, so the two backends can be mixed
+freely on the same working directory. A request the fast engine does not cover
+(a cal library, ``bandtype='BPOLY'``, ...) falls back to the CASA task with a
+warning.
+
+The visibilities are also exposed as lazy dask-ms datasets (``get_data``), from
+the measurement set or, when one was written, from a *dask-ms zarr store*
+(``<code>.zarr``: main table partitioned by FIELD_ID/DATA_DESC_ID plus all
+subtables). The store is optional (``[import].zarr_store`` or ``vlbipy export``)
+and read-only as far as the pipeline is concerned; it is enough on its own to
+rebuild the metadata after the measurement set has been deleted.
 
 Two conversion paths produce identical stores:
 
@@ -14,13 +31,8 @@ Two conversion paths produce identical stores:
   python-casacore is broken (it segfaults on some macOS builds, so health is
   probed in a subprocess) or not installed.
 
-The FITS-IDI -> MS step itself is delegated to
-:class:`~vlbipy.backends.casa.CasaBackend` (importfitsidi is CASA-only).
 """
-import functools
 import shutil
-import subprocess
-import sys
 from pathlib import Path
 from typing import Optional
 
@@ -29,7 +41,8 @@ import numpy as np
 from ..errors import BackendError
 from ..logging_utils import get_logger, warnings
 from ..models import Antenna, FreqSetup, ObsMetadata, Scan, Stokes
-from .base import Backend, CalibrationOps, DataOps, PlotOps
+from ..solvers.msio import table_engine
+from .casa import CasaBackend, CasaCalibrationOps, CasaDataOps
 
 logger = get_logger()
 
@@ -56,19 +69,9 @@ _VALUETYPE_DTYPES = {"complex": np.complex64, "dcomplex": np.complex128, "float"
                      "short": np.int16, "boolean": np.bool_}
 
 
-@functools.cache
 def _casacore_is_healthy() -> bool:
-    """Return True if python-casacore imports cleanly (probed in a subprocess).
-
-    A broken python-casacore wheel segfaults on import (seen on macOS), which
-    cannot be caught in-process; the probe isolates the crash.
-    """
-    probe = subprocess.run([sys.executable, "-c", "import casacore.tables"],
-                           capture_output=True, timeout=120)
-    healthy = probe.returncode == 0
-    logger.debug("python-casacore probe: {}", "healthy" if healthy else
-                 f"unusable (exit {probe.returncode})")
-    return healthy
+    """Return True if python-casacore imports cleanly on this machine (see :func:`vlbipy.solvers.msio.table_engine`)."""
+    return table_engine() == "casacore"
 
 
 def _column_dims(name: str, ndim: int) -> tuple[str, ...]:
@@ -285,22 +288,21 @@ def ms_to_daskms(ms, store, chunk_rows: int = _DEFAULT_CHUNK_ROWS) -> Path:
     return store
 
 
-class DaskMsDataOps(DataOps):
-    """Import to a zarr store and read metadata from it (no CASA after import)."""
+class DaskMsDataOps(CasaDataOps):
+    """CASA data operations plus lazy dask-ms access and the optional zarr store."""
+
+    def _has_ms(self, project_code: str) -> bool:
+        """True when the project's measurement set is on disk."""
+        return self.backend.ms_path(project_code).is_dir()
 
     def is_imported(self, project_code: str) -> bool:
-        """Return True if the project's dask-ms store already exists."""
-        return self.backend.store_path(project_code).is_dir()
+        """Return True if the measurement set or, failing that, the dask-ms store exists."""
+        return self._has_ms(project_code) or self.backend.store_path(project_code).is_dir()
 
     def import_data(self, project_code: str, source_names: list[str], *, scan_gap: int = 15,
-                    files: Optional[list[str]] = None, delete: bool = False,
-                    keep_ms: bool = False, **kwargs) -> None:
-        """Import FITS-IDI files to an MS (via CASA), convert to a dask-ms store, drop the MS.
-
-        The zarr store is the primary data product: all further processing
-        (metadata, calibration) reads it, so the intermediate MS is removed
-        after a successful conversion unless ``keep_ms`` is set
-        (``[import].keep_ms`` in the config).
+                    files: Optional[list[str]] = None, delete: bool = False, mms: bool = True,
+                    zarr_store: bool = False, **kwargs) -> None:
+        """Import FITS-IDI files to a measurement set (CASA) and optionally convert it to a dask-ms store.
 
         Parameters
         ----------
@@ -313,55 +315,63 @@ class DaskMsDataOps(DataOps):
         files : list of str
             The FITS-IDI files, in order.
         delete : bool
-            Redo both the MS and the store if they exist.
-        keep_ms : bool
-            Keep the intermediate measurement set instead of removing it.
+            Redo the MS (and the store) if they exist.
+        mms : bool
+            Write a Multi-MS (default). Its parts are what the calibration application parallelises over, so
+            a plain MS makes that step several times slower.
+        zarr_store : bool
+            Also write ``<code>.zarr`` (``[import].zarr_store``): a compact copy for lazy access and for
+            rebuilding the report after the MS is gone. The pipeline itself never reads it.
         """
         store = self.backend.store_path(project_code)
-        if store.is_dir():
-            if not delete:
-                logger.info("dask-ms store {} already exists; skipping import", store)
-                return
+        if store.is_dir() and not self._has_ms(project_code) and not delete:
+            logger.info("dask-ms store {} already exists and there is no measurement set; skipping import", store)
+            return
+        kwargs.pop("keep_ms", None)  # legacy option: the measurement set is always kept now
+        super().import_data(project_code, source_names, scan_gap=scan_gap, files=files, delete=delete, mms=mms,
+                            **kwargs)
+        if store.is_dir() and delete:
             logger.warning("removing existing dask-ms store {}", store)
             shutil.rmtree(store)
-        from .casa import CasaBackend
-        casa = CasaBackend(work_dir=str(self.work_dir))
-        kwargs.pop("mms", None)  # the intermediate MS is removed after conversion: plain MS suffices
-        casa.data.import_data(project_code, source_names, scan_gap=scan_gap, files=files,
-                              delete=delete, mms=False, **kwargs)
-        ms = casa.ms_path(project_code)
-        ms_to_daskms(ms, store)
-        # gencal (the a_priori step) needs the MS, which is about to be removed:
-        # pre-generate the a-priori caltables now; a_priori() registers them later.
-        apriori_ok = True
-        try:
-            casa.calibrate.a_priori(project_code, field="", needs_eop=kwargs.get("needs_eop", False))
-        except Exception as exc:  # noqa: BLE001 - keep the MS so a_priori can be retried
-            apriori_ok = False
-            warnings.anomaly(f"{project_code}: could not pre-generate the a-priori caltables "
-                             f"({exc}); keeping the MS so the a_priori step can retry")
-        if keep_ms or not apriori_ok:
-            logger.info("keeping the intermediate MS {}", ms.name)
-        elif not (store / "MAIN").is_dir():
-            raise BackendError(f"store {store} has no MAIN table after conversion; "
-                               f"keeping the MS {ms} for safety")
-        else:
-            shutil.rmtree(ms)
-            logger.info("removed intermediate MS {}; the dask-ms store is now the primary "
-                        "data product", ms.name)
+        if zarr_store and not store.is_dir():
+            ms_to_daskms(self.backend.ms_path(project_code), store)
 
     # -- data access --
-    def datasets(self, project_code: str) -> list:
-        """Return the main-table partitions as lazy dask-ms datasets."""
+    def _store_datasets(self, project_code: str) -> list:
+        """Return the main-table partitions of the zarr store as lazy dask-ms datasets."""
         from daskms.experimental.zarr import xds_from_zarr
         store = self.backend.store_path(project_code)
         if not store.is_dir():
             raise BackendError(f"dask-ms store not found: {store} (run import_data first)")
         return xds_from_zarr(str(store))
 
+    def datasets(self, project_code: str) -> list:
+        """Return the visibilities as lazy dask-ms datasets: from the zarr store when there is one, else the MS.
+
+        The store is a snapshot taken at import or export time; the measurement set carries the current flags
+        and the corrected data, so read it (delete or re-export the store) when those matter.
+        """
+        if self.backend.store_path(project_code).is_dir():
+            return self._store_datasets(project_code)
+        ms = self.backend.ms_path(project_code)
+        if not ms.is_dir():
+            raise BackendError(f"data not found for {project_code}: neither a dask-ms store nor a measurement "
+                               "set exists (run import_data first)")
+        if table_engine() != "casacore":
+            raise BackendError("lazy access to a measurement set needs a working python-casacore; "
+                               f"export a store instead: vlbipy export -p {project_code} --format dask-ms")
+        import daskms
+        return daskms.xds_from_ms(str(ms), chunks={"row": _DEFAULT_CHUNK_ROWS})
+
     # -- metadata --
     def get_metadata(self, project_code: str, source_names: list[str], observatory: str) -> ObsMetadata:
-        """Read the full observation metadata from the zarr store (no CASA involved)."""
+        """Read the observation metadata from the measurement set, or from the store when the MS is gone."""
+        if self._has_ms(project_code):
+            return super().get_metadata(project_code, source_names, observatory)
+        return self._metadata_from_store(project_code)
+
+    def _metadata_from_store(self, project_code: str) -> ObsMetadata:
+        """Read the full observation metadata from the zarr store (no measurement set needed)."""
         import dask
         import datetime as dt
 
@@ -406,7 +416,7 @@ class DaskMsDataOps(DataOps):
         # Scans from the main-table partitions (small columns only; computed lazily).
         per_scan: dict[int, dict] = {}
         observed_fields: set[int] = set()
-        for dataset in self.datasets(project_code):
+        for dataset in self._store_datasets(project_code):
             field_id = int(dataset.attrs.get("FIELD_ID", 0))
             observed_fields.add(field_id)
             scan_no, time, ant1, ant2 = dask.compute(dataset.SCAN_NUMBER.data, dataset.TIME.data,
@@ -463,8 +473,10 @@ class DaskMsDataOps(DataOps):
 
     # -- inspection --
     def listobs(self, project_code: str, listfile: Optional[str] = None) -> dict:
-        """Return a scan listing built from the store; optionally write it as text."""
-        meta = self.get_metadata(project_code, [], "")
+        """Return the scan listing: CASA's listobs when the MS exists, else one built from the store."""
+        if self._has_ms(project_code):
+            return super().listobs(project_code, listfile)
+        meta = self._metadata_from_store(project_code)
         listing = {f"scan_{s.scan_number}": {"source": s.source, "time_start": s.time_start,
                                              "time_end": s.time_end, "antennas": s.antennas}
                    for s in meta.scans}
@@ -476,67 +488,138 @@ class DaskMsDataOps(DataOps):
         return listing
 
 
-class DaskMsCalibrationOps(CalibrationOps):
-    """Calibration for the dask-ms backend (a-priori tables come from the import-time MS)."""
+class DaskMsCalibrationOps(CasaCalibrationOps):
+    """CASA calibration operations whose solves and application run on the numpy engine.
+
+    Only the engine hooks are replaced: every public method (``initial_calibration``, ``fringefit``,
+    ``bandpass``, ``scalar_bandpass``, ``scan_snr``, ...) is inherited, so selection, table bookkeeping and
+    the prior chain are exactly those of the CASA backend.
+    """
+
+    #: ``apply`` keywords the fast application understands; anything else is passed to CASA's applycal.
+    _FAST_APPLY_KEYWORDS = ("applymode", "workers", "chunk_rows", "flagbackup")
+
+    def _run_fast(self, label: str, function, params: dict, casa_task) -> None:
+        """Run ``function(**params)``; if it does not cover the request, warn and run the CASA task instead."""
+        try:
+            function(**params)
+        except NotImplementedError as exc:
+            warnings.warn(f"{label}: {exc}; running the CASA task instead")
+            casa_task(params)
+
+    def _run_fringefit_task(self, params: dict) -> None:
+        """Fringe fit with :func:`vlbipy.solvers.fringefit_task.run_fringefit` (same keywords, same table format)."""
+        from ..solvers.fringefit_task import run_fringefit
+        self._run_fast("fringefit", run_fringefit, params, super()._run_fringefit_task)
+
+    def _run_bandpass_task(self, params: dict) -> None:
+        """Solve the bandpass with :func:`vlbipy.solvers.gain_task.run_bandpass` (CASA "B Jones" output)."""
+        from ..solvers.gain_task import run_bandpass
+        self._run_fast("bandpass", run_bandpass, params, super()._run_bandpass_task)
+
+    def _run_gaincal_task(self, params: dict) -> None:
+        """Solve gains with :func:`vlbipy.solvers.gain_task.run_gaincal` (CASA "G Jones" output)."""
+        from ..solvers.gain_task import run_gaincal
+        self._run_fast("gaincal", run_gaincal, params, super()._run_gaincal_task)
+
+    def apply(self, project_code: str, field: str, tables: list, *, gainfield: str = "", parang: bool = True,
+              flagbackup: bool = False, callib: bool = False, **kwargs) -> None:
+        """Apply the calibration tables to the measurement set (CORRECTED_DATA, flags, weights) in one pass.
+
+        Same contract as :meth:`CasaCalibrationOps.apply`: ``field`` empty corrects every observed source,
+        each with the table chain and field mapping resolved for it. All of them are corrected in a single
+        pass over the data by :func:`vlbipy.solvers.apply_task.apply_to_ms`. A cal library (``callib=True``) or
+        an applycal keyword the fast path does not know is handed to CASA instead.
+        """
+        from ..solvers.apply_task import APPLY_MODES, apply_to_ms
+        from ..solvers.fringefit_task import _prior_entries
+        from ..solvers.msio import read_setup
+
+        unknown = sorted(set(kwargs) - set(self._FAST_APPLY_KEYWORDS))
+        mode = str(kwargs.get("applymode", "calflagstrict") or "calflagstrict").lower()
+        if callib or unknown or mode not in APPLY_MODES:
+            reason = "a cal library" if callib else (f"keyword(s) {', '.join(unknown)}" if unknown
+                                                     else f"applymode={mode!r}")
+            warnings.warn(f"{project_code}: the dask-ms apply does not cover {reason}; using CASA applycal")
+            return super().apply(project_code, field, tables, gainfield=gainfield, parang=parang,
+                                 flagbackup=flagbackup, callib=callib,
+                                 **{k: v for k, v in kwargs.items() if k not in ("workers", "chunk_rows")})
+        ms = self.backend.ms_path(project_code)
+        usable = [t for t in tables if t.path and Path(t.path).exists()]
+        missing = [t.cal_type for t in tables if t not in usable]
+        if missing:
+            warnings.warn(f"{project_code}: skipping missing calibration table(s): {', '.join(missing)}")
+        if not usable:
+            raise BackendError(f"{project_code}: no calibration tables to apply")
+        if not parang:
+            warnings.warn(f"{project_code}: applycal without the parallactic-angle correction")
+        setup = read_setup(ms)
+        if field:
+            apply_fields = [name.strip() for name in field.split(",") if name.strip()]
+        else:
+            meta = self.backend.data.get_metadata(project_code, [], "")
+            apply_fields = sorted({scan.source for scan in meta.scans})
+        entries_by_field = {}
+        for apply_field in apply_fields:
+            if apply_field not in setup["field_names"]:
+                raise BackendError(f"{project_code}: unknown field {apply_field!r} in applycal")
+            params = self._compile_apply_params(project_code, usable, apply_field, include_calwt=True,
+                                                gainfield=gainfield)
+            entries = _prior_entries(params["gaintable"], params["gainfield"], params["interp"], params["spwmap"],
+                                     setup["field_names"])
+            for entry, calwt in zip(entries, params["calwt"]):
+                entry["calwt"] = bool(calwt)
+            entries_by_field[setup["field_names"].index(apply_field)] = entries
+            applied = self._tables_for_field(usable, apply_field)
+            logger.info("applycal: {} -> field={} ({} tables: {})", ms.name, apply_field, len(applied),
+                        ", ".join(t.cal_type for t in applied))
+        if flagbackup or kwargs.get("flagbackup"):
+            self.backend.tasks.flagmanager(vis=str(ms), mode="save", versionname="before_applycal", merge="replace")
+        apply_to_ms(ms, entries_by_field, parang=parang, applymode=mode, workers=kwargs.get("workers"),
+                    **({"chunk_rows": int(kwargs["chunk_rows"])} if "chunk_rows" in kwargs else {}))
 
     def a_priori(self, project_code: str, field: str, *, needs_eop: bool = False,
                  eop_file: Optional[str] = None, **kwargs) -> list:
         """A-priori amplitude calibration (gencal Tsys + GC, + EOP for VLBA/LBA).
 
-        The caltables were pre-generated with gencal at import time (before the
-        intermediate MS was removed); this step registers them. If they are
-        missing but the MS was kept, gencal runs now via the CASA backend.
+        Runs gencal on the measurement set like the CASA backend. When only a dask-ms store is left, tables
+        generated earlier are registered as they are; without them the step cannot run.
         """
+        if self.backend.ms_path(project_code).is_dir():
+            return super().a_priori(project_code, field, needs_eop=needs_eop, eop_file=eop_file, **kwargs)
         from ..models import CalTable
-        from .casa import APRIORI_TABLE_SPECS, CasaBackend
-        casa = CasaBackend(work_dir=str(self.work_dir))
-        paths = casa.apriori_table_paths(project_code, needs_eop)
+        from .casa import APRIORI_TABLE_SPECS
+        paths = self.backend.apriori_table_paths(project_code, needs_eop)
         if all(path.is_dir() for path in paths.values()):
-            logger.info("a_priori: using the caltables pre-generated at import time")
+            logger.info("a_priori: no measurement set; using the existing a-priori caltables")
             return [CalTable(cal_type=cal_type, path=str(path), field=field,
                              interp=APRIORI_TABLE_SPECS[cal_type][1])
                     for cal_type, path in paths.items()]
-        if casa.ms_path(project_code).is_dir():
-            return casa.calibrate.a_priori(project_code, field, needs_eop=needs_eop,
-                                           eop_file=eop_file)
         missing = ", ".join(t for t, p in paths.items() if not p.is_dir())
-        raise BackendError(f"{project_code}: a-priori caltables missing ({missing}) and the MS "
-                           "was removed; re-run import_data(force=True) to regenerate them")
+        raise BackendError(f"{project_code}: a-priori caltables missing ({missing}) and there is no measurement "
+                           "set; re-run import_data(force=True) to regenerate them")
 
 
-class DaskMsPlotOps(PlotOps):
-    """Diagnostic plots for the dask-ms backend."""
-
-    def caltable(self, project_code: str, caltable: str, cal_type: str = "") -> list[str]:
-        """Plot a (pre-generated) calibration table to PNG(s) under <work_dir>/plots."""
-        from ..plotting import CalTablePlotter
-        plotter = CalTablePlotter(self.plot_dir("caltables"))
-        return [str(p) for p in plotter.plot(caltable, cal_type=cal_type)]
-
-
-class DaskMsBackend(Backend):
-    """Backend exposing the observation as lazy dask-ms datasets in a zarr store.
-
-    Import runs FITS-IDI -> MS (via the CASA backend) and then MS -> zarr; all
-    reads afterwards touch only the zarr store.
+class DaskMsBackend(CasaBackend):
+    """CASA backend with numpy/dask-ms calibration (fringe fits, bandpass, gains, applycal) and difmapy imaging.
 
     Parameters
     ----------
     work_dir : str
-        Directory holding the store, the MS, and products.
+        Directory holding the measurement set, the optional store, and products.
     """
 
     kind = "dask-ms"
     requires_data_files = True
+    #: Imaging and self-calibration always run in difmapy on the per-source splits; tclean/WSClean are not used.
+    imager = "difmap"
 
     data_ops = DaskMsDataOps
     calibration_ops = DaskMsCalibrationOps
-    plot_ops = DaskMsPlotOps
 
     def __init__(self, work_dir: str = ".") -> None:
         try:
             import daskms  # noqa: F401
-            from daskms.experimental import zarr  # noqa: F401
         except ImportError as exc:
             raise BackendError("the dask-ms backend requires dask-ms: "
                                "pip install vlbipy[daskms]") from exc
@@ -547,7 +630,7 @@ class DaskMsBackend(Backend):
         return self.work_dir / f"{project_code}.zarr"
 
     def get_table(self, project_code: str, table: str):
-        """Return one subtable (e.g. ``"ANTENNA"``) as a dask-ms dataset."""
+        """Return one subtable of the zarr store (e.g. ``"ANTENNA"``) as a dask-ms dataset."""
         from daskms.experimental.zarr import xds_from_zarr
         datasets = xds_from_zarr(f"{self.store_path(project_code)}::{table}")
         if not datasets:

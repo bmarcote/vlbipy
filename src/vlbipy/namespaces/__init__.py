@@ -94,6 +94,7 @@ class ImportDataNamespace(Namespace):
             # in a fresh process has no metadata yet, and every later step needs it.
             if obs._metadata is None:
                 obs._metadata = obs._load_metadata_cache() or self._load_metadata()
+            obs.restrict_sources_to_data()
             return obs.metadata
         imp_cfg = obs.config.get("import", {})
         scan_gap = imp_cfg.get("scan_gap", 15)
@@ -109,7 +110,7 @@ class ImportDataNamespace(Namespace):
                 replace_tsys=imp_cfg.get("replace_tsys", False))
             self._backend.data.import_data(self._code, obs.sources.names, scan_gap=scan_gap,
                                            files=file_list, delete=force,
-                                           keep_ms=imp_cfg.get("keep_ms", False),
+                                           zarr_store=imp_cfg.get("zarr_store", False),
                                            mms=imp_cfg.get("mms", True),
                                            needs_eop=obs._observatory_handler.needs_eop, **kwargs)
             inputs = list(file_list)
@@ -119,6 +120,7 @@ class ImportDataNamespace(Namespace):
                         "auto-download available" if handler.auto_download else "is manual-download only")
             self._backend.data.import_data(self._code, obs.sources.names, scan_gap=scan_gap, **kwargs)
         obs._metadata = self._load_metadata()
+        obs.restrict_sources_to_data()
         obs._state.mark_complete("import_data", outputs=[f"{self._code}.ms"], inputs=inputs)
         return obs._metadata
 
@@ -296,7 +298,11 @@ class CalibrateNamespace(Namespace):
 
     def a_priori(self, *, force: bool = False, smooth: Optional[bool] = None,
                  plot: Optional[bool] = None) -> list[CalTable]:
-        """A-priori amplitude calibration: gencal Tsys + gain curve (+ EOP for VLBA/LBA).
+        """A-priori calibration: gencal Tsys + gain curve (+ ACCOR and EOP for VLBA/LBA).
+
+        For DiFX data (``needs_accor``) the correlator amplitude correction is
+        solved first from the autocorrelations (``accor`` + ``smoothcal``,
+        ``[calibration.accor]``), which are flagged only afterwards.
 
         Refuses to run unless the measurement set actually carries Tsys and
         gain-curve data (those come from the ``.antab`` at import time). The
@@ -318,9 +324,15 @@ class CalibrateNamespace(Namespace):
         cal_cfg = obs.config.get("calibration", {})
         handler = obs._observatory_handler
         antab = handler.get_antab_file(self._code, obs.work_dir)
+        accor_cfg = dict(cal_cfg.get("accor", {}))
+        needs_accor = bool(handler.needs_accor and accor_cfg.pop("enabled", True))
         tables = self._backend.calibrate.a_priori(
             self._code, obs.calibrator_field, needs_eop=handler.needs_eop,
-            eop_file=cal_cfg.get("eop_file") or None, antab=antab)
+            eop_file=cal_cfg.get("eop_file") or None, antab=antab,
+            needs_accor=needs_accor, accor=accor_cfg)
+        if needs_accor and obs._state.status("flag_autocorr") != "done":
+            # flag.apriori left the autocorrelations for accor; it has used them now.
+            obs.flag.autocorr(force=force)
         if smooth if smooth is not None else cal_cfg.get("smooth_tsys", True):
             tables = [self._smooth_table(table, cal_cfg) for table in tables]
         for table in tables:
@@ -394,7 +406,8 @@ class CalibrateNamespace(Namespace):
                             "run — {} antenna(s) {} on scan(s) {}; every pass solves on this set",
                             len(antennas), ",".join(antennas), scans)
                 return antennas, scans
-        raise StepError(f"{self._code}: no scan on {', '.join(attempted) or 'any source'} detects "
+        raise StepError("select_calibration_data",
+                        f"{self._code}: no scan on {', '.join(attempted) or 'any source'} detects "
                         f"a full-band antenna above {threshold:g} sigma; cannot solve the "
                         f"instrumental delay")
 
@@ -575,7 +588,7 @@ class CalibrateNamespace(Namespace):
         The first solutions were derived from data that still contained whatever
         the flagging steps later removed — band edges, RFI, outliers, slewing
         data — so those points biased them. Re-solving from the a-priori tables
-        (Tsys / gain curve / EOP, which do not depend on the data) gives cleaner
+        (Tsys / gain curve / ACCOR / EOP, which do not depend on the solutions) gives cleaner
         solutions. The data-derived tables are replaced, not stacked.
 
         Parameters
@@ -587,9 +600,12 @@ class CalibrateNamespace(Namespace):
         obs = self._obs
         if not obs._state.should_run(step, force=force):
             return obs.gaintables
-        keep = {"tsys", "gc", "eop"}
-        dropped = [t.cal_type for t in obs.gaintables if t.cal_type not in keep]
-        obs.set_gaintables([t for t in obs.gaintables if t.cal_type in keep])
+        # Everything the a-priori step made stays (Tsys, gain curve, and for DiFX data ACCOR and
+        # EOP); the types are named as well for chains recorded before tables carried their step.
+        apriori = [t for t in obs.gaintables
+                   if t.step == "a_priori" or t.cal_type in ("accor", "tsys", "gc", "eop")]
+        dropped = [t.cal_type for t in obs.gaintables if t not in apriori]
+        obs.set_gaintables(apriori)
         logger.info("{}: re-deriving {} from the a-priori tables on the flagged data",
                     step.replace("_", " "), ", ".join(dropped) or "nothing")
         obs._snr_surveys.clear()
@@ -809,7 +825,17 @@ class FlagNamespace(Namespace):
             warnings.anomaly(
                 f"{self._code}: no a-priori flag file for {handler.name}; off-source and slewing "
                 "data will stay in the dataset (visible as low amplitudes at scan starts)")
+        if self._accor_pending():
+            logger.info("flag.apriori: the autocorrelations are kept for accor; calibrate.a_priori flags them")
+            return flagged
         return flagged + self.autocorr(force=force)
+
+    def _accor_pending(self) -> bool:
+        """True when accor still has to run on this observation (it needs the autocorrelations unflagged)."""
+        obs = self._obs
+        enabled = obs.config.get("calibration", {}).get("accor", {}).get("enabled", True)
+        return bool(obs._observatory_handler.needs_accor and enabled
+                    and self._backend.requires_data_files and obs._state.status("a_priori") != "done")
 
     def _ensure_flag_file(self) -> Optional[str]:
         """Return the CASA-format a-priori flag file, fetching and converting it if needed.
@@ -1048,6 +1074,12 @@ class FlagNamespace(Namespace):
             if not dry_run:
                 obs._state.mark_complete(step)
             return {}
+        # An antenna still slewing at the start of a scan is not a statistical outlier of one baseline
+        # but one antenna pulling all of its baselines down. Found once, on the first pass: the typical
+        # times given to the faint fields count from each antenna's first unflagged sample, so a second
+        # application would move that sample and flag again.
+        if step == "flag_outliers" and not field and cfg.get("flag_off_source", True):
+            self.off_source(dry_run=dry_run)
         report = self._backend.flag.outliers(
             self._code, field=field, dry_run=dry_run, metadata=obs.metadata,
             threshold=threshold if threshold is not None else cfg.get("outlier_sigma", 5.0),
@@ -1059,6 +1091,39 @@ class FlagNamespace(Namespace):
         if not dry_run:
             obs._state.mark_complete(step)
         return report
+
+    def off_source(self, *, dry_run: bool = False, **kwargs) -> dict:
+        """Flag antennas while they are not on source, measured on the calibrated data.
+
+        The fringe finders and phase calibrators are measured sample by sample; the
+        targets and check sources, too faint for that, get the time each antenna
+        typically arrives late (see the backend's ``flag.off_source``). Needs the
+        calibration applied, so the pipeline runs it at the start of the first
+        outlier pass. A failure is a warning, not a failed run.
+
+        Returns
+        -------
+        dict
+            The backend report (``commands``, ``per_antenna``, ``typical``, ...), empty when skipped.
+        """
+        obs = self._obs
+        if not self._backend.supports("flag", "off_source"):
+            return {}
+        cfg = obs.config.get("flagging", {})
+        with_data = list(obs.metadata.source_names) if obs.metadata else list(obs.sources.names)
+        bright = [s.name for s in list(obs.sources.fringe_finders) + list(obs.sources.phase_calibrators)
+                  if s.name in with_data]
+        bright = list(dict.fromkeys(bright))
+        if not bright:
+            logger.info("off source: no fringe finder or phase calibrator with data to measure on; skipped")
+            return {}
+        try:
+            return self._backend.flag.off_source(
+                self._code, fields=bright, transfer_fields=[n for n in with_data if n not in bright],
+                level=float(cfg.get("off_source_level", 0.8)), dry_run=dry_run, metadata=obs.metadata, **kwargs)
+        except BackendError as exc:
+            warnings.warn(f"{self._code}: off-source flagging failed ({exc}); continuing without it")
+            return {}
 
     def from_file(self, path: str, *, force: bool = False) -> float:
         """Apply flags from an external flag command file."""
@@ -1076,7 +1141,7 @@ class FlagNamespace(Namespace):
         src = self._resolve_source_name(source)
         split = Path(obs.work_dir) / "calibrated_data" / f"{self._code}_{src}.ms"
         if not split.is_dir():
-            raise StepError(f"{self._code}: no split measurement set for {src} at {split}")
+            raise StepError("flag_from_split", f"{self._code}: no split measurement set for {src} at {split}")
         commands = flag_commands_from_split(str(split), field=src)
         if commands:
             run_flag_commands(str(self._backend.ms_path(self._code)), commands, flag_backup=flag_backup)
@@ -1486,12 +1551,24 @@ class CleanNamespace(Namespace):
             default, imager = "wsclean", None       # in-memory backends have no split MS for difmapy
         return self._image(target, robust, imager or default, **kwargs)
 
+    def _backend_imager(self, requested: str) -> str:
+        """Return the imager to use: the backend's own (``Backend.imager``) when it has one, else ``requested``.
+
+        The dask-ms backend images everything with difmapy; asking it for tclean or WSClean is not an error
+        (configurations and scripts are shared between backends) but it is logged, so the redirect is visible.
+        """
+        forced = getattr(self._backend, "imager", None)
+        if forced and requested != forced:
+            logger.info("{}: the {} backend images with {}; ignoring imager={!r}", self._code, self._backend.kind,
+                        forced, requested)
+        return forced or requested
+
     def wsclean(self, target: TargetLike = None, *, robust=None, **kwargs) -> Union[Image, ImageSet]:
-        """Image with WSClean."""
+        """Image with WSClean (difmapy on a backend that fixes the imager, like dask-ms)."""
         return self._image(target, robust, "wsclean", **kwargs)
 
     def tclean(self, target: TargetLike = None, *, robust=None, **kwargs) -> Union[Image, ImageSet]:
-        """Image with CASA tclean."""
+        """Image with CASA tclean (difmapy on a backend that fixes the imager, like dask-ms)."""
         return self._image(target, robust, "tclean", **kwargs)
 
     def difmap(self, target: TargetLike = None, *, robust=None, **kwargs) -> Union[Image, ImageSet]:
@@ -1524,6 +1601,7 @@ class CleanNamespace(Namespace):
         report = difmap.image_source(split, str(image_dir / f"{self._code}_{src}"), robust_values=robust_values,
                                      niter=int(niter), gain=float(img_cfg.get("clean_gain", 0.05)),
                                      threshold_sigma=float(kwargs.get("threshold_sigma", 3.0)),
+                                     average_channels=bool(img_cfg.get("average_channels", True)),
                                      **_search_settings(img_cfg))
         _write_search_report(image_dir / f"{self._code}_{src}.search.json", report)
         return [_image_from_difmap(src, info, weighting) for info in report["images"].values()]
@@ -1539,6 +1617,7 @@ class CleanNamespace(Namespace):
         """
         obs = self._obs
         src = self._resolve_source_name(target)
+        imager = self._backend_imager(imager)
         img_cfg = obs.config.get("imaging", {})
         weighting = weighting or img_cfg.get("weighting", "briggs")
         niter = img_cfg.get("niter", 0) if niter is None else niter
@@ -1569,8 +1648,9 @@ class CleanNamespace(Namespace):
 
 
 def _search_settings(img_cfg: dict) -> dict:
-    """difmapy source-search keywords from ``[imaging]``: field, significance and re-centring distance."""
-    return {"search_fov_mas": float(img_cfg.get("search_fov", 1000.0)),
+    """difmapy keywords from ``[imaging]``: map width, and the search field, significance and re-centring distance."""
+    return {"mapsize": int(img_cfg.get("mapsize", 8192)),
+            "search_fov_mas": float(img_cfg.get("search_fov", 1000.0)),
             "search_sigma": float(img_cfg.get("search_sigma", 10.0)),
             "recentre_min_beams": float(img_cfg.get("recentre_min_beams", 10.0))}
 
@@ -1782,7 +1862,7 @@ class ExportNamespace(Namespace):
         obs = self._obs
         names = [s.name for s in obs.sources.calibrators]
         if not names:
-            raise StepError(f"{self._code}: no calibrators defined to split")
+            raise StepError("split", f"{self._code}: no calibrators defined to split")
         return self.per_source(sources=names, **kwargs)
 
     def per_source(self, *, force: bool = False, sources: Optional[list] = None,

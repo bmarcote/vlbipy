@@ -12,9 +12,9 @@ data reduction.
 ## Prerequisites
 
 - **Python >= 3.12**
-- A data reduction backend — **CASA** (`casatools`/`casatasks`) is the only
-  one implemented today. AIPS (`parseltongue`) exists as an interface but
-  every method is a stub.
+- A data reduction backend — **CASA** (`casatools`/`casatasks`), optionally
+  with the **dask-ms** fast calibration engine on top of it. AIPS
+  (`parseltongue`) exists as an interface but every method is a stub.
 
 ## Installation
 
@@ -24,14 +24,44 @@ data reduction.
 pip install "vlbipy[casa]"
 ```
 
-### With the dask-ms reader
+### With the dask-ms backend (fast calibration)
 
 ```bash
-pip install "vlbipy[daskms]"
+pip install "vlbipy[casa,daskms]"
 ```
 
-Lazy, distributed-ready access to data already exported to a zarr store —
-a-priori calibration and import only, no full calibration chain.
+The `dask-ms` backend is a complete pipeline backend: it is the CASA backend
+(import, flagging, imaging, plotting and export are still CASA, so
+`casatools`/`casatasks` are required) with the calibration engine replaced by
+numpy solvers that read and write the measurement set directly from parallel
+worker processes. It replaces fringe fitting, `bandpass`, `gaincal` and
+`applycal`, and writes ordinary CASA calibration tables. Select it with
+
+```toml
+[global]
+backend = "dask-ms"
+```
+
+or `--backend dask-ms` on the command line.
+
+Imaging and self-calibration always run in difmapy on the per-source split
+measurement sets under this backend: a request for `tclean` or `wsclean`
+(`[imaging] imager`, `--imager`, `obs.clean.tclean()`) is redirected to
+difmapy with a log message. difmapy is installed by the `daskms` extra.
+
+python-casacore (pulled in by dask-ms) is used for table I/O when it works on
+the machine; otherwise `casatools.table` is used automatically
+(python-casacore is broken on some macOS builds).
+
+The zarr store (`<code>.zarr`) is optional and is not written at import. It
+is a read-only snapshot of the data for lazy access (`obs.data`), and is
+enough on its own to rebuild the report and metadata after the measurement
+set has been deleted. Produce it with
+`vlbipy export -p CODE --format dask-ms`, or set `zarr_store = true` under
+`[import]` in the configuration.
+
+See [Backends](backends/index.md#the-dask-ms-backend) for timings, the
+agreement with CASA and the configuration.
 
 ### Everything
 

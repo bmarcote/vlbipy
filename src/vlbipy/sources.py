@@ -192,6 +192,24 @@ class SourceSet:
         """Names of all sources, in order."""
         return [s.name for s in self._sources]
 
+    def restrict_to(self, observed: Iterable[str]) -> list[str]:
+        """Drop the sources that are not among ``observed``; return the names dropped.
+
+        The epochs of a campaign share one source declaration, but not every
+        epoch observes every source (a calibrator tried once and abandoned, for
+        instance). A declared source with no data in an epoch must not reach that
+        epoch's field selections: one unknown name makes a CASA selection fail as
+        a whole.
+        """
+        present = set(observed)
+        dropped = [s.name for s in self._sources if s.name not in present]
+        if dropped:
+            self._sources = [s for s in self._sources if s.name in present]
+            self.phase_referencing = {
+                target: [c for c in calibrators if c in present]
+                for target, calibrators in self.phase_referencing.items() if target in present}
+        return dropped
+
     # -- phase referencing --
     def calibrators_for(self, target_name: str) -> list[Source]:
         """Return the calibrators phase-referencing a given target.

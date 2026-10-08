@@ -8,8 +8,10 @@ are not implemented yet. See [Status](docs/usage/status.md) for the honest
 inventory of what works.
 
 Aims to support **EVN**, **VLBA**, and **LBA** observations through different
-backends — **CASA**, **AIPS** (via ParselTongue), or a lazy **dask-ms**
-reader — selectable at runtime. Only CASA is implemented today.
+backends — **CASA**, **dask-ms** (the CASA backend with the calibration
+solvers replaced by fast, parallel numpy ones), or **AIPS** (via ParselTongue)
+— selectable at runtime. CASA and dask-ms are implemented today; AIPS is a
+stub.
 
 ## Installation
 
@@ -19,11 +21,11 @@ Requires Python >= 3.12.
 # Core, no backend (inspect metadata, build summaries, develop against the dummy backend)
 pip install .
 
-# With the CASA backend (recommended — the only backend implemented so far)
+# With the CASA backend (recommended)
 pip install ".[casa]"
 
-# With the dask-ms reader (lazy, distributed-ready access to exported data)
-pip install ".[daskms]"
+# With the dask-ms backend: fast calibration, needs CASA as well
+pip install ".[casa,daskms]"
 
 # Everything (CASA + AIPS + dask-ms)
 pip install ".[all]"
@@ -151,6 +153,46 @@ minsnr = 4.0
 
 See [Configuration](docs/configuration.md) for the full reference.
 
+### Fast calibration (dask-ms backend)
+
+The `dask-ms` backend is the CASA backend (import, flagging, imaging, plotting
+and export are still CASA) with the calibration engine replaced by numpy
+solvers that read and write the measurement set directly from parallel worker
+processes: fringe fitting (single-band delay, multi-band delay, the per-scan
+SNR survey), `bandpass`, `gaincal` and `applycal`. Select it in the
+configuration file, or with `--backend dask-ms` on the command line.
+Imaging and self-calibration always run in difmapy under this backend
+(installed by the `daskms` extra); a request for `tclean` or `wsclean` is
+redirected to it:
+
+```toml
+[global]
+backend = "dask-ms"
+```
+
+Measured on the RSM07 test observation (EVN, 14 antennas, 4 subbands x 64
+channels, 1.4 M rows, 2.8 h; 12-core desktop, warm page cache; CASA 6.7.3):
+
+| Step (same call, same data) | CASA task | dask-ms backend | speed-up |
+|---|---|---|---|
+| Single-band delay, 1 scan (fringefit) | 7-8 s | 0.2 s | ~40x |
+| Multi-band delay, 33 scans (fringefit, combine=spw, dispersive) | 87-103 s | 1.3-1.6 s | ~65x |
+| SNR survey, 63 scans (fringefit) | 237-278 s | 2.5-3.3 s | ~85x |
+| Bandpass, 1 scan | 1.7-2.0 s | 0.3 s | ~6x |
+| Scalar bandpass (gaincal calmode='a', whole phase calibrator) | 19-23 s | 1.3-1.6 s | ~14x |
+| applycal, 3 fields, 8 tables | 72 s | 8-14 s | 5-9x |
+
+The solvers write ordinary CASA calibration tables, so `casa` and `dask-ms`
+can be mixed on the same working directory. Against CASA on RSM07: `applycal`
+gives identical flags and corrected visibilities equal to within 4e-4
+(relative, worst case); fringe fits detect and flag the same solutions, with
+delays agreeing to about 0.1 ps (median); bandpass amplitudes agree within
+about 0.1% and gain amplitudes within about 1%. There are a few known
+differences (the reference frequency of multi-band delay rates, the SNR
+column of fringe tables, a constant bandpass phase per antenna and subband);
+see [Backends](docs/backends/index.md#the-dask-ms-backend) for these, the
+configuration, and the cases that fall back to the CASA task.
+
 ## Pipeline steps
 
 `VLBIObs.run()` chains these namespace operations, in order (each is also
@@ -161,7 +203,7 @@ working directory):
 |---|---|
 | `import_data` | find or download FITS-IDI + `.antab`/`.uvflg`; import to a Multi-MS; read metadata |
 | `flag.apriori` | observatory `.uvflg` flags + autocorrelations |
-| `calibrate.a_priori` | Tsys + gain curve (+ EOP for VLBA/LBA), de-spiked |
+| `calibrate.a_priori` | Tsys + gain curve (+ ACCOR and EOP for VLBA/LBA), de-spiked |
 | `plot.diagnostics(column="data")` | raw data: scan SNR, cross-correlations, spectra, time series, corners, radplot, uv coverage |
 | `flag.quack` | slewing time per antenna (configured, or measured when not) |
 | `flag.initial` | tfcrop on the calibrators, per baseline, strong outliers only |
@@ -196,9 +238,10 @@ src/vlbipy/
 ├── backends/
 │   ├── base.py             # Abstract interfaces (DataOps, CalibrationOps, FlagOps, PlotOps, ImagingOps, ExportOps)
 │   ├── casa.py              # CASA backend (casatools/casatasks) — implemented
-│   ├── dask_ms.py           # dask-ms backend — a-priori/import only
+│   ├── dask_ms.py           # dask-ms backend — CASA + fast numpy calibration (fringe fit, bandpass, gaincal, applycal)
 │   ├── aips.py               # AIPS backend (ParselTongue) — stub
 │   └── dummy.py               # In-memory synthetic backend, no external dependency
+├── solvers/                # numpy calibration engine of the dask-ms backend (worker pool, MS I/O, solvers, applycal)
 ├── observatories/
 │   ├── evn.py               # EVN: archive download, ANTAB append, .uvflg
 │   ├── vlba.py                # VLBA specifics

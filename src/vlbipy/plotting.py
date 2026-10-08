@@ -721,14 +721,29 @@ def _bin_lightcurve(times: np.ndarray, vis_sum: np.ndarray, n_vis: np.ndarray, s
         return bin_times / counts, np.abs(summed) / counts
 
 
+def lightcurve_amplitude_limit(amplitudes: list) -> float:
+    """Upper y limit for one source's light curve: 5% above the 99.9th percentile of everything drawn for it.
+
+    The percentile (rather than the maximum) keeps a single noise spike from setting the scale. Returns
+    1.0 when there is nothing finite and positive to show.
+    """
+    values = np.concatenate([np.asarray(a, dtype=float).ravel() for a in amplitudes]) if amplitudes else np.zeros(0)
+    values = values[np.isfinite(values)]
+    top = float(np.percentile(values, 99.9)) * 1.05 if values.size else 0.0
+    return top if top > 0.0 else 1.0
+
+
 def plot_total_lightcurve(data: dict, plot_dir: Union[str, Path], project_code: str = "",
                           label: str = "", averaging_sec: tuple = (0, 30, 120, -1),
                           dpi: int = 150) -> str:
     """Plot the coherently averaged total visibility amplitude vs time, per source.
 
-    One row per source sharing the time axis. Each averaging scale is drawn as
-    its own series so variability shows up as structure that survives the longer
-    averages while noise averages down.
+    One row per source sharing the time axis. Every source has its own amplitude
+    axis, from zero to just above its own values (:func:`lightcurve_amplitude_limit`):
+    the sources of an observation differ in flux density by orders of magnitude, and
+    on a common scale the faint ones are a flat line at the bottom. Each averaging
+    scale is drawn as its own series so variability shows up as structure that
+    survives the longer averages while noise averages down.
 
     Parameters
     ----------
@@ -757,13 +772,13 @@ def plot_total_lightcurve(data: dict, plot_dir: Union[str, Path], project_code: 
     scale_names = {0: "native", -1: "per scan"}
 
     figure, axes = plt.subplots(len(sources), 1, figsize=(8.0, 2.4 * len(sources) + 0.8), sharex=True,
-                                sharey=True, squeeze=False, layout="constrained")
-    plotted: list[np.ndarray] = []
+                                squeeze=False, layout="constrained")
     for axis, (name, entry) in zip(axes[:, 0], sources.items()):
         times = np.asarray(entry["times"], dtype=float)
         vis_sum = np.asarray(entry["vis_sum"], dtype=complex)
         n_vis = np.asarray(entry["n_vis"], dtype=float)
         scans = np.asarray(entry.get("scans", np.zeros(times.size)), dtype=np.int64)
+        plotted: list[np.ndarray] = []
         for k, width in enumerate(averaging_sec):
             if times.size == 0:
                 break
@@ -774,16 +789,11 @@ def plot_total_lightcurve(data: dict, plot_dir: Union[str, Path], project_code: 
             axis.plot((bin_times - time_start) / 3600.0, amp, color=color,
                       label=scale_names.get(width, f"{width:g} s"), **style)
             plotted.append(np.asarray(amp, dtype=float))
+        axis.set_ylim(0.0, lightcurve_amplitude_limit(plotted))
         axis.set_title(name, fontsize=10, fontweight="bold", loc="left")
         axis.set_ylabel("amplitude", fontsize=8)
         axis.tick_params(labelsize=7)
         style_axis(axis)
-    # One amplitude range for every source, from zero: the panels are then directly comparable.
-    # The top is the 99.9th percentile of everything drawn, so one noise spike does not set it.
-    values = np.concatenate(plotted) if plotted else np.zeros(0)
-    values = values[np.isfinite(values)]
-    top = float(np.percentile(values, 99.9)) * 1.05 if values.size else 0.0
-    axes[0, 0].set_ylim(0.0, top if top > 0.0 else 1.0)
     axes[-1, 0].set_xlabel("time (hours from start)", fontsize=9)
     handles, labels = axes[0, 0].get_legend_handles_labels()
     figure.legend(handles=handles, labels=labels, loc="outside upper right", ncols=len(handles) or 1,

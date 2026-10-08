@@ -226,18 +226,29 @@ class VLBIObs:
 
     # -- delegated namespaces (post-merge / single target) --
     @property
+    def _per_epoch_products(self) -> bool:
+        """True for a campaign on real data: every epoch is split, self-calibrated and imaged on its own."""
+        return len(self._observations) > 1 and self._observations[0]._backend.requires_data_files
+
+    @property
     def clean(self):
-        """Imaging namespace on the merged (or sole) observation."""
+        """Imaging namespace: every epoch of a campaign, else the merged (or sole) observation."""
+        if self._per_epoch_products:
+            return _Fanout([o.clean for o in self._observations])
         return self._imaging_target().clean
 
     @property
     def selfcal(self):
-        """Self-cal namespace on the merged (or sole) observation."""
+        """Self-cal namespace: every epoch of a campaign, else the merged (or sole) observation."""
+        if self._per_epoch_products:
+            return _Fanout([o.selfcal for o in self._observations])
         return self._imaging_target().selfcal
 
     @property
     def export(self):
-        """Export namespace on the merged (or sole) observation."""
+        """Export namespace: every epoch of a campaign, else the merged (or sole) observation."""
+        if self._per_epoch_products:
+            return _Fanout([o.export for o in self._observations])
         return self._imaging_target().export
 
     @property
@@ -339,6 +350,9 @@ class VLBIObs:
         if len(self._observations) == 1:
             logger.info("merge requested, but it is already a single project")
             return self._observations[0]
+        if self._per_epoch_products:
+            raise Exception("the epochs of a campaign on real data are combined with combine() "
+                            "(joint calibrator model, per-epoch refinement, combined images), not merge()")
 
         codes = [o.project_code for o in self._observations]
         src_names = self._observations[0].sources.names
@@ -349,6 +363,25 @@ class VLBIObs:
         self._merged = merged
         logger.info("merged {} projects -> {}", len(codes), merged_code)
         return merged
+
+    def combine(self, *, force: bool = False) -> dict:
+        """Combine the calibrated epochs of a campaign (see :mod:`vlbipy.campaign`).
+
+        The phase calibrators are modelled from all epochs together, every epoch
+        is refined against that model and re-imaged, and the epochs of every
+        source are imaged together. Needs each epoch calibrated, self-calibrated
+        and split first (what :meth:`run` does before calling this).
+
+        Returns
+        -------
+        dict
+            The campaign report (also written to ``combined/<name>.campaign.json``).
+        """
+        if len(self._observations) == 1:
+            logger.info("combine requested, but it is a single project")
+            return {}
+        from .campaign import combine_epochs
+        return combine_epochs(self, force=force)
 
     def run(self, *, force: bool = False, scratch: bool = False, from_step: str = "") -> dict:
         """Run the full default pipeline end to end.
@@ -403,16 +436,19 @@ class VLBIObs:
             self.calibrate.apply(force=True)
         self._survey_all_sources()                                      # final calibrated SNR coverage
         self.plot.diagnostics(column="corrected", label="calibrated")  # step 15
-        if len(self._observations) > 1:
-            self.merge(force=force)
-        # Step 16: calibrated, per-source measurement sets — the deliverable of the
-        # calibration. After merge() for a campaign, so the split covers the combined data.
-        self.export.per_source(force=force)
-        self.flag.statistics()                                         # step 20 (report)
+        if self._per_epoch_products:
+            images = self._finish_campaign(force=force)
+        else:
+            if len(self._observations) > 1:
+                self.merge(force=force)
+            # Step 16: calibrated, per-source measurement sets — the deliverable of the
+            # calibration. After merge() for a campaign, so the split covers the combined data.
+            self.export.per_source(force=force)
+            self.flag.statistics()                                         # step 20 (report)
 
-        self._selfcal_all(force=force)                                 # step 17a (difmapy)
-        images = self._image_all(force=force)                          # step 17b
-        self._final_plots()                                            # step 18
+            self._selfcal_all(force=force)                                 # step 17a (difmapy)
+            images = self._image_all(force=force)                          # step 17b
+            self._final_plots()                                            # step 18
         self.report()
         summary = warnings.summary()
         if summary:
@@ -420,6 +456,24 @@ class VLBIObs:
             for item in summary:
                 logger.warning("  - {}", item)
 
+        return images
+
+    def _finish_campaign(self, *, force: bool = False) -> dict:
+        """Steps 16-21 for a campaign: split, self-calibrate and image every epoch, then combine them.
+
+        Returns ``{project_code: {source: images}}`` plus the campaign report under ``"combined"``.
+        """
+        images: dict = {}
+        for obs in self._observations:
+            obs.export.per_source(force=force)
+            obs.flag.statistics()
+            self._selfcal_all(obs, force=force)
+            images[obs.project_code] = self._image_all(obs, force=force)
+            self._final_plots(obs)
+        try:
+            images["combined"] = self.combine(force=force)
+        except Exception as exc:  # noqa: BLE001 - the per-epoch products are complete and must survive
+            warnings.warn(f"multi-epoch combination failed: {exc}")
         return images
 
     def _survey_all_sources(self) -> None:
@@ -444,27 +498,27 @@ class VLBIObs:
                     else:
                         obs.set_cal_selection(*saved_selection, stages=saved_stages)
 
-    def imaging_sources(self) -> list[str]:
+    def imaging_sources(self, obs: Optional[Observation] = None) -> list[str]:
         """Return the sources the pipeline images: ``[imaging].sources`` = ``"all"`` or ``"targets"``.
 
         ``"all"`` is every declared source that has data (calibrators included);
         sources declared in the config but absent from the metadata are skipped.
         """
-        obs = self._imaging_target()
+        obs = obs or self._imaging_target()
         which = str(self.config.get("imaging", {}).get("sources", "all")).lower()
-        names = [s.name for s in self.sources.targets] if which == "targets" else list(self.sources.names)
+        names = [s.name for s in obs.sources.targets] if which == "targets" else list(obs.sources.names)
         if obs.metadata is not None and obs.metadata.source_names:
             names = [n for n in names if n in set(obs.metadata.source_names)]
         return names
 
-    def _selfcal_all(self, *, force: bool = False) -> dict:
+    def _selfcal_all(self, obs: Optional[Observation] = None, *, force: bool = False) -> dict:
         """Self-calibrate the calibrators with difmapy and transfer the gains (``selfcal.run_all``).
 
         A failure here is a warning recorded as a failed ``selfcal`` step: the
         CASA calibration and the split products already exist and are still
         worth imaging.
         """
-        obs = self._imaging_target()
+        obs = obs or self._imaging_target()
         try:
             return obs.selfcal.run_all(force=force)
         except Exception as exc:  # noqa: BLE001 - self-cal must not abort the run
@@ -472,7 +526,7 @@ class VLBIObs:
             warnings.warn(f"{obs.project_code}: self-calibration stage failed: {exc}")
             return {}
 
-    def _image_all(self, *, force: bool = False) -> dict:
+    def _image_all(self, obs: Optional[Observation] = None, *, force: bool = False, reimage: bool = False) -> dict:
         """Image every source of :meth:`imaging_sources` at the configured robust values.
 
         Imaging is the last stage and must not throw away the calibration the
@@ -480,31 +534,33 @@ class VLBIObs:
         fails on one source is a warning recorded as a failed ``clean_<source>``
         step, not a failed run. A backend without imaging skips the step.
         """
-        obs = self._imaging_target()
+        obs = obs or self._imaging_target()
         images: dict = {}
-        difmap_imager = (str(self.config.get("imaging", {}).get("imager", obs.clean.default_imager)) == "difmap"
-                         and obs._backend.requires_data_files)
+        imager = getattr(obs._backend, "imager", None) or self.config.get("imaging", {}).get(
+            "imager", obs.clean.default_imager)
+        difmap_imager = str(imager) == "difmap" and obs._backend.requires_data_files
         if not difmap_imager and not obs._backend.supports("image", "clean"):
             logger.warning("imaging skipped: backend {} does not implement image.clean", obs._backend.kind)
             return images
         robust = self.config.get("imaging", {}).get("robust", [-2, 0, 2])
-        for name in self.imaging_sources():
-            if name in obs._selfcal_results and obs._selfcal_results[name].images:
+        for name in self.imaging_sources(obs):
+            # ``reimage``: the calibration changed since the self-cal session made its images.
+            if not reimage and name in obs._selfcal_results and obs._selfcal_results[name].images:
                 images[name] = ImageSet(obs._selfcal_results[name].images)   # imaged in its difmapy session
                 obs._state.mark_complete(f"clean_{name}", outputs=[i.paths.get("fits", "") for i in images[name]])
                 continue
             if not obs._state.should_run(f"clean_{name}", force=force):
                 continue
             try:
-                images[name] = self.clean(target=name, robust=robust)
+                images[name] = obs.clean(target=name, robust=robust)
             except Exception as exc:  # noqa: BLE001 - imaging failure must not abort the run
                 obs._state.mark_failed(f"clean_{name}", str(exc))
                 warnings.warn(f"imaging {name} failed: {exc}")
         return images
 
-    def _final_plots(self) -> list[str]:
+    def _final_plots(self, obs: Optional[Observation] = None) -> list[str]:
         """Produce the final-data plot set (``plot.final_data``), recorded as the ``final_plots`` step."""
-        obs = self._imaging_target()
+        obs = obs or self._imaging_target()
         try:
             written = obs.plot.final_data()
         except Exception as exc:  # noqa: BLE001 - plotting must never abort the run

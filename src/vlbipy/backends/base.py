@@ -655,6 +655,9 @@ class Backend:
     kind: str = "base"
     #: Whether import needs raw data files on disk (False only for the dummy backend).
     requires_data_files: bool = True
+    #: Imager this backend always uses (``"difmap"``, ...), whatever the caller or the configuration asks for;
+    #: None lets ``[imaging].imager`` and the ``imager=`` argument decide.
+    imager: Optional[str] = None
 
     #: Component classes; subclasses override with their own implementations.
     data_ops: type[DataOps] = DataOps

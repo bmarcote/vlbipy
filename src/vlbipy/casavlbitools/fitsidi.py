@@ -16,6 +16,7 @@
 # Inc., 675 Massachusetts Ave, Cambridge, MA 02139, USA.
 #
 from __future__ import print_function
+import bisect
 import datetime
 import math
 import os
@@ -102,7 +103,9 @@ class IdiData:
         tupletime = tm.strptime(self.rdate, "%Y-%m-%d")
         self.reftime = tm.mktime(tupletime)
 
-        # Create an index
+        # Create an index of (time, source) at every change of source. Only three columns are
+        # needed, read as arrays: iterating the visibility rows one by one takes minutes on a
+        # multi-GB file.
         self.idx = []
         source_id = -1
         self.last_time = float("-inf")
@@ -115,37 +118,27 @@ class IdiData:
             else:
                 source_id_col = 'SOURCE_ID'
                 pass
-            for data in tbhdu.data:
-                jd = data['DATE']
-                time = (jd - 2440587.5 + data['TIME']) * 86400
-                if time > self.last_time:
-                    self.last_time = time
-                    pass
-                if time < self.first_time:
-                    self.first_time = time
-                    pass
-                if data[source_id_col] != source_id:
-                    source_id = data[source_id_col]
-                    self.idx.append((time, source_id))
-                    pass
+            times = (np.asarray(tbhdu.data['DATE'], dtype=float) - 2440587.5
+                     + np.asarray(tbhdu.data['TIME'], dtype=float)) * 86400
+            sources = np.asarray(tbhdu.data[source_id_col]).astype(int)
+            hdulist.close()
+            if len(times) == 0:
                 continue
+            self.last_time = max(self.last_time, float(times.max()))
+            self.first_time = min(self.first_time, float(times.min()))
+            changes = np.flatnonzero(np.diff(sources, prepend=source_id) != 0)
+            self.idx.extend((float(times[i]), int(sources[i])) for i in changes)
+            source_id = int(sources[-1])
             continue
         self.idx.sort()
+        self._idx_times = [entry[0] for entry in self.idx]
         return
 
     def find_source(self, time):
         if time < self.first_time or time > self.last_time:
             return -1
-        source_id = -1
-        i = 0
-        try:
-            while time >= self.idx[i][0]:
-                source_id = self.idx[i][1]
-                i += 1
-                continue
-        except:
-            pass
-        return source_id
+        i = bisect.bisect_right(self._idx_times, time)
+        return self.idx[i - 1][1] if i > 0 else -1
 
 
 class TSysTable:
@@ -223,33 +216,33 @@ def skip_values(infp):
     return
 
 def get_timetuple(ts):
-    # ts as string with these possible formats:
+    # ts as string with these possible formats (the hour may have one or two digits:
+    # stations write both "07:04.8" and "7:04.8"):
     # hh.hh
     # hh:mm.mm
+    # hh:mm:ss
     # hh:mm:ss.ss
-    # NOTE: Regexs below will match any number of decimals on the last quantity (e.g. 19.8222222 and 19.8 both work)
-    if re.match(r"[0-9]{2}\.[0-9]+", ts):
-        # hh.hh
-        tm_hour = int(ts.split('.')[0])
-        tm_min = math.modf(60*float(ts.split('.')[1]))
-        tm_sec = int(60 * tm_min[0])
-        tm_min = int(tm_min[1])
-    elif re.match(r"[0-9]{2}:[0-9]{2}\.[0-9]+", ts):
-        # hh:mm.mm
-        tm_hour = int(ts.split(':')[0])
-        tm_min = math.modf(float(ts.split(':')[1]))
-        tm_sec = int(60 * tm_min[0])
-        tm_min = int(tm_min[1])
-    elif re.match(r"[0-9]{2}:[0-9]{2}:[0-9]{2}$", ts):
-        # hh:mm:ss
-        tm_hour = int(ts.split(':')[0])
-        tm_min = int(ts.split(':')[1])
-        tm_sec = int(ts.split(':')[2])
-    elif re.match(r"[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]+", ts):
-        # hh:mm:ss.ss
-        tm_hour = int(ts.split(':')[0])
-        tm_min = int(ts.split(':')[1])
-        tm_sec = float(ts.split(':')[2])
+    parts = ts.split(':')
+    try:
+        if len(parts) == 1:
+            hours = float(parts[0])
+            tm_hour = int(hours)
+            minutes = 60 * (hours - tm_hour)
+            tm_min = int(minutes)
+            tm_sec = int(round(60 * (minutes - tm_min)))
+        elif len(parts) == 2:
+            tm_hour = int(parts[0])
+            minutes = float(parts[1])
+            tm_min = int(minutes)
+            tm_sec = int(round(60 * (minutes - tm_min)))
+        elif len(parts) == 3:
+            tm_hour = int(parts[0])
+            tm_min = int(parts[1])
+            tm_sec = int(float(parts[2]))
+        else:
+            raise ValueError(ts)
+    except ValueError:
+        raise RuntimeError('cannot read the time stamp %r in the ANTAB file' % ts)
     return tm_hour, tm_min, tm_sec
 
 def process_values(infp, keys, pols, idi, data):
@@ -289,9 +282,10 @@ def process_values(infp, keys, pols, idi, data):
             tm_yday = int(fields[0])
             # Get timestamp data depending on data format
             tm_hour, tm_min, tm_sec = get_timetuple(fields[1])
-            t = "%dy%03dd%02dh%02dm%02ds" % \
-                (tm_year, tm_yday, tm_hour, tm_min, tm_sec)
-            t = tm.mktime(tm.strptime(t, "%Yy%jd%Hh%Mm%Ss"))
+            # Plain arithmetic rather than strptime: stations round up to stamps such as
+            # "07:60.00", which is a valid instant but not a valid clock reading.
+            t = tm.mktime(tm.strptime("%dy001d" % tm_year, "%Yy%jd")) + \
+                86400 * (tm_yday - 1) + 3600 * tm_hour + 60 * tm_min + tm_sec
             days = (t + timeoff - idi.reftime) / 86400
             source = idi.find_source(t)
             values = fields[2:]
@@ -380,7 +374,35 @@ def process_gc_values(infp, keys, pols, idi, data):
     data.sens_2.append(dpfu['L'])
     return
 
-def append_tsys(antabfile, idifiles, replace=False):
+def fill_missing_bands(tsys, antenna_no):
+    """Give the bands an antenna has no Tsys for the median of the bands it has (same polarization).
+
+    Returns {antenna_no: [band, ...]} for the bands filled in. An ANTAB INDEX line that
+    covers only part of the band (a station that reported fewer channels than were
+    correlated) otherwise leaves the rest of that station's data without any amplitude
+    calibration, which flags it.
+    """
+    tsys = np.asarray(tsys, dtype=float)
+    filled = {}
+    if tsys.ndim != 2 or tsys.shape[1] < 2:
+        return tsys, filled
+    antenna_no = np.asarray(antenna_no)
+    for antenna in np.unique(antenna_no):
+        rows = antenna_no == antenna
+        block = tsys[rows]
+        valid = block > 0
+        has_band = valid.any(axis=0)
+        if has_band.all() or not has_band.any():
+            continue
+        level = np.array([np.median(row[ok]) if ok.any() else -999.9 for row, ok in zip(block, valid)])
+        for band in np.flatnonzero(~has_band):
+            block[:, band] = level
+        tsys[rows] = block
+        filled[int(antenna)] = [int(b) for b in np.flatnonzero(~has_band)]
+    return tsys, filled
+
+
+def append_tsys(antabfile, idifiles, replace=False, fill_bands=False):
     # Make sure we're dealing with a list
     if not isinstance(idifiles, list):
         idifiles = [idifiles]
@@ -434,6 +456,15 @@ def append_tsys(antabfile, idifiles, replace=False):
     if len(pols) == 1 and pols[0] == 'L':
         tsys_1 = tsys_2
         pass
+
+    filled = {}
+    if fill_bands and len(antenna_no):
+        tsys_1, filled_1 = fill_missing_bands(tsys_1, antenna_no)
+        tsys_2, filled_2 = fill_missing_bands(tsys_2, antenna_no)
+        names = dict((number, name) for name, number in idi.antenna_map.items())
+        for label, result in (('R', filled_1), ('L', filled_2)):
+            for antenna, bands in result.items():
+                filled.setdefault(names.get(antenna, str(antenna)), {})[label] = [b + 1 for b in bands]
 
     cols = []
     col = pyfits.Column(name='TIME', format='1D', unit='DAYS', array=time)
@@ -514,7 +545,7 @@ def append_tsys(antabfile, idifiles, replace=False):
         hdulist.append(tbhdu)
         hdulist.close()
         pass
-    return
+    return filled
 
 def append_gc(antabfile, idifile, replace=False):
     # Check if we already have a GAIN_CURVE table

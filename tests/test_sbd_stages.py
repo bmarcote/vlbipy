@@ -108,3 +108,36 @@ def test_initial_calibration_plots_every_sbd_stage_with_its_refant(monkeypatch):
     assert [call["scans"] for call in calls] == [[stage["scan"]] for stage in stages]
     assert [call["refant"] for call in calls] == [stage["refant"] for stage in stages]
     assert all(f"scan{stage['scan']}" in call["label"] for call, stage in zip(calls, stages))
+
+
+def test_a_hand_missing_in_the_best_scan_comes_from_a_later_stage():
+    """An antenna with one polarization in the best scan gets the other from a scan that has it."""
+    nan = float("nan")
+    s = ScanSNRSurvey(project_code="T", scan_numbers=[1, 2], scan_sources=["FF", "FF"],
+                      antennas=["EF", "WB", "JB", "MC"], refant="EF",
+                      snr={"RR": [[nan, 50.0, 50.0, nan], [nan, 40.0, nan, 30.0]],
+                           "LL": [[nan, 50.0, 50.0, 50.0], [nan, 40.0, nan, 30.0]]})
+    stages = plan_sbd_stages(s, ["EF", "WB", "JB", "MC"], min_snr=7)
+    assert [st["scan"] for st in stages] == [1, 2]
+    assert stages[1]["antennas"] == ["MC"] and stages[1]["refant"] == "EF"
+
+
+def test_a_dead_polarization_does_not_cost_the_antenna():
+    nan = float("nan")
+    s = ScanSNRSurvey(project_code="T", scan_numbers=[1], scan_sources=["FF"], antennas=["EF", "WB", "TI"],
+                      refant="EF", snr={"RR": [[nan, 50.0, 50.0]], "LL": [[nan, 50.0, nan]]})
+    stages = plan_sbd_stages(s, ["EF", "WB", "TI"], min_snr=7)
+    assert len(stages) == 1 and set(stages[0]["antennas"]) == {"EF", "WB", "TI"}
+
+
+def test_antenna_with_one_dead_polarization_is_selected_on_the_live_one():
+    from vlbipy.models import Antenna, ObsMetadata
+    from vlbipy.selection import select_antennas
+    nan = float("nan")
+    s = ScanSNRSurvey(project_code="T", scan_numbers=[1, 2], scan_sources=["FF", "FF"], antennas=["AT", "MP", "KE"],
+                      refant="AT", snr={"RR": [[nan, 80.0, 40.0], [nan, 90.0, 45.0]],
+                                        "LL": [[nan, 80.0, 2.0], [nan, 90.0, 3.0]]})
+    meta = ObsMetadata(project_code="T", antennas={n: Antenna(name=n) for n in ("AT", "MP", "KE")})
+    assert select_antennas(s, meta, min_snr=7) == ["AT", "MP", "KE"]
+    stages = plan_sbd_stages(s, ["AT", "MP", "KE"], min_snr=7)
+    assert len(stages) == 1 and "KE" in stages[0]["antennas"]

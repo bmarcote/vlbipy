@@ -31,8 +31,8 @@ from .base import Backend, CalibrationOps, DataOps, ExportOps, FlagOps, ImagingO
 logger = get_logger()
 
 #: A-priori caltable name suffix and apply-interpolation per calibration type.
-APRIORI_TABLE_SPECS = {"tsys": (".tsys", "nearest"), "gc": (".gcal", "nearest"),
-                       "eop": (".eop", "linear")}
+APRIORI_TABLE_SPECS = {"accor": (".accor", "nearest"), "tsys": (".tsys", "nearest"),
+                       "gc": (".gcal", "nearest"), "eop": (".eop", "nearest")}
 
 #: SNR value CASA writes for the reference antenna's own (trivial) solution.
 _REFANT_SNR_SENTINEL = 999.0
@@ -52,6 +52,79 @@ _QUACK_SCANS_PER_READ = 20
 # Scans read per subband at once by the whole-field readers (dynamic spectra, uv distance):
 # a full subband of a long target track is tens of GB once unpacked (EM163: 1.2M rows).
 _SCANS_PER_READ = 10
+
+
+#: Name of the flag version saved right after the import (see ``CasaDataOps.reset_calibration``).
+IMPORT_FLAG_VERSION = "as_imported"
+
+#: Telescope names a correlator may write for a network other than the network's own name.
+_TELESCOPE_ALIASES = {"LBA": {"VLBA", "ATLBA"}}
+
+
+#: Polynomial coefficients per polarization that CASA's gain-curve table (``gencal caltype='gc'``,
+#: an "EPowerCurve") can hold. A longer polynomial is cut off there without any message.
+_CASA_GC_MAX_COEFFICIENTS = 8
+
+
+def refit_polynomial(coefficients, lo: float, hi: float, *, max_coefficients: int = _CASA_GC_MAX_COEFFICIENTS,
+                     tolerance: float = 1e-3) -> tuple[np.ndarray, float]:
+    """Approximate a power-series polynomial on ``[lo, hi]`` with at most ``max_coefficients`` terms.
+
+    Returns the lowest-degree least-squares fit whose largest relative deviation
+    from the original on the interval is within ``tolerance`` (the highest
+    allowed degree when none is), as power-series coefficients ``c_0 .. c_n``,
+    and that largest relative deviation.
+    """
+    from numpy.polynomial import Polynomial
+    original = Polynomial(np.asarray(coefficients, dtype=float))
+    x = np.linspace(float(lo), float(hi), 400)
+    y = original(x)
+    scale = np.maximum(np.abs(y), 1e-12)
+    best: tuple[np.ndarray, float] = (np.asarray(coefficients, dtype=float)[:max_coefficients], float("inf"))
+    for degree in range(0, max_coefficients):
+        fit = Polynomial.fit(x, y, degree).convert()
+        deviation = float(np.max(np.abs(fit(x) - y) / scale))
+        if deviation < best[1]:
+            best = (np.asarray(fit.coef, dtype=float), deviation)
+        if deviation <= tolerance:
+            break
+    return best
+
+
+def antenna_elevation_range(metadata, antenna: str, *, pad: float = 2.0,
+                            default: tuple[float, float] = (8.0, 88.0)) -> tuple[float, float]:
+    """Lowest and highest elevation (deg) at which ``antenna`` observed, padded by ``pad`` and kept in 1-90.
+
+    Evaluated at the start, middle and end of every scan the antenna took part
+    in. Falls back to ``default`` when the antenna position or the source
+    coordinates are not known.
+    """
+    try:
+        from astropy import units as u
+        from astropy.coordinates import AltAz, EarthLocation, SkyCoord
+        from astropy.time import Time
+        entry = metadata.antennas.get(antenna)
+        position = entry.position if entry is not None else None
+        coords = dict(getattr(metadata, "source_coords", {}) or {})
+        if position is None or not any(position):
+            return default
+        location = EarthLocation.from_geocentric(*position, unit=u.m)
+        times, ra, dec = [], [], []
+        for scan in metadata.scans:
+            if antenna not in scan.antennas or scan.source not in coords:
+                continue
+            for moment in (scan.time_start, 0.5 * (scan.time_start + scan.time_end), scan.time_end):
+                times.append(moment / 86400.0)
+                ra.append(coords[scan.source][0])
+                dec.append(coords[scan.source][1])
+        if not times:
+            return default
+        frame = AltAz(obstime=Time(np.asarray(times), format="mjd"), location=location)
+        elevation = SkyCoord(np.asarray(ra) * u.deg, np.asarray(dec) * u.deg).transform_to(frame).alt.deg
+        return float(max(1.0, np.min(elevation) - pad)), float(min(90.0, np.max(elevation) + pad))
+    except Exception as exc:  # noqa: BLE001 - a missing ephemeris must not stop the calibration
+        logger.debug("elevation range of {} not computed ({}); using {}", antenna, exc, default)
+        return default
 
 
 def _scan_chunks(scans, size: int = _SCANS_PER_READ) -> list[list[int]]:
@@ -270,6 +343,14 @@ class CasaDataOps(DataOps):
                                          separationaxis="auto", numsubms="auto", flagbackup=False,
                                          datacolumn="all")
             shutil.rmtree(plain_ms)
+        # Keep the flags the import itself made (data the correlator gave zero weight): a
+        # later reset must be able to return to exactly this state. DiFX carries them only
+        # in the visibility weights, so nothing else can put them back.
+        try:
+            self.backend.tasks.flagmanager(vis=str(target), mode="save", versionname=IMPORT_FLAG_VERSION,
+                                           comment="flags as imported", merge="replace")
+        except RuntimeError as exc:
+            logger.warning("could not save the as-imported flags of {} ({})", target.name, exc)
         logger.info("created {}", target)
 
     def import_uvfits(self, project_code: str, uvfits: str, *, delete: bool = False) -> None:
@@ -301,9 +382,14 @@ class CasaDataOps(DataOps):
         accumulate across runs, so without this a re-run inherits every flag a
         previous attempt made and works on a progressively smaller array.
 
-        The correlator flags that came in with the FITS-IDI are cleared too; the
-        pipeline puts them back in the a-priori flagging step, which is the one
-        place that decides what is bad.
+        The weights are put back to their as-imported values as well
+        (:meth:`_reset_weights`): ``applycal`` and the ``statwt`` reweighting of a
+        previous attempt leave WEIGHT holding that attempt's calibration, which a
+        new a-priori calibration would then scale a second time.
+
+        The flags go back to those of the import (data the correlator gave zero
+        weight, saved as the ``as_imported`` flag version); every flag made since
+        is cleared, and the a-priori flagging step applies the observatory's again.
 
         Parameters
         ----------
@@ -339,15 +425,90 @@ class CasaDataOps(DataOps):
         except RuntimeError as exc:
             raise BackendError(f"{project_code}: clearcal failed: {exc}") from exc
         if unflag:
+            imported = ms.with_name(f"{ms.name}.flagversions") / f"flags.{IMPORT_FLAG_VERSION}"
             try:
-                self.backend.tasks.flagdata(vis=str(ms), mode="unflag", flagbackup=False)
+                if imported.exists():
+                    # Back to the flags of the import (zero-weight data), not to no flags at all.
+                    self.backend.tasks.flagmanager(vis=str(ms), mode="restore", versionname=IMPORT_FLAG_VERSION)
+                else:
+                    logger.warning("{} has no saved as-imported flags (imported by an older version): clearing "
+                                   "every flag, including those of data the correlator gave zero weight; "
+                                   "re-import to recover them", ms.name)
+                    self.backend.tasks.flagdata(vis=str(ms), mode="unflag", flagbackup=False)
             except RuntimeError as exc:
                 raise BackendError(f"{project_code}: unflag failed: {exc}") from exc
+        self._reset_weights(ms)
         after = self.backend.flag.flagged_fraction(project_code)
         logger.info("reset {}: flagged {:.1%} -> {:.1%}; corrected data cleared{}",
                     ms.name, before, after,
                     f" (previous flags kept as {backup!r})" if backup else "")
         return {"flagged_before": before, "flagged_after": after, "backup": backup}
+
+    def _reset_weights(self, ms: Path, *, chunk_rows: int = 200_000) -> None:
+        """Put WEIGHT and SIGMA of ``ms`` back to their as-imported values and drop the per-channel weights.
+
+        ``importfitsidi`` gives a visibility the weight ``2 x channel width x
+        integration time`` (the number of independent samples, e.g. 2e6 for 0.5 MHz
+        and 2 s), with ``SIGMA = 1 / sqrt(WEIGHT)``, and weight 0 / sigma 1 where the
+        correlator recorded nothing. Fringe-fit SNRs are scaled by these weights, so
+        they must not simply be set to 1: that makes every detection look a thousand
+        times weaker and the antenna selection rejects the whole array.
+
+        Rows with no data in a polarization (all-zero visibilities: an antenna that
+        did not record that subband) get weight 0 again, so they can never be
+        averaged in after an unflag. The correlator's valid-data fraction of
+        partially filled integrations is the one thing that cannot be recovered
+        without re-importing; those integrations get the full nominal weight.
+
+        WEIGHT_SPECTRUM and SIGMA_SPECTRUM are not written by the import; ``statwt``
+        adds them (tens of GB on a large dataset) and recreates them when it runs.
+        """
+        widths = self._channel_widths_by_ddid(ms)
+        handle = self.backend.tools.table()
+        if not handle.open(str(ms), nomodify=False):
+            raise BackendError(f"could not open {ms} to reset its weights")
+        try:
+            dropped = [c for c in ("WEIGHT_SPECTRUM", "SIGMA_SPECTRUM") if c in handle.colnames()]
+            if dropped:
+                handle.removecols(dropped)
+            n_rows, n_empty = int(handle.nrows()), 0
+            for start in range(0, n_rows, chunk_rows):
+                count = min(chunk_rows, n_rows - start)
+                data = np.asarray(handle.getcol("DATA", startrow=start, nrow=count))           # (npol, nchan, nrow)
+                recorded = (data != 0).any(axis=1)                                             # (npol, nrow)
+                del data
+                exposure = np.asarray(handle.getcol("EXPOSURE", startrow=start, nrow=count), dtype=float)
+                ddid = np.asarray(handle.getcol("DATA_DESC_ID", startrow=start, nrow=count))
+                nominal = 2.0 * widths[ddid] * exposure                                         # (nrow,)
+                weight = np.where(recorded, nominal[np.newaxis, :], 0.0).astype(np.float32)
+                with np.errstate(divide="ignore"):
+                    sigma = np.where(weight > 0, 1.0 / np.sqrt(weight), 1.0).astype(np.float32)
+                handle.putcol("WEIGHT", weight, startrow=start, nrow=count)
+                handle.putcol("SIGMA", sigma, startrow=start, nrow=count)
+                n_empty += int((~recorded).sum())
+        finally:
+            handle.close()
+        logger.info("reset {}: WEIGHT = 2 x channel width x integration time over {} row(s) ({:.0%} of the "
+                    "row/polarization cells carry no data and got weight 0){}", ms.name, n_rows,
+                    n_empty / max(4 * n_rows, 1), f"; dropped {', '.join(dropped)}" if dropped else "")
+
+    def _channel_widths_by_ddid(self, ms: Path) -> np.ndarray:
+        """Channel width in Hz of every DATA_DESC_ID of ``ms`` (the first channel of its spectral window)."""
+        handle = self.backend.tools.table()
+        if not handle.open(str(ms / "DATA_DESCRIPTION")):
+            raise BackendError(f"could not open {ms}/DATA_DESCRIPTION")
+        try:
+            spw_ids = np.asarray(handle.getcol("SPECTRAL_WINDOW_ID"))
+        finally:
+            handle.close()
+        if not handle.open(str(ms / "SPECTRAL_WINDOW")):
+            raise BackendError(f"could not open {ms}/SPECTRAL_WINDOW")
+        try:
+            widths = np.array([abs(float(np.asarray(handle.getcell("CHAN_WIDTH", int(row))).ravel()[0]))
+                               for row in range(handle.nrows())])
+        finally:
+            handle.close()
+        return widths[spw_ids]
 
     def _fix_antenna_names(self, ms: Path) -> None:
         """Restore antenna names from the STATION column when AIPS left numbers in NAME."""
@@ -378,7 +539,9 @@ class CasaDataOps(DataOps):
         try:
             antenna_names = list(msmd.antennanames())
             telescope = msmd.observatorynames()[0] if msmd.observatorynames() else ""
-            if telescope and observatory and telescope.upper() != observatory.upper():
+            # DiFX labels every array it correlates "VLBA", so an LBA dataset saying so is expected.
+            expected = {observatory.upper()} | _TELESCOPE_ALIASES.get(observatory.upper(), set())
+            if telescope and observatory and telescope.upper() not in expected:
                 logger.warning("observatory mismatch: config says {} but the MS says {}",
                                observatory, telescope)
 
@@ -743,6 +906,93 @@ class CasaDataOps(DataOps):
         return {"baselines": spectra, "antennas": present, "times": centres.tolist(),
                 "frequencies_ghz": meta.freq_setup.frequencies_ghz(), "field": field,
                 "column": column, "stokes_i": stokes_i}
+
+    def read_baseline_timeline(self, project_code: str, *, field: str, column: str = "corrected",
+                               metadata: Optional[ObsMetadata] = None) -> dict:
+        """Read one amplitude per baseline and integration, averaged over the whole band.
+
+        Each visibility is vector-averaged over its channels and parallel hands and
+        then over the subbands, so on calibrated data of a bright source every
+        baseline gets its best signal-to-noise at the native time resolution - what
+        is needed to see an antenna arrive on source a few seconds late. Read a few
+        scans of one subband at a time, like the other whole-field readers.
+
+        Parameters
+        ----------
+        field : str
+            One field (a bright calibrator).
+        column : str
+            ``"corrected"`` (post-applycal) or ``"data"``.
+
+        Returns
+        -------
+        dict
+            ``antennas`` (every antenna name, the axis order), ``times`` (MJD seconds),
+            ``scans`` (scan number per time), ``amplitude``
+            (``(n_antenna, n_antenna, n_time)``, symmetric, ``nan`` where flagged) and
+            ``integration`` (seconds).
+        """
+        meta = metadata or self.backend.data.get_metadata(project_code, [], "")
+        scans = [s for s in meta.scans if s.source == field]
+        if not scans:
+            raise BackendError(f"{project_code}: no scans on {field!r}")
+        pol_indices, _ = parallel_hand_indices(meta)
+        column_name = {"corrected": "corrected_data", "data": "data"}[column]
+        antenna_names = list(meta.antennas)
+        pieces: list[tuple] = []
+        ms_tool = self.backend.tools.ms()
+        if not ms_tool.open(str(self.backend.ms_path(project_code))):
+            raise BackendError(f"could not open MS for {project_code}")
+        try:
+            for spw, scan_chunk in ((spw, chunk) for spw in range(meta.freq_setup.n_subbands)
+                                    for chunk in _scan_chunks(scans)):
+                ms_tool.selectinit(datadescid=spw)
+                try:
+                    select_ms_rows(ms_tool, field=field, scans=scan_chunk)
+                except BackendError:
+                    ms_tool.reset()
+                    continue     # nothing recorded in this subband for these scans
+                try:
+                    record = ms_tool.getdata([column_name, "flag", "antenna1", "antenna2", "time", "scan_number"])
+                except RuntimeError as exc:
+                    raise BackendError(f"{project_code}: could not read {column}: {exc}") from exc
+                ms_tool.reset()
+                values = record.pop(column_name, None)
+                if values is None or not values.size:
+                    continue
+                good = ~np.asarray(record.pop("flag"), dtype=bool)[pol_indices, :, :]
+                count = good.sum(axis=(0, 1))
+                total = np.where(good, values[pol_indices, :, :], 0.0).sum(axis=(0, 1))
+                del values, good
+                ant1, ant2 = np.asarray(record["antenna1"]), np.asarray(record["antenna2"])
+                keep = (count > 0) & (ant1 != ant2)
+                pieces.append((ant1[keep], ant2[keep], np.asarray(record["time"], dtype=float)[keep],
+                               np.asarray(record["scan_number"])[keep], total[keep] / count[keep]))
+        finally:
+            ms_tool.close()
+        if not pieces:
+            raise BackendError(f"{project_code}: no unflagged {column} data on {field!r}")
+        ant1, ant2, row_time, row_scan, row_value = (np.concatenate([p[k] for p in pieces]) for k in range(5))
+        times = np.unique(row_time)
+        index = np.searchsorted(times, row_time)
+        n_antenna = len(antenna_names)
+        inside = (ant1 < n_antenna) & (ant2 < n_antenna)
+        low, high = np.minimum(ant1, ant2)[inside], np.maximum(ant1, ant2)[inside]
+        sums = np.zeros((n_antenna, n_antenna, times.size), dtype=complex)
+        counts = np.zeros((n_antenna, n_antenna, times.size))
+        np.add.at(sums, (low, high, index[inside]), row_value[inside])       # one vote per subband
+        np.add.at(counts, (low, high, index[inside]), 1.0)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            amplitude = np.where(counts > 0, np.abs(sums) / np.maximum(counts, 1.0), np.nan)
+        amplitude = np.fmax(amplitude, np.transpose(amplitude, (1, 0, 2)))
+        scan_of_time = np.zeros(times.size, dtype=int)
+        scan_of_time[index] = row_scan
+        steps = np.diff(times)
+        integration = float(np.min(steps[steps > 0])) if (steps > 0).any() else 0.0
+        logger.info("read_baseline_timeline: {} on {}: {} integration(s) of {:.1f} s in {} scan(s)", column, field,
+                    times.size, integration, np.unique(scan_of_time).size)
+        return {"antennas": antenna_names, "times": times, "scans": scan_of_time, "amplitude": amplitude,
+                "integration": integration, "field": field, "column": column}
 
     def read_timeseries(self, project_code: str, *, field: str = "", scans: Optional[list] = None,
                         refant: str = "", column: str = "corrected", max_time_bins: int = 300,
@@ -1354,7 +1604,9 @@ class CasaCalibrationOps(CalibrationOps):
         Runs ``gencal(caltype='tsys', uniform=False)`` (from the SYSCAL subtable) and
         ``gencal(caltype='gc')`` (from the GAIN_CURVE subtable) for every network, and
         ``gencal(caltype='eop', infile=usno_finals.erp)`` for networks correlated with
-        provisional Earth-orientation parameters (VLBA/LBA; not EVN).
+        provisional Earth-orientation parameters (VLBA/LBA; not EVN). With
+        ``needs_accor=True`` (DiFX: VLBA/LBA) the correlator amplitude correction
+        comes first, see :meth:`accor`; ``accor`` is a dict of its settings.
 
         Parameters
         ----------
@@ -1377,8 +1629,13 @@ class CasaCalibrationOps(CalibrationOps):
             raise BackendError(f"{project_code}: measurement set {ms} not found; "
                                "run import_data() before a_priori calibration")
         self._verify_apriori_inputs(project_code, antab=kwargs.get("antab"))
+        self._fit_gain_curves_to_casa(project_code, metadata=kwargs.get("metadata"))
         tables: list[CalTable] = []
         paths = self.backend.apriori_table_paths(project_code, needs_eop)
+        if kwargs.get("needs_accor"):
+            accor = self.accor(project_code, field, **dict(kwargs.get("accor") or {}))
+            if accor is not None:
+                tables.append(accor)
 
         for cal_type, table_path in paths.items():
             if table_path.exists():
@@ -1398,6 +1655,153 @@ class CasaCalibrationOps(CalibrationOps):
         if not needs_eop:
             logger.info("EOP corrections not needed for this network; skipped")
         return tables
+
+    def accor(self, project_code: str, field: str = "", *, solint: str = "30s", smoothtype: str = "median",
+              smoothtime: float = 1800.0, **kwargs) -> Optional[CalTable]:
+        """Correlator amplitude correction from the autocorrelations (CASA ``accor`` + ``smoothcal``).
+
+        DiFX (VLBA, LBA) does not normalise the cross-correlations by the
+        digitiser statistics; the autocorrelations, which should be exactly
+        unity, measure that error per antenna, subband and polarization.
+        ``accor`` solves for it every ``solint`` into ``<code>.accor``, and
+        ``smoothcal`` then smooths the solutions in time (``smoothtype``,
+        ``smoothtime`` seconds) into ``<code>.accor_smooth``, the table that is
+        applied. It must run while the autocorrelations are still unflagged.
+
+        Parameters
+        ----------
+        project_code : str
+            Project code (the MS must exist).
+        field : str
+            Recorded in the returned CalTable (the solve uses every field).
+        solint : str
+            Solution interval of ``accor``.
+        smoothtype : str
+            ``smoothcal`` filter: ``"median"`` or ``"mean"``.
+        smoothtime : float
+            ``smoothcal`` filter width in seconds; 0 applies the unsmoothed table.
+
+        Returns
+        -------
+        CalTable or None
+            The table to apply, or ``None`` when the data hold no usable
+            autocorrelations (reported as an anomaly, not an error).
+        """
+        ms = self.backend.ms_path(project_code)
+        raw = self.backend.caldir() / f"{project_code}{APRIORI_TABLE_SPECS['accor'][0]}"
+        smoothed = raw.with_name(f"{raw.name}_smooth")
+        for path in (raw, smoothed):
+            if path.exists():
+                shutil.rmtree(path)
+        logger.info("accor solint='{}' -> {}", solint, raw.name)
+        try:
+            # corrdepflags: a station with one dead polarization has that autocorrelation flagged
+            # (DiFX gives it zero weight). Without this, accor drops the whole row and the working
+            # polarization gets no solution either, which then flags the antenna altogether.
+            self.backend.tasks.accor(vis=str(ms), caltable=str(raw), solint=str(solint), corrdepflags=True)
+        except RuntimeError as exc:
+            warnings.anomaly(f"{project_code}: accor failed ({exc}); the correlator amplitude correction is "
+                             "not applied")
+            return None
+        if not raw.is_dir() or self._all_flagged(raw):
+            warnings.anomaly(f"{project_code}: accor found no usable autocorrelations (flagged or not in the "
+                             "data); the correlator amplitude correction is not applied")
+            return None
+        applied = raw
+        if float(smoothtime) > 0:
+            logger.info("smoothcal smoothtype='{}' smoothtime={:g} s -> {}", smoothtype, float(smoothtime),
+                        smoothed.name)
+            try:
+                self.backend.tasks.smoothcal(vis=str(ms), tablein=str(raw), caltable=str(smoothed),
+                                             smoothtype=str(smoothtype), smoothtime=float(smoothtime))
+                applied = smoothed
+            except RuntimeError as exc:
+                warnings.warn(f"{project_code}: smoothcal of the accor table failed ({exc}); applying it unsmoothed")
+        return CalTable(cal_type="accor", path=str(applied), field=field, interp=APRIORI_TABLE_SPECS["accor"][1])
+
+    def _all_flagged(self, table_path: Path) -> bool:
+        """True when a calibration table has no row, or no unflagged solution."""
+        handle = self.backend.tools.table()
+        handle.open(str(table_path))
+        try:
+            return handle.nrows() == 0 or bool(np.all(handle.getcol("FLAG")))
+        finally:
+            handle.close()
+
+    def _fit_gain_curves_to_casa(self, project_code: str, *, metadata: Optional[ObsMetadata] = None,
+                                 tolerance: float = 1e-3) -> dict[str, dict]:
+        """Shorten gain-curve polynomials that are longer than CASA can apply.
+
+        ``gencal(caltype='gc')`` copies at most :data:`_CASA_GC_MAX_COEFFICIENTS`
+        coefficients per polarization out of the GAIN_CURVE subtable and silently
+        drops the rest. A station whose ``.antab`` polynomial has one term more
+        (JB in EM163: nine) is then corrected with a curve that is right at low
+        elevation and wrong by orders of magnitude towards the zenith - its
+        amplitudes follow the source's elevation over the whole track.
+
+        Such a polynomial is replaced, in the GAIN_CURVE subtable, by the
+        lowest-degree fit that reproduces it within ``tolerance`` over the
+        elevations at which the antenna actually observed (a high-order
+        polynomial is only meaningful where it was fitted, and wild outside). The
+        untouched subtable is saved once as ``<caltables>/<code>.gain_curve.original``.
+
+        Returns
+        -------
+        dict
+            ``{antenna: {"coefficients_before", "coefficients_after", "elevation_range",
+            "max_deviation", "truncation_error"}}`` for the antennas that were refitted
+            (``truncation_error`` is the largest factor by which CASA's cut-off would
+            have changed the amplitudes).
+        """
+        ms = self.backend.ms_path(project_code)
+        if not (ms / "GAIN_CURVE").is_dir():
+            return {}
+        names = self._table_antenna_names(ms)
+        handle = self.backend.tools.table()
+        if not handle.open(str(ms / "GAIN_CURVE"), nomodify=False):
+            raise BackendError(f"could not open {ms}/GAIN_CURVE")
+        report: dict[str, dict] = {}
+        try:
+            n_poly = np.asarray(handle.getcol("NUM_POLY"))
+            too_long = np.flatnonzero(n_poly > _CASA_GC_MAX_COEFFICIENTS)
+            if not too_long.size:
+                return {}
+            backup = self.backend.caldir() / f"{project_code}.gain_curve.original"
+            if not backup.exists():
+                handle.copy(str(backup), deep=True, valuecopy=True).close()
+            antenna_ids = np.asarray(handle.getcol("ANTENNA_ID"))
+            meta = metadata or self.backend.data.get_metadata(project_code, [], "")
+            for row in too_long:
+                name = names[int(antenna_ids[row])] if int(antenna_ids[row]) < len(names) else f"#{int(antenna_ids[row])}"
+                kind = str(handle.getcell("TYPE", int(row))).upper()
+                gain = np.asarray(handle.getcell("GAIN", int(row)), dtype=float)            # (npol, n_poly)
+                el_lo, el_hi = antenna_elevation_range(meta, name)
+                lo, hi = (90.0 - el_hi, 90.0 - el_lo) if "ZA" in kind else (el_lo, el_hi)
+                fits = [refit_polynomial(coefficients, lo, hi, tolerance=tolerance) for coefficients in gain]
+                width = max(len(coefficients) for coefficients, _ in fits)
+                new_gain = np.zeros((gain.shape[0], width))
+                for pol, (coefficients, _) in enumerate(fits):
+                    new_gain[pol, :len(coefficients)] = coefficients
+                x = np.linspace(lo, hi, 200)
+                full = np.polynomial.polynomial.polyval(x, gain[0])
+                cut = np.polynomial.polynomial.polyval(x, gain[0, :_CASA_GC_MAX_COEFFICIENTS])
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    ratio = np.sqrt(np.abs(cut / full)) if "POWER" in kind else np.abs(cut / full)
+                handle.putcell("GAIN", int(row), new_gain)
+                handle.putcell("NUM_POLY", int(row), int(width))
+                report[name] = {"coefficients_before": int(gain.shape[1]), "coefficients_after": int(width),
+                                "elevation_range": (float(el_lo), float(el_hi)),
+                                "max_deviation": float(max(deviation for _, deviation in fits)),
+                                "truncation_error": float(np.nanmax(np.maximum(ratio, 1.0 / np.maximum(ratio, 1e-12))))}
+        finally:
+            handle.close()
+        for name, entry in sorted(report.items()):
+            logger.info("gain curve: {} has a {}-coefficient polynomial but CASA applies only the first {} (amplitudes "
+                        "off by up to a factor {:.3g} at the elevations observed); refitted with {} coefficients over "
+                        "{:.0f}-{:.0f} deg, within {:.2%} of the original", name, entry["coefficients_before"],
+                        _CASA_GC_MAX_COEFFICIENTS, entry["truncation_error"], entry["coefficients_after"],
+                        *entry["elevation_range"], entry["max_deviation"])
+        return report
 
     def smooth(self, project_code: str, table: CalTable, *, threshold: float = 6.0,
                max_passes: int = 3, window: int = 5, **kwargs) -> CalTable:
@@ -1647,18 +2051,37 @@ class CasaCalibrationOps(CalibrationOps):
                 flag[:, :, row] |= ref_flag
             # Wrap the phase terms (every 4th parameter starting at 0) back into (-pi, pi].
             par[0::4] = (par[0::4] + np.pi) % (2 * np.pi) - np.pi
+            # An antenna already in the main table is here for the polarization an earlier
+            # stage could not give it: fill only what is still flagged there, never replace.
+            existing = {(int(a), int(w)): r for r, (a, w) in enumerate(zip(main_ant, main_spw))}
+            merged = [row for row in keep if (int(ant[row]), int(spw[row])) in existing]
+            for row in merged:
+                target = existing[(int(ant[row]), int(spw[row]))]
+                fill = main_flag[:, :, target] & ~flag[:, :, row]
+                main_par[:, :, target][fill] = par[:, :, row][fill]
+                main_flag[:, :, target][fill] = False
             table.putcol("FPARAM", par)
             table.putcol("FLAG", flag)
             table.putcol("ANTENNA2", np.full(len(ant), main_reference, dtype=main_ref.dtype))
-            drop = [r for r in range(len(ant)) if r not in set(keep)]
+            drop = [r for r in range(len(ant)) if r not in set(keep) or r in set(merged)]
             if drop:
                 table.removerows(drop)
             table.flush()
             appended = table.nrows()
-            table.copyrows(str(main_path))
+            if appended:
+                table.copyrows(str(main_path))
         finally:
             table.close()
-        return int(appended)
+        if merged:
+            table.open(str(main_path), nomodify=False)
+            try:
+                # Rows appended above come after the ones read earlier, so those are untouched.
+                table.putcol("FPARAM", main_par, 0, main_par.shape[2])
+                table.putcol("FLAG", main_flag, 0, main_flag.shape[2])
+                table.flush()
+            finally:
+                table.close()
+        return int(appended + len(merged))
 
     def bandpass(self, project_code: str, field: str, refant: str, *,
                  scans: Optional[list] = None, gaintable: Optional[list] = None,
@@ -1710,7 +2133,7 @@ class CasaCalibrationOps(CalibrationOps):
                     field, params.get("scan", "all"), solint, combine,
                     ", ".join(t.cal_type for t in gaintable or []) or "none")
         try:
-            self.backend.tasks.bandpass(**params)
+            self._run_bandpass_task(params)
         except RuntimeError as exc:
             if new_path.exists():
                 shutil.rmtree(new_path)
@@ -1883,7 +2306,7 @@ class CasaCalibrationOps(CalibrationOps):
         logger.info("scalar_bandpass: gaincal calmode='a' field={} solint={} combine={} "
                     "(one amplitude per antenna and subband)", field, solint, combine)
         try:
-            self.backend.tasks.gaincal(**params)
+            self._run_gaincal_task(params)
         except RuntimeError as exc:
             if new_path.exists():
                 shutil.rmtree(new_path)
@@ -2001,6 +2424,14 @@ class CasaCalibrationOps(CalibrationOps):
         staging, spw maps, SNR reading) stays shared.
         """
         self.backend.tasks.fringefit(**params)
+
+    def _run_bandpass_task(self, params: dict) -> None:
+        """Run the bandpass solver (the override point for alternate engines)."""
+        self.backend.tasks.bandpass(**params)
+
+    def _run_gaincal_task(self, params: dict) -> None:
+        """Run gaincal (the override point for alternate engines)."""
+        self.backend.tasks.gaincal(**params)
 
     def _median_table_snr(self, table_path: Path) -> float:
         """Return the median SNR of the unflagged solutions in a calibration table."""
@@ -2856,6 +3287,19 @@ class CasaFlagOps(FlagOps):
             return empty[0], relative
         return np.where(usable & (np.abs(relative) > threshold * sigma))[0], relative
 
+    @staticmethod
+    def _baseline_coherence(values: np.ndarray) -> float:
+        """How much of a baseline's amplitude is signal: 1 for a strong source, towards 0 for noise.
+
+        Per time bin, the amplitude of the channel-averaged visibility over the mean
+        channel amplitude; the median over the bins. Noise averages down across the
+        channels while a calibrated source does not.
+        """
+        with np.errstate(invalid="ignore", divide="ignore"):
+            ratio = np.abs(np.nanmean(values, axis=1)) / np.nanmean(np.abs(values), axis=1)
+        ratio = ratio[np.isfinite(ratio)]
+        return float(np.median(ratio)) if ratio.size else 0.0
+
     def _spike_bins(self, amplitude: np.ndarray, finite: np.ndarray, threshold: float, smooth_bins: int) -> np.ndarray:
         """Return only the time bins of :meth:`_spike_departures`."""
         return self._spike_departures(amplitude, finite, threshold, smooth_bins)[0]
@@ -2909,6 +3353,7 @@ class CasaFlagOps(FlagOps):
         gross_departure = float(kwargs.pop("gross_departure", 0.25))
         gross_max_fraction = float(kwargs.pop("gross_max_fraction", 0.35))
         gross_min_bins = int(kwargs.pop("gross_min_bins", 30))
+        gross_min_coherence = float(kwargs.pop("gross_min_coherence", 0.5))
         commands: list[str] = []
         per_baseline: list[tuple[str, float]] = []
         suspect: list[tuple[str, float]] = []
@@ -2946,10 +3391,16 @@ class CasaFlagOps(FlagOps):
                     # Too many for the sigma cut to be trusted - but on a well-sampled baseline the
                     # bins that sit far from the local level in absolute terms (an antenna still
                     # slewing, a dropout) are bad whatever the statistics say. Keep only those.
+                    # Only where the source itself sets the amplitude, though: on a baseline that
+                    # is mostly noise (a faint target, a long spacing on a weak source) the level
+                    # of a bin follows how many samples went into it, and cutting on it would
+                    # flag good data and bias what is left.
                     populated = int(np.isfinite(relative).sum())
+                    coherence = self._baseline_coherence(values)
                     gross = bad_bins[np.abs(relative[bad_bins]) > gross_departure]
                     gross_share = float(finite[gross].sum()) / float(finite.sum()) if gross.size else 0.0
-                    if populated < gross_min_bins or not gross.size or gross_share > gross_max_fraction:
+                    if (populated < gross_min_bins or not gross.size or gross_share > gross_max_fraction
+                            or coherence < gross_min_coherence):
                         logger.info("outliers: {} {}&{} looks {:.0%} anomalous — too much to be "
                                     "spikes; leaving it untouched", name, first, second, share)
                         suspect.append((f"{name} {first}&{second}", share))
@@ -2994,6 +3445,152 @@ class CasaFlagOps(FlagOps):
         report["flagged_fraction_of_data"] = max(0.0, after - before)
         logger.info("outliers: flagged {:.2%} of the data ({:.1%} -> {:.1%})",
                     report["flagged_fraction_of_data"], before, after)
+        return report
+
+    def off_source(self, project_code: str, *, fields: list[str], transfer_fields: Optional[list[str]] = None,
+                   level: float = 0.8, column: str = "corrected", gapless_seconds: float = 10.0,
+                   margin: int = 1, min_share: float = 0.2, dry_run: bool = False,
+                   metadata: Optional[ObsMetadata] = None, **kwargs) -> dict:
+        """Flag antennas while they are not on source, measured on the calibrated data.
+
+        The station flags that come with the data cover the slewing of most
+        antennas, but not of all (no log at all for the e-MERLIN out-stations or
+        IB in EM163) and not always to the end (WB arrives 4-14 s after its flag
+        ends in nine scans out of ten). Before calibration this cannot be seen on a
+        weak calibrator; after it, an antenna that is still slewing drags *all* its
+        baselines down together, sample by sample.
+
+        Two parts:
+
+        ``fields`` (bright calibrators) are measured directly. Per integration the
+        normalised amplitudes of every baseline are split into one factor per
+        antenna (:func:`vlbipy.statistics.detect_off_source`); an antenna below
+        ``level`` is flagged for that integration, plus ``margin`` integrations
+        while it settles.
+
+        ``transfer_fields`` (targets and other sources too faint to measure) get the
+        time each antenna *typically* needs to arrive: the 90th percentile, over the
+        calibrator scans of the same kind (starting right after the previous scan,
+        i.e. containing the slew, or after a gap), of the time from the scan start
+        until the antenna was on source. That time is a property of the slew and is
+        tight (EM163: e-MERLIN stations 10-12 s in three scans out of four, WB
+        34-38 s in all of them). An antenna that is rarely late (in fewer than
+        ``min_share`` of those scans) gets nothing, and one whose own station flags
+        already cover its slew is never late in this sense.
+
+        Parameters
+        ----------
+        fields : list of str
+            Fields bright enough to measure on.
+        transfer_fields : list of str, optional
+            Fields that receive the per-antenna typical times instead.
+        level : float
+            On-source fraction below which an antenna is flagged.
+        gapless_seconds : float
+            A scan starting within this many seconds of the previous scan's end contains the slew.
+        margin : int
+            Integrations flagged after the last off-source one.
+        dry_run : bool
+            Measure and report without flagging.
+
+        Returns
+        -------
+        dict
+            ``commands``, ``per_antenna`` (seconds flagged directly), ``typical``
+            (arrival after the scan start, ``{"gapless": {antenna: seconds}, "gap": {...}}``), ``n_direct``,
+            ``n_transfer`` and, when applied, ``flagged_fraction_of_data``.
+        """
+        from ..statistics import detect_off_source
+        meta = metadata or self.backend.data.get_metadata(project_code, [], "")
+        ordered = sorted(meta.scans, key=lambda s: s.time_start)
+        previous_end = {s.scan_number: (ordered[k - 1].time_end if k else -np.inf) for k, s in enumerate(ordered)}
+        scan_info = {s.scan_number: s for s in meta.scans}
+        stamp = "%Y/%m/%d/%H:%M:%S.%f"
+
+        def command(antenna: str, start: float, end: float) -> str:
+            first, last = mjdsec2datetime(start), mjdsec2datetime(end)
+            return f"antenna='{antenna}' timerange='{first.strftime(stamp)[:-3]}~{last.strftime(stamp)[:-3]}'"
+
+        commands: list[str] = []
+        per_antenna: dict[str, float] = {}
+        leading: dict[str, dict[str, list[float]]] = {"gapless": {}, "gap": {}}
+        for field in fields:
+            try:
+                data = self.backend.data.read_baseline_timeline(project_code, field=field, column=column, metadata=meta)
+            except BackendError as exc:
+                logger.info("off source: skipping field {} ({})", field, exc)
+                continue
+            times, scan_of_time, step = data["times"], data["scans"], data["integration"] or 1.0
+            found = detect_off_source(data["amplitude"], scan_of_time, level=level)
+            for index, name in enumerate(data["antennas"]):
+                judged, off = found["judged"][index], found["off"][index]
+                if not judged.any():
+                    continue
+                for scan_number in np.unique(scan_of_time[judged]):
+                    samples = np.flatnonzero((scan_of_time == scan_number) & judged)
+                    if samples.size < 5:
+                        continue
+                    scan = scan_info.get(int(scan_number))
+                    kind = "gapless" if scan and scan.time_start - previous_end[scan.scan_number] <= gapless_seconds else "gap"
+                    bad = off[samples]
+                    lead = int(np.argmin(bad)) if not bad.all() else bad.size        # length of the leading run
+                    begin = (scan.time_start if scan else times[samples[0]]) - step / 2.0
+                    arrival = (times[samples[lead - 1]] + step / 2.0 - begin) if lead else 0.0
+                    leading[kind].setdefault(name, []).append(arrival)
+                    # one command per run of consecutive off-source integrations, with the settling margin
+                    edges = np.flatnonzero(np.diff(np.r_[0, bad.astype(int), 0]))
+                    for first, last in zip(edges[::2], edges[1::2]):
+                        start = times[samples[first]] - step / 2.0
+                        if first == 0 and scan:
+                            start = min(start, scan.time_start - step / 2.0)
+                        end = times[samples[last - 1]] + step / 2.0 + margin * step
+                        commands.append(command(name, start, end))
+                        per_antenna[name] = per_antenna.get(name, 0.0) + (last - first) * step
+        n_direct = len(commands)
+
+        # What each antenna typically needs, for the fields too faint to measure.
+        typical: dict[str, dict[str, float]] = {"gapless": {}, "gap": {}}
+        for kind, by_antenna in leading.items():
+            for name, durations in by_antenna.items():
+                values = np.asarray(durations)
+                if values.size >= 5 and float((values > 0).mean()) >= min_share:
+                    typical[kind][name] = float(np.percentile(values, 90))
+        wanted = [f for f in (transfer_fields or []) if f not in fields]
+        for scan in meta.scans:
+            if scan.source not in wanted:
+                continue
+            kind = "gapless" if scan.time_start - previous_end[scan.scan_number] <= gapless_seconds else "gap"
+            step = scan.integration_time or 2.0
+            for name, seconds in typical[kind].items():
+                if seconds <= 0 or name not in scan.antennas:
+                    continue
+                begin = scan.time_start - step / 2.0
+                commands.append(command(name, begin, min(begin + seconds + margin * step, scan.time_end + step / 2.0)))
+        report = {"commands": commands, "per_antenna": per_antenna, "typical": typical, "n_direct": n_direct,
+                  "n_transfer": len(commands) - n_direct, "level": float(level)}
+        if per_antenna:
+            logger.info("off source: {} stretch(es) flagged on {}: seconds per antenna {}", n_direct, ", ".join(fields),
+                        ", ".join(f"{n} {s:.0f}" for n, s in sorted(per_antenna.items(), key=lambda item: -item[1])))
+        else:
+            logger.info("off source: every antenna is on source throughout {}", ", ".join(fields))
+        for kind, label in (("gapless", "scans that contain the slew"), ("gap", "scans that start after a gap")):
+            if typical[kind]:
+                logger.info("off source: typical arrival after the scan start in {} (applied to {}): {}", label,
+                            ", ".join(wanted) or "no other field",
+                            ", ".join(f"{n} {s:.0f} s" for n, s in sorted(typical[kind].items(), key=lambda item: -item[1])))
+        if dry_run or not commands:
+            return report
+        before = self.flagged_fraction(project_code)
+        try:
+            self.backend.tasks.flagdata(vis=str(self.backend.ms_path(project_code)), mode="list", inpfile=commands,
+                                        flagbackup=False, action="apply")
+        except RuntimeError as exc:
+            raise BackendError(f"{project_code}: flagging the off-source antennas failed: {exc}") from exc
+        after = self.flagged_fraction(project_code)
+        report["flagged_fraction_of_data"] = max(0.0, after - before)
+        logger.info("flag[off source]: {:.2%} newly flagged ({:.1%} -> {:.1%} of observable data; {} direct, {} "
+                    "transferred command(s))", report["flagged_fraction_of_data"], before, after, n_direct,
+                    report["n_transfer"])
         return report
 
     def measure_quack(self, project_code: str, *, field: str = "", column: str = "corrected",
@@ -3370,18 +3967,34 @@ class CasaFlagOps(FlagOps):
         n_channels = values.shape[1]
         commands: list[str] = []
         per_antenna: dict[str, int] = {}
+        dead: dict[str, set[str]] = {}
+        correlations = self._correlation_labels(project_code)
+        # Feed labels in table order (R, L or X, Y), from the parallel hands of the data.
+        hands = [c[0] for c in correlations if len(c) == 2 and c[0] == c[1]]
         for row in range(values.shape[2]):
             solved = ~flags[:, :, row]
             if not solved.any():
                 continue                  # the antenna has no solution in this subband: no data to protect
-            bad = (~solved | (np.abs(values[:, :, row]) < min_gain)).any(axis=0)      # either polarization
+            name = names[int(antenna_ids[row])] if int(antenna_ids[row]) < len(names) else str(int(antenna_ids[row]))
+            # A polarization with no solution at all in this subband is a dead receiver
+            # channel, not a gap in the band: only the correlations it enters are lost, and it
+            # must not take the other polarization's channels with it.
+            alive = solved.any(axis=1)
+            for pol in np.flatnonzero(~alive):
+                products = ",".join(c for c in correlations if hands[pol] in c) if pol < len(hands) else ""
+                if products:
+                    commands.append(f"antenna='{name}' spw='{int(spw_ids[row])}' correlation='{products}'")
+                    dead.setdefault(name, set()).add(hands[pol])
+            bad = (~solved | (np.abs(values[:, :, row]) < min_gain))[alive].any(axis=0)   # any live polarization
             if not bad.any():
                 continue
-            name = names[int(antenna_ids[row])] if int(antenna_ids[row]) < len(names) else str(int(antenna_ids[row]))
             edges = np.flatnonzero(np.diff(np.r_[0, bad.astype(int), 0]))
             ranges = ";".join(f"{a}~{b - 1}" for a, b in zip(edges[::2], edges[1::2]))
             commands.append(f"antenna='{name}' spw='{int(spw_ids[row])}:{ranges}'")
             per_antenna[name] = per_antenna.get(name, 0) + int(bad.sum())
+        if dead:
+            logger.info("bandpass gaps: no solution in one polarization, only its correlations are flagged: {}",
+                        ", ".join(f"{name} ({'/'.join(sorted(pols))})" for name, pols in sorted(dead.items())))
         report = {"commands": commands, "n_channels_flagged": int(sum(per_antenna.values())),
                   "per_antenna": per_antenna, "n_channels": int(n_channels), "min_gain": float(min_gain)}
         if not commands:
@@ -3403,6 +4016,17 @@ class CasaFlagOps(FlagOps):
         logger.info("flag[bandpass gaps]: {:.2%} newly flagged ({:.1%} -> {:.1%} of observable data)",
                     report["flagged_fraction_of_data"], before, after)
         return report
+
+    def _correlation_labels(self, project_code: str) -> list[str]:
+        """Return the correlation products of the data, in order (e.g. ``['RR', 'RL', 'LR', 'LL']``)."""
+        codes = {5: "RR", 6: "RL", 7: "LR", 8: "LL", 9: "XX", 10: "XY", 11: "YX", 12: "YY"}
+        handle = self.backend.tools.table()
+        handle.open(str(self.backend.ms_path(project_code) / "POLARIZATION"))
+        try:
+            types = np.atleast_1d(np.asarray(handle.getcell("CORR_TYPE", 0)))
+        finally:
+            handle.close()
+        return [codes.get(int(code), "") for code in types]
 
     def _edge_trim(self, amp_profile: np.ndarray, phase_profile: np.ndarray,
                    flagged_fraction: np.ndarray, *, threshold: float, max_trim: int,
@@ -3717,6 +4341,105 @@ class CasaExportOps(ExportOps):
         except Exception as exc:  # noqa: BLE001 - the snapshot is a convenience, not a product
             logger.debug("could not snapshot the flags of {}: {}", target, exc)
         return str(target)
+
+    def merge(self, project_codes: list[str], source_names: list[str], *, inputs: Optional[list[str]] = None,
+              outputvis: str = "", scales: Optional[list[float]] = None, **kwargs) -> str:
+        """Concatenate the calibrated per-source measurement sets of several epochs into one.
+
+        Parameters
+        ----------
+        project_codes : list of str
+            Project codes of the epochs, in the order of ``inputs`` (for the log).
+        source_names : list of str
+            The source the inputs hold (one name; for the log).
+        inputs : list of str
+            The per-source split measurement sets, one per epoch.
+        outputvis : str
+            Path of the combined measurement set (replaced when it exists).
+        scales : list of float, optional
+            One amplitude factor per input: its visibilities are multiplied by it
+            (and its weights divided by the square) in the combined file. Used to
+            bring epochs in which a variable source had different flux densities
+            to a common level, so that one model can describe all of them.
+
+        Returns
+        -------
+        str
+            Path of the combined measurement set.
+        """
+        if not inputs or not outputvis:
+            raise BackendError("merge needs the per-epoch measurement sets and an output path")
+        missing = [path for path in inputs if not Path(path).is_dir()]
+        if missing:
+            raise BackendError(f"merge: measurement set(s) not found: {', '.join(missing)}")
+        target = Path(outputvis)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            shutil.rmtree(target)
+        logger.info("concat: {} [{}] -> {}", ",".join(source_names), ", ".join(project_codes), target.name)
+        # A split of a Multi-MS is itself a Multi-MS, and concat cannot append to one: every
+        # such input goes through a plain-MS copy first (these are small, averaged files).
+        temporary: list[Path] = []
+        try:
+            plain = []
+            for index, path in enumerate(inputs):
+                if (Path(path) / "SUBMSS").is_dir():
+                    copy = target.with_name(f"{target.name}.part{index}")
+                    if copy.exists():
+                        shutil.rmtree(copy)
+                    # split(keepmms=False): mstransform on a Multi-MS writes a Multi-MS again.
+                    self.backend.tasks.split(vis=str(path), outputvis=str(copy), datacolumn="data",
+                                             keepmms=False)
+                    temporary.append(copy)
+                    plain.append(str(copy))
+                else:
+                    plain.append(str(path))
+            if len(plain) == 1:
+                shutil.copytree(plain[0], target)
+            else:
+                self.backend.tasks.concat(vis=plain, concatvis=str(target), respectname=True, copypointing=False)
+        except RuntimeError as exc:
+            raise BackendError(f"concat of {', '.join(source_names)} failed: {exc}") from exc
+        finally:
+            for copy in temporary:
+                shutil.rmtree(copy, ignore_errors=True)
+        if scales and any(abs(float(scale) - 1.0) > 1e-6 for scale in scales):
+            self._scale_epochs(target, [str(path) for path in inputs], [float(scale) for scale in scales])
+        return str(target)
+
+    def _scale_epochs(self, combined: Path, inputs: list[str], scales: list[float]) -> None:
+        """Multiply the visibilities of each epoch inside ``combined`` by its factor (rows found by time)."""
+        handle = self.backend.tools.table()
+        windows = []
+        for path in inputs:
+            handle.open(path)
+            try:
+                times = np.asarray(handle.getcol("TIME"))
+            finally:
+                handle.close()
+            windows.append((float(times.min()) - 1.0, float(times.max()) + 1.0))
+        handle.open(str(combined), nomodify=False)
+        try:
+            times = np.asarray(handle.getcol("TIME"))
+            columns = [c for c in ("DATA", "CORRECTED_DATA") if c in handle.colnames()]
+            for (start, end), scale in zip(windows, scales):
+                rows = np.flatnonzero((times >= start) & (times <= end))
+                if scale == 1.0 or rows.size == 0:
+                    continue
+                query = handle.selectrows(rows.tolist())
+                try:
+                    for column in columns:
+                        query.putcol(column, np.asarray(query.getcol(column)) * scale)
+                    for column, power in (("WEIGHT", -2.0), ("SIGMA", 1.0)):
+                        query.putcol(column, np.asarray(query.getcol(column)) * scale ** power)
+                    if "WEIGHT_SPECTRUM" in handle.colnames():
+                        query.putcol("WEIGHT_SPECTRUM", np.asarray(query.getcol("WEIGHT_SPECTRUM")) * scale ** -2.0)
+                finally:
+                    query.close()
+            handle.flush()
+        finally:
+            handle.close()
+        logger.info("concat: epochs scaled to a common flux level ({})", ", ".join(f"{s:.3f}" for s in scales))
 
     def uvfits(self, project_code: str, source: str, *, multisource: bool = False,
                combinespw: bool = True, padwithflags: bool = True, overwrite: bool = True,

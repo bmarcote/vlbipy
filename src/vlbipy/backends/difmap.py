@@ -38,6 +38,7 @@ from typing import Optional
 
 import numpy as np
 
+from ..errors import BackendError
 from ..logging_utils import get_logger
 
 logger = get_logger()
@@ -55,11 +56,25 @@ SEARCH_OVERSAMPLE = 3.0
 SEARCH_MAX_PIXELS = 16384
 
 
+#: Width in pixels of the map the final images are made on (difmapy's own default is 4096). Only the inner
+#: half along each axis is valid and kept in the FITS file, so the images are IMAGE_PIXELS / 2 wide on disk.
+IMAGE_PIXELS = 8192
+
+
 def _load_difmapy():
     """Import difmapy lazily so vlbipy imports without it; plots go off-screen."""
     import os
     os.environ.setdefault("DIFMAPY_PLOT_MODE", "inline")
-    import difmapy  # noqa: WPS433 - optional dependency
+    try:
+        import difmapy  # noqa: WPS433 - optional dependency
+    except ImportError as exc:
+        raise BackendError("imaging and self-calibration need difmapy: pip install vlbipy[difmap]") from exc
+    # A directory called "difmapy" on sys.path (a source checkout next to the project) imports as an empty
+    # namespace package: say so instead of failing later with "module has no attribute 'load'".
+    if not hasattr(difmapy, "load"):
+        where = ", ".join(str(p) for p in getattr(difmapy, "__path__", [])) or "an unknown location"
+        raise BackendError(f"difmapy is not installed: 'import difmapy' found only the directory {where}, not the "
+                           "package. Install it (pip install vlbipy[difmap], or 'pip install -e' on its checkout)")
     return difmapy
 
 
@@ -124,7 +139,7 @@ def _bad_fraction(report: dict) -> float:
 
 
 def phase_selfcal(obs, solints: list[str], *, min_improvement: float = 0.002,
-                  max_bad_fraction: float = 0.25) -> tuple[object, list[dict]]:
+                  max_bad_fraction: float = 0.25, refit: bool = True) -> tuple[object, list[dict]]:
     """Phase-only self-calibration down the ``solints`` ladder with accept/revert per step.
 
     A step is accepted when the weighted chi-squared of the model fit drops by at
@@ -132,7 +147,8 @@ def phase_selfcal(obs, solints: list[str], *, min_improvement: float = 0.002,
     the solution bins failed; the model is then re-fitted. A rejected step is
     reverted by discarding the attempt (the observation is cloned first) and
     ends the ladder: shorter intervals only add noise once the data stop asking
-    for them.
+    for them. With ``refit=False`` the model is left exactly as it is (a model
+    brought in from elsewhere, see :func:`refine_against_model`).
 
     Returns
     -------
@@ -158,7 +174,8 @@ def phase_selfcal(obs, solints: list[str], *, min_improvement: float = 0.002,
         if not accepted:
             break
         obs = trial
-        obs.modelfit(quiet=True)
+        if refit:
+            obs.modelfit(quiet=True)
     return obs, rounds
 
 
@@ -184,6 +201,50 @@ def amplitude_calibration(obs, prefix: str, parent_ms: str, *, models=("clean", 
         summary["report"] = {}
     logger.info("difmapy bayes_gscale: best model {}; table {}", summary["best_model"], table)
     return summary
+
+
+def write_gain_record(obs, path: str, amplitude: Optional[dict] = None) -> dict:
+    """Write the amplitude gain correction every station needed, per IF, as a small JSON record.
+
+    The Bayesian report (``<prefix>.amp.json``) holds the same numbers among its diagnostics; this file is
+    the plain answer to "what did each antenna need": one value per station and IF.
+
+    Parameters
+    ----------
+    obs : difmapy Observation
+        The self-calibrated observation (its accumulated gains are read with ``station_gains``).
+    path : str
+        Output JSON path.
+    amplitude : dict, optional
+        Summary of :func:`amplitude_calibration`; adds the per-station uncertainty and the probability that
+        a correction was needed, when its report has them.
+
+    Returns
+    -------
+    dict
+        The record written: ``source``, ``antennas``, ``if_freqs_hz``, ``convention``, ``gain_per_if``
+        (station -> list over IFs), ``gain_median`` (station -> float) and, when known, ``sigma`` and
+        ``p_correction`` (station -> float).
+    """
+    per_if = {name: [float(v) for v in values] for name, values in obs.station_gains(per_if=True).items()}
+    record = {"source": obs.source, "antennas": list(per_if),
+              "if_freqs_hz": [float(f) for f in ((amplitude or {}).get("report", {}).get("if_freqs_hz") or [])],
+              "convention": "amplitude factor the visibilities of the station were multiplied by; 1.0 = no "
+                            "correction (or no solution). CASA tables store the reciprocal.",
+              "gain_per_if": per_if,
+              "gain_median": {name: float(np.median(values)) for name, values in per_if.items()}}
+    stations = (amplitude or {}).get("report", {}).get("stations") or []
+    for key in ("sigma", "p_correction"):
+        # A station without a solution has no uncertainty: null in the file, not NaN (which is not JSON).
+        values = {s["station"]: (float(s[key]) if math.isfinite(float(s[key])) else None)
+                  for s in stations if s.get("station") and s.get(key) is not None}
+        if values:
+            record[key] = values
+    Path(path).write_text(json.dumps(record, indent=2), encoding="utf-8")
+    changed = {name: value for name, value in record["gain_median"].items() if abs(value - 1.0) > 0.005}
+    logger.info("difmapy: station gain corrections of {} -> {} ({})", obs.source, Path(path).name,
+                ", ".join(f"{name} {value:.3f}" for name, value in changed.items()) or "none above 0.5%")
+    return record
 
 
 def export_phase_table(obs, path: str, parent_ms: str, since) -> dict:
@@ -279,13 +340,17 @@ def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_value
                      max_bad_fraction: float = 0.25, bayes_models=("clean", "gauss1", "gauss2", "gauss3"),
                      prior_sigma: float = 0.1, workers: Optional[int] = None, imagename: Optional[str] = None,
                      search_fov_mas: float = 0.0, search_sigma: float = 10.0, recentre_min_beams: float = 10.0,
-                     **clean_kwargs) -> dict:
+                     mapsize: int = IMAGE_PIXELS, **clean_kwargs) -> dict:
     """Full difmapy calibrator sequence: model, phase ladder, amplitude gains, images, tables.
 
     Products (``prefix`` is a path stem, e.g. ``<work_dir>/selfcal/<code>.<source>``):
     ``<prefix>.phase.G`` (CASA table of the phase self-cal), ``<prefix>.amp.G`` (+``.json``,
-    ``.png`` from the Bayesian gscale) and ``<imagename>.robust<r>.fits``. Returns a
+    ``.png`` from the Bayesian gscale), ``<prefix>.gains.json`` (the amplitude correction of every
+    station and IF, see :func:`write_gain_record`) and ``<imagename>.robust<r>.fits``. Returns a
     JSON-able report with the rounds, both table paths and the image statistics.
+
+    The self-calibration itself runs on difmapy's default map; the final images are made on a map
+    ``mapsize`` pixels wide (same cell), since that is where a larger clean field pays off.
 
     The channels the split keeps are averaged per IF on load (see :func:`load`):
     a calibrator sits at the phase centre, so nothing is lost. The source is
@@ -303,6 +368,8 @@ def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_value
         else {}
     amplitude = amplitude_calibration(obs, f"{prefix}.amp", parent_ms, models=bayes_models, prior_sigma=prior_sigma,
                                       workers=workers)
+    gains = write_gain_record(obs, f"{prefix}.gains.json", amplitude)
+    obs.auto_mapsize(npix=int(mapsize))
     images = image_all_robust(obs, imagename or prefix, robust_values, **clean_kwargs)
     if any(shift):
         for info in images.values():
@@ -311,7 +378,109 @@ def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_value
               "search": search, "shift_mas": list(shift),
               "model_rchisq": model.get("rchisq"), "ladder": ladder, "rounds": rounds,
               "phase_table": phase_table.get("path", ""), "amplitude": amplitude, "images": images,
-              "station_gains": {k: float(v) for k, v in obs.station_gains().items()}}
+              "station_gains": {k: float(v) for k, v in obs.station_gains().items()},
+              "station_gains_per_if": gains["gain_per_if"], "gains_file": f"{prefix}.gains.json"}
+    Path(f"{prefix}.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    return report
+
+
+def joint_model(combined_ms: str, prefix: str, *, robust_values=(-2.0, 0.0, 2.0), model_robust: float = 0.0,
+                solints: Optional[list[str]] = None, min_improvement: float = 0.002,
+                max_bad_fraction: float = 0.25, mapsize: int = IMAGE_PIXELS, **clean_kwargs) -> dict:
+    """Model a calibrator from the data of several epochs together; write ``<prefix>.mod``.
+
+    ``combined_ms`` is the concatenation of the calibrated per-epoch splits of
+    one source, brought to a common flux level. The joint uv coverage is what
+    one epoch lacks: structure that no single epoch constrains is fixed here.
+    The sequence is the calibrator one (single Gaussian, phase self-cal ladder)
+    without amplitude calibration - the stations kept their names but not
+    their gains from one epoch to the next - followed by CLEAN. The CLEAN
+    components of the ``model_robust`` image are the model.
+
+    Returns a JSON-able report with ``model`` (the ``.mod`` file), ``model_flux``,
+    the self-cal ``rounds`` and the ``images`` (one per robust value).
+    """
+    obs = load(combined_ms, average_channels=True)
+    fit_starting_model(obs)
+    ladder = solints or selfcal_ladder(scan_lengths(obs))
+    obs, rounds = phase_selfcal(obs, ladder, min_improvement=min_improvement, max_bad_fraction=max_bad_fraction)
+    obs.auto_mapsize(npix=int(mapsize))
+    # The model image goes last so that its CLEAN components are the ones left in the observation.
+    order = [float(r) for r in robust_values if float(r) != float(model_robust)] + [float(model_robust)]
+    images = {}
+    for robust in order:
+        obs, images[robust] = clean_image(obs, f"{prefix}.robust{robust:g}.fits", robust=robust, **clean_kwargs)
+    model_path = f"{prefix}.mod"
+    obs.wmodel(model_path)
+    report = {"source": obs.source, "combined_ms": str(combined_ms), "model": model_path,
+              "model_flux": float(obs.model_flux), "ladder": ladder, "rounds": rounds,
+              "images": {robust: images[robust] for robust in sorted(images)}}
+    Path(f"{prefix}.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    logger.info("difmapy joint model of {}: {:.4g} Jy in CLEAN components -> {}", obs.source, report["model_flux"],
+                Path(model_path).name)
+    return report
+
+
+def scale_model_file(model_path: str, out_path: str, factor: float) -> str:
+    """Write a copy of a difmap ``.mod`` file with every component flux multiplied by ``factor``."""
+    lines = []
+    for line in Path(model_path).read_text().splitlines():
+        fields = line.split()
+        if not fields or line.lstrip().startswith("!"):
+            lines.append(line)
+            continue
+        # The flux is the first column; a trailing "v" marks it as free in modelfit.
+        token = fields[0]
+        suffix = "v" if token.endswith("v") else ""
+        value = float(token.rstrip("v")) * float(factor)
+        lines.append(line.replace(token, f"{value:.9g}{suffix}", 1))
+    Path(out_path).write_text("\n".join(lines) + "\n")
+    return str(out_path)
+
+
+def refine_against_model(split_ms: str, parent_ms: str, prefix: str, model_path: str, *,
+                         solints: Optional[list[str]] = None, min_improvement: float = 0.002,
+                         max_bad_fraction: float = 0.25, amplitude: bool = True) -> dict:
+    """Self-calibrate one epoch of a calibrator against a fixed model; write ``<prefix>.G``.
+
+    The model (a ``.mod`` file, e.g. the multi-epoch one of :func:`joint_model`
+    scaled to this epoch's flux density) is not touched: only the antenna gains
+    move. Phases go down the same accept/revert ladder as the calibrator
+    sequence; then one amplitude factor per station and IF (``gscale``, which
+    keeps the flux scale of the data) is kept if it improves the fit. The gains
+    accumulated here are exported as one CASA table for ``parent_ms``.
+
+    Returns a JSON-able report: ``caltable`` ("" when no step was accepted),
+    ``rounds``, ``amplitude`` (the accepted station factors) and the fit
+    ``chisq_before`` / ``chisq_after``.
+    """
+    obs = load(split_ms, average_channels=True)
+    obs.clrmod()
+    obs.rmodel(str(model_path))
+    start = float(obs.moddif()["chisq"])
+    snapshot = obs.gain_snapshot()
+    ladder = solints or selfcal_ladder(scan_lengths(obs))
+    obs, rounds = phase_selfcal(obs, ladder, min_improvement=min_improvement, max_bad_fraction=max_bad_fraction,
+                                refit=False)
+    gains: dict = {}
+    if amplitude:
+        trial = obs.copy()
+        result = trial.gscale(quiet=True)
+        before, after = float(result["fit_before"]["chisq"]), float(result["fit_after"]["chisq"])
+        accepted = math.isfinite(after) and before > 0 and (before - after) / before >= min_improvement
+        logger.info("difmapy gscale against the joint model: chisq {:.4g} -> {:.4g} -> {}", before, after,
+                    "accepted" if accepted else "rejected")
+        if accepted:
+            obs = trial
+            gains = {name: float(value) for name, value in result.get("gains", {}).items()
+                     if math.isfinite(float(value))}
+    table = ""
+    if gains or any(r["accepted"] for r in rounds):
+        info = obs.savecaltable(f"{prefix}", outformat="CASA", ms=str(parent_ms), since=snapshot, quiet=True)
+        table = str(info.get("path", f"{prefix}"))
+    report = {"source": obs.source, "split_ms": str(split_ms), "model": str(model_path), "caltable": table,
+              "ladder": ladder, "rounds": rounds, "amplitude": gains, "chisq_before": start,
+              "chisq_after": float(obs.moddif()["chisq"])}
     Path(f"{prefix}.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     return report
 
@@ -427,17 +596,26 @@ def locate_source(obs, imagename: str, *, search_fov_mas: float = 1000.0, search
 
 
 def image_source(split_ms: str, imagename: str, *, robust_values=(-2.0, 0.0, 2.0), search_fov_mas: float = 0.0,
-                 search_sigma: float = 10.0, recentre_min_beams: float = 10.0, **clean_kwargs) -> dict:
+                 search_sigma: float = 10.0, recentre_min_beams: float = 10.0, average_channels: bool = True,
+                 mapsize: int = IMAGE_PIXELS, **clean_kwargs) -> dict:
     """Image an already-calibrated source (target / check source) with CLEAN only, no self-cal.
+
+    ``average_channels`` (default on) collapses every IF to one channel while loading, as the
+    self-calibration path does: CLEAN then works on a fraction of the visibilities. The price is
+    bandwidth smearing of emission far from the phase centre, which is small inside the ~1 arcsec the
+    source search covers; turn it off (``[imaging].average_channels = false``) for wider fields.
+    The images are made on a map ``mapsize`` pixels wide (``[imaging].mapsize``), of which the FITS
+    file keeps the valid inner half.
 
     With ``search_fov_mas`` > 0 the source is first located (:func:`locate_source`;
     the dirty map goes to ``<imagename>.search.fits``) and the phase centre moved
     onto it when it lies far outside the regular map. The report carries the
     search under ``"search"`` and the applied ``"shift_mas"`` (east, north).
     """
-    obs = load(split_ms)
+    obs = load(split_ms, average_channels=average_channels)
     search, shift = locate_source(obs, imagename, search_fov_mas=search_fov_mas, search_sigma=search_sigma,
                                   recentre_min_beams=recentre_min_beams)
+    obs.auto_mapsize(npix=int(mapsize))
     images = image_all_robust(obs, imagename, robust_values, **clean_kwargs)
     if any(shift):
         for info in images.values():

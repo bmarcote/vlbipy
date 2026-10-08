@@ -35,7 +35,7 @@ def test_parse_spw_channel_ranges():
 def test_parse_scans_timerange_antennas_solint():
     assert task.parse_scans("1,2,4~6") == {1, 2, 4, 5, 6} and task.parse_scans("") is None
     t0, t1 = task.parse_timerange("2024/03/05/12:00:00~2024/03/05/12:01:30.5")
-    assert t1 - t0 == pytest.approx(90.5) and t0 == pytest.approx(60359 * 86400 + 12 * 3600)
+    assert t1 - t0 == pytest.approx(90.5) and t0 == pytest.approx(60374 * 86400 + 12 * 3600)
     ids, among = task.parse_antennas("EF,JB&", ["JB", "WB", "EF"])
     assert ids == {0, 2} and among is True
     assert task.parse_antennas("", ["JB"]) == (None, False)
@@ -66,10 +66,11 @@ def test_prior_entries_from_casa_lists():
     assert entries[1]["gainfield"] == [0] and entries[1]["spwmap"] == [0, 0, 0, 0]
 
 
-def test_fast_backend_is_registered():
+def test_fast_engine_lives_in_the_dask_ms_backend_only():
+    """The numpy calibration engine is the dask-ms backend; the old casa-fast/fast names are gone."""
     from vlbipy.registry import list_backends
     names = set(list_backends())
-    assert "casa-fast" in names and "fast" in names
+    assert "dask-ms" in names and not {"casa-fast", "fast"} & names
 
 
 @pytest.mark.skipif(not RSM07_MS.is_dir() or os.environ.get("VLBIPY_SKIP_REALDATA"), reason="RSM07 MS not available")

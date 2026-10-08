@@ -40,12 +40,94 @@ LBA data characteristics:
 
 ## vlbipy LBA Workflow
 
-The `LbaHandler` class handles LBA-specific steps:
+`LBAObservatory` (`network="LBA"`) works from files on disk; nothing is downloaded.
 
-1. **Data download**: Attempts to retrieve data from ATOA. Falls back to searching for already-downloaded files.
-2. **File discovery**: Searches for multiple formats: FITS-IDI, UVFITS, RPFITS, and FITS files matching the project code.
-3. **ANTAB append**: If an ANTAB file is found, it can be appended to FITS-IDI headers (similar to EVN workflow).
-4. **Flag file**: Looks for `<project>.flag`, `<project>.uvflg`, or `<project>.flags`.
+1. **File discovery**: `<CODE>.FITS` (any case; also `.fitsidi` / `.idifits`), `<code>.antab`
+   and `<code>.uvflg` are looked for in the working directory, in its `input_data/`, and in
+   its parent — the usual layout of a multi-epoch project, with all raw files side by side
+   and one working directory per epoch.
+2. **ANTAB append** (in place, into the FITS-IDI file). DiFX writes no `SYSTEM_TEMPERATURE`
+   table and an empty `GAIN_CURVE` one; the empty table is removed and both are written from
+   the `.antab`. LBA `.antab` files are concatenations of per-station files, so the reader
+   accepts what they contain: `INDEX` given as ranges (`'R1:4'`) or lists (`'R1|L1'`),
+   one- or two-digit hours, stamps such as `07:60.00`, a single `DPFU`. A station whose
+   `INDEX` covers only part of the band gets the level of the subbands it has for the rest
+   (with a warning) instead of losing them. Stations absent from the `.antab` are reported:
+   add nominal values for them and re-import.
+3. **Flags**: the `.uvflg` (also a concatenation of dialects: header keywords without a
+   terminating slash, commas between keywords, zero-padded day numbers) is converted to CASA
+   flag commands in `<work_dir>/<code>.flag` by `vlbipy.uvflg`. Records for stations that are
+   not in the data are dropped; zero-length ranges are skipped. A record longer than
+   `LBAObservatory.max_flag_hours` (2 h) is not applied and is reported instead: these files flag
+   slews, and a record of hours is an interval the station log never closed (in V589A one such
+   record would have removed ATCA, the most sensitive antenna, for 12 of the 13 hours).
+4. **Import and a-priori calibration**: `importfitsidi`, then ACCOR, Tsys, gain curve and the
+   EOP correction (see below). The flags the
+   import makes from the DiFX weights are saved as the `as_imported` flag version, which a
+   `--scratch` run returns to.
+
+DiFX labels the array `VLBA` in the data; that is expected and not reported.
+
+### ACCOR and EOP (DiFX data)
+
+Both apply to anything correlated with DiFX (LBA and VLBA), and both tables are applied with
+`nearest` interpolation.
+
+- **ACCOR** corrects the cross-correlation amplitudes for the digitiser statistics, measured
+  on the autocorrelations: `accor(solint='30s')` writes `<code>.accor`, and
+  `smoothcal(smoothtype='median', smoothtime=1800.0)` writes `<code>.accor_smooth`, the table
+  in the chain. Because it needs the autocorrelations, `flag.apriori` leaves them unflagged and
+  `calibrate.a_priori` flags them once ACCOR is done. Data without usable autocorrelations
+  skip the step with a warning. `accor` runs with `corrdepflags=True`: DiFX gives the
+  autocorrelation of a dead polarization zero weight, and without it the working
+  polarization of that station would get no solution either (and be flagged with it).
+  The table is made by the a-priori step, so the second and third calibration passes keep
+  it like Tsys and EOP. Settings:
+
+  ```toml
+  [calibration.accor]
+  enabled = true
+  solint = "30s"
+  smoothtype = "median"
+  smoothtime = 1800.0      # seconds; 0 applies the table unsmoothed
+  ```
+
+- **EOP**: DiFX correlates with predicted Earth-orientation parameters. `usno_finals.erp` is
+  fetched into the working directory the standard way,
+
+  ```bash
+  curl -u anonymous:<e-mail> --ftp-ssl \
+      ftp://gdc.cddis.eosdis.nasa.gov/vlbi/gsfc/ancillary/solve_apriori/usno_finals.erp > usno_finals.erp
+  ```
+
+  (an HTTPS mirror is tried if CDDIS cannot be reached; `[calibration].eop_file` points at a
+  file you already have), and `gencal(caltype='eop', infile='usno_finals.erp')` writes
+  `<code>.eop`.
+
+### Amplitude scale
+
+Most LBA stations come with nominal values (`Tsys = 1.0` and a `DPFU` that stands for the
+SEFD), and phased ATCA is recorded in its own units. After the a-priori calibration the
+amplitudes are therefore off by factors of a few per antenna, not by the ~10% the
+self-calibration assumes by default. Widen the prior of the Bayesian amplitude step for LBA
+data, or it will correct only a fraction of the error:
+
+```toml
+[selfcal]
+prior_sigma = 1.0      # width of the prior on the log-amplitude corrections (default 0.1)
+```
+
+The flux scale is then only as good as the average of the nominal values.
+
+### Antennas with one polarization
+
+Stations with a dead receiver channel, or that recorded one polarization for part of the
+run, are common. The instrumental calibration works per polarization: such a station keeps
+the hand it has (the scan selection may take a second scan to pick up the other one), and
+only the correlations involving the missing hand are flagged.
+
+Subbands need not be in frequency order (V589: 8393, 8425, 8457, 8489, 8409, ... MHz); the
+multi-band delay uses the true frequencies.
 
 ### Reference antenna priority
 

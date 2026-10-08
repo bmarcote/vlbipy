@@ -180,12 +180,8 @@ def _ensure_backend_builtins() -> None:
         from .backends.dask_ms import DaskMsBackend
         return DaskMsBackend
 
-    def _fast_casa():
-        from .backends.fast_casa import FastCasaBackend
-        return FastCasaBackend
-
-    for name, loader in [("dummy", _dummy), ("casa", _casa), ("casa-fast", _fast_casa), ("fast", _fast_casa),
-                         ("aips", _aips), ("dask-ms", _daskms), ("daskms", _daskms)]:
+    for name, loader in [("dummy", _dummy), ("casa", _casa), ("aips", _aips), ("dask-ms", _daskms),
+                         ("daskms", _daskms)]:
         _backend_registry.setdefault(name, loader)
 
 

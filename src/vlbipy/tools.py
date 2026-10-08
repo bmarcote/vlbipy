@@ -171,17 +171,24 @@ def download_file(url: str, dest: Union[str, Path], username: Optional[str] = No
     return dest
 
 
-#: HTTPS source(s) tried first for the USNO Earth-orientation-parameter file.
-EOP_URLS = ("https://gemini.gsfc.nasa.gov/500/oper/solve_apriori_files/usno_finals.erp",)
-#: CDDIS FTPS fallback (anonymous), fetched via curl exactly like the NRAO VLBI pipeline.
+#: CDDIS FTPS archive (anonymous), the standard source of the USNO Earth-orientation-parameter file.
 EOP_CDDIS_URL = "ftp://gdc.cddis.eosdis.nasa.gov/vlbi/gsfc/ancillary/solve_apriori/usno_finals.erp"
+#: Password of the anonymous CDDIS login: by convention an e-mail address.
+EOP_CDDIS_EMAIL = "vlbipy@marcote.jive.eu"
+#: HTTPS mirror(s) tried when CDDIS cannot be reached.
+EOP_URLS = ("https://gemini.gsfc.nasa.gov/500/oper/solve_apriori_files/usno_finals.erp",)
 
 
 def fetch_eop_file(directory: Union[str, Path]) -> Path:
     """Fetch the USNO EOP file (``usno_finals.erp``) needed by gencal caltype='eop'.
 
-    An already-present file in ``directory`` is reused. Otherwise the HTTPS
-    mirrors are tried first, then the CDDIS FTPS archive via ``curl --ftp-ssl``.
+    An already-present file in ``directory`` is reused. Otherwise it is
+    downloaded the standard way::
+
+        curl -u anonymous:<e-mail> --ftp-ssl \
+            ftp://gdc.cddis.eosdis.nasa.gov/vlbi/gsfc/ancillary/solve_apriori/usno_finals.erp > usno_finals.erp
+
+    and, should that fail, from the HTTPS mirror(s).
 
     Raises
     ------
@@ -192,18 +199,23 @@ def fetch_eop_file(directory: Union[str, Path]) -> Path:
     if dest.is_file() and dest.stat().st_size > 0:
         logger.info("using existing EOP file {}", dest)
         return dest
+    logger.info("downloading the EOP file from CDDIS ({})", EOP_CDDIS_URL)
+    try:
+        result = subprocess.run(["curl", "-sS", "-u", f"anonymous:{EOP_CDDIS_EMAIL}", "--ftp-ssl",
+                                 EOP_CDDIS_URL, "-o", str(dest)], capture_output=True, text=True, timeout=300)
+        failure = result.stderr.strip() or f"curl exit code {result.returncode}"
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        result, failure = None, str(exc)
+    if result is not None and result.returncode == 0 and dest.is_file() and dest.stat().st_size > 0:
+        return dest
+    dest.unlink(missing_ok=True)
+    logger.warning("EOP download from CDDIS failed ({}); trying the HTTPS mirror(s)", failure)
     for url in EOP_URLS:
         try:
             logger.info("downloading EOP file from {}", url)
             return download_file(url, dest)
         except ConnectionError as exc:
             logger.warning("EOP download failed from {}: {}", url, exc)
-    logger.info("falling back to CDDIS (curl --ftp-ssl) for the EOP file")
-    result = subprocess.run(["curl", "-sS", "-u", "anonymous:daip@nrao.edu", "--ftp-ssl",
-                             EOP_CDDIS_URL, "-o", str(dest)], capture_output=True, text=True, timeout=300)
-    if result.returncode == 0 and dest.is_file() and dest.stat().st_size > 0:
-        return dest
-    dest.unlink(missing_ok=True)
     raise ConnectionError("could not download usno_finals.erp from any source; download it manually "
                           "and point [calibration].eop_file at it")
 

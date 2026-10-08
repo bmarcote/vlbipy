@@ -67,12 +67,29 @@ progress. Existing flags are saved as a restorable flag version first.
 
 ## Campaigns
 
-Give several project codes and steps fan out across them, with `merge()`
-combining them after calibration:
+Give several project codes: each epoch is calibrated, self-calibrated and
+imaged in its own directory (`<cwd>/<code>`), and the epochs are then combined:
 
 ```python
-obs = VLBIObs(["ek048a", "ek048b", "ek048c"], network="EVN", target="3C84")
-obs.run()
+obs = VLBIObs(["V589A", "V589B", "V589C", "V589D"], config="v589.toml")
+obs.run()            # every epoch, then obs.combine()
 ```
 
-Multi-epoch combination beyond the merge is not implemented yet.
+```bash
+vlbipy pipeline --config v589.toml -p V589A V589B V589C V589D
+vlbipy combine  --config v589.toml -p V589A V589B V589C V589D --force   # only the multi-epoch stage
+```
+
+The combination writes to `<cwd>/combined`:
+
+| Path | Content |
+|---|---|
+| `selfcal/<name>.<calibrator>.joint.mod` | model of the phase calibrator from all epochs together (+ its images and `.json`) |
+| `<code>/selfcal/<code>.<calibrator>.joint*` | per-epoch refinement against that model: the gain table and its report |
+| `data/<name>_<source>.ms` | the calibrated epochs of each source, concatenated |
+| `images/<name>_<source>.robust*.fits` | image of all epochs together (+ PNG preview) |
+| `<name>.campaign.json` | fluxes per epoch, accepted steps, image statistics of every epoch before and after |
+
+`<name>` is what the project codes have in common (`V589`). The sources are
+declared once for the campaign; an epoch that did not observe one of them
+simply ignores it. `merge()` remains for the in-memory dummy backend only.

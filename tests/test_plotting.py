@@ -317,3 +317,20 @@ def test_caltable_scalar_bandpass_is_amplitude_only(tmp_path):
     from vlbipy.plotting import CalTablePlotter
     paths = CalTablePlotter(tmp_path)._plot_gains(_gains_data(1), tmp_path / "x.scalar_bp.png", "scalar_bp")
     assert [p.name for p in paths] == ["x.scalar_bp.amp.png"] and paths[0].stat().st_size > 1000
+
+
+def test_lightcurve_panels_have_their_own_amplitude_axis(tmp_path, monkeypatch):
+    """A faint target and a bright calibrator must not share y limits: each panel scales to its own source."""
+    import matplotlib.pyplot as plt
+    from vlbipy import plotting
+    assert plotting.lightcurve_amplitude_limit([]) == 1.0
+    assert plotting.lightcurve_amplitude_limit([np.array([0.5, np.nan]), np.array([2.0])]) == pytest.approx(2.1, rel=1e-2)
+    times = 5e9 + np.arange(0, 120, 2.0)
+    n_vis = np.full(times.size, 400.0)
+    sources = {name: {"times": times, "vis_sum": n_vis * flux + 0j, "n_vis": n_vis, "scans": np.ones(times.size)}
+               for name, flux in (("TARGET", 0.02), ("CAL", 1.5))}
+    limits = {}
+    monkeypatch.setattr(plt, "close", lambda figure: limits.update(
+        {axis.get_title(loc="left"): axis.get_ylim() for axis in figure.axes}))
+    plotting.plot_total_lightcurve({"sources": sources, "column": "corrected", "time_start": 5e9}, tmp_path, "lc03")
+    assert limits["TARGET"] == pytest.approx((0.0, 0.021)) and limits["CAL"] == pytest.approx((0.0, 1.575))

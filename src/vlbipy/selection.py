@@ -135,6 +135,37 @@ def detected_antennas_per_scan(survey: ScanSNRSurvey, antennas: list[str],
     return detected
 
 
+def detected_hands_per_scan(survey: ScanSNRSurvey, antennas: list[str],
+                            min_snr: float = DEFAULT_MIN_SNR) -> dict[int, set[tuple[str, str]]]:
+    """Return ``{scan_number: {(antenna, polarization) detected above min_snr}}`` restricted to ``antennas``.
+
+    The unit is one polarization of one antenna, not the antenna: a station with
+    a dead receiver channel, or one that recorded a polarization only part of
+    the time, is common in heterogeneous arrays and must neither be rejected
+    for the hand it lacks nor lose the hand it has.
+    """
+    wanted = set(antennas)
+    reference = set(survey.refant_names)
+    detected: dict[int, set[tuple[str, str]]] = {}
+    for index, scan in enumerate(survey.scan_numbers):
+        found: set[tuple[str, str]] = set()
+        for pol in survey.polarizations:
+            row = survey.snr[pol][index]
+            solved = any(value == value for value in row)
+            for column, name in enumerate(survey.antennas):
+                if name not in wanted:
+                    continue
+                if name in reference:
+                    # Every solution of this hand is referenced to it, so if the scan
+                    # produced any the reference antenna was detected in that hand.
+                    if solved:
+                        found.add((name, pol))
+                elif row[column] == row[column] and row[column] >= min_snr:
+                    found.add((name, pol))
+        detected[scan] = found
+    return detected
+
+
 def _antenna_priority(survey: ScanSNRSurvey) -> list[str]:
     """Antennas best-first: the survey's reference antenna(s), then by median fringe SNR."""
     ordered = list(survey.refant_names)
@@ -149,10 +180,16 @@ def plan_sbd_stages(survey: ScanSNRSurvey, antennas: list[str], *, min_snr: floa
     The instrumental delay is constant in time, so it must come from *one*
     scan: several scans give several independent solutions whose phases are
     not continuous once applied. Stage 1 is the best scan detecting the most
-    antennas (ideally all of them). Only when antennas remain uncovered are
-    further scans added, each detecting at least one already-solved antenna
-    that becomes that stage's reference, so its solutions can be re-based onto
-    the first stage's reference. As few scans as possible are used.
+    antenna polarizations (ideally all of them). Only when some remain
+    uncovered are further scans added, each detecting at least one
+    already-solved antenna that becomes that stage's reference, so its
+    solutions can be re-based onto the first stage's reference. As few scans
+    as possible are used.
+
+    Coverage is counted per polarization of each antenna (see
+    :func:`detected_hands_per_scan`): an antenna whose second polarization only
+    shows up in another scan gets that hand from a later stage, and so appears
+    in more than one stage.
 
     Parameters
     ----------
@@ -176,54 +213,70 @@ def plan_sbd_stages(survey: ScanSNRSurvey, antennas: list[str], *, min_snr: floa
     """
     if not antennas:
         return []
-    detected = detected_antennas_per_scan(survey, antennas, min_snr)
+    detected = detected_hands_per_scan(survey, antennas, min_snr)
     if metadata is not None:
         present = {scan.scan_number: set(scan.antennas) for scan in metadata.scans}
-        detected = {scan: ants & present.get(scan, ants) for scan, ants in detected.items()}
+        detected = {scan: {hand for hand in hands if scan not in present or hand[0] in present[scan]}
+                    for scan, hands in detected.items()}
     if sources:
         allowed = {scan for scan, source in zip(survey.scan_numbers, survey.scan_sources)
                    if source in sources}
-        detected = {scan: ants for scan, ants in detected.items() if scan in allowed}
-    detected = {scan: ants for scan, ants in detected.items() if ants}
+        detected = {scan: hands for scan, hands in detected.items() if scan in allowed}
+    detected = {scan: hands for scan, hands in detected.items() if hands}
     if not detected:
         return []
-    required = set(antennas)
+    required = set().union(*detected.values())
     priority = _antenna_priority(survey)
+
+    def rank(name: str) -> int:
+        return priority.index(name) if name in priority else len(priority)
 
     def score(scan: int) -> float:
         value = survey.median_snr(scan_number=scan)
         return value if value == value else 0.0
 
-    def best_of(names: set[str]) -> str:
-        return next((n for n in priority if n in names), sorted(names)[0])
+    def hands_of(name: str, hands: set) -> set[str]:
+        return {pol for antenna, pol in hands if antenna == name}
 
     stages: list[dict] = []
-    covered: set[str] = set()
+    covered: set[tuple[str, str]] = set()
     remaining = dict(detected)
     while remaining and not required <= covered:
-        if not stages:
-            candidates = remaining
-        else:
-            # Only a scan detecting an already-solved antenna can be tied to the chain.
-            candidates = {scan: found for scan, found in remaining.items() if found & covered}
-            if not candidates:
-                break
-        best = max(candidates, key=lambda s: (len(candidates[s] - covered), score(s)))
-        gained = candidates[best] - covered
-        if not gained:
+        references: dict[int, list[str]] = {}
+        for scan, found in remaining.items():
+            gained_pols = {pol for _, pol in found - covered}
+            names = {antenna for antenna, _ in found}
+            if not stages:
+                # The first reference only has to be there in every hand being solved.
+                usable = [n for n in names if gained_pols <= hands_of(n, found)]
+            else:
+                # A later one must already be solved in those hands, to tie the chain.
+                usable = [n for n in names if gained_pols <= hands_of(n, found) & hands_of(n, covered)]
+            if usable and found - covered:
+                references[scan] = sorted(usable, key=rank)
+        if not references:
             break
-        refant = best_of(candidates[best] if not stages else candidates[best] & covered)
-        stages.append({"scan": best, "antennas": sorted(gained, key=priority.index), "refant": refant})
+        best = max(references, key=lambda s: (len(remaining[s] - covered), score(s)))
+        gained = remaining[best] - covered
+        gained_names = sorted({antenna for antenna, _ in gained}, key=rank)
+        stages.append({"scan": best, "antennas": gained_names, "refant": references[best][0]})
         covered |= gained
         remaining.pop(best)
 
+    n_antennas = len({antenna for antenna, _ in required})
     if len(stages) == 1:
-        logger.info("scan selection: scan {} detects all {} antennas (median SNR {:.0f}); single-stage SBD",
-                    stages[0]["scan"], len(required), score(stages[0]["scan"]))
+        logger.info("scan selection: scan {} detects all {} antennas in every polarization they have "
+                    "(median SNR {:.0f}); single-stage SBD", stages[0]["scan"], n_antennas, score(stages[0]["scan"]))
     else:
         logger.info("scan selection: no single scan covers the array; SBD in {} stage(s): {}", len(stages),
                     "; ".join(f"scan {s['scan']} ({','.join(s['antennas'])}; ref {s['refant']})" for s in stages))
-    missing = sorted(required - covered)
+    one_handed = sorted(name for name in {antenna for antenna, _ in required}
+                        if len(hands_of(name, required)) < len(survey.polarizations))
+    if one_handed:
+        logger.warning("scan selection: detected in one polarization only: {}",
+                       ", ".join(f"{name} ({'/'.join(sorted(hands_of(name, required)))})" for name in one_handed))
+    missing = sorted(f"{antenna} {pol}" for antenna, pol in required - covered)
+    missing += sorted(set(antennas) - {antenna for antenna, _ in required})
     if missing:
         logger.warning("scan selection: no scan detects {} above {:.0f} sigma; they will have no "
                        "instrumental-delay solution", ", ".join(missing), min_snr)

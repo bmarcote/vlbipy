@@ -284,25 +284,27 @@ def test_g_jones_nearest_vs_linear_and_calwt(fake_ms, tmp_path):
     np.testing.assert_array_equal(w_same, weight)
 
 
-def test_g_jones_flagged_solution_falls_back_to_unflagged(fake_ms, tmp_path):
-    """A flagged solution is skipped: nearest picks the other time stamp instead of flagging the data."""
+def test_g_jones_flagged_solution_flags_the_data(fake_ms, tmp_path):
+    """A flagged solution is not skipped (CASA): the times that use it are flagged, the others are not."""
     path, g0, g1 = _g_jones_setup(fake_ms, tmp_path)
     table = ap.load_caltable(path)
     first = (table.time == T0) & (table.antenna1 == 1)
     table.flag[first] = True
-    gains, gflag = ap.antenna_gains(table, [1], [T0 + 10.0], 0, MS_CHAN_FREQ[0], interp="nearest")
-    assert not gflag.any()
-    np.testing.assert_allclose(gains[0, 0, 0], g1[1, 0], rtol=1e-6)
-    table.flag[table.antenna1 == 1] = True
-    gains, gflag = ap.antenna_gains(table, [1, 2], [T0 + 10.0], 0, MS_CHAN_FREQ[0], interp="linear")
-    assert gflag[0].all() and not gflag[1].any()
+    # nearest: the time next to the flagged solution is flagged, the one next to the good solution is not.
+    gains, gflag = ap.antenna_gains(table, [1], [T0 + 10.0, T0 + 110.0], 0, MS_CHAN_FREQ[0], interp="nearest")
+    assert gflag[0, 0].all() and not gflag[0, 1].any()
+    np.testing.assert_allclose(gains[0, 1, 0], g1[1, 0], rtol=1e-6)
+    # linear: any time strictly between a flagged and a good solution is flagged; at the good solution it is not.
+    gains, gflag = ap.antenna_gains(table, [1, 2], [T0 + 60.0, T0 + 120.0], 0, MS_CHAN_FREQ[0], interp="linear")
+    assert gflag[0, 0].all() and not gflag[0, 1].any() and not gflag[1].any()
 
 
 # ----------------------------------------------------------------------------------------------------------------
 # B Jones / B TSYS / phase_only
 # ----------------------------------------------------------------------------------------------------------------
 def test_b_jones_identical_grid(fake_ms, tmp_path):
-    """A bandpass table on the data channel grid flattens the simulated bandpass; flagged channels propagate."""
+    """A bandpass on the data channel grid flattens the simulated bandpass; a flagged channel is interpolated across
+    from its neighbours (CASA) unless a ``...flag`` frequency mode keeps it flagged."""
     rng = np.random.default_rng(7)
     bp = rng.uniform(0.5, 1.5, (NANT, NSPW, NCHAN, 2)) * np.exp(1j * rng.uniform(-3, 3, (NANT, NSPW, NCHAN, 2)))
     rows = [(s, a) for s in range(NSPW) for a in range(NANT)]
@@ -316,12 +318,18 @@ def test_b_jones_identical_grid(fake_ms, tmp_path):
     t_idx = np.searchsorted(times, tt)
     gains = np.transpose(np.broadcast_to(bp[:, None], (NANT, times.size, NSPW, NCHAN, 2)), (0, 1, 2, 3, 4))
     vis = _vis_from_gains(gains, a1, a2, t_idx, ss)
-    vis_c, flag_c, _ = ap.apply_tables(vis, np.zeros(vis.shape, bool), None, a1, a2, tt, ss, MS_CHAN_FREQ,
-                                       [{"path": str(path), "interp": "linear"}])
     bad = ((a1 == 2) | (a2 == 2)) & (ss == 0)
+    vis_c, flag_c, _ = ap.apply_tables(vis, np.zeros(vis.shape, bool), None, a1, a2, tt, ss, MS_CHAN_FREQ,
+                                       [{"path": str(path), "interp": "linear,linearflag"}])
     assert flag_c[bad, 3, :].all()
     assert not flag_c[~bad].any() and not flag_c[bad][:, [0, 1, 2, 4, 5, 6, 7]].any()
     np.testing.assert_allclose(vis_c[~flag_c], 1.0, atol=1e-5)
+    vis_c, flag_c, _ = ap.apply_tables(vis, np.zeros(vis.shape, bool), None, a1, a2, tt, ss, MS_CHAN_FREQ,
+                                       [{"path": str(path), "interp": "linear"}])
+    assert not flag_c.any()
+    patched = np.ones(vis.shape, dtype=bool)
+    patched[bad, 3, :] = False
+    np.testing.assert_allclose(vis_c[patched], 1.0, atol=1e-5)
 
 
 def test_b_jones_frequency_interpolation(fake_ms, tmp_path):
@@ -394,14 +402,14 @@ def test_phase_only_skips_amplitude_tables(fake_ms, tmp_path):
     assert np.abs(vis_full).min() > 20.0
 
 
-def test_gain_curve_raises_unless_phase_only(fake_ms, tmp_path):
-    """An EPowerCurve table raises NotImplementedError in antenna_gains and is skipped with phase_only=True."""
+def test_gain_curve_needs_elevation_unless_phase_only(fake_ms, tmp_path):
+    """An EPowerCurve table needs elevations in antenna_gains (ValueError without) and is skipped with phase_only=True."""
     rows = [(s, a) for s in range(NSPW) for a in range(NANT)]
     param = np.ones((len(rows), 1, 2), dtype=np.float32)
     path = _write_generic_table(tmp_path / "test.gc", fake_ms, "EPowerCurve", param, np.zeros(param.shape, bool),
                                 np.full(len(rows), T0), [s for s, _ in rows], [a for _, a in rows],
                                 MS_CHAN_FREQ[:, [0]])
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(ValueError):
         ap.antenna_gains(path, [0], [T0], 0, MS_CHAN_FREQ[0])
     a1, a2, tt, ss = _baseline_block([T0])
     vis = np.ones((a1.size, NCHAN, 4), dtype=np.complex64)

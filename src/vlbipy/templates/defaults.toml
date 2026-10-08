@@ -5,7 +5,7 @@
 [global]
 project = ""
 observatory = "EVN"          # EVN | VLBA | LBA (or any registered/plugin observatory)
-backend = "casa"             # casa (default) | casa-fast (numpy fringe fits) | dask-ms | dummy | aips | plugin
+backend = "casa"             # casa (default) | dask-ms (fast numpy calibration + difmapy imaging) | dummy | aips | plugin
 mode = "continuum"          # continuum | spectral-line | pulsar-binning | multi-phase-center
 reference_antenna = []       # preferred refant(s); auto-ranked if empty
 work_dir = ""               # working directory; empty = cwd
@@ -38,7 +38,7 @@ reset_existing = true        # clearcal + unflag an existing MS so a previous at
                              # does not carry over (flags otherwise only accumulate)
 unflag_existing = true       # part of the reset: clear all flags (re-applied by flag.apriori)
 backup_flags = true          # save a restorable flag version before unflagging
-keep_ms = false              # dask-ms backend: keep the intermediate MS after the zarr conversion
+zarr_store = false           # dask-ms backend: also write <code>.zarr (lazy access; report without the MS)
 
 [flagging]
 # Quack (slewing time at scan start), applied before any solve. Per-antenna values in
@@ -65,6 +65,9 @@ outlier_gross_departure = 0.25  # a baseline with too many outliers to trust the
 outlier_gross_max_fraction = 0.35  # ... unless they are more than this share of the baseline
 bandpass_min_gain = 0.5      # channels whose bandpass solution is flagged or below this (subband median = 1)
                              # are flagged per antenna and subband after the bandpass
+flag_off_source = true       # after the first apply: flag antennas while they are still slewing or have dropped
+                             # out, measured per integration on the calibrators and transferred to the faint fields
+off_source_level = 0.8       # an antenna is off source when all its baselines sit below this fraction of their level
 
 # Seconds to quack per antenna, e.g. EF = 4. Empty = use quack_interval / measure.
 [flagging.quack_antennas]
@@ -132,6 +135,14 @@ enabled = true
 column = "corrected"
 minsamp = 2
 
+# Correlator amplitude correction from the autocorrelations, for DiFX data (VLBA, LBA): CASA accor,
+# then smoothcal. Applied with nearest interpolation, like the EOP correction.
+[calibration.accor]
+enabled = true
+solint = "30s"               # accor solution interval
+smoothtype = "median"        # smoothcal filter
+smoothtime = 1800.0          # smoothcal filter width in seconds (0 = apply the table unsmoothed)
+
 [calibration.tsys_smooth]
 window = 5                   # running-median window, in solutions, used to de-spike Tsys
 
@@ -152,7 +163,11 @@ prior_sigma = 0.1            # width of the prior on log-amplitude corrections (
 workers = 0                  # threads for bayes_gscale (0 = difmapy's default)
 
 [imaging]
-imager = "difmap"            # "difmap" (difmapy CLEAN on the per-source split) | "tclean"
+mapsize = 8192               # difmapy: width in pixels of the map the images are made on (the FITS keeps the
+                             # valid inner half, 4096 px); cell = resolution / 10
+average_channels = true      # difmapy: average each subband to one channel before CLEAN (much faster; set
+                             # false for fields wider than ~1 arcsec, where bandwidth smearing matters)
+imager = "difmap"            # "difmap" (difmapy CLEAN on the per-source split) | "tclean"; dask-ms: always difmap
 weighting = "briggs"
 clean_gain = 0.05            # difmapy CLEAN loop gain
 robust = [-2, 0, 2]          # one image per robust value, shown side by side in the PNG preview

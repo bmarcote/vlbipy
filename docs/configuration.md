@@ -38,6 +38,8 @@ outlier_sigma = 5.0          # Robust-sigma cut for per-baseline outlier flaggin
 outlier_gross_departure = 0.25      # On a baseline with too many outliers, still flag bins this far off
 outlier_gross_max_fraction = 0.35   # ... unless they are more than this share of the baseline
 bandpass_min_gain = 0.5      # Flag channels whose bandpass is flagged or below this
+flag_off_source = true       # Flag antennas while they are still slewing or have dropped out
+off_source_level = 0.8       # ... i.e. all their baselines below this fraction of their level
 aoflagger_strategy = "default"
 tfcrop_winsize = 3
 tfcrop_timecutoff = 4.5
@@ -142,6 +144,8 @@ Source names must exactly match those in the data file. Both the new-style keys 
 | `outlier_gross_departure` | float | `0.25` | A baseline with more outliers than the sigma cut can be trusted on (over 10%) still loses the time bins further than this fraction from its local level |
 | `outlier_gross_max_fraction` | float | `0.35` | ... unless those bins are more than this share of the baseline, which is then left untouched and reported |
 | `bandpass_min_gain` | float | `0.5` | After the bandpass, channels whose solution is flagged or whose amplitude (subband median = 1) is below this are flagged per antenna and subband |
+| `flag_off_source` | bool | `true` | After the first apply, flag antennas while they are not on source: measured per integration on the fringe finders and phase calibrators (one factor per antenna and time sample, so a late antenna is told from a late partner) and transferred to the fainter fields as the time each antenna typically arrives late |
+| `off_source_level` | float | `0.8` | An antenna counts as off source when all its baselines sit below this fraction of their own level |
 | `aoflagger_strategy` | string | `"default"` | AOFlagger strategy file name |
 | `tfcrop_winsize` | int | `3` | Window size for the tfcrop auto-flagger |
 | `tfcrop_timecutoff` | float | `4.5` | Sigma cutoff along time axis |

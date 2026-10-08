@@ -240,6 +240,21 @@ class Observation:
             self._metadata = self._load_metadata_cache()
         return self._metadata
 
+    def restrict_sources_to_data(self) -> list[str]:
+        """Forget declared sources this observation has no data for; return their names.
+
+        Called whenever the metadata is (re)loaded, so every later field
+        selection is built from sources that exist in this epoch.
+        """
+        metadata = self._metadata
+        if metadata is None or not metadata.source_names:
+            return []
+        dropped = self.sources.restrict_to(metadata.source_names)
+        if dropped:
+            logger.info("[{}] declared but not observed in this epoch (ignored here): {}",
+                        self.project_code, ", ".join(dropped))
+        return dropped
+
     def _load_metadata_cache(self) -> Optional[ObsMetadata]:
         """Read ``.metadata.json``; ``None`` for in-memory backends or a missing/corrupt file."""
         if not self._backend.requires_data_files:
@@ -348,12 +363,16 @@ class Observation:
             return
         if from_step:
             if from_step not in STEP_ORDER:
-                raise StepError(f"unknown step {from_step!r}; known steps: "
+                raise StepError(from_step, f"unknown step {from_step!r}; known steps: "
                                 f"{', '.join(STEP_ORDER)}")
             logger.info("[{}] resuming from {}", self.project_code, from_step)
             self._state.invalidate_downstream(from_step, STEP_ORDER)
             # The tables those steps produced are about to be re-derived: keeping them
             # in the chain would apply the stale solution alongside its replacement.
+            # Redoing the survey or the first instrumental solve means deciding again which
+            # antennas and scans it uses; a cached choice would make the new survey pointless.
+            if STEP_ORDER.index(from_step) <= STEP_ORDER.index("initial_calibration"):
+                self.clear_cal_selection()
             stale = self.drop_gaintables(STEP_ORDER[STEP_ORDER.index(from_step):])
             if stale:
                 logger.info("[{}] dropped from the calibration chain: {}",

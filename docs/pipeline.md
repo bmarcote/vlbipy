@@ -42,7 +42,8 @@ antennas, scans, frequency setup.
 ### `calibrate.a_priori`
 
 Amplitude calibration from the Tsys and gain-curve data appended to the
-FITS-IDI at import time (`gencal`, plus an EOP table for VLBA/LBA). The Tsys
+FITS-IDI at import time (`gencal`; for DiFX data, VLBA/LBA, also `accor` + `smoothcal` on the
+autocorrelations and an EOP table, see [LBA](observatories/lba.md#accor-and-eop-difx-data)). The Tsys
 table is de-spiked (and optionally smoothed) before it enters the chain, and
 each table is plotted per antenna. Refuses to run if the data has no Tsys /
 gain-curve information to calibrate from.
@@ -181,9 +182,25 @@ without images rather than failing the whole run.
 
 ## Campaigns
 
-Give `VLBIObs` several project codes and every step above fans out across
-them; `merge()` combines the calibrated data before `export.per_source()`.
-See [Full pipeline — Campaigns](usage/pipeline.md#campaigns).
+Give `VLBIObs` several project codes and every step above runs on each epoch
+on its own, up to and including its self-calibration and images. The epochs
+are then combined (`combine()`, see [Full pipeline — Campaigns](usage/pipeline.md#campaigns)):
+
+1. the calibrated data of each phase calibrator are concatenated across the
+   epochs, each scaled to a common flux density (calibrators vary), and
+   modelled together: phase self-calibration, then CLEAN. The joint uv coverage
+   constrains structure that no single track does;
+2. each epoch of that calibrator is self-calibrated against the joint model
+   (scaled back to that epoch's flux density, and never re-fitted): the phase
+   ladder, then one amplitude factor per station and subband, each kept only
+   if it improves the fit. The gains become a `joint_<source>` table in that
+   epoch's chain, applied to the fields the calibrator's own self-calibration
+   goes to;
+3. every epoch is re-applied, re-split and re-imaged;
+4. the epochs of every source are concatenated and imaged together.
+
+A source declared for the campaign but absent from an epoch is ignored in that
+epoch, and a calibrator observed in a single epoch gets no joint model.
 
 ## Self-calibration
 

@@ -76,9 +76,36 @@ def has_tsys(fitsidi_file: Union[str, Path]) -> bool:
 
 
 def has_gain_curve(fitsidi_file: Union[str, Path]) -> bool:
-    """Return True if the FITS-IDI file contains a GAIN_CURVE table."""
+    """Return True if the FITS-IDI file contains a GAIN_CURVE table with at least one row."""
     with fits.open(fitsidi_file) as hdulist:
-        return any(hdu.name == "GAIN_CURVE" for hdu in hdulist)
+        return any(hdu.name == "GAIN_CURVE" and hdu.header.get("NAXIS2", 0) > 0 for hdu in hdulist)
+
+
+def remove_empty_table(fitsidi_file: Union[str, Path], extname: str) -> bool:
+    """Remove a zero-row table from a FITS-IDI file; return True if one was removed.
+
+    DiFX writes a ``GAIN_CURVE`` table with no rows when it has no gain curves to
+    give (LBA). It carries no information, but its presence stops the real table
+    from being appended. When it is the last HDU — where DiFX puts it — the file
+    is simply truncated at the start of that HDU, which costs nothing; anywhere
+    else the file has to be rewritten without it.
+    """
+    with fits.open(fitsidi_file) as hdulist:
+        empty = [i for i, hdu in enumerate(hdulist)
+                 if hdu.name == extname and hdu.header.get("NAXIS2", 0) == 0]
+        if not empty:
+            return False
+        index = empty[0]
+        is_last = index == len(hdulist) - 1
+        offset = hdulist.fileinfo(index)["hdrLoc"]
+    if is_last:
+        with open(fitsidi_file, "r+b") as handle:
+            handle.truncate(offset)
+    else:
+        with fits.open(fitsidi_file, mode="update") as hdulist:
+            del hdulist[index]
+    logger.info("removed the empty {} table from {}", extname, Path(fitsidi_file).name)
+    return True
 
 
 def _read_antennas(hdulist: fits.HDUList) -> dict[str, Antenna]:

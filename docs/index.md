@@ -11,7 +11,7 @@ vlbipy is a Python package for reducing [Very Long Baseline Interferometry (VLBI
 VLBI data reduction has traditionally required deep familiarity with observatory-specific data formats, calibration procedures, and software ecosystems. Each VLBI network delivers data in slightly different formats and requires different preparation steps before the core calibration can begin. vlbipy abstracts these differences behind a common interface:
 
 - **Observatory-agnostic**: A single pipeline handles EVN, VLBA, and LBA data. Observatory-specific steps (data download, ANTAB handling, flag file parsing) are handled transparently.
-- **Backend-agnostic**: Choose between CASA (`casatools`/`casatasks`), AIPS (`ParselTongue`), or a lazy dask-ms reader at runtime, through abstract interfaces. Only CASA is implemented today; AIPS is a stub.
+- **Backend-agnostic**: Choose between CASA (`casatools`/`casatasks`), dask-ms (the CASA backend with the calibration solvers replaced by fast, parallel numpy ones), or AIPS (`ParselTongue`) at runtime, through abstract interfaces. CASA and dask-ms are implemented today; AIPS is a stub.
 - **Scriptable and reproducible**: Run the full pipeline from a single TOML configuration file and CLI command, or drive each step interactively from Python — both operate on the same `VLBIObs` object.
 - **Modular**: Each stage is a callable namespace (`import_data`, `calibrate`, `flag`, `plot`, `export`, ...). Run the default chain, call one step, or resume from where a previous run stopped.
 
@@ -55,6 +55,7 @@ obs.run()
 | Backend | Package | Description |
 |---|---|---|
 | [**CASA**](backends/casa.md) | `casatools`, `casatasks` | The Common Astronomy Software Applications package, the modern standard for radio interferometric calibration |
+| [**dask-ms**](backends/index.md#the-dask-ms-backend) | `casatools`, `casatasks`, `dask-ms` | The CASA backend with fringe fitting, bandpass, gaincal and applycal done by numpy solvers in parallel worker processes |
 | [**AIPS**](backends/aips.md) | `parseltongue` | The Astronomical Image Processing System, the classic VLBI calibration package accessed via ParselTongue Python bindings |
 
 ## License

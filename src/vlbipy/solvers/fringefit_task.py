@@ -1,27 +1,28 @@
-"""A drop-in replacement for ``casatasks.fringefit`` built on dask-ms and the numpy fringe solver.
+"""A drop-in replacement for ``casatasks.fringefit`` for the dask-ms backend (numpy fringe solver).
 
 :func:`run_fringefit` accepts the keyword set of the CASA task (``vis``, ``caltable``, the data
-selection, the solve options and the on-the-fly prior lists), reads the measurement set with
-dask-ms (one lazy dataset per field and scan), solves every solution interval with
-:mod:`vlbipy.solvers.fringe` and writes a CASA "Fringe Jones" table with
+selection, the solve options and the on-the-fly prior lists). Each (field, scan) is one job run in
+a worker process (:mod:`vlbipy.solvers.workers`): it reads the parallel hands of the selected
+channels straight from the measurement set (:mod:`vlbipy.solvers.msio`), applies the priors, and
+solves every solution interval with :mod:`vlbipy.solvers.fringe`. The parent only collects the
+solutions and writes a CASA "Fringe Jones" table with
 :func:`vlbipy.solvers.caltable.write_fringe_table`. The conventions (units, reference frequency
 and time, parallactic angle, SNR) follow CASA so the table can be applied by ``applycal`` and read
 by the rest of the pipeline unchanged.
 
 Differences from CASA that are deliberate:
 
-* prior tables are applied *phase-only* (``phase_only=True`` in :mod:`vlbipy.solvers.apply`):
-  the fit works on unit vectors, so amplitude-only priors (Tsys, gain curve) cannot change it;
+* the SNR column holds the AIPS FRING estimate of the FFT stage (the one ``minsnr`` is applied to);
+  CASA writes a value that scales with the square root of the weights instead, so the two columns
+  agree on what is detected but not on the numbers;
 * the MODEL_DATA column is ignored (calibrators are treated as point sources, as the pipeline does);
 * ``docallib=True`` (cal-library files) is not supported: pass the explicit parallel lists.
 """
 from __future__ import annotations
 
 import datetime as dt
-import os
 import re
 import time as _time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -30,12 +31,12 @@ import numpy as np
 from ..logging_utils import get_logger
 from .caltable import write_fringe_table
 from .fringe import REFANT_SNR_SENTINEL, FringeData, fringefit_interval
+from .msio import read_layout, read_setup, run_specs, select_runs, table_engine
+from .workers import run_jobs
 
 logger = get_logger()
 
 _MJD_EPOCH = dt.datetime(1858, 11, 17)
-#: Default number of scans solved concurrently (threads: numpy/FFT/BLAS and casacore I/O release the GIL).
-DEFAULT_WORKERS = int(os.environ.get("VLBIPY_FRINGE_WORKERS", "4"))
 
 
 # ---------------------------------------------------------------------------
@@ -146,82 +147,6 @@ def parse_solint(solint) -> float:
     return value * {"s": 1.0, "sec": 1.0, None: 1.0, "min": 60.0, "h": 3600.0}[match.group(2)]
 
 
-# ---------------------------------------------------------------------------
-# Measurement-set access through dask-ms
-# ---------------------------------------------------------------------------
-def read_ms_setup(vis: str) -> dict:
-    """Read the small subtables needed for a solve: antenna/field names, spw frequencies, DDID map, mounts."""
-    from daskms import xds_from_table
-    antenna = xds_from_table(f"{vis}::ANTENNA")[0]
-    field = xds_from_table(f"{vis}::FIELD")[0]
-    spw = xds_from_table(f"{vis}::SPECTRAL_WINDOW")[0]
-    ddid = xds_from_table(f"{vis}::DATA_DESCRIPTION")[0]
-    phase_dir = np.asarray(field.PHASE_DIR.values, dtype=float).reshape(field.sizes["row"], -1)
-    return {"antenna_names": [str(n) for n in antenna.NAME.values],
-            "antenna_xyz": np.asarray(antenna.POSITION.values, dtype=float),
-            "mounts": [str(m) for m in antenna.MOUNT.values] if "MOUNT" in antenna else [],
-            "field_names": [str(n) for n in field.NAME.values],
-            "field_dirs": phase_dir[:, :2],
-            "chan_freq": np.asarray(spw.CHAN_FREQ.values, dtype=float),
-            "ddid_to_spw": np.asarray(ddid.SPECTRAL_WINDOW_ID.values, dtype=int)}
-
-
-def _has_column(dataset, name: str) -> bool:
-    """True when the dask-ms dataset carries ``name``."""
-    return name in dataset.data_vars
-
-
-def read_scan_block(dataset, ddid_to_spw: np.ndarray, data_column: str = "DATA") -> dict:
-    """Materialise one (field, scan) dask-ms dataset into numpy arrays (flags include FLAG_ROW)."""
-    import dask
-    names = [data_column, "FLAG", "TIME", "ANTENNA1", "ANTENNA2", "DATA_DESC_ID"]
-    names.append("WEIGHT_SPECTRUM" if _has_column(dataset, "WEIGHT_SPECTRUM") else "WEIGHT")
-    if _has_column(dataset, "FLAG_ROW"):
-        names.append("FLAG_ROW")
-    arrays = dict(zip(names, dask.compute(*[dataset[n].data for n in names])))
-    flag = np.asarray(arrays["FLAG"], dtype=bool)
-    if "FLAG_ROW" in arrays:
-        flag = flag | np.asarray(arrays["FLAG_ROW"], dtype=bool)[:, None, None]
-    weight = arrays.get("WEIGHT_SPECTRUM", arrays.get("WEIGHT"))
-    return {"vis": np.asarray(arrays[data_column]), "flag": flag, "weight": np.asarray(weight, dtype=np.float32),
-            "time": np.asarray(arrays["TIME"], dtype=float), "antenna1": np.asarray(arrays["ANTENNA1"], dtype=int),
-            "antenna2": np.asarray(arrays["ANTENNA2"], dtype=int),
-            "spw": ddid_to_spw[np.asarray(arrays["DATA_DESC_ID"], dtype=int)]}
-
-
-def _apply_priors(block: dict, chan_freq: np.ndarray, priors: list[dict]) -> dict:
-    """Apply the prior tables phase-only to a block (flags and weights follow), returning a new block."""
-    if not priors:
-        return block
-    from .apply import apply_tables
-    vis, flag, weight = apply_tables(block["vis"], block["flag"], block["weight"], block["antenna1"],
-                                     block["antenna2"], block["time"], block["spw"], chan_freq, priors,
-                                     phase_only=True, calwt=False)
-    return dict(block, vis=vis, flag=flag, weight=weight)
-
-
-def _apply_parang(block: dict, setup: dict, field_id: int) -> dict:
-    """Rotate the block by the parallactic/feed angles (CASA ``parang=True``)."""
-    from .parang import apply_parang, feed_angles_for_ms
-    times = np.unique(block["time"])
-    ra, dec = setup["field_dirs"][field_id]
-    angles = feed_angles_for_ms(setup["antenna_xyz"], setup["mounts"], float(ra), float(dec), times)
-    return dict(block, vis=apply_parang(block["vis"], block["antenna1"], block["antenna2"], block["time"], angles,
-                                        time_index=times))
-
-
-def _select_rows(block: dict, spw_sel: dict, antennas: Optional[set], among: bool,
-                 timerange: Optional[tuple]) -> np.ndarray:
-    """Boolean row mask for the spw / antenna / timerange selection."""
-    keep = np.isin(block["spw"], list(spw_sel))
-    if antennas is not None:
-        in1, in2 = np.isin(block["antenna1"], list(antennas)), np.isin(block["antenna2"], list(antennas))
-        keep &= (in1 & in2) if among else (in1 | in2)
-    if timerange is not None:
-        keep &= (block["time"] >= timerange[0]) & (block["time"] <= timerange[1])
-    return keep
-
-
 def _interval_edges(times: np.ndarray, solint_sec: float) -> list[tuple[float, float]]:
     """Split the sorted unique ``times`` of a scan into solution intervals of ``solint_sec`` (inf = one)."""
     if not np.isfinite(solint_sec):
@@ -253,7 +178,11 @@ def _first_refant_with_data(chain: list[int], antenna1: np.ndarray, antenna2: np
 # ---------------------------------------------------------------------------
 def _solve_block(block: dict, setup: dict, spw_sel: dict, spw_groups: list[list[int]], refant_chain: list[int],
                  solint_sec: float, solve_kwargs: dict, field_id: int, scan: int) -> list[dict]:
-    """Solve every (interval, spw group) of one scan block; returns the table rows as dicts of arrays."""
+    """Solve every (interval, spw group) of one scan block; returns the table rows as dicts of arrays.
+
+    ``block`` comes from :func:`vlbipy.solvers.calblock.load_block`: its cubes already hold only the selected
+    channels (``block["chan_freq"]`` are their frequencies) and the parallel hands.
+    """
     nant = len(setup["antenna_names"])
     rows = []
     unique_times = np.unique(block["time"])
@@ -267,18 +196,16 @@ def _solve_block(block: dict, setup: dict, spw_sel: dict, spw_groups: list[list[
             chans = spw_sel[group[0]]
             if any(not np.array_equal(spw_sel[s], chans) for s in group):
                 raise ValueError("combine='spw' needs the same channel selection in every subband")
-            freq = setup["chan_freq"][:, chans]
+            freq = block["chan_freq"]
             refant = _first_refant_with_data(refant_chain, block["antenna1"][keep], block["antenna2"][keep],
-                                             block["flag"][keep][:, chans])
+                                             block["flag"][keep])
             if refant < 0:
                 logger.warning("fringefit: scan {} spw {}: no reference antenna with data; interval skipped",
                                scan, group)
                 continue
-            data = FringeData.from_baselines(block["vis"][keep][:, chans], block["flag"][keep][:, chans],
-                                             block["weight"][keep][:, chans] if block["weight"].ndim == 3
-                                             else block["weight"][keep], block["antenna1"][keep],
-                                             block["antenna2"][keep], block["time"][keep], block["spw"][keep],
-                                             freq, nant=nant)
+            data = FringeData.from_baselines(block["vis"][keep], block["flag"][keep], block["weight"][keep],
+                                             block["antenna1"][keep], block["antenna2"][keep], block["time"][keep],
+                                             block["spw"][keep], freq, nant=nant)
             t_sol = 0.5 * (t_lo + t_hi)
             solution = fringefit_interval(data, refant, t_sol=t_sol, **solve_kwargs)
             table = solution.to_fparam()
@@ -290,6 +217,24 @@ def _solve_block(block: dict, setup: dict, spw_sel: dict, spw_groups: list[list[
     return rows
 
 
+def solve_scan_job(*, specs: list[dict], setup: dict, engine: str, columns: list[str], data_column: str,
+                   spw_sel: dict, spw_groups: list[list[int]], refant_chain: list[int], solint_sec: float,
+                   solve_kwargs: dict, antennas: Optional[set], among: bool, timerange: Optional[tuple],
+                   parang: bool, priors: list) -> list[dict]:
+    """Worker job: read one (field, scan), apply the priors and fringe fit its solution intervals.
+
+    Returns the table rows of the scan as dicts of small arrays (see :func:`_solve_block`).
+    """
+    from .calblock import load_block
+    block = load_block(specs, setup=setup, engine=engine, columns=columns, data_column=data_column, chans=spw_sel,
+                       parallel_hands=True, timerange=timerange, antennas=antennas, among=among, parang=parang,
+                       priors=priors)
+    if block is None:
+        return []
+    return _solve_block(block, setup, spw_sel, spw_groups, refant_chain, solint_sec, solve_kwargs, block["field"],
+                        int(specs[0]["scan"]))
+
+
 def run_fringefit(vis: str, caltable: str, *, field="", spw="", scan="", timerange="", antenna="",
                   solint="inf", combine="", refant="", minsnr=3.0, zerorates=False, globalsolve=True, niter=100,
                   paramactive=None, delaywindow=None, ratewindow=None, parang=False, gaintable=None,
@@ -299,16 +244,17 @@ def run_fringefit(vis: str, caltable: str, *, field="", spw="", scan="", timeran
 
     Parameters follow the CASA task. ``paramactive`` is ``[delay, rate, dispersive]`` (default
     delay and rate). ``gaintable``/``gainfield``/``interp``/``spwmap`` are the explicit prior
-    lists; ``docallib`` is rejected. ``workers`` scans are solved concurrently (default
-    :data:`DEFAULT_WORKERS`). Unknown keywords (``corrdepflags``, ``selectdata``, ...) are ignored.
-    Returns the table path.
+    lists; ``docallib`` is rejected. ``workers`` is the number of worker processes (default
+    :func:`vlbipy.solvers.workers.default_workers`; 1 solves in this process). Unknown keywords
+    (``corrdepflags``, ``selectdata``, ...) are ignored. Returns the table path.
     """
-    from daskms import xds_from_ms
     if docallib:
         raise NotImplementedError("run_fringefit: cal-library files are not supported; pass gaintable lists")
     t_start = _time.time()
     vis, caltable = str(vis), Path(caltable)
-    setup = read_ms_setup(vis)
+    engine = table_engine()
+    setup = read_setup(vis, engine=engine)
+    layout = read_layout(vis, engine=engine)
     nspw, nchan = setup["chan_freq"].shape
     field_ids = set(parse_names(field, setup["field_names"]))
     spw_sel = parse_spw(spw, nspw, nchan)
@@ -326,67 +272,62 @@ def run_fringefit(vis: str, caltable: str, *, field="", spw="", scan="", timeran
                     "global_solve": bool(globalsolve), "max_iter": int(niter),
                     "delay_window_ns": tuple(delaywindow) if delaywindow else None,
                     "rate_window": tuple(ratewindow) if ratewindow else None}
-    priors = _prior_entries(gaintable, gainfield, interp, spwmap, setup["field_names"])
-    # casatools table handles are not thread-safe: read every prior table here, before the worker threads start.
-    if priors:
-        from .apply import load_caltable
-        for entry in priors:
-            entry["name"] = Path(entry["path"]).name
-            entry["path"] = load_caltable(entry["path"])
-    logger.info("fringefit[numpy]: {} field={} spw={} scans={} solint={} combine={} refant={} minsnr={} "
+    prior_entries = _prior_entries(gaintable, gainfield, interp, spwmap, setup["field_names"])
+    # The prior tables are read once here (casatools) and travel to the workers as plain arrays. Every table
+    # calibrates the weights, as in CASA: the fit itself works on unit vectors, but the amplitude tables (Tsys,
+    # gain curve) set how much each baseline counts in it.
+    from .apply import normalise_entries
+    table_cache: dict = {}
+    priors_by_field = {field_id: [entry[:4] + (True,) for entry in normalise_entries(
+        prior_entries, cache=table_cache, field_dirs=setup["field_dirs"], target_field=field_id)]
+        for field_id in sorted(field_ids)}
+    logger.info("fringefit[dask-ms]: {} field={} spw={} scans={} solint={} combine={} refant={} minsnr={} "
                 "paramactive={} zerorates={} parang={} priors={}", Path(vis).name, sorted(field_ids), spw or "all",
                 scan or "all", solint, combine or "none", [setup["antenna_names"][a] for a in refant_chain],
-                minsnr, list(active), zerorates, parang, [p["name"] for p in priors])
+                minsnr, list(active), zerorates, parang, [Path(str(e["path"])).name for e in prior_entries])
 
-    datasets = xds_from_ms(vis, group_cols=["FIELD_ID", "SCAN_NUMBER"], index_cols=["TIME", "ANTENNA1", "ANTENNA2"],
-                           columns=[data_column, "FLAG", "FLAG_ROW", "WEIGHT_SPECTRUM", "WEIGHT", "TIME",
-                                    "ANTENNA1", "ANTENNA2", "DATA_DESC_ID"])
-    selected = [d for d in datasets if int(d.attrs["FIELD_ID"]) in field_ids
-                and (scans is None or int(d.attrs["SCAN_NUMBER"]) in scans)]
-    if not selected:
+    ddids = {ddid for ddid, s in enumerate(setup["ddid_to_spw"]) if int(s) in spw_sel}
+    selected = select_runs(layout, fields=field_ids, scans=scans, ddids=ddids, timerange=trange)
+    if not selected.size:
         raise ValueError(f"run_fringefit: no data for field={field!r} scan={scan!r}")
-
-    def solve_one(dataset) -> list[dict]:
-        field_id, scan_no = int(dataset.attrs["FIELD_ID"]), int(dataset.attrs["SCAN_NUMBER"])
-        block = read_scan_block(dataset, setup["ddid_to_spw"], data_column)
-        keep = _select_rows(block, spw_sel, antennas, among, trange)
-        if not keep.any():
-            return []
-        block = {k: v[keep] for k, v in block.items()}
-        if parang:
-            block = _apply_parang(block, setup, field_id)
-        block = _apply_priors(block, setup["chan_freq"], priors)
-        return _solve_block(block, setup, spw_sel, spw_groups, refant_chain, solint_sec, solve_kwargs, field_id,
-                            scan_no)
-
-    nworkers = max(1, min(workers or DEFAULT_WORKERS, len(selected)))
-    if nworkers == 1:
-        results = [solve_one(d) for d in selected]
-    else:
-        with ThreadPoolExecutor(max_workers=nworkers) as pool:
-            results = list(pool.map(solve_one, selected))
+    common = {"setup": setup, "engine": engine, "columns": layout["columns"], "data_column": data_column,
+              "spw_sel": spw_sel, "spw_groups": spw_groups, "refant_chain": refant_chain, "solint_sec": solint_sec,
+              "solve_kwargs": solve_kwargs, "antennas": antennas, "among": among, "timerange": trange,
+              "parang": bool(parang)}
+    keys = sorted({(int(layout["field"][i]), int(layout["scan"][i])) for i in selected})
+    jobs = [dict(common, priors=priors_by_field[field_id],
+                 specs=run_specs(layout, [i for i in selected if int(layout["field"][i]) == field_id
+                                          and int(layout["scan"][i]) == scan_no]))
+            for field_id, scan_no in keys]
+    # Longest scans first: the pool then finishes with short jobs instead of waiting on one long straggler.
+    order = np.argsort([-sum(spec["nrow"] for spec in job["specs"]) for job in jobs], kind="stable")
+    results = run_jobs("vlbipy.solvers.fringefit_task:solve_scan_job", [jobs[i] for i in order], workers)
     rows = [r for group in results for r in group]
     if not rows:
         raise RuntimeError("run_fringefit: no solution interval had data")
     _write_table(caltable, vis, setup, rows, spw_sel, combine_spw)
     n_ok = sum(r["n_ok"] for r in rows)
-    logger.info("fringefit[numpy]: {} interval(s) on {} scan(s), {} antenna solutions, median SNR {:.0f}; "
-                "{} written in {:.1f}s ({} worker(s))", len(rows), len(selected), n_ok,
+    logger.info("fringefit[dask-ms]: {} interval(s) on {} scan(s), {} antenna solutions, median SNR {:.0f}; "
+                "{} written in {:.2f}s", len(rows), len(jobs), n_ok,
                 float(np.median([r["snr_median"] for r in rows if r["n_ok"]])) if n_ok else 0.0,
-                caltable.name, _time.time() - t_start, nworkers)
+                caltable.name, _time.time() - t_start)
     return caltable
 
 
 def _prior_entries(gaintable, gainfield, interp, spwmap, field_names: list[str]) -> list[dict]:
-    """Turn the CASA parallel prior lists into :func:`vlbipy.solvers.apply.apply_tables` entries."""
+    """Turn the CASA parallel prior lists into :func:`vlbipy.solvers.apply.apply_tables` entries.
+
+    A ``gainfield`` of names or ids becomes a list of field ids, ``''`` an empty list (all fields) and
+    ``'nearest'`` stays ``"nearest"`` until the field being calibrated is known.
+    """
     tables = [str(t) for t in (gaintable or [])] if not isinstance(gaintable, str) else _split_list(gaintable)
     entries = []
     for i, path in enumerate(tables):
-        mapping = (gainfield or [""] * len(tables))[i] if i < len(gainfield or []) else ""
-        if mapping and mapping != "nearest":
-            fields = parse_names(mapping, field_names)
+        mapping = str((gainfield or [""] * len(tables))[i] if i < len(gainfield or []) else "").strip()
+        if mapping.lower() == "nearest":
+            fields = "nearest"
         else:
-            fields = []
+            fields = parse_names(mapping, field_names) if mapping else []
         entries.append({"path": path, "interp": (interp or [])[i] if i < len(interp or []) else "linear",
                         "spwmap": list((spwmap or [])[i]) if i < len(spwmap or []) and (spwmap or [])[i] else [],
                         "gainfield": fields, "calwt": False})

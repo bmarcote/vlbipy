@@ -23,15 +23,26 @@ T0_MJD_S = 58000.0 * 86400.0
 
 
 def _site_xyz(lat_deg, lon_deg=0.0):
-    """ITRF position (1, 3) in metres of a site at the given geodetic latitude/longitude."""
-    loc = EarthLocation.from_geodetic(lon_deg * u.deg, lat_deg * u.deg, 0.0 * u.m)
-    return np.array([[loc.x.to_value(u.m), loc.y.to_value(u.m), loc.z.to_value(u.m)]])
+    """ITRF position (1, 3) in metres of a site at the given *geocentric* latitude/longitude.
+
+    The geometry uses the geocentric latitude (casacore's AZEL convention), so the test sites are placed on a sphere.
+    """
+    lat, lon, radius = np.radians(lat_deg), np.radians(lon_deg), 6.371e6
+    return np.array([[radius * np.cos(lat) * np.cos(lon), radius * np.cos(lat) * np.sin(lon), radius * np.sin(lat)]])
 
 
 def _transit_ra(lon_deg, time_mjd_s):
     """Right ascension [rad] that transits (H = 0) at longitude ``lon_deg`` at ``time_mjd_s``."""
     t = Time(time_mjd_s / 86400.0, format="mjd", scale="utc")
     return t.sidereal_time("apparent", longitude=lon_deg * u.deg).to_value(u.rad)
+
+
+def _icrs_for(ra_date, dec_date, time_mjd_s):
+    """ICRS (ra, dec) [rad] of the source whose direction of date at ``time_mjd_s`` is (ra_date, dec_date)."""
+    from astropy.coordinates import TETE, SkyCoord
+    t = Time(time_mjd_s / 86400.0, format="mjd", scale="utc")
+    icrs = SkyCoord(ra_date * u.rad, dec_date * u.rad, frame=TETE(obstime=t)).transform_to("icrs")
+    return float(icrs.ra.to_value(u.rad)), float(icrs.dec.to_value(u.rad))
 
 
 def _wrap_deg(x):
@@ -42,9 +53,9 @@ def _wrap_deg(x):
 def test_parallactic_angle_zero_at_transit_south_of_zenith():
     """At transit a source south of the zenith (lat 50, dec 0) has chi = 0 and el = 40 deg."""
     xyz = _site_xyz(50.0)
-    ra = _transit_ra(0.0, T0_MJD_S)
-    chi = parang.parallactic_angle(xyz, ra, 0.0, [T0_MJD_S])
-    el = parang.elevation(xyz, ra, 0.0, [T0_MJD_S])
+    ra, dec = _icrs_for(_transit_ra(0.0, T0_MJD_S), 0.0, T0_MJD_S)
+    chi = parang.parallactic_angle(xyz, ra, dec, [T0_MJD_S])
+    el = parang.elevation(xyz, ra, dec, [T0_MJD_S])
     assert chi.shape == (1, 1)
     assert abs(np.degrees(chi[0, 0])) < 0.05
     assert abs(np.degrees(el[0, 0]) - 40.0) < 0.05
@@ -53,9 +64,9 @@ def test_parallactic_angle_zero_at_transit_south_of_zenith():
 def test_parallactic_angle_sign_before_and_after_transit():
     """Scanning a day around transit: chi is negative before (H < 0) and positive after (H > 0) transit."""
     xyz = _site_xyz(50.0)
-    ra = _transit_ra(0.0, T0_MJD_S)
+    ra, dec = _icrs_for(_transit_ra(0.0, T0_MJD_S), 0.0, T0_MJD_S)
     times = T0_MJD_S + np.array([-3600.0, 3600.0])
-    chi = parang.parallactic_angle(xyz, ra, 0.0, times)[0]
+    chi = parang.parallactic_angle(xyz, ra, dec, times)[0]
     assert chi[0] < 0 < chi[1]
     assert abs(chi[0] + chi[1]) < 1e-3
 
@@ -63,8 +74,8 @@ def test_parallactic_angle_sign_before_and_after_transit():
 def test_elevation_at_zenith_transit():
     """A source with dec = site latitude transits at the zenith: elevation ~ 90 deg."""
     xyz = _site_xyz(50.0)
-    ra = _transit_ra(0.0, T0_MJD_S)
-    el = parang.elevation(xyz, ra, np.radians(50.0), [T0_MJD_S])
+    ra, dec = _icrs_for(_transit_ra(0.0, T0_MJD_S), np.radians(50.0), T0_MJD_S)
+    el = parang.elevation(xyz, ra, dec, [T0_MJD_S])
     assert np.degrees(el[0, 0]) > 89.9
 
 

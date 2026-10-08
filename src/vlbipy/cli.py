@@ -164,6 +164,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_pipe.add_argument("--summary-only", action="store_true", help="Import and print the summary, then stop")
     p_pipe.add_argument("--dashboard", action="store_true", help="Build the HTML dashboard and open it in the browser")
+    p_pipe.add_argument("--list-steps", action="store_true",
+                        help="List the pipeline steps in order (all valid for --from-step) and exit; "
+                             "with -p it also shows which ones are already done")
 
     p_imp = sub.add_parser(
         "import", parents=[common], formatter_class=RichHelpFormatter,
@@ -200,7 +203,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Image target source(s)"
     )
     p_img.add_argument("--robust", nargs="+", type=float, help="Briggs robust value(s); default from config")
-    p_img.add_argument("--imager", choices=["wsclean", "tclean"], help="Imager to use; default wsclean")
+    p_img.add_argument("--imager", choices=["difmap", "wsclean", "tclean"],
+                       help="Imager to use; default [imaging].imager (difmap). The dask-ms backend always "
+                            "uses difmap")
     p_img.add_argument("--niter", type=int, help="Clean iterations; default from config")
 
     p_plot = sub.add_parser(
@@ -254,6 +259,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Build the HTML dashboard (<work_dir>/html/index.html) from the plots and state on disk"
     )
     p_rep.add_argument("--open", action="store_true", help="Open the dashboard in the default browser")
+    p_comb = sub.add_parser(
+        "combine", parents=[common], formatter_class=RichHelpFormatter,
+        help="Combine the calibrated epochs of a campaign (several -p codes): joint phase-calibrator model, "
+             "per-epoch refinement, combined images (<campaign dir>/combined)"
+    )
+    del p_comb
     p_nb = sub.add_parser(
         "notebook", parents=[common], formatter_class=RichHelpFormatter,
         help="Write the interactive Jupyter notebook (<work_dir>/<code>.ipynb) describing the reduction so far"
@@ -342,8 +353,43 @@ def _build_obs(args: argparse.Namespace) -> VLBIObs:
                    config=args.config, **overrides)
 
 
+def format_steps(statuses: Optional[dict] = None) -> str:
+    """Return the pipeline steps as a numbered text listing, in execution order.
+
+    Every listed step is a valid ``--from-step`` value. ``statuses`` (step name -> recorded
+    status, e.g. from :meth:`vlbipy.state.StepState.status`) adds a status column; steps
+    without a record show ``-``.
+    """
+    from .observation import STEP_ORDER
+    width = max(len(step) for step in STEP_ORDER)
+    lines = []
+    for number, step in enumerate(STEP_ORDER, start=1):
+        line = f"{number:3d}  {step:<{width}}"
+        if statuses is not None:
+            line += f"  {statuses.get(step) or '-'}"
+        lines.append(line.rstrip())
+    return "\n".join(lines)
+
+
+def _cmd_list_steps(obs: Optional[VLBIObs]) -> int:
+    """Print the pipeline steps (per project with their recorded status when ``obs`` is given)."""
+    note = "Any of these can be given to --from-step: that step and everything after it is re-run."
+    if obs is None:
+        print(f"Pipeline steps, in order:\n{format_steps()}\n{note}")
+        return 0
+    from .observation import STEP_ORDER
+    for observation in obs.observations:
+        statuses = {step: observation.state.status(step) for step in STEP_ORDER}
+        print(f"Pipeline steps of {observation.project_code}, in order (status from the last run):\n"
+              f"{format_steps(statuses)}")
+    print(note)
+    return 0
+
+
 def _cmd_pipeline(obs: VLBIObs, args: argparse.Namespace) -> int:
-    """Full pipeline (or --summary-only / --dashboard)."""
+    """Full pipeline (or --summary-only / --dashboard / --list-steps)."""
+    if args.list_steps:
+        return _cmd_list_steps(obs)
     if args.dashboard:
         from .dashboard import serve_dashboard
         obs.import_data(force=False)
@@ -505,14 +551,10 @@ def _cmd_export(obs: VLBIObs, args: argparse.Namespace) -> int:
             print(observation.export.uvfits())
         return 0
 
-    # dask-ms zarr store. The dask-ms backend produced it at import time already;
-    # for the CASA backend, convert its MS here.
+    # dask-ms zarr store: converted from the measurement set unless it already exists.
     from .backends.dask_ms import ms_to_daskms
     for observation in obs.observations:
         backend = observation._backend
-        if hasattr(backend, "store_path"):
-            print(backend.store_path(observation.project_code))
-            continue
         if not hasattr(backend, "ms_path"):
             logger.error("the {} backend has no measurement set to convert; "
                          "use --backend casa or dask-ms", backend.kind)
@@ -524,6 +566,13 @@ def _cmd_export(obs: VLBIObs, args: argparse.Namespace) -> int:
         else:
             ms_to_daskms(backend.ms_path(observation.project_code), store)
         print(store)
+    return 0
+
+
+def _cmd_combine(obs: VLBIObs, args: argparse.Namespace) -> int:
+    """Multi-epoch stage on already-calibrated epochs."""
+    obs.import_data(force=False)
+    obs.combine(force=args.force)
     return 0
 
 
@@ -565,7 +614,7 @@ _HANDLERS = {"pipeline": _cmd_pipeline, "run": _cmd_pipeline, "import": _cmd_imp
              "calibrate": _cmd_calibrate, "flag": _cmd_flag,
              "image": _cmd_image, "plot": _cmd_plot, "applycal": _cmd_applycal,
              "summary": _cmd_summary, "export": _cmd_export, "report": _cmd_report,
-             "notebook": _cmd_notebook}
+             "notebook": _cmd_notebook, "combine": _cmd_combine}
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -585,6 +634,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Default form: `vlbipy -p CODE ...` (no subcommand) is treated as `vlbipy pipeline ...`.
     if argv and argv[0].startswith("-") and argv[0] not in ("-h", "--help"):
         argv.insert(0, "pipeline")
+
+    # `--list-steps` needs no project: without one, print the plain list before -p is required.
+    if "--list-steps" in argv and argv[0] in ("pipeline", "run") and not {"-p", "--project"} & set(argv):
+        return _cmd_list_steps(None)
 
     parser = build_parser()
     args = _relocate_selectors(parser.parse_args(argv))

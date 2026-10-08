@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-daskms = ["dask-ms[xarray,zarr]"]
+daskms = ["dask-ms[xarray,zarr]", "difmapy"]
 aips = ["parseltongue"]
 difmap = ["difmapy"]
 notebook = ["nbformat", "ipykernel", "jupyterlab", "ipywidgets", "plotly", "anywidget"]

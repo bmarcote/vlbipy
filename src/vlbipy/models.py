@@ -428,8 +428,17 @@ class ScanSNRSurvey:
         return sorted([r for r in ranked if r[1] == r[1]], key=lambda r: r[1], reverse=True)
 
     def rank_antennas(self) -> list[tuple[str, float]]:
-        """Return ``(antenna, median_snr)`` pairs, most sensitive antenna first."""
-        ranked = [(ant, self.median_snr(antenna=ant)) for ant in self.antennas]
+        """Return ``(antenna, median_snr)`` pairs, most sensitive antenna first.
+
+        The SNR of an antenna is that of its better polarization: a station with
+        one dead receiver channel is as good as its working one, and must not be
+        ranked (or rejected) on the median of a signal and a non-detection.
+        """
+        ranked = []
+        for ant in self.antennas:
+            per_hand = [self.median_snr(antenna=ant, polarization=pol) for pol in self.polarizations]
+            per_hand = [value for value in per_hand if value == value]
+            ranked.append((ant, max(per_hand) if per_hand else float("nan")))
         return sorted([r for r in ranked if r[1] == r[1]], key=lambda r: r[1], reverse=True)
 
     @property

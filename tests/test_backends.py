@@ -601,3 +601,61 @@ def test_scalar_bandpass_is_normalised_per_antenna(tmp_path, monkeypatch):
     assert np.allclose(gains[:4], [1.0, 1.1, 0.9, 1.0])               # antenna level 0.40 removed, steps kept
     assert not flags[:7].any() and flags[7]                            # 0.3 against ~1.22 is a factor 4: flagged
     assert dropped == ["BB spw 3 pol 0", "BB spw 3 pol 1"]
+
+
+def test_baseline_coherence_separates_signal_from_noise():
+    import numpy as np
+    from vlbipy.backends.casa import CasaFlagOps
+    rng = np.random.default_rng(5)
+    noise = rng.standard_normal((40, 256)) + 1j * rng.standard_normal((40, 256))
+    assert CasaFlagOps._baseline_coherence(noise) < 0.2
+    assert CasaFlagOps._baseline_coherence(10.0 + 0.3 * noise) > 0.9
+
+
+def test_dask_ms_backend_always_images_with_difmap(tmp_path):
+    """Under dask-ms every imaging request is redirected to difmapy; other backends honour the request."""
+    from types import SimpleNamespace
+    from vlbipy.backends.base import Backend
+    from vlbipy.backends.dask_ms import DaskMsBackend
+    from vlbipy.namespaces import CleanNamespace
+    assert Backend.imager is None and DaskMsBackend.imager == "difmap"
+    fixed = SimpleNamespace(_backend=SimpleNamespace(imager="difmap", kind="dask-ms"), _code="TS01")
+    free = SimpleNamespace(_backend=SimpleNamespace(imager=None, kind="casa"), _code="TS01")
+    for requested in ("tclean", "wsclean", "difmap"):
+        assert CleanNamespace._backend_imager(fixed, requested) == "difmap"
+        assert CleanNamespace._backend_imager(free, requested) == requested
+
+
+def test_missing_difmapy_is_reported_clearly(monkeypatch):
+    """A 'difmapy' directory on the path imports as an empty namespace package: that must not pass for the package."""
+    import sys
+    import types
+    import pytest
+    from vlbipy.backends import difmap
+    from vlbipy.errors import BackendError
+    shell = types.ModuleType("difmapy")
+    shell.__path__ = ["/somewhere/difmapy"]
+    monkeypatch.setitem(sys.modules, "difmapy", shell)
+    with pytest.raises(BackendError, match="difmapy is not installed.*/somewhere/difmapy"):
+        difmap._load_difmapy()
+
+
+def test_gain_record_lists_every_station_per_if(tmp_path):
+    """The gain record holds one amplitude correction per station and IF, plus medians and Bayesian extras."""
+    import json
+    from types import SimpleNamespace
+    from vlbipy.backends import difmap
+    per_if = {"EF": [1.0, 1.02, 0.98, 1.0], "HH": [1.2, 1.25, 1.15, 1.2]}
+    obs = SimpleNamespace(source="3C345", station_gains=lambda per_if=False: per_if and globals_per_if)
+    globals_per_if = per_if
+    amplitude = {"report": {"if_freqs_hz": [1.6e9, 1.63e9, 1.66e9, 1.69e9],
+                            "stations": [{"station": "EF", "sigma": 0.07, "p_correction": 0.5},
+                                         {"station": "HH", "sigma": float("nan"), "p_correction": 0.99}]}}
+    path = tmp_path / "x.gains.json"
+    record = difmap.write_gain_record(obs, str(path), amplitude)
+    assert json.loads(path.read_text()) == record and "NaN" not in path.read_text()
+    assert record["sigma"] == {"EF": 0.07, "HH": None}          # no solution -> null, valid JSON
+    assert record["gain_per_if"] == per_if and record["antennas"] == ["EF", "HH"]
+    assert record["gain_median"] == {"EF": 1.0, "HH": 1.2} and record["p_correction"]["HH"] == 0.99
+    assert len(record["if_freqs_hz"]) == 4 and "multiplied" in record["convention"]
+    assert difmap.IMAGE_PIXELS == 8192

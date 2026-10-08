@@ -15,6 +15,7 @@ Units: delays in ns, rates in s/s, phases in rad, dispersive term in CASA units,
 from __future__ import annotations
 
 import logging
+import os
 import time as _time
 from dataclasses import dataclass, field
 
@@ -24,6 +25,8 @@ import scipy.fft
 log = logging.getLogger(__name__)
 
 REFANT_SNR_SENTINEL = 999.0
+#: Threads scipy.fft may use per transform (-1 = all cores); worker processes run with 1.
+FFT_WORKERS = int(os.environ.get("VLBIPY_FFT_WORKERS", "-1"))
 TWO_PI = 2.0 * np.pi
 # Parameter order inside FPARAM blocks: phi0 [rad], tau [ns], rate [s/s], disp [CASA units].
 PARAM_NAMES = ("phase", "delay_ns", "rate", "disp")
@@ -215,8 +218,11 @@ class FringeData:
             vis = vis.copy()
             vis[swap] = np.conj(vis[swap])
         keep = a1 != a2
-        vis, flag, weight = vis[keep][..., corr], flag[keep][..., corr], weight[keep][..., corr]
-        a1, a2, time, spw = a1[keep], a2[keep], time[keep], spw[keep]
+        if not keep.all():
+            vis, flag, weight = vis[keep], flag[keep], weight[keep]
+            a1, a2, time, spw = a1[keep], a2[keep], time[keep], spw[keep]
+        if len(corr) != ncorr:
+            vis, flag, weight = vis[..., corr], flag[..., corr], weight[..., corr]
         if nant is None:
             nant = int(max(a1.max(), a2.max())) + 1 if a1.size else 0
         spw_ids, spw_idx = np.unique(spw, return_inverse=True)
@@ -230,16 +236,23 @@ class FringeData:
         out_vis = np.zeros((nbl, nt, nchan, npol), dtype=np.complex64)
         out_flag = np.ones((nbl, nt, nchan, npol), dtype=bool)
         out_w = np.zeros((nbl, nt, nchan, npol), dtype=np.float32)
-        chan_cols = (spw_idx * nchan_spw)[:, None] + np.arange(nchan_spw)[None, :]
-        out_vis[bl_idx[:, None], t_idx[:, None], chan_cols] = vis
-        out_flag[bl_idx[:, None], t_idx[:, None], chan_cols] = flag
-        out_w[bl_idx[:, None], t_idx[:, None], chan_cols] = weight
+        # Rows arrive run by run (one spw each), so the scatter goes segment by segment: two index arrays and a
+        # channel slice per segment copy whole (channel, pol) cells, far faster than indexing every sample.
+        edges = np.concatenate([[0], np.flatnonzero(np.diff(spw_idx)) + 1, [spw_idx.size]])
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            if hi <= lo:
+                continue
+            chans = slice(int(spw_idx[lo]) * nchan_spw, (int(spw_idx[lo]) + 1) * nchan_spw)
+            rows_bl, rows_t = bl_idx[lo:hi], t_idx[lo:hi]
+            out_vis[rows_bl, rows_t, chans] = vis[lo:hi]
+            out_flag[rows_bl, rows_t, chans] = flag[lo:hi]
+            out_w[rows_bl, rows_t, chans] = np.where(flag[lo:hi], np.float32(0.0), weight[lo:hi])
         freq = chan_freq[spw_ids].reshape(-1)
         spw_of_chan = np.repeat(spw_ids, nchan_spw)
         order = np.argsort(freq, kind="stable")
-        freq, spw_of_chan = freq[order], spw_of_chan[order]
-        out_vis, out_flag, out_w = out_vis[:, :, order], out_flag[:, :, order], out_w[:, :, order]
-        out_w[out_flag] = 0.0
+        if not np.array_equal(order, np.arange(nchan)):
+            freq, spw_of_chan = freq[order], spw_of_chan[order]
+            out_vis, out_flag, out_w = out_vis[:, :, order], out_flag[:, :, order], out_w[:, :, order]
         df = float(np.median(np.abs(np.diff(freq)))) if nchan > 1 else 1.0
         chan_offset = np.rint((freq - freq[0]) / df).astype(np.int64)
         log.debug("FringeData.from_baselines: nbl=%d ntime=%d nchan=%d npol=%d nspw=%d", nbl, nt, nchan, npol, nspw)
@@ -336,6 +349,22 @@ def _empty_fft_result(nant, npol):
                 sumww=z.copy(), xcount=np.zeros((nant, npol), dtype=np.int64), ok=np.zeros((nant, npol), dtype=bool))
 
 
+def _contiguous_segments(index):
+    """Split a strictly increasing integer index into (source slice, target slice) pairs of contiguous runs."""
+    index = np.asarray(index, dtype=np.int64)
+    edges = np.concatenate([[0], np.flatnonzero(np.diff(index) != 1) + 1, [index.size]])
+    return [(slice(int(lo), int(hi)), slice(int(index[lo]), int(index[lo]) + int(hi - lo)))
+            for lo, hi in zip(edges[:-1], edges[1:])]
+
+
+def _place_on_grid(grid, z, t_off, chan_offset):
+    """Copy ``z`` (..., ntime, nchan) onto the uniform FFT ``grid`` at integration offsets ``t_off`` and channel
+    offsets ``chan_offset`` (both increasing), block by contiguous block."""
+    for t_src, t_dst in _contiguous_segments(t_off):
+        for c_src, c_dst in _contiguous_segments(chan_offset):
+            grid[..., t_dst, c_dst] = z[..., t_src, c_src]
+
+
 def fringe_fft_search(data, refant, *, pad=4, delay_window_ns=None, rate_window=None):
     """FFT delay/rate search on the baselines to the reference antenna (CASA DelayRateFFT).
 
@@ -376,34 +405,35 @@ def fringe_fft_search(data, refant, *, pad=4, delay_window_ns=None, rate_window=
         log.warning("fringe_fft_search: no baselines to refant %d", refant)
         return result
     # Weighted unit vectors, zero where flagged; conjugated when the refant is ANTENNA1 (sgn rule of CASA).
+    flagged = data.flag[bl_index]
+    w = np.where(flagged, np.float32(0.0), data.weight[bl_index])
     z = data.vis[bl_index].astype(np.complex64)
     amp = np.abs(z)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        z = np.where(amp > 0, z / amp, 0).astype(np.complex64)
-    z *= data.weight[bl_index]
-    z[data.flag[bl_index]] = 0
+    z *= np.divide(w, amp, out=np.zeros_like(amp), where=amp > 0)
     z[conj] = np.conj(z[conj])
     z = np.ascontiguousarray(z.transpose(0, 3, 1, 2))  # (nk, npol, ntime, nchan)
     grid = np.zeros((ants.size, npol, nt_grid, ngrid), dtype=np.complex64)
-    grid[:, :, t_off[:, None], data.chan_offset[None, :]] = z
-    spec = scipy.fft.fft2(grid, s=(nt_pad, nf_pad), axes=(-2, -1), workers=-1)
-    power = np.abs(spec)
+    _place_on_grid(grid, z, t_off, data.chan_offset)
+    # Frequency axis first, on the unpadded time rows only (a quarter of the padded grid), then the time axis.
+    spec = scipy.fft.fft(grid, n=nf_pad, axis=-1, workers=FFT_WORKERS)
+    spec = scipy.fft.fft(spec, n=nt_pad, axis=-2, workers=FFT_WORKERS)
+    power = spec.real ** 2 + spec.imag ** 2
     delay_axis = scipy.fft.fftfreq(nf_pad, d=df) * 1e9
     rate_axis = scipy.fft.fftfreq(nt_pad, d=dt) / f0
-    valid = np.ones((nt_pad, nf_pad), dtype=bool)
-    if delay_window_ns is not None:
-        valid &= ((delay_axis >= min(delay_window_ns)) & (delay_axis <= max(delay_window_ns)))[None, :]
-    if rate_window is not None:
-        valid &= ((rate_axis >= min(rate_window)) & (rate_axis <= max(rate_window)))[:, None]
-    power = np.where(valid[None, None], power, -1.0)
+    if delay_window_ns is not None or rate_window is not None:
+        valid = np.ones((nt_pad, nf_pad), dtype=bool)
+        if delay_window_ns is not None:
+            valid &= ((delay_axis >= min(delay_window_ns)) & (delay_axis <= max(delay_window_ns)))[None, :]
+        if rate_window is not None:
+            valid &= ((rate_axis >= min(rate_window)) & (rate_axis <= max(rate_window)))[:, None]
+        power[:, :, ~valid] = -1.0
     flat = np.argmax(power.reshape(ants.size, npol, -1), axis=-1)
     it, jf = np.unravel_index(flat, (nt_pad, nf_pad))
-    peak = np.take_along_axis(power.reshape(ants.size, npol, -1), flat[..., None], axis=-1)[..., 0]
-    unflagged = ~data.flag[bl_index]
-    w = np.where(unflagged, data.weight[bl_index], 0.0).astype(np.float64)
-    sumw = w.sum(axis=(1, 2))
-    sumww = (w * w).sum(axis=(1, 2))
-    xcount = unflagged.sum(axis=(1, 2))
+    peak = np.sqrt(np.maximum(np.take_along_axis(power.reshape(ants.size, npol, -1), flat[..., None],
+                                                 axis=-1)[..., 0], 0.0)).astype(np.float64)
+    sumw = w.sum(axis=(1, 2), dtype=np.float64)
+    sumww = np.einsum("ktfp,ktfp->kp", w, w, dtype=np.float64)
+    xcount = np.count_nonzero(~flagged, axis=(1, 2))
     ok = (sumw > 0) & (peak > 0)
     x = (data.freq - f_grid0) * 1e-9
     y = (data.time - t_grid0) * f0
