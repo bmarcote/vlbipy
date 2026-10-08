@@ -250,7 +250,13 @@ class Observation:
         if metadata is None or not metadata.source_names:
             return []
         dropped = self.sources.restrict_to(metadata.source_names)
-        if dropped:
+        if dropped and not self.sources.names:
+            # Every role is now empty, so the calibration has no source to solve on: almost always a
+            # naming mismatch between the configuration and the data rather than a missing epoch.
+            warnings.anomaly(f"{self.project_code}: none of the declared sources ({', '.join(dropped)}) "
+                             f"exists in the data, which holds {', '.join(metadata.source_names)}; "
+                             f"fix the [sources] names in the configuration")
+        elif dropped:
             logger.info("[{}] declared but not observed in this epoch (ignored here): {}",
                         self.project_code, ", ".join(dropped))
         return dropped

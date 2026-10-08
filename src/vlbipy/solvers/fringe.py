@@ -120,6 +120,11 @@ class FringeData:
         Position of each channel on the uniform FFT grid, round((f - f[0]) / df).
     nant : int
         Number of antennas in the ANTENNA table (solution arrays are indexed by antenna id).
+    f_ref_fixed : float, optional
+        Reference frequency to fit against [Hz]; ``None`` uses the centre of ``freq``. A
+        ``combine='spw'`` solve passes the centre of its whole channel selection so that every
+        solution interval shares one reference frequency even when an interval is missing the
+        antenna that holds an edge subband.
     """
 
     vis: np.ndarray
@@ -132,6 +137,7 @@ class FringeData:
     spw_of_chan: np.ndarray
     chan_offset: np.ndarray
     nant: int
+    f_ref_fixed: float | None = None
 
     @property
     def nbl(self):
@@ -155,7 +161,9 @@ class FringeData:
 
     @property
     def f_ref_hz(self):
-        """Centre of the frequency grid: 0.5 * (fmin + fmax) [Hz] (CASA f_ref for the solve)."""
+        """Reference frequency of the solve [Hz]: ``f_ref_fixed``, else the centre of the grid."""
+        if self.f_ref_fixed is not None:
+            return float(self.f_ref_fixed)
         return 0.5 * (float(self.freq.min()) + float(self.freq.max()))
 
     @property
@@ -174,7 +182,8 @@ class FringeData:
         return fmin, fmax
 
     @classmethod
-    def from_baselines(cls, vis, flag, weight, antenna1, antenna2, time, spw, chan_freq, *, nant=None):
+    def from_baselines(cls, vis, flag, weight, antenna1, antenna2, time, spw, chan_freq, *, nant=None,
+                       f_ref_hz=None):
         """Build a FringeData from MS row-ordered arrays (the only place that knows the MS row layout).
 
         Parameters
@@ -191,6 +200,8 @@ class FringeData:
             Channel frequencies per spw id [Hz], already restricted to the selected channels.
         nant : int, optional
             Number of antennas in the ANTENNA table; default max(antenna id) + 1.
+        f_ref_hz : float, optional
+            Reference frequency of the solve [Hz]; default the centre of the channels present.
 
         Returns
         -------
@@ -257,7 +268,7 @@ class FringeData:
         chan_offset = np.rint((freq - freq[0]) / df).astype(np.int64)
         log.debug("FringeData.from_baselines: nbl=%d ntime=%d nchan=%d npol=%d nspw=%d", nbl, nt, nchan, npol, nspw)
         return cls(vis=out_vis, weight=out_w, flag=out_flag, antenna1=bl_a1, antenna2=bl_a2, time=times, freq=freq,
-                   spw_of_chan=spw_of_chan, chan_offset=chan_offset, nant=int(nant))
+                   spw_of_chan=spw_of_chan, chan_offset=chan_offset, nant=int(nant), f_ref_fixed=f_ref_hz)
 
 
 def antenna_time_centroid(data):

@@ -199,3 +199,28 @@ def _dummy_config(tmp_path) -> str:
     path = tmp_path / "cfg.toml"
     path.write_text(f'[global]\nwork_dir = "{tmp_path}"\n')
     return str(path)
+
+
+def test_backend_option_takes_daskms_without_advertising_it(capsys):
+    """``--backend dask-ms`` is accepted on the command line although the help does not list it."""
+    from vlbipy.cli import build_parser
+    parser = build_parser()
+    args = parser.parse_args(["pipeline", "--backend", "dask-ms", "-p", "V589A"])
+    assert args.backend == "dask-ms"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["pipeline", "-h"])
+    help_text = capsys.readouterr().out
+    assert "--backend" in help_text and "dask" not in help_text.split("--backend", 1)[1].split("\n  -", 1)[0]
+
+
+def test_daskms_backend_is_its_own_backend():
+    """The dask-ms backend is registered apart from the CASA one and replaces its calibration engine."""
+    pytest.importorskip("casatools")
+    pytest.importorskip("daskms")
+    from vlbipy.backends.casa import CasaBackend, CasaCalibrationOps
+    from vlbipy.backends.dask_ms import DaskMsBackend, DaskMsCalibrationOps
+    assert DaskMsBackend.kind == "dask-ms" and CasaBackend.kind == "casa"
+    assert DaskMsBackend.calibration_ops is DaskMsCalibrationOps
+    assert CasaBackend.calibration_ops is CasaCalibrationOps
+    for hook in ("_run_fringefit_task", "_run_bandpass_task", "_run_gaincal_task", "apply"):
+        assert getattr(DaskMsCalibrationOps, hook) is not getattr(CasaCalibrationOps, hook)

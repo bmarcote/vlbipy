@@ -192,8 +192,10 @@ are then combined (`combine()`, see [Full pipeline — Campaigns](usage/pipeline
    constrains structure that no single track does;
 2. each epoch of that calibrator is self-calibrated against the joint model
    (scaled back to that epoch's flux density, and never re-fitted): the phase
-   ladder, then one amplitude factor per station and subband, each kept only
-   if it improves the fit. The gains become a `joint_<source>` table in that
+   ladder, each step kept only if it improves the fit. Station amplitudes are
+   left as the epoch's own self-calibration set them unless
+   `[selfcal].joint_amplitude = true` (the model is built from other epochs of
+   a variable source; amplitudes fitted to it made the V589 targets worse). The gains become a `joint_<source>` table in that
    epoch's chain, applied to the fields the calibrator's own self-calibration
    goes to;
 3. every epoch is re-applied, re-split and re-imaged;

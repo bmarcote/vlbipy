@@ -111,6 +111,84 @@ class CalTableData:
         return int(self.param.shape[2])
 
 
+def _row_major_column(values, nrow, name, path) -> np.ndarray:
+    """Return a caltable array column as (nrow, nchan_t, npar), whatever shape ``getcol`` returned.
+
+    FPARAM/CPARAM, FLAG and SNR are declared with a variable number of dimensions (see
+    :func:`vlbipy.solvers.caltable._array_column`), so one table can hold (npar, nchan_t) cells
+    for one of them and (npar,) cells for another — CASA's gain curves do. Each column is
+    therefore normalised on its own ndim: adding the missing channel axis to all three because
+    the *parameter* column lacked it turns an already-3-D column into a 4-D array whose first
+    index is no longer the row, and every later ``column[rows, chan, par]`` then breaks.
+
+    Parameters
+    ----------
+    values : array
+        Output of ``tb.getcol(name)``, in Fortran order (npar[, nchan_t], nrow).
+    nrow : int
+        Number of rows of the table, checked against the transposed first axis.
+    name : str
+        Column name, for the error message.
+    path : Path or str
+        Table path, for the error message.
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape (nrow, nchan_t, npar).
+    """
+    column = np.ascontiguousarray(np.asarray(values).T)
+    if column.ndim == 1:                                     # one value per row: (nrow,)
+        column = column[:, None, None]
+    elif column.ndim == 2:                                   # no channel axis: (nrow, npar)
+        column = column[:, None, :]
+    if column.ndim != 3 or column.shape[0] != nrow:
+        raise ValueError(f"{path}: column {name} has shape {np.asarray(values).shape}, which is not "
+                         f"(npar, nchan_t, {nrow}), (npar, {nrow}) or ({nrow},)")
+    return column
+
+
+def _match_param_grid(column, param_shape, name, path) -> np.ndarray:
+    """Expand a (nrow, nchan_t, npar) FLAG/SNR column onto the parameter column's grid.
+
+    CASA flags one parameter at a time, but a table may store one value per channel-less row, or
+    one per polarization rather than per parameter. A degenerate channel axis is stretched, and a
+    shorter parameter axis is repeated over the parameters of each polarization — which is what
+    "this polarization is flagged" means for a gain curve (npar = 2 x ncoef) or a fringe solution
+    (npar = 2 x 4).
+
+    Parameters
+    ----------
+    column : numpy.ndarray
+        Normalised FLAG or SNR column, shape (nrow, nchan_t, npar).
+    param_shape : tuple
+        Shape of the parameter column, which defines the grid.
+    name : str
+        Column name, for the error message.
+    path : Path or str
+        Table path, for the error message.
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape ``param_shape``.
+    """
+    if column.shape == tuple(param_shape):
+        return column
+    nrow, nchan, npar = param_shape
+    if column.shape[1] != nchan:
+        if column.shape[1] != 1:
+            raise ValueError(f"{path}: column {name} has {column.shape[1]} channels, the parameter column "
+                             f"{nchan}; they must match or the column must hold one value per row")
+        column = np.broadcast_to(column, (nrow, nchan, column.shape[2]))
+    if column.shape[2] != npar:
+        if column.shape[2] < 1 or npar % column.shape[2]:
+            raise ValueError(f"{path}: column {name} has {column.shape[2]} parameters, which does not divide "
+                             f"the {npar} of the parameter column")
+        column = np.repeat(column, npar // column.shape[2], axis=2)
+    return np.ascontiguousarray(column)
+
+
 def load_caltable(path) -> CalTableData:
     """Read a CASA calibration table (main columns + SPECTRAL_WINDOW/ANTENNA/FIELD subtables) into a CalTableData.
 
@@ -134,13 +212,13 @@ def load_caltable(path) -> CalTableData:
     if nrow == 0:
         raise ValueError(f"calibration table {path} has no rows")
     # casatools returns Fortran order (npar, nchan_t, nrow); transpose to (nrow, nchan_t, npar).
-    param = np.ascontiguousarray(np.asarray(tb.getcol(param_col)).T)
-    flag = np.ascontiguousarray(np.asarray(tb.getcol("FLAG")).T, dtype=bool)
-    snr = np.ascontiguousarray(np.asarray(tb.getcol("SNR")).T, dtype=np.float64)
+    param = _row_major_column(tb.getcol(param_col), nrow, param_col, path)
+    flag = _row_major_column(tb.getcol("FLAG"), nrow, "FLAG", path)
+    snr = _row_major_column(tb.getcol("SNR"), nrow, "SNR", path)
     tb.close()
-    if param.ndim == 2:
-        param, flag, snr = param[:, None, :], flag[:, None, :], snr[:, None, :]
     param = param.astype(np.complex128 if np.iscomplexobj(param) else np.float64)
+    flag = _match_param_grid(flag, param.shape, "FLAG", path).astype(bool)
+    snr = _match_param_grid(snr, param.shape, "SNR", path).astype(np.float64)
 
     tb.open(str(path / "SPECTRAL_WINDOW"))
     nspw = tb.nrows()
@@ -397,13 +475,14 @@ def antenna_gains(table, antenna_ids, times, spw, chan_freq, *, field_id=None, i
     for k, ant in enumerate(antenna_ids):
         rows = _select_rows(table, int(ant), spw_t, field_id)
         if table.kind in GAIN_CURVE_KINDS:
+            ncoef = table.npar // 2                          # npar = 2 pols x ncoef polynomial coefficients
+            if ncoef < 1:
+                continue
             for hand in range(2):
                 pol = min(hand, npol_t - 1)
-                good_rows = rows[~table.flag[rows, 0, pol]] if rows.size else rows
+                # The flag of a polarization sits with the first coefficient of its block of npar.
+                good_rows = rows[~table.flag[rows, 0, pol * ncoef]] if rows.size else rows
                 if not good_rows.size:
-                    continue
-                ncoef = table.npar // 2
-                if ncoef < 1:
                     continue
                 i0, i1, w = _bracket(table.time[good_rows], times, interp)
                 coefficients = table.param[good_rows, 0, pol * ncoef:(pol + 1) * ncoef]

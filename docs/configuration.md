@@ -289,7 +289,7 @@ robust values.
 | `robust` | list[float] | `[-2, -1, 0, 1, 2]` | Briggs robust values to image at (−2 = uniform, +2 = natural) |
 | `pixels_per_beam` | int | `10` | Used to auto-compute cell size from the synthesised beam |
 | `niter` | int | `4000` | Number of CLEAN deconvolution iterations |
-| `threshold_sigma` | float | `3.0` | CLEAN threshold in units of the estimated image RMS |
+| `threshold_sigma` | float | `3.0` | CLEAN stops when the residual peak is below this many times the residual rms *and* the last batch of components lowered that rms by less than 1% (while it is still falling it is made of the sidelobes of uncleaned flux, not of noise); also when the rms starts to rise, or at `niter` |
 | `deconvolver` | string | `"hogbom"` | CLEAN deconvolution algorithm (`hogbom`, `clark`, `multiscale`) |
 | `search_fov` | float | `1000.0` | Width (mas) of the dirty map searched for each source before difmapy images or self-calibrates it. `0` disables the search. |
 | `search_sigma` | float | `10.0` | A peak in that map counts as the source only above this many rms. |

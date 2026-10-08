@@ -119,6 +119,24 @@ prior_sigma = 1.0      # width of the prior on the log-amplitude corrections (de
 
 The flux scale is then only as good as the average of the nominal values.
 
+### Scalar bandpass on weak stations
+
+The scalar bandpass (one amplitude per antenna and subband, from the phase calibrators) flags
+the solutions below `minsnr`, and the data with them. Its SNR follows CASA's convention: the
+formal value divided by the misfit of a unit point source to the data. With the nominal LBA
+amplitude scale that misfit is large, so the SNR says little about the station: YG and KE
+in V589B have delay solutions with SNR above 100 per subband in two minutes, and a
+scalar-bandpass SNR of 3-8. Small stations therefore sit on the default cut of 3. When some
+of their subbands fall below it, the apply step can flag them in the scan the instrumental
+delay is solved on, and the next calibration pass then loses the antenna altogether (V589B:
+YG and KE). For LBA data switch the cut off; solutions more than a factor 2 from the level
+of their antenna are still flagged:
+
+```toml
+[calibration.scalar_bandpass]
+minsnr = 0.0
+```
+
 ### Antennas with one polarization
 
 Stations with a dead receiver channel, or that recorded one polarization for part of the

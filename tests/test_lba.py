@@ -94,3 +94,19 @@ def test_campaign_report_is_outdated_by_a_recalibrated_epoch(tmp_path):
         os.utime(chain, (stamp, stamp))
         chains.append(SimpleNamespace(project_code=code, _caltables_path=chain))
     assert _epochs_changed_since(chains, report) == ["V589B"]
+
+
+def test_incomplete_campaign_report_is_not_reused(tmp_path):
+    import os
+    from types import SimpleNamespace
+    from vlbipy.campaign import stale_reason
+    report = tmp_path / "V589.campaign.json"
+    report.write_text("{}")
+    chain = tmp_path / "V589A.caltables.json"
+    chain.write_text("[]")
+    stamp = report.stat().st_mtime - 100
+    os.utime(chain, (stamp, stamp))
+    epochs = [SimpleNamespace(project_code="V589A", _caltables_path=chain)]
+    assert stale_reason(epochs, report, {"failed": []}) == ""
+    assert stale_reason(epochs, report, {}) == ""                      # a report written before failures were recorded
+    assert "incomplete" in stale_reason(epochs, report, {"failed": ["joint model of J1346-6024"]})

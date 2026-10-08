@@ -251,7 +251,32 @@ def _finite_mean(block: np.ndarray) -> np.ndarray:
     return np.where(finite.any(axis=0), mean_value, np.nan)
 
 
-def central_channel_selection(n_channels: int, fraction: float) -> str:
+def compact_subband_selection(subbands) -> str:
+    """Return a CASA spw selection for ``subbands`` as contiguous runs, e.g. ``"1~3,5"``.
+
+    Parameters
+    ----------
+    subbands : sequence of int
+        Subband (spw) indices; empty gives ``""`` (meaning every subband).
+
+    Returns
+    -------
+    str
+    """
+    ordered = sorted({int(s) for s in subbands or ()})
+    if not ordered:
+        return ""
+    runs, start, previous = [], ordered[0], ordered[0]
+    for spw in ordered[1:]:
+        if spw != previous + 1:
+            runs.append(f"{start}~{previous}" if previous > start else str(start))
+            start = spw
+        previous = spw
+    runs.append(f"{start}~{previous}" if previous > start else str(start))
+    return ",".join(runs)
+
+
+def central_channel_selection(n_channels: int, fraction: float, subbands=()) -> str:
     """Return a CASA spw selection string for the central ``fraction`` of channels.
 
     Parameters
@@ -259,19 +284,26 @@ def central_channel_selection(n_channels: int, fraction: float) -> str:
     n_channels : int
         Channels per subband.
     fraction : float
-        Fraction of channels to keep (1.0 or less than 2 channels -> all channels).
+        Fraction of channels to keep (1.0 or less than 4 channels -> all channels).
+    subbands : sequence of int, optional
+        Subbands to solve on (empty = every subband). The channel range is repeated for each
+        contiguous run of them: CASA applies a channel range only to the subbands of the token
+        it is attached to, so ``"1~3,5:4~27"`` would take every channel of subbands 1-3.
 
     Returns
     -------
     str
-        e.g. ``"*:3~28"`` for 32 channels at 0.8, or ``"*"`` when nothing is trimmed.
+        e.g. ``"*:3~28"`` for 32 channels at 0.8, ``"1~6:3~28"`` when only subbands 1-6 are
+        selected, or ``"*"`` when nothing is trimmed.
     """
+    spw_part = compact_subband_selection(subbands) or "*"
     if fraction >= 1.0 or n_channels < 4:
-        return "*"
+        return spw_part
     n_edge = int(round(n_channels * (1.0 - fraction) / 2.0))
     if n_edge < 1:
-        return "*"
-    return f"*:{n_edge}~{n_channels - 1 - n_edge}"
+        return spw_part
+    channels = f"{n_edge}~{n_channels - 1 - n_edge}"
+    return ",".join(f"{run}:{channels}" for run in spw_part.split(","))
 
 
 class CasaDataOps(DataOps):
@@ -1941,7 +1973,7 @@ class CasaCalibrationOps(CalibrationOps):
         CalTable
         """
         meta = metadata or self.backend.data.get_metadata(project_code, [], "")
-        spw = central_channel_selection(meta.freq_setup.n_channels, channel_fraction)
+        spw = self._solve_spw(meta, channel_fraction)
         table_path = self.backend.caldir() / f"{project_code}.{suffix}"
         base = {"field": field, "spw": spw, "solint": solint, "zerorates": True, "minsnr": minsnr,
                 "corrdepflags": True, "parang": True}
@@ -2204,7 +2236,7 @@ class CasaCalibrationOps(CalibrationOps):
         # Solve on the central channels only, like the SBD: the subband edges roll off and
         # their phase is the least trustworthy part of the band, so letting them into the
         # fit biases the delay. The solution is still applied to every channel.
-        spw = central_channel_selection(meta.freq_setup.n_channels, channel_fraction)
+        spw = self._solve_spw(meta, channel_fraction)
         params = {"caltable": str(table_path), "field": field, "spw": spw, "solint": solint,
                   "combine": combine, "zerorates": zerorates, "corrdepflags": True,
                   "refant": self.refant_chain(meta, refant), "minsnr": minsnr, "parang": True}
@@ -2862,7 +2894,7 @@ class CasaCalibrationOps(CalibrationOps):
             raise BackendError(f"{project_code}: measurement set {ms} not found; "
                                "run import_data() before the SNR survey")
         meta = metadata or self.backend.data.get_metadata(project_code, [], "")
-        spw = central_channel_selection(meta.freq_setup.n_channels, channel_fraction)
+        spw = self._solve_spw(meta, channel_fraction)
         refant = self.refant_chain(meta, refant)
         scans = self._survey_scans(meta, field, scans, max_scans)
         table_path = self.backend.caldir() / f"{project_code}.snr"
@@ -2952,6 +2984,30 @@ class CasaCalibrationOps(CalibrationOps):
         if not chain:
             raise BackendError("cannot pick a reference antenna: no antenna has data")
         return ",".join(chain)
+
+    def _solve_spw(self, metadata: ObsMetadata, channel_fraction: float) -> str:
+        """Return the CASA spw selection every solve uses: central channels of the usable band.
+
+        The usable band is the subbands at least two antennas recorded
+        (:attr:`~vlbipy.models.ObsMetadata.usable_subbands`). A subband a single antenna recorded
+        has no baseline, so including it gives nothing to fit while widening the band a
+        ``combine='spw'`` solve references its delay to. The selection is left as ``"*"`` when
+        every subband is usable, which is the homogeneous-array case.
+
+        Parameters
+        ----------
+        metadata : ObsMetadata
+            Observation metadata (supplies the channel count and subband participation).
+        channel_fraction : float
+            Fraction of central channels of each subband to solve on.
+        """
+        usable, n_subbands = metadata.usable_subbands, metadata.freq_setup.n_subbands
+        # No restriction when every subband is usable, nor when participation left nothing to go on.
+        subbands = usable if 0 < len(usable) < n_subbands else ()
+        if subbands:
+            logger.info("solving on the usable band only: subband(s) {} of {} have at least two antennas",
+                        compact_subband_selection(subbands), n_subbands)
+        return central_channel_selection(metadata.freq_setup.n_channels, channel_fraction, subbands)
 
     def read_snr_table(self, project_code: str, metadata: ObsMetadata,
                        refant: str = "") -> Optional[ScanSNRSurvey]:

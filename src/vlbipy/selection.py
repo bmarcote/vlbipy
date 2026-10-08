@@ -35,7 +35,9 @@ def rank_reference_antennas(metadata: ObsMetadata, requested: str = "") -> list[
     """Return candidate reference antennas, best first.
 
     Order: antennas the caller asked for, then :data:`REFANT_PRIORITY`, then the
-    rest by how many scans they took part in. Only antennas with data are kept.
+    rest by how many scans they took part in, and last the antennas whose subbands
+    all fall outside the usable band — they have no baseline, so they can reference
+    nothing. They are kept (ranked last) rather than dropped so the chain is never empty.
     """
     observed = [a.name for a in metadata.observed_antennas] or list(metadata.antennas)
     upper = {name.upper(): name for name in observed}
@@ -51,6 +53,15 @@ def rank_reference_antennas(metadata: ObsMetadata, requested: str = "") -> list[
     for name in sorted(observed, key=lambda n: -metadata.antennas[n].n_scans):
         if name not in ordered:
             ordered.append(name)
+    usable = set(metadata.usable_subbands)
+    if not usable:
+        return ordered
+    stranded = [n for n in ordered if metadata.antennas[n].subbands
+                and not usable.intersection(metadata.antennas[n].subbands)]
+    if stranded:
+        logger.info("reference antenna: {} recorded no subband that has a baseline; ranked last",
+                    ", ".join(stranded))
+        ordered = [n for n in ordered if n not in stranded] + stranded
     return ordered
 
 

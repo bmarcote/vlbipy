@@ -215,6 +215,30 @@ class ImportDataNamespace(Namespace):
                    if s and len(s) < metadata.freq_setup.n_subbands]
         if partial:
             logger.info("heterogeneous array: {} recorded only some subbands", ", ".join(partial))
+        self._report_usable_band(metadata)
+
+    def _report_usable_band(self, metadata) -> None:
+        """Log the usable band and warn about the subbands and antennas that carry no baseline.
+
+        A subband fewer than two antennas recorded has no cross-correlation, so it cannot be
+        fringe-fitted and is excluded from every solve (see
+        :attr:`~vlbipy.models.ObsMetadata.usable_subbands`). An antenna whose subbands are all
+        of that kind has no baseline at all and cannot be calibrated.
+        """
+        unusable = metadata.unusable_subbands
+        if not unusable:
+            return
+        per_subband = metadata.antennas_per_subband()
+        detail = ", ".join(f"{spw} ({', '.join(per_subband[spw]) or 'no antenna'})" for spw in unusable)
+        warnings.anomaly(f"{self._code}: subband(s) {detail} have fewer than two antennas, so they carry no "
+                         f"baseline; the usable band is subband(s) {list(metadata.usable_subbands)} of "
+                         f"{metadata.freq_setup.n_subbands} and every solve is restricted to it")
+        usable = set(metadata.usable_subbands)
+        for antenna in metadata.observed_antennas:
+            if antenna.subbands and not usable & set(antenna.subbands):
+                warnings.anomaly(f"{self._code}: {antenna.name} recorded only subband(s) "
+                                 f"{list(antenna.subbands)}, which no other antenna recorded: it has no "
+                                 f"baseline and cannot be calibrated")
 
     def _locate_files(self, files, imp_cfg: dict) -> list[str]:
         """Resolve the raw data files: explicit argument, disk search, or archive download."""
@@ -358,6 +382,10 @@ class CalibrateNamespace(Namespace):
         Antennas must have been detected above ``min_snr`` (partial-band antennas
         included); scans are then picked so that all of those antennas are
         detected, using several linked scans when no single one covers the array.
+        The survey behind it only sees the usable band — the subbands at least two
+        antennas recorded — and the sources it runs on are the declared roles, or
+        every observed source when no role is declared (see
+        :meth:`_calibration_source_groups`).
 
         Returns
         -------
@@ -386,13 +414,12 @@ class CalibrateNamespace(Namespace):
         # through them. The fringe finder is both the right source to solve on and
         # usually the one with fewest scans, so this avoids fringe-fitting every
         # phase-calibrator scan just to end up not using any of them.
-        attempted = []
-        for group in (obs.sources.fringe_finders, obs.sources.phase_calibrators, obs.sources.targets):
-            if not group:
-                continue
-            names = [s.name for s in group]
+        attempted, best = [], (0.0, "")
+        for names in self._calibration_source_groups():
             attempted.extend(names)
             survey = self.scan_snr(field=",".join(names))
+            ranked = survey.rank_antennas()
+            best = max([best] + [(snr, name) for name, snr in ranked if snr == snr and snr != float("inf")])
             antennas = select_antennas(survey, obs.metadata, min_snr=threshold)
             if not antennas:
                 logger.info("select_calibration_data: no antenna qualifies on {}; trying the "
@@ -406,10 +433,44 @@ class CalibrateNamespace(Namespace):
                             "run — {} antenna(s) {} on scan(s) {}; every pass solves on this set",
                             len(antennas), ",".join(antennas), scans)
                 return antennas, scans
+        best_snr, best_antenna = best
+        detected = f"the best was {best_antenna} at {best_snr:.1f}" if best_antenna else "nothing was detected at all"
+        usable = list(obs.metadata.usable_subbands) if obs.metadata else []
+        band = f"subband(s) {usable} of {obs.metadata.freq_setup.n_subbands}" if obs.metadata else "unknown"
         raise StepError("select_calibration_data",
-                        f"{self._code}: no scan on {', '.join(attempted) or 'any source'} detects "
-                        f"a full-band antenna above {threshold:g} sigma; cannot solve the "
-                        f"instrumental delay")
+                        f"{self._code}: no scan on {', '.join(attempted)} detects an antenna above "
+                        f"{threshold:g} sigma ({detected}); the usable band is {band}. Lower "
+                        f"calibration.detection_snr or check the flagging; cannot solve the instrumental delay")
+
+    def _calibration_source_groups(self) -> list[list[str]]:
+        """Source names to survey for the instrumental solve, best group first.
+
+        Normally the declared roles, tried in the order the calibration falls back through them
+        (fringe finders, then phase calibrators, then targets). An observation with no role
+        declared at all — an external project with no ``[sources]`` configuration, or one whose
+        declared names do not match the data and were all dropped by
+        :meth:`~vlbipy.observation.Observation.restrict_sources_to_data` — falls back to every
+        source the data holds, because the instrumental delay only needs one bright scan.
+
+        Returns
+        -------
+        list of list of str
+        """
+        obs = self._obs
+        groups = [[s.name for s in group] for group in
+                  (obs.sources.fringe_finders, obs.sources.phase_calibrators, obs.sources.targets) if group]
+        if groups:
+            return groups
+        observed = list(obs.metadata.source_names) if obs.metadata else []
+        if not observed:
+            raise StepError("select_calibration_data",
+                            f"{self._code}: no source has a role (fringe_finders / phase_calibrators / "
+                            f"targets) and the metadata lists no source either; declare [sources] in the "
+                            f"configuration")
+        warnings.anomaly(f"{self._code}: no source has a role (fringe_finders / phase_calibrators / targets) "
+                         f"in this observation — check that the [sources] names match the data; surveying "
+                         f"every observed source instead: {', '.join(observed)}")
+        return [observed]
 
     def initial_calibration(self, *, force: bool = False, scans: Optional[list] = None,
                             antennas: Optional[list] = None, suffix: str = "sbd") -> CalTable:
@@ -686,8 +747,10 @@ class CalibrateNamespace(Namespace):
         if not self._backend.supports("calibrate", "solution_coverage"):
             return {}
         coverage = self._backend.calibrate.solution_coverage(self._code, table, obs.metadata)
+        # Only the usable band can be solved: a subband with a single antenna has no baseline.
+        usable = set(obs.metadata.usable_subbands) if obs.metadata else set()
         for name in antennas:
-            recorded = set(obs.metadata.antennas[name].subbands) if obs.metadata else set()
+            recorded = set(obs.metadata.antennas[name].subbands) & usable if obs.metadata else set()
             solved = coverage.get(name, set())
             missing = sorted(recorded - solved)
             if missing:

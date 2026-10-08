@@ -160,6 +160,9 @@ min_improvement = 0.002      # a step must lower the weighted chi-squared by thi
 max_bad_fraction = 0.25      # ... and fail in at most this fraction of its solution bins
 bayes_models = ["clean", "gauss1", "gauss2", "gauss3"]  # source models weighed by bayes_gscale
 prior_sigma = 0.1            # width of the prior on log-amplitude corrections (10%)
+joint_amplitude = false      # multi-epoch stage: also re-solve the station amplitudes of each epoch against the
+                             # joint calibrator model (off: phases only; the model comes from other epochs of a
+                             # source that varies, and amplitudes fitted to it degraded the targets in tests)
 workers = 0                  # threads for bayes_gscale (0 = difmapy's default)
 
 [imaging]

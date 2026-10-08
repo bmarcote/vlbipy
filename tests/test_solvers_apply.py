@@ -93,10 +93,13 @@ def _spw_columns(chan_freq):
             "REF_FREQUENCY": chan_freq[:, 0], "TOTAL_BANDWIDTH": np.full(nspw, NCHAN * 1e6)}
 
 
-def _write_generic_table(path, fake_ms, kind, param, flag, times, spw_ids, ant_ids, spw_chan_freq, field_ids=None):
+def _write_generic_table(path, fake_ms, kind, param, flag, times, spw_ids, ant_ids, spw_chan_freq, field_ids=None,
+                         flat_param=False):
     """Write a minimal CASA caltable of VisCal `kind` with CPARAM (complex param) or FPARAM (float param).
 
     `param`/`flag` are C-ordered (nrow, nchan_t, npar); `spw_chan_freq` (nspw, nchan_t) fills SPECTRAL_WINDOW.
+    `flat_param` writes the parameter column with no channel axis (cells of shape (npar,), as CASA's gain
+    curves have) while FLAG and SNR keep theirs: both columns allow a variable number of dimensions.
     """
     path = Path(path).absolute()
     nrow, nchan_t, npar = param.shape
@@ -116,7 +119,8 @@ def _write_generic_table(path, fake_ms, kind, param, flag, times, spw_ids, ant_i
     tb.putcol("INTERVAL", np.zeros(nrow))
     tb.putcol("SCAN_NUMBER", np.ones(nrow, dtype=np.int32))
     tb.putcol("OBSERVATION_ID", np.zeros(nrow, dtype=np.int32))
-    tb.putcol("CPARAM" if is_complex else "FPARAM", np.ascontiguousarray(param).T)
+    values = np.ascontiguousarray(param[:, 0, :] if flat_param else param)
+    tb.putcol("CPARAM" if is_complex else "FPARAM", values.T)
     tb.putcol("PARAMERR", np.zeros((nrow, nchan_t, npar), dtype=np.float32).T)
     tb.putcol("FLAG", np.ascontiguousarray(flag, dtype=bool).T)
     tb.putcol("SNR", np.full((nrow, nchan_t, npar), 10.0, dtype=np.float32).T)
@@ -416,6 +420,37 @@ def test_gain_curve_needs_elevation_unless_phase_only(fake_ms, tmp_path):
     vis_c, _, _ = ap.apply_tables(vis, np.zeros(vis.shape, bool), None, a1, a2, tt, ss, MS_CHAN_FREQ,
                                   [{"path": str(path)}], phase_only=True)
     np.testing.assert_array_equal(vis_c, vis)
+
+
+def test_gain_curve_with_a_channel_less_parameter_column(fake_ms, tmp_path):
+    """A gain curve whose FPARAM has no channel axis while FLAG has one still reads and applies.
+
+    Both columns allow a variable number of dimensions, so a table can mix them. Normalising all
+    three columns from the parameter column's ndim made the flags 4-D and every later
+    ``flag[rows, chan, par]`` raised "too many indices".
+    """
+    rows = [(s, a) for s in range(NSPW) for a in range(NANT)]
+    ncoef = 4
+    param = np.zeros((len(rows), 1, 2 * ncoef), dtype=np.float32)
+    param[:, 0, 0] = param[:, 0, ncoef] = 2.0                     # constant power of 2 in both polarizations
+    path = _write_generic_table(tmp_path / "flat.gc", fake_ms, "EPowerCurve", param, np.zeros(param.shape, bool),
+                                np.full(len(rows), T0), [s for s, _ in rows], [a for _, a in rows],
+                                MS_CHAN_FREQ[:, [0]], flat_param=True)
+    table = ap.load_caltable(path)
+    assert table.param.shape == table.flag.shape == table.snr.shape == (len(rows), 1, 2 * ncoef)
+    gains, gflag = ap.antenna_gains(path, [0], [T0], 0, MS_CHAN_FREQ[0],
+                                    elevation_grid=np.full((1, 1), np.pi / 4))
+    assert not gflag.any()
+    np.testing.assert_allclose(gains.real, np.sqrt(2.0), rtol=1e-6)   # EPowerCurve: gain = sqrt(power)
+
+
+def test_flag_column_stored_per_polarization_covers_that_polarization():
+    """One flag per polarization expands over the parameters of that polarization, not just the first."""
+    flag = np.zeros((3, 1, 2), dtype=bool)
+    flag[:, 0, 1] = True
+    out = ap._match_param_grid(flag, (3, 1, 8), "FLAG", "t")
+    assert out.shape == (3, 1, 8)
+    assert not out[:, 0, :4].any() and out[:, 0, 4:].all()
 
 
 def test_caltable_entries_from_vlbipy():

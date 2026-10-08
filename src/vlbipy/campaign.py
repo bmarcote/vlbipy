@@ -11,7 +11,10 @@ that day. :func:`combine_epochs` uses all of them together:
 2. each epoch of that calibrator is self-calibrated again against the joint
    model, scaled back to the epoch's own flux density; the resulting gains go
    into that epoch's calibration chain as one more table (``joint_<source>``),
-   applied to the same fields as the calibrator's own self-calibration;
+   applied to the same fields as the calibrator's own self-calibration. Phases
+   only by default: station amplitudes fitted to a model made from other
+   epochs of a variable source made the target images worse where they were
+   accepted (V589A, V589B); ``[selfcal].joint_amplitude = true`` enables them;
 3. every epoch is re-split and re-imaged with the refined calibration;
 4. the epochs of every source are concatenated and imaged together, which for
    the target is the deep image of the campaign.
@@ -101,6 +104,20 @@ def _epochs_changed_since(observations: list, report_path: Path) -> list[str]:
     return changed
 
 
+def stale_reason(observations: list, report_path: Path, report: dict) -> str:
+    """Why an existing campaign report cannot be reused ("" when it can).
+
+    Two cases: an epoch was calibrated again after the report was written, or
+    the combination that wrote it did not complete (it lists what ``failed``).
+    """
+    outdated = _epochs_changed_since(observations, report_path)
+    if outdated:
+        return f"the calibration of {', '.join(outdated)} changed after the last combination"
+    if report.get("failed"):
+        return f"the last combination was incomplete ({'; '.join(report['failed'])})"
+    return ""
+
+
 def _joint_step(source: str) -> str:
     return f"joint_{source}"
 
@@ -145,7 +162,7 @@ def refine_calibrator(observations: list, source: str, root: Path, name: str, co
     record = {"epochs": codes, "flux_jy": dict(zip(codes, fluxes)), "reference_flux_jy": reference,
               "model": model["model"], "model_flux_jy": model["model_flux"], "joint_rounds": model["rounds"],
               "joint_images": {str(robust): info for robust, info in model["images"].items()},
-              "refinement": {}, "tables": {}}
+              "refinement": {}, "tables": {}, "failed_epochs": []}
     step = _joint_step(source)
     for obs, split, flux in zip(observations, splits, fluxes):
         code = obs.project_code
@@ -156,10 +173,12 @@ def refine_calibrator(observations: list, source: str, root: Path, name: str, co
         epoch_model = difmap.scale_model_file(model["model"], f"{prefix}.mod", flux / reference)
         try:
             report = difmap.refine_against_model(split, str(obs._backend.ms_path(code)), str(prefix), epoch_model,
-                                                 solints=solints, **limits)
+                                                 solints=solints, amplitude=bool(cfg.get("joint_amplitude", False)),
+                                                 **limits)
         except Exception as exc:  # noqa: BLE001 - one epoch failing must not lose the others
             warnings.warn(f"{code}: refinement of {source} against the joint model failed ({exc})")
             obs._state.mark_failed(step, str(exc))
+            record["failed_epochs"].append(code)
             continue
         accepted = [r["solint"] for r in report["rounds"] if r["accepted"]]
         record["refinement"][code] = {"accepted_phase_solints": accepted, "amplitude": report["amplitude"],
@@ -222,17 +241,18 @@ def combine_epochs(vlbi, *, force: bool = False) -> dict:
     root = campaign_dir(observations)
     report_path = root / f"{name}.campaign.json"
     if report_path.is_file() and not force:
-        outdated = _epochs_changed_since(observations, report_path)
-        if not outdated:
+        previous = json.loads(report_path.read_text())
+        reason = stale_reason(observations, report_path, previous)
+        if not reason:
             logger.info("campaign {}: already combined ({}); use force=True to redo", name, report_path)
-            return json.loads(report_path.read_text())
-        logger.info("campaign {}: the calibration of {} changed after the last combination; combining again",
-                    name, ", ".join(outdated))
+            return previous
+        logger.info("campaign {}: {}; combining again", name, reason)
     root.mkdir(parents=True, exist_ok=True)
     config = vlbi.config
     logger.info("campaign {}: combining {} epochs ({}) -> {}", name, len(codes), ", ".join(codes), root)
-    report: dict = {"name": name, "epochs": codes, "calibrators": {}, "combined": {},
-                    "images_before": {obs.project_code: epoch_image_statistics(obs) for obs in observations}}
+    # Whatever fails is recorded: a report with failures is a record of an attempt, and the
+    # next run combines again instead of taking the stage for done.
+    report: dict = {"name": name, "epochs": codes, "calibrators": {}, "combined": {}, "failed": []}
 
     # A previous combination left its tables in the chains: the joint model must be built from the
     # per-epoch calibration alone, so they come out first (and the splits are redone without them).
@@ -247,6 +267,10 @@ def combine_epochs(vlbi, *, force: bool = False) -> dict:
             stale.add(obs.project_code)
             obs.calibrate.apply(force=True)
             obs.export.per_source(force=True, uvfits=False)
+            # The images on disk were made with those tables: redo them, or the "before" of the
+            # comparison below would already contain a previous combination.
+            vlbi._image_all(obs, force=True, reimage=True)
+    report["images_before"] = {obs.project_code: epoch_image_statistics(obs) for obs in observations}
 
     changed: set[str] = set()
     for source in calibrators:
@@ -265,8 +289,10 @@ def combine_epochs(vlbi, *, force: bool = False) -> dict:
             record = refine_calibrator(having, source, root, name, config)
         except Exception as exc:  # noqa: BLE001 - one calibrator failing must not lose the rest
             warnings.warn(f"campaign {name}: joint model of {source} failed ({exc})")
+            report["failed"].append(f"joint model of {source}")
             continue
         report["calibrators"][source] = record
+        report["failed"] += [f"refinement of {source} in {code}" for code in record["failed_epochs"]]
         changed |= set(record["tables"])
 
     for obs in observations:
@@ -289,6 +315,7 @@ def combine_epochs(vlbi, *, force: bool = False) -> dict:
             report["combined"][source] = image_combined(having, source, root, name, config)
         except Exception as exc:  # noqa: BLE001 - one source failing must not lose the rest
             warnings.warn(f"campaign {name}: combined image of {source} failed ({exc})")
+            report["failed"].append(f"combined image of {source}")
 
     report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     _log_summary(report)

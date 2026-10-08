@@ -50,6 +50,9 @@ LONG_SCAN_SEC = 300.0
 SHORT_SOLINT = "2min"
 #: CLEAN stops (and undoes its last batch) when the residual rms grows by more than this fraction.
 DIVERGENCE_TOLERANCE = 0.02
+#: ... and does not stop on the residual-peak criterion while a batch still lowers the residual rms by more
+#: than this fraction: the rms is then still made of the sidelobes of flux that has not been cleaned.
+RMS_CONVERGENCE = 0.01
 #: Pixels per resolution element in the wide dirty map searched for a target.
 SEARCH_OVERSAMPLE = 3.0
 #: Largest side (pixels) of that map; the cell grows instead when the field needs more.
@@ -263,8 +266,9 @@ def clean_image(obs, fits_path: str, *, robust: float, niter: int = 4000, gain: 
     The model is cleared first (the CLEAN image should not inherit the
     modelfit component), then Högbom CLEAN runs in batches until the residual
     peak inside the inner quarter drops below ``threshold_sigma`` times its rms
-    or ``niter`` components. Returns peak / rms / dynamic range / model flux /
-    beam and the FITS path.
+    while the rms itself has stopped falling (see :data:`RMS_CONVERGENCE`), the
+    rms starts to rise, or ``niter`` components. Returns peak / rms / dynamic
+    range / model flux / beam and the FITS path.
     """
     obs.clrmod()
     obs.uvweight(robust=float(robust))
@@ -283,11 +287,16 @@ def clean_image(obs, fits_path: str, *, robust: float, niter: int = 4000, gain: 
             obs = checkpoint
             stopped = f"residual rms rose ({rms:.3g} -> {new_rms:.3g})"
             break
+        still_falling = rms > 0 and (rms - new_rms) > RMS_CONVERGENCE * rms
         done += batch
         rms = new_rms
         # The residual rms shrinks as the sidelobes are removed, so the stopping level
-        # is measured on the current residual, not on the dirty map.
-        if rms > 0 and abs(float(stats.get("max", 0.0))) < threshold_sigma * rms:
+        # is measured on the current residual, not on the dirty map. For the same reason the
+        # peak criterion alone is not trusted while the rms is still dropping: on a faint,
+        # resolved source seen mostly by one sensitive baseline, the sidelobes of the
+        # uncleaned flux fill the map and lift the rms until the peak already looks like noise
+        # (V589A target, natural weighting: stopped after 100 components at twice the noise).
+        if rms > 0 and abs(float(stats.get("max", 0.0))) < threshold_sigma * rms and not still_falling:
             stopped = f"residual peak below {threshold_sigma:g} sigma"
             break
     obs.restore()

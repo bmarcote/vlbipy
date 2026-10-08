@@ -205,7 +205,8 @@ def _solve_block(block: dict, setup: dict, spw_sel: dict, spw_groups: list[list[
                 continue
             data = FringeData.from_baselines(block["vis"][keep], block["flag"][keep], block["weight"][keep],
                                              block["antenna1"][keep], block["antenna2"][keep], block["time"][keep],
-                                             block["spw"][keep], freq, nant=nant)
+                                             block["spw"][keep], freq,
+                                             nant=nant, f_ref_hz=group_reference_freq(freq, group))
             t_sol = 0.5 * (t_lo + t_hi)
             solution = fringefit_interval(data, refant, t_sol=t_sol, **solve_kwargs)
             table = solution.to_fparam()
@@ -215,6 +216,30 @@ def _solve_block(block: dict, setup: dict, spw_sel: dict, spw_groups: list[list[
                          "n_ok": int((~solution.flag).sum()), "snr_median": float(np.median(
                              solution.snr[~solution.flag])) if (~solution.flag).any() else 0.0})
     return rows
+
+
+def group_reference_freq(chan_freq, group: list[int]) -> float:
+    """Return the reference frequency of one solve group: the centre of its selected channels [Hz].
+
+    It comes from the *selection*, not from the subbands that happen to hold data in one solution
+    interval. ``combine='spw'`` pools several subbands into a single solution whose delay is
+    referenced to this frequency and whose table stores one value for it, so an interval missing
+    the antenna that holds an edge subband must not reference its delay to a narrower band.
+
+    Parameters
+    ----------
+    chan_freq : float array (nspw, nchan_sel)
+        Channel frequencies per subband [Hz], already restricted to the selected channels
+        (:func:`vlbipy.solvers.calblock.load_block` output; rows of unselected subbands are zero).
+    group : list of int
+        Subbands solved together, all of them selected (one entry unless ``combine='spw'``).
+
+    Returns
+    -------
+    float
+    """
+    freqs = np.concatenate([np.asarray(chan_freq[spw], dtype=np.float64).reshape(-1) for spw in group])
+    return 0.5 * (float(freqs.min()) + float(freqs.max()))
 
 
 def solve_scan_job(*, specs: list[dict], setup: dict, engine: str, columns: list[str], data_column: str,
@@ -356,8 +381,12 @@ def _write_table(caltable: Path, vis: str, setup: dict, rows: list[dict], spw_se
             spw_centre[s] = 0.5 * (chan_freq[s, chans].min() + chan_freq[s, chans].max())
         spw_width[s] = chans.size * chan_width[s]
     if combine_spw:
+        # One solution per interval, stored in the lowest *selected* subband (not necessarily 0) and
+        # referenced to the centre of the whole selection, which every interval shares.
         solved = int(rows[0]["spw"])
         spw_centre[solved] = rows[0]["f_ref_hz"]
+        logger.info("fringefit: combined solutions stored in subband {} at reference frequency {:.6f} GHz",
+                    solved, spw_centre[solved] / 1e9)
     write_fringe_table(caltable, vis, times=per_row["times"], field_ids=per_row["field_ids"],
                        spw_ids=per_row["spw_ids"], antenna_ids=per_row["antenna_ids"],
                        refant_id=per_row["refant_ids"], scan_numbers=per_row["scan_numbers"],

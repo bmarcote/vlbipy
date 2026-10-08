@@ -599,6 +599,38 @@ class ObsMetadata:
         """Return ``{antenna: [participated_in_scan_0, ...]}`` over all scans."""
         return {name: [name in scan.antennas for scan in self.scans] for name in self.antennas}
 
+    def antennas_per_subband(self) -> dict[int, list[str]]:
+        """Return ``{subband index: [antennas that recorded it]}`` over the antennas with data.
+
+        An antenna whose participation was never determined (empty :attr:`Antenna.subbands`)
+        counts as having recorded every subband, so a backend that cannot report participation
+        leaves the whole band usable.
+        """
+        per_subband: dict[int, list[str]] = {spw: [] for spw in range(self.freq_setup.n_subbands)}
+        for antenna in self.observed_antennas:
+            for spw in antenna.subbands or tuple(per_subband):
+                if spw in per_subband:
+                    per_subband[spw].append(antenna.name)
+        return per_subband
+
+    @property
+    def usable_subbands(self) -> tuple[int, ...]:
+        """Subbands at least two antennas recorded, i.e. the ones that carry a baseline.
+
+        A subband a single antenna recorded has no cross-correlation at all: fringe-fitting it
+        cannot produce a solution, and pooling it into a multi-band solve only widens the band
+        the delay is referenced to. Heterogeneous arrays where one station records a single edge
+        subband therefore have a usable band narrower than the recorded one. Empty when the
+        number of subbands is unknown.
+        """
+        return tuple(spw for spw, names in self.antennas_per_subband().items() if len(names) >= 2)
+
+    @property
+    def unusable_subbands(self) -> tuple[int, ...]:
+        """Subbands fewer than two antennas recorded (no baseline); empty for a homogeneous array."""
+        usable = set(self.usable_subbands)
+        return tuple(spw for spw in range(self.freq_setup.n_subbands) if spw not in usable)
+
     def to_dict(self) -> dict:
         """Serialise to plain JSON types (the SNR survey reloads from its caltable instead)."""
         return {"project_code": self.project_code,
