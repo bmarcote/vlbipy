@@ -39,7 +39,7 @@ from ..results import Image, SelfcalResult
 
 #: Attributes on a component that are not operations (excluded from introspection).
 _NON_OPERATIONS = frozenset({"group", "kind", "work_dir", "backend", "operations",
-                             "implemented", "supports"})
+                             "implemented", "supports", "estimate_memory"})
 
 #: Fraction of the channels of a subband, in its middle, that the raw time-evolution figures average
 #: over. Before the fringe fit the residual delay winds the phase across the band, so only a narrow
@@ -660,6 +660,24 @@ class PlotOps(BackendComponent):
         """Plot a time x frequency panel per antenna pair, coloured by phase or amplitude."""
         raise self._unsupported("baseline_corner")
 
+    def baseline_corners(self, project_code: str, *, field: str = "", column: str = "corrected",
+                         quantities=("phase", "amp"), **kwargs) -> list[str]:
+        """Plot the :meth:`baseline_corner` grid once per quantity; returns the paths in that order.
+
+        This default makes one :meth:`baseline_corner` call per quantity; a backend that can read the data
+        once for all of them overrides it.
+        """
+        return [self.baseline_corner(project_code, field=field, column=column, quantity=quantity, **kwargs)
+                for quantity in quantities]
+
+    def estimate_memory(self, project_code: str, method: str, kwargs: dict) -> Optional[int]:
+        """Peak bytes a process drawing ``method(project_code, **kwargs)`` reaches, or None when unknown.
+
+        Used to decide how many plots can be drawn at once (:mod:`vlbipy.plot_jobs`); it must not read the
+        data, only the metadata in ``kwargs``. Unknown (this default) counts as nothing.
+        """
+        return None
+
     def bandpass_profile(self, project_code: str, measurement: dict, **kwargs) -> str:
         """Plot the per-channel amplitude / phase-scatter / flagged profile of the band."""
         raise self._unsupported("bandpass_profile")
@@ -743,6 +761,26 @@ class Backend:
         """Return True if ``component.operation`` is implemented by this backend."""
         target = self.components().get(component)
         return bool(target and target.supports(operation))
+
+    def worker_spec(self, project_code: str) -> Optional[dict]:
+        """What a worker process needs to rebuild this backend and plot ``project_code`` there, or None.
+
+        The diagnostic plot sets run their plots as jobs in worker processes (:mod:`vlbipy.plot_jobs`), each
+        on a backend rebuilt by :meth:`from_worker_spec`. None (this default) keeps every plot in this
+        process: a backend that holds its data in memory cannot be rebuilt elsewhere.
+
+        Returns
+        -------
+        dict or None
+            Picklable; ``"backend"`` is the class as ``"module:qualname"``, the rest is for
+            :meth:`from_worker_spec`.
+        """
+        return None
+
+    @classmethod
+    def from_worker_spec(cls, spec: dict) -> "Backend":
+        """Rebuild the backend described by :meth:`worker_spec` (in a worker process)."""
+        return cls(work_dir=spec["work_dir"])
 
     def __repr__(self) -> str:
         counts = ", ".join(f"{name}={len(ops)}" for name, ops in self.capabilities().items())

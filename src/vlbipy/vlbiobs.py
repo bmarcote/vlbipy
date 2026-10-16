@@ -143,16 +143,23 @@ class VLBIObs:
     PROJECT_FILENAME = ".project.json"
 
     def _save_project(self, codes: list[str], base_work) -> None:
-        """Persist the project codes and the fully-merged configuration next to the products."""
+        """Persist the project codes and the fully-merged configuration next to the products.
+
+        The archive password (``[import].password``) is blanked in the saved copy: it is only needed to
+        download, and the file sits beside the products where anyone given the run can read it.
+        """
         if not self._observations or not self._observations[0]._backend.requires_data_files:
             return
         root = Path(base_work) if base_work else Path(self._observations[0].work_dir)
         if len(codes) > 1 and not base_work:
             root = Path(self._observations[0].work_dir).parent
+        saved = dict(self.config)
+        if saved.get("import", {}).get("password"):
+            saved["import"] = {**saved["import"], "password": ""}
         try:
             root.mkdir(parents=True, exist_ok=True)
             (root / self.PROJECT_FILENAME).write_text(json.dumps(
-                {"projects": codes, "config": self.config, "work_dir": str(root)}, indent=2, default=str))
+                {"projects": codes, "config": saved, "work_dir": str(root)}, indent=2, default=str))
         except OSError as exc:
             logger.warning("could not write {}: {}", root / self.PROJECT_FILENAME, exc)
 

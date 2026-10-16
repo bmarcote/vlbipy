@@ -4,6 +4,8 @@ The CLI exposes one subcommand per pipeline stage, each a thin translation of
 flags into :class:`~vlbipy.vlbiobs.VLBIObs` namespace calls::
 
     vlbipy pipeline -p RSM07 --network EVN --target 3C286  # full default pipeline
+    vlbipy pipeline -p EG078B --username EG078B --password ...  # proprietary data (any subcommand)
+    vlbipy pipeline -p EG078B --obsdate 231015                     # archive date (any subcommand)
     vlbipy import -p RSM07 --obsdate 250916                # download (if needed) + import to MS
     vlbipy export -p RSM07 --format dask-ms                # export MS to dask-ms (lazy/distributed)
     vlbipy calibrate bandpass fringefit -p RSM07           # selected cal steps (positional)
@@ -98,6 +100,12 @@ def _common_parser(*, project_required: bool = True) -> argparse.ArgumentParser:
                         "(clearcal + unflag). Without it the run resumes where it stopped.")
     p.add_argument("--from-step", dest="from_step", metavar="STEP",
                    help="Re-run from this step onward, invalidating it and everything after")
+    # Any subcommand may have to download (the pipeline imports when no data is on disk), so the
+    # archive options are common; the password is never written to .project.json.
+    p.add_argument("--obsdate", help="Observing date (YYMMDD) for the archive download; "
+                                     "auto-resolved from the data or the EVN archive if omitted")
+    p.add_argument("--username", help="Archive username for proprietary data")
+    p.add_argument("--password", help="Archive password for proprietary data")
     p.add_argument("-v", "--verbose", action="store_true", help="Verbose (DEBUG) logging")
     return p
 
@@ -177,10 +185,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_imp.add_argument("--files", nargs="+", metavar="FILE",
                        help="Explicit FITS-IDI file(s) or a glob pattern; skips search/download")
-    p_imp.add_argument("--obsdate", help="Observing date (YYMMDD) for the archive download; "
-                                         "auto-resolved from the data or the EVN archive if omitted")
-    p_imp.add_argument("--username", help="Archive username for proprietary data")
-    p_imp.add_argument("--password", help="Archive password for proprietary data")
     p_imp.add_argument("--replace-tsys", action="store_true", dest="replace_tsys",
                        help="Overwrite Tsys/GC tables in the FITS-IDI files even if already present")
 
@@ -503,7 +507,7 @@ def _cmd_direct_plot(args: argparse.Namespace) -> int:
         common["outdir"] = str(Path(args.outdir).resolve())
     methods = {"spectrum": "spectrum", "autocorr": "autocorr", "radplot": "radplot",
                "lightcurve": "lightcurve", "timeseries": "timeseries", "subband_phases": "subband_phases",
-               "baseline_corner": "baseline_corner", "corners": "baseline_corner", "scan_snr": "scan_snr"}
+               "baseline_corner": "baseline_corner", "corners": "baseline_corners", "scan_snr": "scan_snr"}
     results = []
     for kind in args.kinds:
         if kind in ("uv_coverage", "diagnostic"):

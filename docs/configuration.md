@@ -312,6 +312,15 @@ Controls `obs.export.per_source`.
 | `target_channel_average` | int | `4` | The same for the target(s). |
 | `average_targets` | bool | `true` | `false` splits the target(s) at full time and frequency resolution; calibrators and check sources are always averaged. |
 
+### `[plotting]`
+
+Controls the diagnostic plot sets (`obs.plot.diagnostics`, `obs.plot.final_data`).
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `workers` | int | `8` | Most plots drawn at the same time. Each runs in its own worker process and reads its own data from the measurement set, which is where almost all the time goes. Never more than the CPUs, and only as many as fit in memory: before a set starts, the peak memory of every plot is estimated from the metadata (the largest single read of the measurement set) and the number is lowered until the largest plots fit together in `memory_fraction` of the free memory. The log shows the plan, and each plot's measured peak beside its estimate. `1` draws them one after another in the main process. |
+| `memory_fraction` | float | `0.8` | Share of the free memory (Linux `MemAvailable`) the plots drawn together may take. |
+
 ## CLI Parameter Mapping
 
 CLI arguments override the corresponding TOML parameters:
@@ -327,6 +336,9 @@ CLI arguments override the corresponding TOML parameters:
 | `--check-source` | `[sources] check_sources` |
 | `--pwd` | `[global] pwd` |
 | `--no-ionos` | `[calibration] ionos = false` |
+| `--obsdate` | `[import] obsdate` (every subcommand) |
+| `--username` | `[import] username` (every subcommand) |
+| `--password` | `[import] password` (every subcommand; never saved to `.project.json`) |
 | `--from-step` | *(run control, no TOML equivalent)* |
 | `--scratch` | *(run control, no TOML equivalent)* |
 | `--force` | *(run control, no TOML equivalent)* |

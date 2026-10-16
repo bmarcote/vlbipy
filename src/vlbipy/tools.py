@@ -61,6 +61,25 @@ def space_available_gb(path: Union[str, Path]) -> float:
     return results.f_frsize * results.f_bavail / 1e9
 
 
+def available_memory() -> Optional[int]:
+    """Bytes of memory new work can take without swapping (Linux ``MemAvailable``), or None when unknown."""
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError) as exc:
+        logger.debug("available memory unknown: {}", exc)
+    return None
+
+
+def usable_cpus() -> int:
+    """Number of CPUs this process may run on (its affinity mask where the platform has one)."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:            # macOS: no affinity masks
+        return os.cpu_count() or 1
+
+
 def collect_casa_logs(log_dir: Union[str, Path], search_dirs=None) -> list[Path]:
     """Move stray ``casa*.log`` files into ``log_dir``; return what was moved.
 

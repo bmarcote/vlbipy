@@ -224,3 +224,32 @@ def test_daskms_backend_is_its_own_backend():
     assert CasaBackend.calibration_ops is CasaCalibrationOps
     for hook in ("_run_fringefit_task", "_run_bandpass_task", "_run_gaincal_task", "apply"):
         assert getattr(DaskMsCalibrationOps, hook) is not getattr(CasaCalibrationOps, hook)
+
+
+def test_archive_credentials_are_accepted_by_every_pipeline_subcommand():
+    """The pipeline downloads when no data is on disk, so --username/--password are not import-only."""
+    for command in ("pipeline", "import", "calibrate", "flag", "summary"):
+        args = parse([command, "-p", "EG078B", "--username", "eg078b", "--password", "secret"])
+        assert (args.username, args.password) == ("eg078b", "secret")
+
+
+def test_credentials_reach_the_import_config_but_not_the_project_file(tmp_path):
+    """The credentials are in [import] for the download; the password is blanked in .project.json."""
+    import json
+
+    from vlbipy.cli import _build_obs
+    args = parse(["pipeline", "-p", "TS01", "--backend", "dummy", "-t", "SRC", "--username", "ts01",
+                  "--password", "secret", "--config", _dummy_config(tmp_path)])
+    obs = _build_obs(args)
+    assert (obs.config["import"]["username"], obs.config["import"]["password"]) == ("ts01", "secret")
+    obs._observations[0]._backend.requires_data_files = True      # the dummy backend writes no project file
+    obs._save_project(["TS01"], tmp_path)
+    saved = json.loads((tmp_path / ".project.json").read_text())["config"]["import"]
+    assert (saved["username"], saved["password"]) == ("ts01", "")
+    assert obs.config["import"]["password"] == "secret"            # the running process keeps it
+
+
+def test_obsdate_is_a_common_option():
+    """--obsdate matters wherever a download can happen, so every pipeline subcommand takes it."""
+    for command in ("pipeline", "import", "calibrate", "summary"):
+        assert parse([command, "-p", "EG078B", "--obsdate", "231015"]).obsdate == "231015"

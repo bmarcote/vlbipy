@@ -13,6 +13,10 @@ from pathlib import Path
 from loguru import logger as _logger
 
 _CONFIGURED = False
+#: Console level last configured, handed to worker processes (:func:`logging_setup`).
+_CONSOLE_LEVEL = "INFO"
+#: The :func:`logging_setup` this (worker) process was last attached to, so re-attaching is free.
+_ATTACHED: dict = {}
 _FORMAT = "<level>{message}</level>"
 #: File sink format: timestamped and level-tagged, so a run can be audited afterwards.
 _FILE_FORMAT = "{time:YYYY-MM-DD HH:mm:ss} | {level: <7} | {message}"
@@ -31,12 +35,13 @@ def configure_logging(level: str = "INFO") -> None:
     level : str
         Minimum level to display (e.g. ``"INFO"``, ``"DEBUG"``).
     """
-    global _CONFIGURED
+    global _CONFIGURED, _CONSOLE_LEVEL
     _logger.remove()
     _logger.level("WARNING", color="<yellow>")
     _logger.level("ERROR", color="<red><bold>")
     _logger.add(sys.stderr, level=level, format=_FORMAT, colorize=True)
     _CONFIGURED = True
+    _CONSOLE_LEVEL = level
 
 
 def add_file_log(log_dir, project_code: str = "", level: str = "DEBUG"):
@@ -79,6 +84,40 @@ def add_file_log(log_dir, project_code: str = "", level: str = "DEBUG"):
     _FILE_SINKS[str(directory.resolve())] = {"path": path, "id": sink_id}
     _logger.info("logging this run to {}", path)
     return path
+
+
+def logging_setup() -> dict:
+    """Describe this process's logging so a worker process can log the same way (:func:`attach_logging`).
+
+    Returns
+    -------
+    dict
+        ``{"level": console level, "files": [log file paths]}``; JSON- and pickle-safe.
+    """
+    return {"level": _CONSOLE_LEVEL, "files": sorted(str(sink["path"]) for sink in _FILE_SINKS.values())}
+
+
+def attach_logging(setup: dict) -> None:
+    """Log like the process that produced ``setup``: same console level, appending to the same run log(s).
+
+    Meant for worker processes, which start with loguru's default sink. Several processes appending to one
+    file is safe line by line (append mode, one write per line). Idempotent for the same ``setup``.
+
+    Parameters
+    ----------
+    setup : dict
+        The output of :func:`logging_setup` in the parent process.
+    """
+    global _ATTACHED
+    if setup == _ATTACHED:
+        return
+    configure_logging(setup.get("level") or "INFO")
+    _FILE_SINKS.clear()               # configure_logging removed every sink, the files' included
+    for path in setup.get("files") or []:
+        sink_id = _logger.add(path, level="DEBUG", format=_FILE_FORMAT, colorize=False, enqueue=False,
+                              backtrace=True, diagnose=False)
+        _FILE_SINKS[str(Path(path).parent.resolve())] = {"path": Path(path), "id": sink_id}
+    _ATTACHED = dict(setup)
 
 
 def get_logger():

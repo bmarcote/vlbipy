@@ -21,6 +21,18 @@ vlbipy <command> -p <project> [-t TARGET] [--phasecal NAME] [--fringe-finder NAM
 `vlbipy --version` prints the installed version, which is the `version` written
 in `pyproject.toml`.
 
+Proprietary data needs the archive credentials. `--username`, `--password` and
+`--obsdate` (the observing date for the archive, normally found on its own) are
+accepted by every subcommand, not only `import`: `run`/`pipeline` (and any step
+that finds no data on disk) download it first.
+
+```bash
+vlbipy run -p eg078b -t J1234+5678 --username eg078b --password '...'
+```
+
+They can also go in the configuration (`[import] username`, `password`,
+`obsdate`). The password is never written to `<work_dir>/.project.json`.
+
 ## A worked reduction
 
 ```bash

@@ -230,6 +230,40 @@ def _scan_chunks(scans, size: int = _SCANS_PER_READ) -> list[list[int]]:
     return [numbers[i:i + size] for i in range(0, len(numbers), size)]
 
 
+def largest_read_rows(metadata: ObsMetadata, *, fields=(), scans=(), baselines: str = "all",
+                      scans_per_read: Optional[int] = None) -> int:
+    """Rows of the largest single read of one subband, estimated from the metadata alone.
+
+    Parameters
+    ----------
+    metadata : ObsMetadata
+        Scans with their length, integration time and antennas.
+    fields, scans : iterable
+        Source names and scan numbers read (empty = all).
+    baselines : str
+        ``"refant"`` (the baselines to one antenna), ``"auto"`` (autocorrelations) or ``"all"`` (every row of
+        a scan: cross and auto).
+    scans_per_read : int, optional
+        Scans read together, in scan-number order like :func:`_scan_chunks`; None reads them all at once.
+
+    Returns
+    -------
+    int
+        Integrations times baselines of the biggest read (0 when nothing is selected).
+    """
+    wanted, numbers = set(fields or ()), set(scans or ())
+    selected = sorted((s for s in metadata.scans if (not wanted or s.source in wanted)
+                       and (not numbers or s.scan_number in numbers)), key=lambda s: s.scan_number)
+    counts = []
+    for scan in selected:
+        n = len(scan.antennas)
+        per_integration = {"refant": max(n - 1, 0), "auto": n, "all": n * (n + 1) // 2}[baselines]
+        integrations = max(1, round((scan.time_end - scan.time_start) / max(float(scan.integration_time), 1e-3)))
+        counts.append(integrations * per_integration)
+    size = scans_per_read or len(counts) or 1
+    return max((sum(counts[i:i + size]) for i in range(0, len(counts), size)), default=0)
+
+
 def count_query_text(ms: str, column: str, *, where: str = "", groupby: str = "") -> str:
     """Build the TaQL that counts flagged and observable visibilities.
 
@@ -5211,6 +5245,58 @@ class CasaImagingOps(ImagingOps):
 class CasaPlotOps(PlotOps):
     """Diagnostic plots rendered from CASA tables with matplotlib."""
 
+    # Memory model of one plot (estimate_memory), fitted on RSM07 with every plot of the calibrated and
+    # final sets drawn alone in a fresh process (VmHWM): base 287 MB; above it 104-111 B per visibility of
+    # the largest read for corners, radplots, spectra and time series (casatools builds complex128 from
+    # the on-disk complex64, then the readers make NaN-masked and parallel-hand copies) plus ~40 MB, and
+    # 2.6 B per visibility for the uv coverage, which reads only flags and uvw. Rounded up: an estimate
+    # that is too high costs a plot drawn at the same time, one that is too low can exhaust the memory.
+    #: Resident size of a worker process once casatools, casatasks and matplotlib are loaded, before any read.
+    WORKER_BASE_BYTES = 300_000_000
+    #: Fixed cost of drawing one plot above the base (figure, accumulators).
+    PLOT_OVERHEAD_BYTES = 60_000_000
+    #: Bytes held per visibility (one channel of one correlation of one row) of the largest single read.
+    READ_BYTES_PER_VISIBILITY = 120
+    #: The same for the uv-coverage plot, which reads only the flags and the uvw of every row.
+    FLAG_BYTES_PER_VISIBILITY = 3
+    #: How each plot method reads the measurement set: which baselines, and how many scans per read (None =
+    #: every selected scan at once). One subband is read at a time in every case.
+    READ_PATTERNS = {"spectrum": ("refant", None), "timeseries": ("refant", None),
+                     "subband_phases": ("refant", None), "autocorr": ("auto", None),
+                     "radplot": ("all", _SCANS_PER_READ), "baseline_corner": ("all", _SCANS_PER_READ),
+                     "baseline_corners": ("all", _SCANS_PER_READ), "lightcurve": ("all", 1),
+                     "diagnostic": ("all", None)}
+
+    def _has_model_column(self, project_code: str) -> bool:
+        """Whether the measurement set has a MODEL_DATA column (True when that cannot be told: the safe side)."""
+        try:
+            return self.backend.data._has_column(self.backend.ms_path(project_code), "MODEL_DATA")
+        except Exception as exc:  # noqa: BLE001 - an estimate must never fail a plot set
+            logger.debug("{}: MODEL_DATA presence unknown ({}); counting it", project_code, exc)
+            return True
+
+    def estimate_memory(self, project_code: str, method: str, kwargs: dict) -> Optional[int]:
+        """Peak bytes of a worker drawing ``method``: its base size, a fixed overhead and the largest single read.
+
+        The read is estimated from the metadata in ``kwargs`` (:func:`largest_read_rows` with the method's
+        :attr:`READ_PATTERNS`), every correlation and channel of one subband being read; a radplot with the
+        model reads the MODEL column too, when the measurement set has one (its table description is the
+        only thing opened). None for a method without a known pattern or without metadata.
+        """
+        metadata = kwargs.get("metadata")
+        pattern = self.READ_PATTERNS.get(method)
+        if metadata is None or pattern is None or not metadata.scans:
+            return None
+        baselines, scans_per_read = pattern
+        fields = kwargs.get("fields") or [name for name in str(kwargs.get("field") or "").split(",") if name]
+        rows = largest_read_rows(metadata, fields=fields, scans=kwargs.get("scans") or (), baselines=baselines,
+                                 scans_per_read=scans_per_read)
+        visibilities = rows * metadata.freq_setup.n_channels * max(1, len(metadata.freq_setup.polarizations))
+        per_visibility = self.FLAG_BYTES_PER_VISIBILITY if method == "diagnostic" else self.READ_BYTES_PER_VISIBILITY
+        if method == "radplot" and kwargs.get("with_model") and self._has_model_column(project_code):
+            per_visibility *= 2                                  # the MODEL column is read alongside
+        return int(self.WORKER_BASE_BYTES + self.PLOT_OVERHEAD_BYTES + visibilities * per_visibility)
+
     def caltable(self, project_code: str, caltable: str, cal_type: str = "",
                  metadata: Optional[ObsMetadata] = None, **kwargs) -> list[str]:
         """Plot a calibration table to PNG(s) under <work_dir>/plots.
@@ -5357,12 +5443,29 @@ class CasaPlotOps(PlotOps):
                         quantity: str = "phase", max_time_bins: int = 200, label: str = "",
                         metadata: Optional[ObsMetadata] = None, **kwargs) -> str:
         """Plot the per-baseline time x frequency corner grid for one field."""
+        return self.baseline_corners(project_code, field=field, column=column, quantities=(quantity,),
+                                     max_time_bins=max_time_bins, label=label, metadata=metadata)[0]
+
+    def baseline_corners(self, project_code: str, *, field: str = "", column: str = "corrected",
+                         quantities=("phase", "amp"), max_time_bins: int = 200, label: str = "",
+                         metadata: Optional[ObsMetadata] = None, **kwargs) -> list[str]:
+        """Plot the corner grid of one field once per quantity, from a single read of its data.
+
+        The read (:meth:`CasaDataOps.read_dynamic_spectra`, every baseline of every scan of the field) is
+        nearly all the cost of a corner plot, and the phase and amplitude grids show the same binned data.
+
+        Returns
+        -------
+        list of str
+            One PNG per quantity, in the order of ``quantities``.
+        """
         from ..plotting import plot_baseline_corner
         spectra = self.backend.data.read_dynamic_spectra(
             project_code, field=field, column=column, max_time_bins=max_time_bins,
             stokes_i=True, metadata=metadata)
-        return str(plot_baseline_corner(spectra, self.plot_dir(self.category_for_column(column)),
-                                        project_code, quantity=quantity, label=label))
+        directory = self.plot_dir(self.category_for_column(column))
+        return [str(plot_baseline_corner(spectra, directory, project_code, quantity=quantity, label=label))
+                for quantity in quantities]
 
     def bandpass_profile(self, project_code: str, measurement: dict, **kwargs) -> str:
         """Plot the per-channel band profile that drove the edge-channel decision."""
@@ -5485,6 +5588,18 @@ class CasaBackend(Backend):
     def register_ms(self, project_code: str, ms_path: Path) -> None:
         """Record an explicit measurement-set path for a project (used by ``data.adopt_ms``)."""
         self._ms_overrides[project_code] = ms_path
+
+    def worker_spec(self, project_code: str) -> Optional[dict]:
+        """Class, work directory and measurement set: all a worker process needs to read and plot the same data."""
+        return {"backend": f"{type(self).__module__}:{type(self).__qualname__}", "work_dir": str(self.work_dir),
+                "project_code": project_code, "ms_path": str(self.ms_path(project_code))}
+
+    @classmethod
+    def from_worker_spec(cls, spec: dict) -> "CasaBackend":
+        """Rebuild the backend of :meth:`worker_spec`, pointed at the same measurement set (adopted ones included)."""
+        backend = cls(work_dir=spec["work_dir"])
+        backend.register_ms(spec["project_code"], Path(spec["ms_path"]))
+        return backend
 
     def caldir(self) -> Path:
         """Return (and create) the calibration-table directory (work_dir/caltables)."""

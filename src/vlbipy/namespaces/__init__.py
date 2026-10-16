@@ -24,6 +24,7 @@ from ..diagnostics import write_summary
 from ..errors import BackendError, StepError
 from ..logging_utils import get_logger, warnings
 from ..models import CalTable, QualityMetrics
+from ..plot_jobs import PlotJob, draw, run_plot_jobs
 from ..results import Image, ImageSet, SelfcalResult
 from ..sources import Source
 from ..tools import natsort_key
@@ -1574,17 +1575,21 @@ class PlotNamespace(Namespace):
         """Produce the standard diagnostic set (see :meth:`diagnostics`)."""
         return self.diagnostics(column=column, label=label)
 
-    def _run_jobs(self, jobs: list, label: str) -> list[str]:
-        """Run ``(name, callable)`` plot jobs, warning on failures instead of aborting."""
-        written: list[str] = []
-        for name, job in jobs:
-            try:
-                result = job()
-            except Exception as exc:  # noqa: BLE001 - a plot must never abort the reduction
-                warnings.warn(f"{self._code}: {label} {name} plot failed ({exc})")
-                continue
-            written.extend(result if isinstance(result, list) else [result])
-        return written
+    def _run_jobs(self, jobs: list[PlotJob], label: str) -> list[str]:
+        """Draw a plot set several plots at a time, warning on failures instead of aborting.
+
+        Backend plots run in worker processes, ``call`` jobs here meanwhile
+        (:func:`vlbipy.plot_jobs.run_plot_jobs`): at most ``[plotting].workers`` and the CPU count,
+        and only as many as fit together in ``[plotting].memory_fraction`` of the free memory.
+        Returns the paths written, in job order.
+        """
+        cfg = self._obs.config.get("plotting", {})
+        return run_plot_jobs(self._backend, self._code, jobs, max_workers=int(cfg.get("workers", 1) or 1),
+                             memory_fraction=float(cfg.get("memory_fraction", 0.8)), label=label)
+
+    def _draw(self, job: PlotJob):
+        """Draw one plot job in this process, now (the single-plot methods: a failure raises)."""
+        return draw(self._backend, self._code, job)
 
     def diagnostics(self, *, column: str = "corrected", label: str = "",
                     force: bool = False) -> list[str]:
@@ -1602,7 +1607,8 @@ class PlotNamespace(Namespace):
         antenna over the whole observation (raw only, :meth:`time_evolution`).
 
         Plotting is reporting: a plot that fails is logged as a warning and the
-        rest of the set (and the pipeline) carries on.
+        rest of the set (and the pipeline) carries on. ``[plotting].workers``
+        plots are drawn at a time, each in a worker process (see :meth:`_run_jobs`).
 
         The raw set is recorded as the ``plot_raw`` step: it reads the whole
         dataset and does not change once the a-priori flags are in, so a resumed
@@ -1619,33 +1625,34 @@ class PlotNamespace(Namespace):
             self._obs.calibrate.scan_snr()     # the survey still drives the calibration selection
             # A project whose raw set was drawn before the time-evolution figures existed gets them now.
             if self._lacks_time_evolution():
-                self._run_jobs([("time_evolution", lambda: self.time_evolution(column=column, label=label))], label)
+                job = PlotJob("time_evolution", call=lambda: self.time_evolution(column=column, label=label))
+                self._run_jobs([job], label)
             return sorted(str(p) for p in self._backend.plot.plot_dir("raw").glob("*.png"))
         calibrators = obs.sources.calibrators or obs.sources.targets
         # Raw diagnostics trigger the calibrator-only survey used for calibration
         # selection. Corrected diagnostics only render the comprehensive survey that
-        # the orchestrator measured after the final applycal.
-        jobs = [("scan_snr", lambda: self.scan_snr())] if (
-            column == "data" or (obs.metadata and obs.metadata.snr_survey is not None)) else []
+        # the orchestrator measured after the final applycal. It goes first: the
+        # survey it may measure picks the reference antenna of each per-scan plot.
+        written: list[str] = []
+        if column == "data" or (obs.metadata and obs.metadata.snr_survey is not None):
+            written += self._run_jobs([PlotJob("scan_snr", call=lambda: self.scan_snr())], label)
+        jobs: list[PlotJob] = []
         if column == "data":
-            jobs += [("scan_diagnostics", lambda: self.scan_diagnostics(column=column, label=label))]
+            jobs += self._scan_diagnostic_jobs(column=column, label=label)
             if self._backend.supports("plot", "diagnostic"):
-                jobs += [("uv_coverage", lambda: [self.uv_coverage()])]
+                jobs.append(self._uv_coverage_job("uv_coverage"))
             if self._backend.supports("plot", "time_evolution"):
-                jobs += [("time_evolution", lambda: self.time_evolution(column=column, label=label))]
-        jobs += [(f"spectrum[{s.name}]", lambda source=s: self.spectrum(
-                    field=source.name, column=column, label=f"{label}_{source.name}"))
+                jobs.append(PlotJob("time_evolution", call=lambda: self.time_evolution(column=column, label=label)))
+        jobs += [self._spectrum_job(f"spectrum[{s.name}]", field=s.name, column=column, label=f"{label}_{s.name}")
                  for s in calibrators]
-        jobs += [(f"timeseries[{s.name}]", lambda source=s: self.timeseries(
-                    field=source.name, column=column, label=f"{label}_{source.name}"))
+        jobs += [self._timeseries_job(f"timeseries[{s.name}]", field=s.name, column=column, label=f"{label}_{s.name}")
                  for s in calibrators]
-        jobs += [("corners", lambda: [p for s in calibrators for p in
-                                      self.corners(field=s.name, column=column, label=f"{label}_{s.name}")]),
-                 ("radplot", lambda: self.radplot(column=column, label=label))]
+        jobs += [self._corners_job(f"corners[{s.name}]", field=s.name, column=column, label=f"{label}_{s.name}")
+                 for s in calibrators]
+        jobs += self._radplot_jobs(column=column, label=label)
         if column == "corrected":
-            jobs.append(("subband_phases", lambda: [self.subband_phases(
-                column=column, label=label)]))
-        written = self._run_jobs(jobs, label)
+            jobs.append(self._subband_phases_job("subband_phases", column=column, label=label))
+        written += self._run_jobs(jobs, label)
         logger.info("plot.diagnostics[{}]: {} plot(s) on the {} column", label, len(written), column)
         if column == "data" and label == "raw":
             obs._state.mark_complete("plot_raw")
@@ -1661,17 +1668,15 @@ class PlotNamespace(Namespace):
         and the set carries on.
         """
         names = self._all_source_names()
-        jobs = []
+        jobs: list[PlotJob] = []
         if self._backend.supports("plot", "diagnostic"):
-            jobs.append(("uv_coverage", lambda: [self.uv_coverage()]))
-        jobs += [("radplot", lambda: self.radplot(all_sources=True, column="corrected", label="final",
-                                                  with_model=True))]
-        jobs += [(f"spectrum[{name}]", lambda n=name: self.spectrum(field=n, column="corrected", label=f"final_{n}"))
+            jobs.append(self._uv_coverage_job("uv_coverage"))
+        jobs += self._radplot_jobs(all_sources=True, column="corrected", label="final", with_model=True)
+        jobs += [self._spectrum_job(f"spectrum[{name}]", field=name, column="corrected", label=f"final_{name}")
                  for name in names]
-        jobs += [(f"timeseries[{name}]", lambda n=name: self.timeseries(field=n, column="corrected",
-                                                                         label=f"final_{n}"))
+        jobs += [self._timeseries_job(f"timeseries[{name}]", field=name, column="corrected", label=f"final_{name}")
                  for name in names]
-        jobs += [("lightcurve", lambda: self.lightcurve(column="corrected", label="final"))]
+        jobs.append(self._lightcurve_job("lightcurve", column="corrected", label="final"))
         written = self._run_jobs(jobs, "final")
         logger.info("plot.final_data: {} plot(s) over {} source(s)", len(written), len(names))
         return written
@@ -1690,7 +1695,11 @@ class PlotNamespace(Namespace):
 
     def uv_coverage(self) -> str:
         """UV coverage of every source with data, one panel per source in a single figure."""
-        return self._plot("uv_coverage", metadata=self._obs.metadata)
+        return self._draw(self._uv_coverage_job("uv_coverage"))
+
+    def _uv_coverage_job(self, name: str) -> PlotJob:
+        """The :meth:`uv_coverage` plot as a job named ``name``."""
+        return PlotJob(name, method="diagnostic", kwargs={"kind": "uv_coverage", "metadata": self._obs.metadata})
 
     def elevation(self) -> str:
         """Source elevation vs time."""
@@ -1707,9 +1716,16 @@ class PlotNamespace(Namespace):
     def autocorr(self, *, field: str = "", scans: Optional[list] = None, column: str = "data",
                  label: str = "", **kwargs) -> str:
         """Autocorrelation amplitude spectra, one panel per antenna, for a field / scan selection."""
+        return self._draw(self._autocorr_job("autocorr", field=field, scans=scans, column=column, label=label,
+                                             **kwargs))
+
+    def _autocorr_job(self, name: str, *, field: str = "", scans: Optional[list] = None, column: str = "data",
+                      label: str = "", **kwargs) -> PlotJob:
+        """The :meth:`autocorr` plot as a job named ``name``."""
         obs = self._obs
-        return self._backend.plot.autocorr(self._code, field=field or obs.calibrator_field, scans=scans,
-                                           column=column, label=label, metadata=obs.metadata, **kwargs)
+        return PlotJob(name, method="autocorr", kwargs=dict(field=field or obs.calibrator_field, scans=scans,
+                                                            column=column, label=label, metadata=obs.metadata,
+                                                            **kwargs))
 
     def crosscorr(self) -> str:
         """Cross-correlation spectra."""
@@ -1746,12 +1762,16 @@ class PlotNamespace(Namespace):
         ``refant`` overrides the observation's reference antenna (a chain is
         reduced to its first member).
         """
+        return self._draw(self._spectrum_job("spectrum", field=field, scans=scans, column=column, label=label,
+                                             all_pols=all_pols, refant=refant, **kwargs))
+
+    def _spectrum_job(self, name: str, *, field: str = "", scans: Optional[list] = None, column: str = "corrected",
+                      label: str = "", all_pols: bool = False, refant: str = "", **kwargs) -> PlotJob:
+        """The :meth:`spectrum` plot as a job named ``name``."""
         obs = self._obs
-        refant = (refant or str(obs.refant)).split(",")[0]
-        return self._backend.plot.spectrum(self._code, field=field or obs.calibrator_field,
-                                           scans=scans, refant=refant, column=column,
-                                           label=label, all_pols=all_pols,
-                                           metadata=obs.metadata, **kwargs)
+        return PlotJob(name, method="spectrum", kwargs=dict(
+            field=field or obs.calibrator_field, scans=scans, refant=(refant or str(obs.refant)).split(",")[0],
+            column=column, label=label, all_pols=all_pols, metadata=obs.metadata, **kwargs))
 
     def _refant_for_scan(self, scan) -> str:
         """Return a reference antenna that is present in ``scan``.
@@ -1819,21 +1839,22 @@ class PlotNamespace(Namespace):
         in full Stokes: before calibration the cross-hands carry the
         instrumental polarization signature, afterwards they are only noise.
         """
-        written: list[str] = []
+        return self._run_jobs(self._scan_diagnostic_jobs(column=column, label=label), label)
+
+    def _scan_diagnostic_jobs(self, *, column: str, label: str) -> list[PlotJob]:
+        """The plots of :meth:`scan_diagnostics`: autocorrelations, then cross-correlation spectra, per scan."""
         scans = self._diagnostic_scans()
+        logger.info("scan_diagnostics: {} scan(s) ({})", len(scans),
+                    ", ".join(str(s.scan_number) for s in scans) or "none")
+        jobs: list[PlotJob] = []
         for scan in scans:
             tag = f"{label}_scan{scan.scan_number}"
-            jobs = [(f"autocorr[{scan.scan_number}]",
-                     lambda s=scan, t=tag: self.autocorr(field=s.source, scans=[s.scan_number], column=column,
-                                                         label=t)),
-                    (f"spectrum[{scan.scan_number}]",
-                     lambda s=scan, t=tag: self.spectrum(field=s.source, scans=[s.scan_number], column=column,
-                                                         all_pols=(column == "data"), label=t,
-                                                         refant=self._refant_for_scan(s)))]
-            written.extend(self._run_jobs(jobs, label))
-        logger.info("scan_diagnostics: {} plot(s) over {} scan(s) ({})", len(written), len(scans),
-                    ", ".join(str(s.scan_number) for s in scans) or "none")
-        return written
+            jobs.append(self._autocorr_job(f"autocorr[{scan.scan_number}]", field=scan.source,
+                                           scans=[scan.scan_number], column=column, label=tag))
+            jobs.append(self._spectrum_job(f"spectrum[{scan.scan_number}]", field=scan.source,
+                                           scans=[scan.scan_number], column=column, all_pols=(column == "data"),
+                                           label=tag, refant=self._refant_for_scan(scan)))
+        return jobs
 
     def raw_stokes(self, **kwargs) -> list[str]:
         """Backwards-compatible alias of :meth:`scan_diagnostics` on the raw data."""
@@ -1850,21 +1871,28 @@ class PlotNamespace(Namespace):
         ``all_sources`` plots every source with data instead; ``with_model``
         overlays the MODEL column (calibrated data only, skipped when absent).
         """
+        jobs = self._radplot_jobs(sources=sources, all_sources=all_sources, column=column, time_bin=time_bin,
+                                  label=label, with_model=with_model, **kwargs)
+        written = [self._draw(job) for job in jobs]
+        logger.info("radplot: {} plot(s) for {}", len(written), ", ".join(job.kwargs["field"] for job in jobs))
+        return written
+
+    def _radplot_jobs(self, *, sources: Optional[list] = None, all_sources: bool = False, column: str = "corrected",
+                      time_bin: Optional[float] = None, label: str = "", with_model: bool = False,
+                      **kwargs) -> list[PlotJob]:
+        """The plots of :meth:`radplot` (same arguments), one job per source, named ``radplot[<source>]``."""
         obs = self._obs
         if all_sources:
             names = self._all_source_names()
         else:
             names = list(sources or [s.name for s in obs.sources.calibrators]
                          or [s.name for s in obs.sources.targets])
-        cfg = obs.config.get("export", {})
-        written = []
-        for name in names:
-            written.append(self._backend.plot.radplot(
-                self._code, field=name, column=column, label=label,
-                time_bin=time_bin if time_bin is not None else cfg.get("radplot_time_bin", 10.0),
-                with_model=with_model and column == "corrected", metadata=obs.metadata, **kwargs))
-        logger.info("radplot: {} plot(s) for {}", len(written), ", ".join(names))
-        return written
+        if time_bin is None:
+            time_bin = obs.config.get("export", {}).get("radplot_time_bin", 10.0)
+        return [PlotJob(f"radplot[{name}]", method="radplot", kwargs=dict(
+                    field=name, column=column, label=label, time_bin=time_bin,
+                    with_model=with_model and column == "corrected", metadata=obs.metadata, **kwargs))
+                for name in names]
 
     def lightcurve(self, *, column: str = "corrected", label: str = "calibrated",
                    averaging_sec: Optional[list] = None, **kwargs) -> str:
@@ -1873,11 +1901,17 @@ class PlotNamespace(Namespace):
         ``averaging_sec`` defaults to ``[export].lightcurve_averaging`` (``0`` =
         native integrations, positive = seconds within a scan, ``-1`` = per scan).
         """
+        return self._draw(self._lightcurve_job("lightcurve", column=column, label=label, averaging_sec=averaging_sec,
+                                               **kwargs))
+
+    def _lightcurve_job(self, name: str, *, column: str = "corrected", label: str = "calibrated",
+                        averaging_sec: Optional[list] = None, **kwargs) -> PlotJob:
+        """The :meth:`lightcurve` plot as a job named ``name``."""
         obs = self._obs
         scales = averaging_sec or obs.config.get("export", {}).get("lightcurve_averaging", [0, 30, 120, -1])
-        return self._backend.plot.lightcurve(self._code, fields=self._all_source_names(), column=column,
-                                             label=label, averaging_sec=list(scales), metadata=obs.metadata,
-                                             **kwargs)
+        return PlotJob(name, method="lightcurve", kwargs=dict(fields=self._all_source_names(), column=column,
+                                                              label=label, averaging_sec=list(scales),
+                                                              metadata=obs.metadata, **kwargs))
 
     def subband_phases(self, *, column: str = "corrected", label: str = "calibrated", **kwargs) -> str:
         """Residual phase jumps between subbands, per calibrator scan and baseline to the refant.
@@ -1887,20 +1921,31 @@ class PlotNamespace(Namespace):
         Goes through every scan on every calibrator (fringe finders and phase
         calibrators).
         """
+        return self._draw(self._subband_phases_job("subband_phases", column=column, label=label, **kwargs))
+
+    def _subband_phases_job(self, name: str, *, column: str = "corrected", label: str = "calibrated",
+                            **kwargs) -> PlotJob:
+        """The :meth:`subband_phases` plot as a job named ``name``."""
         obs = self._obs
         fields = [s.name for s in obs.sources.calibrators] or [s.name for s in obs.sources.targets]
-        return self._backend.plot.subband_phases(self._code, fields=fields, refant=str(obs.refant).split(",")[0],
-                                                 column=column, label=label, metadata=obs.metadata, **kwargs)
+        return PlotJob(name, method="subband_phases", kwargs=dict(
+            fields=fields, refant=str(obs.refant).split(",")[0], column=column, label=label,
+            metadata=obs.metadata, **kwargs))
 
     def timeseries(self, *, field: str = "", scans: Optional[list] = None,
                    column: str = "corrected", label: str = "", refant: str = "",
                    **kwargs) -> list[str]:
         """Amplitude and phase vs time per baseline for an optional exact scan selection."""
+        return self._draw(self._timeseries_job("timeseries", field=field, scans=scans, column=column, label=label,
+                                               refant=refant, **kwargs))
+
+    def _timeseries_job(self, name: str, *, field: str = "", scans: Optional[list] = None, column: str = "corrected",
+                        label: str = "", refant: str = "", **kwargs) -> PlotJob:
+        """The :meth:`timeseries` plot as a job named ``name``."""
         obs = self._obs
-        return self._backend.plot.timeseries(
-            self._code, field=field or obs.calibrator_field, scans=scans,
-            refant=(refant or str(obs.refant)).split(",")[0], column=column, label=label,
-            metadata=obs.metadata, **kwargs)
+        return PlotJob(name, method="timeseries", kwargs=dict(
+            field=field or obs.calibrator_field, scans=scans, refant=(refant or str(obs.refant)).split(",")[0],
+            column=column, label=label, metadata=obs.metadata, **kwargs))
 
     def time_evolution(self, *, column: str = "data", label: str = "raw") -> list[str]:
         """Amplitude and phase vs time over the whole observation, per baseline to a reference antenna.
@@ -1936,9 +1981,9 @@ class PlotNamespace(Namespace):
                                            without_data={first[0]: gaps["no_data"]},
                                            without_fringes={first[0]: gaps["no_fringes"]})
         roles = {s.name: s.source_type.value for s in obs.sources}
-        jobs = [(f"time_evolution[{entry['refant']},spw{entry['subband']}]",
-                 lambda e=entry: self._time_evolution_figure(e, read.get((e["refant"], e["subband"])), column,
-                                                             label, roles))
+        jobs = [PlotJob(f"time_evolution[{entry['refant']},spw{entry['subband']}]",
+                        call=lambda e=entry: self._time_evolution_figure(e, read.get((e["refant"], e["subband"])),
+                                                                         column, label, roles))
                 for entry in plan]
         written = self._run_jobs(jobs, label)
         logger.info("plot.time_evolution: {} figure(s) of {} planned ({})", len(written), len(plan),
@@ -1996,17 +2041,23 @@ class PlotNamespace(Namespace):
         phases should be flat everywhere, so any structure left in a cell is a
         calibration problem rather than the sky.
         """
+        return self._draw(self._corners_job("corner", field=field, quantities=(quantity,), column=column,
+                                            label=label, **kwargs))[0]
+
+    def corners(self, *, field: str = "", column: str = "corrected", label: str = "", **kwargs) -> list[str]:
+        """Both corner plots — phase and amplitude (Stokes I) — for one field, from a single read of its data."""
+        return self._draw(self._corners_job("corners", field=field, column=column, label=label, **kwargs))
+
+    def _corners_job(self, name: str, *, field: str = "", quantities=("phase", "amp"), column: str = "corrected",
+                     label: str = "", **kwargs) -> PlotJob:
+        """The corner plots of ``quantities`` (one read of the data for all of them) as a job named ``name``."""
         obs = self._obs
         if not field:
             group = obs.sources.phase_calibrators or obs.sources.calibrators or obs.sources.targets
             field = ",".join(s.name for s in group)
-        return self._backend.plot.baseline_corner(self._code, field=field, quantity=quantity,
-                                                  column=column, label=label,
-                                                  metadata=obs.metadata, **kwargs)
-
-    def corners(self, **kwargs) -> list[str]:
-        """Both corner plots — phase and amplitude (Stokes I) — for one field."""
-        return [self.corner(quantity=q, **kwargs) for q in ("phase", "amp")]
+        return PlotJob(name, method="baseline_corners", kwargs=dict(field=field, quantities=list(quantities),
+                                                                    column=column, label=label,
+                                                                    metadata=obs.metadata, **kwargs))
 
     def image_grid(self, images: dict) -> list[str]:
         """Render the FITS images of each source side by side (``{source: {robust: fits}}``)."""

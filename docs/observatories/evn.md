@@ -41,7 +41,7 @@ EVN data products are distributed through the **JIVE archive** at [http://archiv
 - **ANTAB file** (`<project>.antab`): Contains system temperature (Tsys) measurements and gain curve polynomials for each antenna. This must be appended to the FITS-IDI headers before import.
 - **Flag file** (`<project>.uvflg`): A-priori flags in AIPS UVFLG format, marking known bad data (antenna slewing, known RFI, equipment failures).
 
-Protected experiments (those with proprietary periods) require username/password authentication.
+Protected experiments (those with proprietary periods) require username/password authentication: give `--username`/`--password` to any `vlbipy` subcommand (`run` downloads the data when it is not on disk), or set `[import] username` and `password` in the configuration.
 
 ## vlbipy EVN Workflow
 

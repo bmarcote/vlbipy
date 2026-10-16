@@ -213,3 +213,9 @@ average_targets = true       # false = split the target(s) at full time and freq
 radplot_time_bin = 10.0      # seconds averaged per point in the uv-distance plots
 lightcurve_averaging = [0, 30, 120, -1]  # averaging scales (s) in the total light curve:
                              # 0 = native integrations, -1 = one point per scan
+
+[plotting]
+workers = 8                  # most plots of the diagnostic and final-data sets drawn at the same time, each in
+                             # its own worker process reading its own data; never more than the CPUs, and only
+                             # as many as their estimated peak memory allows (below). 1 = one after another.
+memory_fraction = 0.8        # share of the free memory the plots drawn together may take

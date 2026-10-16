@@ -25,11 +25,12 @@ from __future__ import annotations
 import atexit
 import importlib
 import os
+import queue
 import subprocess
 import sys
 import threading
 import traceback
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from multiprocessing.connection import Client, Listener
 from typing import Optional
 
@@ -93,15 +94,17 @@ class WorkerPool:
                                f"({sys.executable} -m vlbipy.solvers.workers): {exc!r}") from exc
         finally:
             listener.close()
-        self._idle = list(range(self.size))
-        self._idle_lock = threading.Lock()
+        # A queue, so a caller with more jobs in flight than workers waits for one to come free; last in,
+        # first out, so the worker freed last (its libraries already loaded) is the one reused.
+        self._idle: queue.LifoQueue = queue.LifoQueue()
+        for index in reversed(range(self.size)):
+            self._idle.put(index)
         self._threads = ThreadPoolExecutor(max_workers=self.size)
         self.closed = False
 
     def _run(self, job: tuple) -> object:
         """Send one job to an idle worker and return its result (raises :class:`WorkerError` on failure)."""
-        with self._idle_lock:
-            index = self._idle.pop()
+        index = self._idle.get()
         try:
             connection = self._connections[index]
             connection.send(job)
@@ -111,11 +114,14 @@ class WorkerPool:
             self.closed = True
             raise WorkerError(f"worker process running {job[0]} died: {exc!r}") from exc
         finally:
-            with self._idle_lock:
-                self._idle.append(index)
+            self._idle.put(index)
         if not ok:
             raise WorkerError(f"worker job {job[0]} failed:\n{payload}")
         return payload
+
+    def run(self, function_path: str, kwargs: dict) -> object:
+        """Run ``function(**kwargs)`` in an idle worker (waiting for one) and return its result."""
+        return self._run((function_path, kwargs))
 
     def map(self, function_path: str, jobs: list[dict]) -> list:
         """Run ``function(**kwargs)`` for every kwargs dict of ``jobs``; results come back in job order."""
@@ -172,6 +178,22 @@ def run_jobs(function_path: str, jobs: list[dict], workers: Optional[int] = None
         function = resolve(function_path)
         return [function(**kwargs) for kwargs in jobs]
     return get_pool(workers).map(function_path, jobs)
+
+
+def submit_jobs(function_path: str, jobs: list[dict], workers: int) -> list[Future]:
+    """Start ``jobs`` in the shared pool, at most ``workers`` at a time, and return one future per job, in order.
+
+    Returns at once, so the caller can do other work meanwhile. Each future gives the job's result or raises
+    :class:`WorkerError` (the job raised, or its worker died); a failed job does not stop the others. Raises
+    ``RuntimeError`` when the pool cannot be started.
+    """
+    if not jobs:
+        return []
+    pool = get_pool()
+    executor = ThreadPoolExecutor(max_workers=max(1, min(int(workers), pool.size)))
+    futures = [executor.submit(pool.run, function_path, kwargs) for kwargs in jobs]
+    executor.shutdown(wait=False)       # the submitted jobs still run; the threads end with the last one
+    return futures
 
 
 def _serve(address: str) -> None:
