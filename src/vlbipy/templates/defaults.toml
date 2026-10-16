@@ -215,6 +215,8 @@ lightcurve_averaging = [0, 30, 120, -1]  # averaging scales (s) in the total lig
                              # 0 = native integrations, -1 = one point per scan
 
 [plotting]
+engine = "auto"              # standard plots (spectra, time series, time evolution): "jplotter" (jiveplot,
+                             # fast), "matplotlib", or "auto" = jplotter when jiveplot is installed
 workers = 8                  # most plots of the diagnostic and final-data sets drawn at the same time, each in
                              # its own worker process reading its own data; never more than the CPUs, and only
                              # as many as their estimated peak memory allows (below). 1 = one after another.

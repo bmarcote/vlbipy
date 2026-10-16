@@ -1170,10 +1170,13 @@ class CalibrateNamespace(Namespace):
             if not wanted <= have:
                 continue
             restricted = survey.restricted_to(wanted)
-            if not expected <= set(restricted.scan_numbers):
-                logger.info("scan_snr: the survey of {} covers only {} of the {} scan(s) on {}; "
+            # The survey has a row for every scan of its sources, but a sampled survey only
+            # fringe-fitted some of them: the others are all-nan and were never looked at.
+            solved = set(restricted.solved_scans())
+            if not expected <= solved:
+                logger.info("scan_snr: the survey of {} solved only {} of the {} scan(s) on {}; "
                             "solving this group on its own", cached_selection,
-                            len(restricted.scan_numbers), len(expected), selection)
+                            len(solved & expected), len(expected), selection)
                 continue
             logger.info("scan_snr: taking {} from the wider survey of {} ({} scan(s)); not "
                         "fringe-fitting again", selection, cached_selection, len(restricted.scan_numbers))
@@ -1637,16 +1640,24 @@ class PlotNamespace(Namespace):
         if column == "data" or (obs.metadata and obs.metadata.snr_survey is not None):
             written += self._run_jobs([PlotJob("scan_snr", call=lambda: self.scan_snr())], label)
         jobs: list[PlotJob] = []
-        if column == "data":
-            jobs += self._scan_diagnostic_jobs(column=column, label=label)
-            if self._backend.supports("plot", "diagnostic"):
-                jobs.append(self._uv_coverage_job("uv_coverage"))
-            if self._backend.supports("plot", "time_evolution"):
-                jobs.append(PlotJob("time_evolution", call=lambda: self.time_evolution(column=column, label=label)))
-        jobs += [self._spectrum_job(f"spectrum[{s.name}]", field=s.name, column=column, label=f"{label}_{s.name}")
-                 for s in calibrators]
-        jobs += [self._timeseries_job(f"timeseries[{s.name}]", field=s.name, column=column, label=f"{label}_{s.name}")
-                 for s in calibrators]
+        if column == "data" and self._backend.supports("plot", "diagnostic"):
+            jobs.append(self._uv_coverage_job("uv_coverage"))
+        if self._use_jplotter():
+            # Per-scan spectra, per-field spectra and time series and the whole-track time evolution in one
+            # batch of parallel jplotter sessions (seconds per figure instead of minutes).
+            jobs.append(PlotJob("jplotter", call=lambda: self.jplotter_set(
+                column=column, label=label, fields=[s.name for s in calibrators], per_scan=column == "data",
+                time_evolution=column == "data" and self._backend.supports("plot", "time_evolution"))))
+        else:
+            if column == "data":
+                jobs += self._scan_diagnostic_jobs(column=column, label=label)
+                if self._backend.supports("plot", "time_evolution"):
+                    jobs.append(PlotJob("time_evolution", call=lambda: self.time_evolution(column=column,
+                                                                                           label=label)))
+            jobs += [self._spectrum_job(f"spectrum[{s.name}]", field=s.name, column=column,
+                                        label=f"{label}_{s.name}") for s in calibrators]
+            jobs += [self._timeseries_job(f"timeseries[{s.name}]", field=s.name, column=column,
+                                          label=f"{label}_{s.name}") for s in calibrators]
         jobs += [self._corners_job(f"corners[{s.name}]", field=s.name, column=column, label=f"{label}_{s.name}")
                  for s in calibrators]
         jobs += self._radplot_jobs(column=column, label=label)
@@ -1963,11 +1974,34 @@ class PlotNamespace(Namespace):
         list of str
             Paths of the PNG files written, ``<code>.<label>.time_evolution.ref<ANT>.spw<N>.png``.
         """
+        obs = self._obs
+        if obs.metadata is None:
+            return []
+        plan, read = self._time_evolution_plan(column)
+        roles = {s.name: s.source_type.value for s in obs.sources}
+        jobs = [PlotJob(f"time_evolution[{entry['refant']},spw{entry['subband']}]",
+                        call=lambda e=entry: self._time_evolution_figure(e, read.get((e["refant"], e["subband"])),
+                                                                         column, label, roles))
+                for entry in plan]
+        written = self._run_jobs(jobs, label)
+        logger.info("plot.time_evolution: {} figure(s) of {} planned ({})", len(written), len(plan),
+                    "; ".join(f"ref {e['refant']} subband {e['subband']}: {e['reason']}" for e in plan) or "none")
+        return written
+
+    def _time_evolution_plan(self, column: str) -> tuple[list[dict], dict]:
+        """The time-evolution figures to make (:func:`~vlbipy.selection.plan_time_evolution`) and the data read.
+
+        The data of the first planned figure tells where its reference antenna has no unflagged data or no
+        fringes, which the metadata cannot; the plan is then made again with that knowledge.
+
+        Returns
+        -------
+        (plan, read)
+            The plan entries and ``{(refant, subband): series}`` of what was read on the way.
+        """
         from ..selection import plan_time_evolution, reference_antenna_gaps
         obs = self._obs
         metadata = obs.metadata
-        if metadata is None:
-            return []
         refant = str(obs.refant).split(",")[0]
         plan = plan_time_evolution(metadata, metadata.snr_survey, refant)
         read: dict[tuple[str, int], dict] = {}
@@ -1980,15 +2014,73 @@ class PlotNamespace(Namespace):
                 plan = plan_time_evolution(metadata, metadata.snr_survey, refant,
                                            without_data={first[0]: gaps["no_data"]},
                                            without_fringes={first[0]: gaps["no_fringes"]})
-        roles = {s.name: s.source_type.value for s in obs.sources}
-        jobs = [PlotJob(f"time_evolution[{entry['refant']},spw{entry['subband']}]",
-                        call=lambda e=entry: self._time_evolution_figure(e, read.get((e["refant"], e["subband"])),
-                                                                         column, label, roles))
-                for entry in plan]
-        written = self._run_jobs(jobs, label)
-        logger.info("plot.time_evolution: {} figure(s) of {} planned ({})", len(written), len(plan),
-                    "; ".join(f"ref {e['refant']} subband {e['subband']}: {e['reason']}" for e in plan) or "none")
-        return written
+        return plan, read
+
+    def _use_jplotter(self) -> bool:
+        """Whether the standard plots are drawn with jiveplot's jplotter (``[plotting].engine``)."""
+        from .. import jplot
+        engine = str(self._obs.config.get("plotting", {}).get("engine", "auto")).lower()
+        if engine == "matplotlib" or not self._backend.supports("data", "is_imported"):
+            return False
+        if not self._backend.data.is_imported(self._code):
+            return False
+        if engine == "jplotter" and not jplot.available():
+            warnings.warn(f"{self._code}: [plotting].engine is 'jplotter' but jiveplot cannot be imported; "
+                          "drawing the standard plots with matplotlib")
+        return jplot.available()
+
+    def _common_subband(self) -> int:
+        """The subband recorded by the most antennas (the first such)."""
+        metadata = self._obs.metadata
+        counts: dict[int, int] = {}
+        for antenna in metadata.observed_antennas:
+            for subband in antenna.subbands or range(metadata.freq_setup.n_subbands):
+                counts[int(subband)] = counts.get(int(subband), 0) + 1
+        return min(counts, key=lambda s: (-counts[s], s)) if counts else 0
+
+    def jplotter_set(self, *, column: str = "data", label: str = "raw", fields: Optional[list[str]] = None,
+                     per_scan: bool = True, time_evolution: bool = True) -> list[str]:
+        """The standard per-scan, per-field and whole-track plots, drawn by jplotter in parallel sessions.
+
+        The same figures and file names as :meth:`scan_diagnostics` (autocorrelation and cross-correlation
+        spectra of each diagnostic scan), :meth:`spectrum` and :meth:`timeseries` (per field, to the
+        reference antenna) and :meth:`time_evolution` (every baseline to each planned reference antenna over
+        the whole observation), in jiveplot's ``standardplots`` style. See :mod:`vlbipy.jplot`.
+
+        Returns
+        -------
+        list of str
+            The PNG pages written.
+        """
+        from .. import jplot
+        obs = self._obs
+        plot = self._backend.plot
+        folder = plot.plot_dir(plot.category_for_column(column))
+        stem = lambda tail: str(folder / f"{self._code}.{tail}")       # noqa: E731
+        refant = str(obs.refant).split(",")[0]
+        figures = []
+        if per_scan:
+            for scan in self._diagnostic_scans():
+                tag = f"{label}_scan{scan.scan_number}"
+                figures.append(jplot.auto_spectrum(stem(f"{tag}.autocorr"), scans=[scan.scan_number]))
+                figures.append(jplot.cross_spectrum(stem(f"{tag}.spectrum"), refant=self._refant_for_scan(scan),
+                                                    scans=[scan.scan_number], all_pols=(column == "data")))
+        subband = self._common_subband()
+        for name in fields if fields is not None else [s.name for s in (obs.sources.calibrators
+                                                                        or obs.sources.targets)]:
+            figures.append(jplot.cross_spectrum(stem(f"{label}_{name}.spectrum"), refant=refant, source=name))
+            figures.append(jplot.amp_phase_time(stem(f"{label}_{name}.timeseries"), refant=refant, subband=subband,
+                                                source=name, by_source=False))
+        if time_evolution and obs.metadata is not None:
+            plan, _ = self._time_evolution_plan(column)
+            for entry in plan:
+                figures.append(jplot.amp_phase_time(
+                    stem(f"{label}.time_evolution.ref{entry['refant']}.spw{entry['subband']}"),
+                    refant=entry["refant"], subband=entry["subband"]))
+        result = jplot.draw(self._backend.ms_path(self._code), figures,
+                            column={"data": "DATA", "corrected": "CORRECTED_DATA"}[column],
+                            log_dir=Path(obs.work_dir) / "logs")
+        return result["files"]
 
     def _time_evolution_figure(self, entry: dict, series: Optional[dict], column: str, label: str,
                                roles: dict) -> list[str]:

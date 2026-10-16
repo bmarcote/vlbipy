@@ -425,6 +425,11 @@ class ScanSNRSurvey:
         out = [self.snr[p][r][c] for p in pols for r in rows for c in cols]
         return [v for v in out if v == v]  # drop nan
 
+    def solved_scans(self) -> list[int]:
+        """Return the scans with at least one solution: a sampled survey leaves the others all-``nan``."""
+        return [scan for row, scan in enumerate(self.scan_numbers)
+                if any(value == value for pol in self.polarizations for value in self.snr[pol][row])]
+
     def median_snr(self, *, antenna: Optional[str] = None, scan_number: Optional[int] = None,
                    polarization: Optional[str] = None) -> float:
         """Return the median finite SNR over a selection (``nan`` if nothing matched)."""

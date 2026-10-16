@@ -212,19 +212,58 @@ def solve_antenna_gains(cross: np.ndarray, wsum: np.ndarray, *, mode: str = "ap"
     return np.where(flags, 1.0, gains), flags, np.where(flags, 0.0, snr)
 
 
-def reference_gains(gains: np.ndarray, flags: np.ndarray, refant_chain: list[int]) -> tuple[np.ndarray, int]:
+def _connected_groups(wsum: np.ndarray, solved: np.ndarray) -> list[list[int]]:
+    """Split the solved antennas into groups joined by baselines with data (``wsum`` (nant, nant, ...))."""
+    linked = wsum.reshape(wsum.shape[0], wsum.shape[1], -1).sum(axis=2) > 0
+    linked = linked | linked.T
+    groups, seen = [], set()
+    for start in np.flatnonzero(solved):
+        if start in seen:
+            continue
+        group, todo = [], [int(start)]
+        seen.add(int(start))
+        while todo:
+            ant = todo.pop()
+            group.append(ant)
+            for other in np.flatnonzero(linked[ant] & solved):
+                if int(other) not in seen:
+                    seen.add(int(other))
+                    todo.append(int(other))
+        groups.append(sorted(group))
+    return groups
+
+
+def reference_gains(gains: np.ndarray, flags: np.ndarray, refant_chain: list[int],
+                    wsum: Optional[np.ndarray] = None) -> tuple[np.ndarray, int]:
     """Rotate one solution (nant, nchan, npol) so its reference antenna has phase zero in every channel and pol.
 
     The reference is the first antenna of ``refant_chain`` with any unflagged value; returns the rotated gains
     and that antenna (-1, gains unchanged, when the chain has no solution).
+
+    With ``wsum`` (the per-baseline weights the solve used), antennas with no baseline path to that reference
+    (a sub-array that never observed with it, combined into the same interval) are referenced to their own
+    best antenna instead: their phase origin is otherwise arbitrary in every channel.
     """
-    refant = next((ant for ant in refant_chain if 0 <= ant < gains.shape[0] and not flags[ant].all()), -1)
-    if refant < 0:
+    nant = gains.shape[0]
+    solved = ~flags.reshape(nant, -1).all(axis=1)
+    refant = next((ant for ant in refant_chain if 0 <= ant < nant and solved[ant]), -1)
+    if refant < 0 and wsum is None:
         return gains, refant
-    reference = gains[refant]
-    modulus = np.abs(reference)
-    rotation = np.conj(np.divide(reference, modulus, out=np.ones_like(reference), where=modulus > 0))
-    return np.where(flags, 1.0, gains * rotation[None]), refant
+    groups = _connected_groups(wsum, solved) if wsum is not None else [list(np.flatnonzero(solved))]
+    rank = {ant: index for index, ant in enumerate(refant_chain)}
+    out = gains.copy()
+    for group in groups:
+        if refant in group:
+            local = refant
+        elif wsum is not None and len(group) > 1:
+            local = min(group, key=lambda ant: (rank.get(ant, len(rank)), -int((~flags[ant]).sum())))
+        else:
+            continue
+        reference = gains[local]
+        modulus = np.abs(reference)
+        rotation = np.conj(np.divide(reference, modulus, out=np.ones_like(reference), where=modulus > 0))
+        out[group] = gains[group] * rotation[None]
+    return np.where(flags, 1.0, out), refant
 
 
 def fill_channel_gaps(gains: np.ndarray, flags: np.ndarray, max_gap: int) -> None:
@@ -342,7 +381,7 @@ def _solve(vis, caltable, *, bandpass: bool, field="", spw="", scan="", timerang
         spw_id = key[1]
         chunk = slice(index * nsol, (index + 1) * nsol)
         flags, snr = flags_all[:, chunk], snr_all[:, chunk]
-        gains, used_refant = reference_gains(gains_all[:, chunk], flags, refant_chain)
+        gains, used_refant = reference_gains(gains_all[:, chunk], flags, refant_chain, wsum=sums[key]["wsum"])
         if solve_mode == "a":
             used_refant = next((ant for ant in refant_chain if not flags[ant].all()), -1)
         if used_refant < 0 and refant_chain:

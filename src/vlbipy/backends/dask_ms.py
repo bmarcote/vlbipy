@@ -33,6 +33,7 @@ Two conversion paths produce identical stores:
 
 """
 import shutil
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -42,7 +43,7 @@ from ..errors import BackendError
 from ..logging_utils import get_logger, warnings
 from ..models import Antenna, FreqSetup, ObsMetadata, Scan, Stokes
 from ..solvers.msio import table_engine
-from .casa import CasaBackend, CasaCalibrationOps, CasaDataOps
+from .casa import CasaBackend, CasaCalibrationOps, CasaDataOps, CasaFlagOps
 
 logger = get_logger()
 
@@ -288,7 +289,77 @@ def ms_to_daskms(ms, store, chunk_rows: int = _DEFAULT_CHUNK_ROWS) -> Path:
     return store
 
 
-class DaskMsDataOps(CasaDataOps):
+class DaskMsPlotReads:
+    """Parallel replacements of the CASA readers behind the slow diagnostic plots (see
+    :mod:`vlbipy.solvers.plot_read`); mixed into :class:`DaskMsDataOps`."""
+
+    def read_dynamic_spectra(self, project_code: str, *, field: str = "", column: str = "corrected",
+                             max_time_bins: int = 200, stokes_i: bool = True,
+                             metadata: Optional[ObsMetadata] = None) -> dict:
+        from ..solvers.plot_read import read_dynamic_spectra
+        from .casa import parallel_hand_indices
+        meta = metadata or self.get_metadata(project_code, [], "")
+        wanted = [f for f in field.split(",") if f]
+        scans = [s for s in meta.scans if not wanted or s.source in wanted]
+        if not scans:
+            raise BackendError(f"{project_code}: no scans on {field!r}")
+        n_time = max(1, int(max_time_bins))
+        edges = np.linspace(min(s.time_start for s in scans), max(s.time_end for s in scans), n_time + 1)
+        pol_indices, pol_labels = parallel_hand_indices(meta)
+        result = read_dynamic_spectra(self.backend.ms_path(project_code), fields=wanted or None,
+                                      column={"corrected": "CORRECTED_DATA", "data": "DATA"}[column],
+                                      corrs=list(pol_indices), edges=edges, stokes_i=stokes_i)
+        names = list(meta.antennas)
+        spectra = {(names[a], names[b]): grid for (a, b), grid in result["spectra"].items()}
+        present = sorted({name for pair in spectra for name in pair}, key=names.index)
+        logger.info("read_dynamic_spectra[dask-ms]: {} baseline(s) over {} time bins x {} channels ({}) in {:.1f}s",
+                    len(spectra), n_time, meta.freq_setup.n_subbands * meta.freq_setup.n_channels,
+                    "Stokes I" if stokes_i else ",".join(pol_labels), result["seconds"])
+        return {"baselines": spectra, "antennas": present, "times": ((edges[:-1] + edges[1:]) / 2.0).tolist(),
+                "frequencies_ghz": meta.freq_setup.frequencies_ghz(), "field": field, "column": column,
+                "stokes_i": stokes_i}
+
+    def _time_evolution_rows(self, project_code: str, meta: ObsMetadata, scans: list, refant: str,
+                             refant_id: int, subband: int, first: int, last: int, column_name: str,
+                             pol_indices: list[int]) -> tuple:
+        """The same rows as the CASA reader, read in parallel (one subband, the central channels only)."""
+        from ..solvers.msio import read_setup
+        from ..solvers.plot_read import read_time_evolution_rows
+        ms_path = self.backend.ms_path(project_code)
+        ddid_to_spw = read_setup(ms_path)["ddid_to_spw"]
+        ncorr = len(meta.freq_setup.polarizations)
+        return read_time_evolution_rows(
+            ms_path, column=column_name.upper(),
+            corrs=None if list(pol_indices) == list(range(ncorr)) else list(pol_indices), refant=refant_id,
+            ddids=[ddid for ddid, spw in enumerate(ddid_to_spw) if int(spw) == int(subband)],
+            scans=[s.scan_number for s in scans], channels=list(range(first, last + 1)))
+
+    def read_uvdistance(self, project_code: str, *, field: str = "", column: str = "corrected",
+                        time_bin: float = 10.0, with_model: bool = False,
+                        metadata: Optional[ObsMetadata] = None) -> dict:
+        from ..solvers.plot_read import read_uvdistance
+        from .casa import parallel_hand_indices
+        meta = metadata or self.get_metadata(project_code, [], "")
+        pol_indices, pol_labels = parallel_hand_indices(meta)
+        ms_path = self.backend.ms_path(project_code)
+        with_model = with_model and self._has_column(ms_path, "MODEL_DATA")
+        wanted = [f for f in field.split(",") if f]
+        starts = {s.scan_number: s.time_start for s in meta.scans if not wanted or s.source in wanted}
+        result = read_uvdistance(ms_path, fields=wanted or None,
+                                 column={"corrected": "CORRECTED_DATA", "data": "DATA"}[column],
+                                 corrs=list(pol_indices), time_bin=time_bin, scan_starts=starts,
+                                 with_model=with_model)
+        logger.info("read_uvdistance[dask-ms]: {} averaged point(s) on {} ({} s bins, per subband{}) in {:.1f}s",
+                    result["uvdist_mlambda"].size, field or "all fields", time_bin,
+                    ", with model" if with_model else "", result["seconds"])
+        out = {"uvdist_mlambda": result["uvdist_mlambda"], "values": result["values"], "polarizations": pol_labels,
+               "field": field, "column": column, "time_bin": time_bin}
+        if with_model:
+            out["model"] = {"uvdist_mlambda": result["uvdist_mlambda"], "values": result["model"]}
+        return out
+
+
+class DaskMsDataOps(DaskMsPlotReads, CasaDataOps):
     """CASA data operations plus lazy dask-ms access and the optional zarr store."""
 
     def _has_ms(self, project_code: str) -> bool:
@@ -600,6 +671,135 @@ class DaskMsCalibrationOps(CasaCalibrationOps):
                            "set; re-run import_data(force=True) to regenerate them")
 
 
+class NativeFlagTasks:
+    """``casatasks`` with ``flagdata`` answered natively where it can be (see :mod:`vlbipy.solvers.flag_task`).
+
+    Every flagging call of the CASA flag operations goes through ``backend.tasks.flagdata``, so wrapping it
+    here moves all of them (a-priori file, autocorrelations, quack, band edges, bandpass gaps, off-source and
+    outlier commands) off ``casatasks.flagdata`` at once. A call the native engine does not reproduce exactly
+    (tfcrop, rflag, an unusual selection) is passed to CASA unchanged; every other attribute is casatasks'.
+    """
+
+    def __init__(self, tasks) -> None:
+        self._tasks = tasks
+
+    def __getattr__(self, name):
+        return getattr(self._tasks, name)
+
+    def flagdata(self, **kwargs):
+        """Run ``flagdata`` natively when the call is a supported selection, otherwise through CASA."""
+        from ..solvers.flag_task import Unsupported, apply_flag_selections, compile_flagdata, read_flag_setup
+        vis = kwargs.get("vis")
+        if vis and Path(str(vis)).is_dir():
+            try:
+                setup = read_flag_setup(vis)
+                selections = compile_flagdata(kwargs, setup)
+            except Unsupported as exc:
+                logger.debug("flagdata: {}; using casatasks.flagdata", exc)
+            else:
+                if kwargs.get("flagbackup"):
+                    self._tasks.flagmanager(vis=str(vis), mode="save", versionname=f"flagdata_{int(time.time())}")
+                stats = apply_flag_selections(vis, selections, setup=setup)
+                logger.info("flagdata[native]: {} command(s) -> {} selection(s), {} of {} row(s) touched, "
+                            "{} cell(s) changed in {} part(s), {:.2f}s", len(selections) if kwargs.get("mode")
+                            != "list" else _count_commands(kwargs), stats["commands"], stats["rows_touched"],
+                            stats["rows"], stats["cells_changed"], stats["parts"], stats["seconds"])
+                return {}
+            from ..solvers.flag_task import parallel_casa_flagdata
+            if kwargs.get("flagbackup"):
+                self._tasks.flagmanager(vis=str(vis), mode="save", versionname=f"flagdata_{int(time.time())}")
+            try:
+                logfile = str(self._tasks.casalog.logfile())
+            except Exception:  # noqa: BLE001 - the parts then log to their own default file
+                logfile = ""
+            stats = parallel_casa_flagdata(dict(kwargs, flagbackup=False), logfile=logfile)
+            if stats is not None:
+                logger.info("flagdata[casa x{}]: mode={} run on every part in parallel, {:.1f}s", stats["parts"],
+                            kwargs.get("mode", "manual"), stats["seconds"])
+                return {}
+        return self._tasks.flagdata(**kwargs)
+
+
+def _count_commands(kwargs: dict) -> int:
+    source = kwargs.get("inpfile")
+    if isinstance(source, (list, tuple)):
+        return len(source)
+    try:
+        return sum(1 for line in Path(str(source)).read_text().splitlines() if line.strip())
+    except OSError:
+        return 0
+
+
+class DaskMsFlagOps(CasaFlagOps):
+    """CASA flag operations with native flag statistics and data reads; the flagdata calls themselves go
+    through :class:`NativeFlagTasks`."""
+
+    def _quack_series(self, project_code: str, meta: ObsMetadata, scans: list, wanted: list[str],
+                      column_name: str, pol_indices: list[int]) -> dict:
+        """Same series as the CASA reader, read in parallel over the table parts (one pass, wanted fields only)."""
+        from ..solvers.flag_task import read_row_amplitudes
+        ncorr = len(meta.freq_setup.polarizations)
+        rows = read_row_amplitudes(self.backend.ms_path(project_code), fields=wanted or None,
+                                   column=column_name.upper(),
+                                   corrs=None if list(pol_indices) == list(range(ncorr)) else list(pol_indices))
+        logger.info("quack: read {} baseline sample(s) in {:.1f}s", rows["time"].size, rows["seconds"])
+        starts = np.array([s.time_start for s in scans], dtype=float)
+        ends = np.array([s.time_end for s in scans], dtype=float)
+        times, ant1, ant2 = rows["time"], rows["ant1"].astype(np.int64), rows["ant2"].astype(np.int64)
+        scan_index = np.searchsorted(starts, times, side="right") - 1
+        inside = (scan_index >= 0) & (scan_index < len(scans))
+        inside[inside] &= times[inside] <= ends[scan_index[inside]]
+        keep = np.flatnonzero(inside)
+        if not keep.size:
+            return {}
+        n_ant = max(len(meta.antennas), 1)
+        codes = (scan_index[keep].astype(np.int64) * n_ant + ant1[keep]) * n_ant + ant2[keep]
+        order = np.argsort(codes, kind="stable")          # keeps subband-then-time order inside each baseline
+        keep, codes = keep[order], codes[order]
+        unique, first = np.unique(codes, return_index=True)
+        series = {}
+        for code, group in zip(unique, np.split(keep, first[1:])):
+            scan_id, pair = divmod(int(code), n_ant * n_ant)
+            series[(scan_id, *divmod(pair, n_ant))] = (times[group] - starts[scan_id],
+                                                       rows["amplitude"][group].astype(float))
+        return series
+
+    def flagged_fraction(self, project_code: str, *, where: str = "") -> float:
+        if where:
+            return super().flagged_fraction(project_code, where=where)
+        from ..solvers.flag_task import count_flags
+        counts = count_flags(self.backend.ms_path(project_code))
+        observable = int(counts["observable"].sum())
+        return int(counts["flagged"].sum()) / observable if observable else 0.0
+
+    def summary(self, project_code: str, *, where: str = "") -> dict:
+        if where:
+            return super().summary(project_code, where=where)
+        from ..solvers.flag_task import count_flags
+        counts = count_flags(self.backend.ms_path(project_code))
+        flagged, observable, names = counts["flagged"], counts["observable"], counts["antenna_names"]
+
+        def entry(f: int, o: int) -> dict:
+            return {"flagged": int(f), "observable": int(o), "fraction": f / o if o else 0.0}
+
+        report = entry(flagged.sum(), observable.sum())
+        report["spw"] = {ddid: entry(flagged[:, :, ddid].sum(), observable[:, :, ddid].sum())
+                         for ddid in range(flagged.shape[2]) if observable[:, :, ddid].sum()}
+        # Each baseline is stored once: an antenna's data is its row plus its column.
+        per_flag = flagged.sum(axis=2)
+        per_obs = observable.sum(axis=2)
+        antenna_f = per_flag.sum(axis=1) + per_flag.sum(axis=0) - np.diag(per_flag)
+        antenna_o = per_obs.sum(axis=1) + per_obs.sum(axis=0) - np.diag(per_obs)
+        report["antenna"] = {name: entry(antenna_f[i], antenna_o[i]) for i, name in enumerate(names)}
+        dead = [i for i, name in enumerate(names) if antenna_o[i] > 0 and antenna_f[i] == antenna_o[i]]
+        alive = np.ones(len(names), dtype=bool)
+        alive[dead] = False
+        keep = alive[:, None] & alive[None, :]
+        report["excluding_dead"] = entry(per_flag[keep].sum(), per_obs[keep].sum())
+        report["excluding_dead"]["excluded_antennas"] = [names[i] for i in dead]
+        return report
+
+
 class DaskMsBackend(CasaBackend):
     """CASA backend with numpy/dask-ms calibration (fringe fits, bandpass, gains, applycal) and difmapy imaging.
 
@@ -616,6 +816,7 @@ class DaskMsBackend(CasaBackend):
 
     data_ops = DaskMsDataOps
     calibration_ops = DaskMsCalibrationOps
+    flag_ops = DaskMsFlagOps
 
     def __init__(self, work_dir: str = ".") -> None:
         try:
@@ -624,6 +825,7 @@ class DaskMsBackend(CasaBackend):
             raise BackendError("the dask-ms backend requires dask-ms: "
                                "pip install vlbipy[daskms]") from exc
         super().__init__(work_dir)
+        self.tasks = NativeFlagTasks(self.tasks)
 
     def store_path(self, project_code: str) -> Path:
         """Return the zarr-store path for a project (work_dir/<code>.zarr)."""

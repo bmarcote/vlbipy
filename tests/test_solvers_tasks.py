@@ -311,3 +311,15 @@ def test_apply_to_ms_writes_corrected_data_flags_and_weights(sim, tmp_path):
     with pytest.raises(NotImplementedError):
         apply_to_ms(sim["ms"], {0: entries}, applymode="trial")
     workers.close_pool()
+
+
+def test_reference_gains_references_each_sub_array_on_its_own_antenna():
+    # Antennas 0-2 and 3-5 never share a baseline (two sub-arrays combined in one solve interval).
+    rng = np.random.default_rng(7)
+    truth = rng.uniform(0.6, 1.5, (6, 4, 2)) * np.exp(1j * rng.uniform(-3, 3, (6, 4, 2)))
+    cross, wsum = _baseline_sums(truth, sparse={(i, j) for i in range(3) for j in range(3, 6)})
+    gains, flags, _ = solve_antenna_gains(cross, wsum, mode="ap", minblperant=2)
+    gains, refant = reference_gains(gains, flags, [1, 4], wsum=wsum)
+    assert refant == 1 and not flags.any()
+    np.testing.assert_allclose(gains[:3], truth[:3] * np.exp(-1j * np.angle(truth[1]))[None], atol=1e-6)
+    np.testing.assert_allclose(gains[3:], truth[3:] * np.exp(-1j * np.angle(truth[4]))[None], atol=1e-6)

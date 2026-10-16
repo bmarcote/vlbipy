@@ -1220,6 +1220,8 @@ class CasaDataOps(DataOps):
         if not pieces:
             raise BackendError(f"{project_code}: no unflagged {column} data on {field!r}")
         ant1, ant2, row_time, row_scan, row_value = (np.concatenate([p[k] for p in pieces]) for k in range(5))
+        if not row_time.size:       # rows were read, but every one of them is fully flagged
+            raise BackendError(f"{project_code}: no unflagged {column} data on {field!r}")
         times = np.unique(row_time)
         index = np.searchsorted(times, row_time)
         n_antenna = len(antenna_names)
@@ -1346,6 +1348,55 @@ class CasaDataOps(DataOps):
         return {"baselines": dict(sorted(baselines.items())), "times": centres.tolist(),
                 "polarizations": pol_labels, "refant": refant, "field": field, "column": column}
 
+    def _time_evolution_rows(self, project_code: str, meta: ObsMetadata, scans: list, refant: str,
+                             refant_id: int, subband: int, first: int, last: int, column_name: str,
+                             pol_indices: list[int]) -> tuple:
+        """Channel-averaged rows of every baseline to ``refant`` in one subband (see :meth:`read_time_evolution`).
+
+        Returns
+        -------
+        tuple
+            ``(other antenna id, time, scan, vis (n_row, n_hand) complex64)``, the reference antenna leading.
+        """
+        pieces: list[tuple] = []
+        ms_tool = self.backend.tools.ms()
+        if not ms_tool.open(str(self.backend.ms_path(project_code)), nomodify=True):
+            raise BackendError(f"could not open MS for {project_code}")
+        try:
+            for scan_chunk in _scan_chunks(scans):
+                ms_tool.selectinit(datadescid=subband)
+                if not ms_tool.selectchannel(last - first + 1, first, 1, 1):
+                    raise BackendError(f"{project_code}: could not select channels {first}-{last} of "
+                                       f"subband {subband}")
+                try:
+                    select_ms_rows(ms_tool, baseline=f"{refant}&*", scans=scan_chunk)
+                except BackendError:
+                    ms_tool.reset()
+                    continue     # nothing recorded on these baselines in these scans
+                try:
+                    record = ms_tool.getdata([column_name, "flag", "antenna1", "antenna2", "time", "scan_number"])
+                except RuntimeError as exc:
+                    raise BackendError(f"{project_code}: could not read {column_name}: {exc}") from exc
+                ms_tool.reset()
+                values = record.get(column_name)
+                if values is None or not values.size:
+                    continue
+                averaged = average_recorded_channels(values, record["flag"], pol_indices)     # (n_row, n_hand)
+                ant1, ant2 = np.asarray(record["antenna1"]), np.asarray(record["antenna2"])
+                # A row is stored once, lower antenna first: turn it so the reference antenna leads.
+                averaged = np.where((ant2 == refant_id)[:, np.newaxis], np.conj(averaged), averaged)
+                keep = np.isfinite(averaged).any(axis=1) & (ant1 != ant2)
+                pieces.append((np.where(ant1 == refant_id, ant2, ant1)[keep],
+                               np.asarray(record["time"], dtype=float)[keep],
+                               np.asarray(record["scan_number"])[keep], averaged[keep]))
+        finally:
+            ms_tool.close()
+
+        if pieces:
+            return tuple(np.concatenate([piece[k] for piece in pieces]) for k in range(4))
+        return (np.zeros(0, dtype=int), np.zeros(0), np.zeros(0, dtype=int),
+                np.zeros((0, len(pol_indices)), dtype=np.complex64))
+
     def read_time_evolution(self, project_code: str, *, refant: str, subband: int, column: str = "data",
                             channel_fraction: float = TIME_EVOLUTION_CHANNEL_FRACTION,
                             metadata: Optional[ObsMetadata] = None, **kwargs) -> dict:
@@ -1400,45 +1451,8 @@ class CasaDataOps(DataOps):
         column_name = {"corrected": "corrected_data", "data": "data"}[column]
         scans = [s for s in meta.scans if refant in s.antennas and (not s.subbands or subband in s.subbands)]
 
-        pieces: list[tuple] = []
-        ms_tool = self.backend.tools.ms()
-        if not ms_tool.open(str(self.backend.ms_path(project_code)), nomodify=True):
-            raise BackendError(f"could not open MS for {project_code}")
-        try:
-            for scan_chunk in _scan_chunks(scans):
-                ms_tool.selectinit(datadescid=subband)
-                if not ms_tool.selectchannel(last - first + 1, first, 1, 1):
-                    raise BackendError(f"{project_code}: could not select channels {first}-{last} of "
-                                       f"subband {subband}")
-                try:
-                    select_ms_rows(ms_tool, baseline=f"{refant}&*", scans=scan_chunk)
-                except BackendError:
-                    ms_tool.reset()
-                    continue     # nothing recorded on these baselines in these scans
-                try:
-                    record = ms_tool.getdata([column_name, "flag", "antenna1", "antenna2", "time", "scan_number"])
-                except RuntimeError as exc:
-                    raise BackendError(f"{project_code}: could not read {column}: {exc}") from exc
-                ms_tool.reset()
-                values = record.get(column_name)
-                if values is None or not values.size:
-                    continue
-                averaged = average_recorded_channels(values, record["flag"], pol_indices)     # (n_row, n_hand)
-                ant1, ant2 = np.asarray(record["antenna1"]), np.asarray(record["antenna2"])
-                # A row is stored once, lower antenna first: turn it so the reference antenna leads.
-                averaged = np.where((ant2 == refant_id)[:, np.newaxis], np.conj(averaged), averaged)
-                keep = np.isfinite(averaged).any(axis=1) & (ant1 != ant2)
-                pieces.append((np.where(ant1 == refant_id, ant2, ant1)[keep],
-                               np.asarray(record["time"], dtype=float)[keep],
-                               np.asarray(record["scan_number"])[keep], averaged[keep]))
-        finally:
-            ms_tool.close()
-
-        if pieces:
-            other, row_time, row_scan, row_vis = (np.concatenate([piece[k] for piece in pieces]) for k in range(4))
-        else:
-            other, row_time, row_scan = np.zeros(0, dtype=int), np.zeros(0), np.zeros(0, dtype=int)
-            row_vis = np.zeros((0, len(pol_indices)), dtype=np.complex64)
+        other, row_time, row_scan, row_vis = self._time_evolution_rows(
+            project_code, meta, scans, refant, refant_id, subband, first, last, column_name, pol_indices)
         others = [name for name in antenna_names if name != refant and meta.antennas[name].observed]
         baselines: dict[str, dict] = {}
         notes: dict[str, str] = {}
@@ -2519,13 +2533,18 @@ class CasaCalibrationOps(CalibrationOps):
         scan, into a temporary table. Those solutions are referenced to that
         stage's refant, so the refant's own stage-1 solution is added to them
         (phase, delay and dispersive delay) before the rows are appended, which
-        puts every antenna on the stage-1 reference. Nothing is applied to the
-        data in between and nothing is flagged: the priors are attached on the
-        fly for all stages alike.
+        puts every antenna on the stage-1 reference. A stage marked
+        ``independent`` (a sub-array that shares no baseline with the antennas
+        solved so far) keeps its own reference and is appended unchanged.
+        Nothing is applied to the data in between and nothing is flagged: the
+        priors are attached on the fly for all stages alike.
         """
         for index, stage in enumerate(stages):
             first = index == 0
-            antennas = list(stage["antennas"]) + ([] if first else [stage["refant"]])
+            independent = bool(stage.get("independent")) and not first
+            antennas = list(stage["antennas"])
+            if not first and stage["refant"] not in antennas:
+                antennas.append(stage["refant"])
             target = table_path if first else table_path.with_name(f"{table_path.name}.stage{index + 1}")
             # The field must match the stage's own scan: stages may come from different
             # sources (the brightest source need not detect every antenna), and a field
@@ -2538,21 +2557,29 @@ class CasaCalibrationOps(CalibrationOps):
                         "antennas={} refant={}", suffix, index + 1, len(stages), field, stage["scan"],
                         params["timerange"] or "whole scan", ",".join(antennas), stage["refant"])
             self._fringefit(project_code, params, gaintable, field=field, callib=callib)
-            if not first:
+            if independent:
+                added = self._rebase_and_append(table_path, target, meta, stage["refant"], stage["antennas"],
+                                                rebase=False)
+                shutil.rmtree(target, ignore_errors=True)
+                logger.info("initial_calibration[{}] stage {}: {} solution row(s) of a separate sub-array "
+                            "(own reference {}) appended", suffix, index + 1, added, stage["refant"])
+            elif not first:
                 added = self._rebase_and_append(table_path, target, meta, stage["refant"], stage["antennas"])
                 shutil.rmtree(target, ignore_errors=True)
                 logger.info("initial_calibration[{}] stage {}: {} solution row(s) re-based onto the stage-1 "
                             "reference and appended", suffix, index + 1, added)
 
     def _rebase_and_append(self, main_path: Path, stage_path: Path, meta: ObsMetadata, refant: str,
-                           antennas: list[str]) -> int:
+                           antennas: list[str], *, rebase: bool = True) -> int:
         """Append ``stage_path`` rows for ``antennas`` to ``main_path``, re-based onto the main reference.
 
         A fringe table stores per row FPARAM ``(4 * npol, 1)`` = (phase, delay,
         rate, dispersive) per polarization, relative to the row's reference
         antenna. Adding the ``refant`` row of the main table (same subband)
         to each stage row expresses it relative to the main table's reference.
-        Rows of the stage refant itself (zero by construction) are dropped.
+        Rows of the stage refant itself (zero by construction) are dropped unless
+        it is one of ``antennas``. With ``rebase=False`` (a separate sub-array)
+        the rows are appended as solved, on their own reference.
         """
         table = self.backend.tools.table()
         table.open(str(main_path / "ANTENNA"))
@@ -2574,7 +2601,7 @@ class CasaCalibrationOps(CalibrationOps):
         offsets: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         for row in np.where(main_ant == ref_id)[0]:
             offsets[int(main_spw[row])] = (main_par[:, :, row], main_flag[:, :, row])
-        if not offsets:
+        if not offsets and rebase:
             raise BackendError(f"stage reference antenna {refant} has no solution in {main_path.name}")
         main_reference = int(np.bincount(main_ref[main_ref >= 0]).argmax()) if np.any(main_ref >= 0) else ref_id
 
@@ -2584,8 +2611,8 @@ class CasaCalibrationOps(CalibrationOps):
             spw = np.asarray(table.getcol("SPECTRAL_WINDOW_ID"))
             par = np.asarray(table.getcol("FPARAM"))
             flag = np.asarray(table.getcol("FLAG"))
-            keep = [r for r in range(len(ant)) if int(ant[r]) in wanted and int(spw[r]) in offsets]
-            for row in keep:
+            keep = [r for r in range(len(ant)) if int(ant[r]) in wanted and (not rebase or int(spw[r]) in offsets)]
+            for row in keep if rebase else []:
                 ref_par, ref_flag = offsets[int(spw[row])]
                 par[:, :, row] += ref_par
                 flag[:, :, row] |= ref_flag
@@ -2602,7 +2629,8 @@ class CasaCalibrationOps(CalibrationOps):
                 main_flag[:, :, target][fill] = False
             table.putcol("FPARAM", par)
             table.putcol("FLAG", flag)
-            table.putcol("ANTENNA2", np.full(len(ant), main_reference, dtype=main_ref.dtype))
+            if rebase:
+                table.putcol("ANTENNA2", np.full(len(ant), main_reference, dtype=main_ref.dtype))
             drop = [r for r in range(len(ant)) if r not in set(keep) or r in set(merged)]
             if drop:
                 table.removerows(drop)
@@ -4159,6 +4187,81 @@ class CasaFlagOps(FlagOps):
                     report["n_transfer"])
         return report
 
+    def _quack_series(self, project_code: str, meta: ObsMetadata, scans: list, wanted: list[str],
+                      column_name: str, pol_indices: list[int]) -> dict:
+        """Read the channel-averaged amplitude of every baseline in every scan of ``scans``.
+
+        Returns
+        -------
+        dict
+            ``{(scan index, antenna1, antenna2): (seconds since the scan start, amplitudes)}``, the samples of
+            each subband after the previous one's (subbands in DATA_DESC_ID order, time order within each);
+            empty when nothing usable was read.
+        """
+        antenna_names = list(meta.antennas)
+        starts = np.array([s.time_start for s in scans], dtype=float)
+        ends = np.array([s.time_end for s in scans], dtype=float)
+        # amplitude[(scan, a, b)] -> (offsets, amplitudes) for one baseline in one scan.
+        # Read a few scans of one subband at a time: a whole subband over every field
+        # does not fit in memory on a long experiment (EM163: ~9 GB per subband).
+        n_ant = max(len(antenna_names), 1)
+        pieces: dict[tuple, list] = {}
+        scan_numbers = [s.scan_number for s in scans]
+        scan_chunks = [scan_numbers[i:i + _QUACK_SCANS_PER_READ]
+                       for i in range(0, len(scan_numbers), _QUACK_SCANS_PER_READ)]
+        ms_tool = self.backend.tools.ms()
+        if not ms_tool.open(str(self.backend.ms_path(project_code))):
+            raise BackendError(f"could not open MS for {project_code}")
+        try:
+            for spw in range(meta.freq_setup.n_subbands):
+                for scan_chunk in scan_chunks:
+                    ms_tool.selectinit(datadescid=spw)
+                    try:
+                        select_ms_rows(ms_tool, field=",".join(wanted), scans=scan_chunk)
+                    except BackendError:
+                        ms_tool.reset()
+                        continue     # nothing recorded in this subband for these scans
+                    try:
+                        record = ms_tool.getdata([column_name, "flag", "time",
+                                                  "antenna1", "antenna2"])
+                    except RuntimeError as exc:
+                        raise BackendError(f"{project_code}: could not read {column_name}: {exc}") from exc
+                    ms_tool.reset()
+                    values = record.get(column_name)
+                    if values is None or not values.size:
+                        continue
+                    flags = np.asarray(record["flag"], dtype=bool)[pol_indices, :, :]
+                    amplitude = np.abs(values[pol_indices, :, :])
+                    del values, record["flag"]
+                    amplitude[flags] = np.nan
+                    with np.errstate(invalid="ignore"):
+                        amplitude = np.nanmean(amplitude, axis=(0, 1))
+                    times = np.asarray(record["time"], dtype=float)
+                    ant1, ant2 = np.asarray(record["antenna1"]), np.asarray(record["antenna2"])
+                    scan_index = np.searchsorted(starts, times, side="right") - 1
+                    inside = (scan_index >= 0) & (scan_index < len(scans))
+                    inside[inside] &= times[inside] <= ends[scan_index[inside]]
+                    rows = np.flatnonzero(inside & np.isfinite(amplitude) & (ant1 != ant2))
+                    if not rows.size:
+                        continue
+                    codes = (scan_index[rows].astype(np.int64) * n_ant + ant1[rows]) * n_ant + ant2[rows]
+                    order = np.argsort(codes, kind="stable")
+                    rows, codes = rows[order], codes[order]
+                    unique, first = np.unique(codes, return_index=True)
+                    for code, group in zip(unique, np.split(rows, first[1:])):
+                        scan_id, pair = divmod(int(code), n_ant * n_ant)
+                        key = (scan_id, *divmod(pair, n_ant))
+                        pieces.setdefault(key, []).append(
+                            (times[group] - starts[scan_id], amplitude[group].astype(np.float32)))
+        finally:
+            ms_tool.close()
+        if not pieces:
+            return {}
+        series = {key: (np.concatenate([p[0] for p in parts]),
+                        np.concatenate([p[1] for p in parts]).astype(float))
+                  for key, parts in pieces.items()}
+        return series
+
     def measure_quack(self, project_code: str, *, field: str = "", column: str = "corrected",
                       sigma: float = 2.0, max_seconds: float = 120.0,
                       metadata: Optional[ObsMetadata] = None, **kwargs) -> dict:
@@ -4211,72 +4314,13 @@ class CasaFlagOps(FlagOps):
             raise BackendError(f"{project_code}: no scans on {field!r}")
         integration = max(0.5, min((s.integration_time for s in scans if s.integration_time),
                                    default=2.0))
-        starts = np.array([s.time_start for s in scans], dtype=float)
-        ends = np.array([s.time_end for s in scans], dtype=float)
         antenna_names = list(meta.antennas)
         pol_indices, _ = parallel_hand_indices(meta)
         column_name = {"corrected": "corrected_data", "data": "data"}[column]
 
-        # amplitude[(scan, a, b)] -> (offsets, amplitudes) for one baseline in one scan.
-        # Read a few scans of one subband at a time: a whole subband over every field
-        # does not fit in memory on a long experiment (EM163: ~9 GB per subband).
-        n_ant = max(len(antenna_names), 1)
-        pieces: dict[tuple, list] = {}
-        scan_numbers = [s.scan_number for s in scans]
-        scan_chunks = [scan_numbers[i:i + _QUACK_SCANS_PER_READ]
-                       for i in range(0, len(scan_numbers), _QUACK_SCANS_PER_READ)]
-        ms_tool = self.backend.tools.ms()
-        if not ms_tool.open(str(self.backend.ms_path(project_code))):
-            raise BackendError(f"could not open MS for {project_code}")
-        try:
-            for spw in range(meta.freq_setup.n_subbands):
-                for scan_chunk in scan_chunks:
-                    ms_tool.selectinit(datadescid=spw)
-                    try:
-                        select_ms_rows(ms_tool, field=",".join(wanted), scans=scan_chunk)
-                    except BackendError:
-                        ms_tool.reset()
-                        continue     # nothing recorded in this subband for these scans
-                    try:
-                        record = ms_tool.getdata([column_name, "flag", "time",
-                                                  "antenna1", "antenna2"])
-                    except RuntimeError as exc:
-                        raise BackendError(f"{project_code}: could not read {column}: {exc}") from exc
-                    ms_tool.reset()
-                    values = record.get(column_name)
-                    if values is None or not values.size:
-                        continue
-                    flags = np.asarray(record["flag"], dtype=bool)[pol_indices, :, :]
-                    amplitude = np.abs(values[pol_indices, :, :])
-                    del values, record["flag"]
-                    amplitude[flags] = np.nan
-                    with np.errstate(invalid="ignore"):
-                        amplitude = np.nanmean(amplitude, axis=(0, 1))
-                    times = np.asarray(record["time"], dtype=float)
-                    ant1, ant2 = np.asarray(record["antenna1"]), np.asarray(record["antenna2"])
-                    scan_index = np.searchsorted(starts, times, side="right") - 1
-                    inside = (scan_index >= 0) & (scan_index < len(scans))
-                    inside[inside] &= times[inside] <= ends[scan_index[inside]]
-                    rows = np.flatnonzero(inside & np.isfinite(amplitude) & (ant1 != ant2))
-                    if not rows.size:
-                        continue
-                    codes = (scan_index[rows].astype(np.int64) * n_ant + ant1[rows]) * n_ant + ant2[rows]
-                    order = np.argsort(codes, kind="stable")
-                    rows, codes = rows[order], codes[order]
-                    unique, first = np.unique(codes, return_index=True)
-                    for code, group in zip(unique, np.split(rows, first[1:])):
-                        scan_id, pair = divmod(int(code), n_ant * n_ant)
-                        key = (scan_id, *divmod(pair, n_ant))
-                        pieces.setdefault(key, []).append(
-                            (times[group] - starts[scan_id], amplitude[group].astype(np.float32)))
-        finally:
-            ms_tool.close()
-        if not pieces:
+        series = self._quack_series(project_code, meta, scans, wanted, column_name, pol_indices)
+        if not series:
             raise BackendError(f"{project_code}: no usable data on {field!r} to measure the slew")
-        series = {key: (np.concatenate([p[0] for p in parts]),
-                        np.concatenate([p[1] for p in parts]).astype(float))
-                  for key, parts in pieces.items()}
-        del pieces
         # (scan, antenna) -> baselines of that antenna in that scan
         by_scan_antenna: dict[tuple, list] = {}
         for key, entries in series.items():
@@ -4296,8 +4340,12 @@ class CasaFlagOps(FlagOps):
             offsets, amps = offsets[keep], amps[keep]
             return _leading_low_seconds(offsets, amps, sigma, integration, max_seconds)
 
-        scan_antennas = {i: {int(a) for key in series if key[0] == i for a in key[1:]}
-                         for i in range(len(scans))}
+        scan_antennas: dict[int, set] = {}
+        for key in series:
+            scan_antennas.setdefault(key[0], set()).update(int(a) for a in key[1:])
+        # A baseline's leading-low stretch changes only when an antenna of its scan is masked: cache it per scan
+        # and drop a scan's entries when that happens, instead of re-measuring every baseline on every round.
+        lows_cache: dict[tuple, list] = {}
         per_scan: dict[str, list] = {}
         per_antenna: dict[str, float] = {}
         masked: dict[int, float] = {}
@@ -4311,7 +4359,10 @@ class CasaFlagOps(FlagOps):
                     if len(baselines) < 2:
                         continue     # one baseline cannot separate the two ends
                     # Median consensus: at least half (and >=2) baselines must agree.
-                    lows = [baseline_leading_low(entries, masked, scan) for entries in baselines]
+                    lows = lows_cache.get((scan, antenna_id))
+                    if lows is None:
+                        lows = lows_cache[(scan, antenna_id)] = [baseline_leading_low(entries, masked, scan)
+                                                                 for entries in baselines]
                     estimates.setdefault(antenna_id, []).append(_scan_consensus(lows))
             # Per-antenna: median over scans (robust to scans where the antenna did not slew).
             aggregated = {a: float(np.median(v)) for a, v in estimates.items() if v}
@@ -4325,6 +4376,7 @@ class CasaFlagOps(FlagOps):
             if seconds <= 0:
                 continue     # nothing to flag for this one; the rest will be smaller still
             masked[worst] = seconds
+            lows_cache = {key: lows for key, lows in lows_cache.items() if worst not in scan_antennas.get(key[0], ())}
             per_antenna[name] = seconds
             logger.info("quack: {} slews for {:.0f}s (median over {} scan(s))",
                         name, seconds, len(estimates.get(worst, [])))
@@ -5444,7 +5496,7 @@ class CasaPlotOps(PlotOps):
                         metadata: Optional[ObsMetadata] = None, **kwargs) -> str:
         """Plot the per-baseline time x frequency corner grid for one field."""
         return self.baseline_corners(project_code, field=field, column=column, quantities=(quantity,),
-                                     max_time_bins=max_time_bins, label=label, metadata=metadata)[0]
+                                     max_time_bins=max_time_bins, label=label, metadata=metadata, **kwargs)[0]
 
     def baseline_corners(self, project_code: str, *, field: str = "", column: str = "corrected",
                          quantities=("phase", "amp"), max_time_bins: int = 200, label: str = "",
@@ -5457,10 +5509,10 @@ class CasaPlotOps(PlotOps):
         Returns
         -------
         list of str
-            One PNG per quantity, in the order of ``quantities``.
+            One PNG per quantity, in the order of ``quantities``. ``spectra=`` reuses a read.
         """
         from ..plotting import plot_baseline_corner
-        spectra = self.backend.data.read_dynamic_spectra(
+        spectra = kwargs.get("spectra") or self.backend.data.read_dynamic_spectra(
             project_code, field=field, column=column, max_time_bins=max_time_bins,
             stokes_i=True, metadata=metadata)
         directory = self.plot_dir(self.category_for_column(column))

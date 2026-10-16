@@ -227,7 +227,10 @@ def plan_sbd_stages(survey: ScanSNRSurvey, antennas: list[str], *, min_snr: floa
     uncovered are further scans added, each detecting at least one
     already-solved antenna that becomes that stage's reference, so its
     solutions can be re-based onto the first stage's reference. As few scans
-    as possible are used.
+    as possible are used. Antennas that no remaining scan ties to the solved
+    ones (a sub-array that never observed together with the rest, as in
+    staggered global VLBI) start a separate chain on their own reference; such
+    a stage is marked ``"independent": True`` and is not re-based.
 
     Coverage is counted per polarization of each antenna (see
     :func:`detected_hands_per_scan`): an antenna whose second polarization only
@@ -298,13 +301,28 @@ def plan_sbd_stages(survey: ScanSNRSurvey, antennas: list[str], *, min_snr: floa
                 usable = [n for n in names if gained_pols <= hands_of(n, found) & hands_of(n, covered)]
             if usable and found - covered:
                 references[scan] = sorted(usable, key=rank)
+        independent = False
+        if not references and stages:
+            # Nothing left shares a solved antenna: a sub-array that never observed together
+            # with the rest (staggered global VLBI). Its baselines never involve the solved
+            # antennas, so its own reference serves just as well: start a separate chain.
+            independent = True
+            for scan, found in remaining.items():
+                gained_pols = {pol for _, pol in found - covered}
+                usable = [n for n in {antenna for antenna, _ in found} if gained_pols <= hands_of(n, found)]
+                # One antenna on its own has no baseline: nothing to solve.
+                if usable and len({antenna for antenna, _ in found - covered}) >= 2:
+                    references[scan] = sorted(usable, key=rank)
         if not references:
             break
         # Best source first, then the widest coverage on it, then its strongest scan.
         best = max(references, key=lambda s: (by_source.get(s, 0), len(remaining[s] - covered), score(s)))
         gained = remaining[best] - covered
         gained_names = sorted({antenna for antenna, _ in gained}, key=rank)
-        stages.append({"scan": best, "antennas": gained_names, "refant": references[best][0]})
+        stage = {"scan": best, "antennas": gained_names, "refant": references[best][0]}
+        if independent:
+            stage["independent"] = True
+        stages.append(stage)
         covered |= gained
         remaining.pop(best)
 
@@ -321,7 +339,8 @@ def plan_sbd_stages(survey: ScanSNRSurvey, antennas: list[str], *, min_snr: floa
     else:
         logger.info("scan selection: no single scan covers the array; SBD in {} stage(s): {}", len(stages),
                     "; ".join(f"scan {s['scan']} on {scan_source.get(s['scan'], '?')} "
-                              f"({','.join(s['antennas'])}; ref {s['refant']})" for s in stages))
+                              f"({','.join(s['antennas'])}; ref {s['refant']}{', separate sub-array' if s.get('independent') else ''})"
+                              for s in stages))
     one_handed = sorted(name for name in {antenna for antenna, _ in required}
                         if len(hands_of(name, required)) < len(survey.polarizations))
     if one_handed:

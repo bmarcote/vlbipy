@@ -348,3 +348,43 @@ def test_restricting_a_survey_keeps_only_the_wanted_sources():
     assert only_ff.snr["RR"] == [s.snr["RR"][0]]
     assert s.scan_numbers == [1, 2]                        # the original is untouched
     assert s.restricted_to(["NOPE"]).scan_numbers == []
+
+
+def test_a_sub_array_that_never_meets_the_rest_gets_its_own_chain():
+    # Staggered global VLBI (GL048): EF/WB/JB observe first, MC/T6 later, and no scan has both groups.
+    s = survey({1: [90, 50, 40, NAN, NAN], 2: [NAN, NAN, NAN, 30, 20]})
+    stages = plan_sbd_stages(s, ["EF", "WB", "JB", "MC", "T6"], min_snr=7)
+    assert [st["scan"] for st in stages] == [1, 2]
+    assert not stages[0].get("independent")
+    assert stages[1]["independent"] and set(stages[1]["antennas"]) == {"MC", "T6"}
+    assert stages[1]["refant"] in {"MC", "T6"}
+
+
+def test_a_scan_that_can_be_chained_is_preferred_over_a_separate_sub_array():
+    # Scan 2 ties MC to WB; scan 3 holds MC and T6 alone. Chain first, then T6 comes through MC.
+    s = survey({1: [90, 50, 40, NAN, NAN], 2: [NAN, 60, NAN, 30, NAN], 3: [NAN, NAN, NAN, 30, 20]})
+    stages = plan_sbd_stages(s, ["EF", "WB", "JB", "MC", "T6"], min_snr=7)
+    assert [st["scan"] for st in stages] == [1, 2, 3]
+    assert not any(st.get("independent") for st in stages)
+    assert stages[2]["refant"] == "MC" and stages[2]["antennas"] == ["T6"]
+
+
+def test_solved_scans_leaves_out_the_rows_a_sampled_survey_never_fitted():
+    s = survey({1: [90, 50, 40, NAN, NAN], 2: [NAN] * 5, 3: [NAN, NAN, NAN, 30, 20]})
+    assert s.solved_scans() == [1, 3]
+
+
+def test_a_sampled_wider_survey_is_not_reused_for_scans_it_never_fitted():
+    from types import SimpleNamespace
+    from vlbipy.models import Scan
+    from vlbipy.namespaces import CalibrateNamespace
+    # The phase-calibrator survey sampled scan 1 of the fringe finder but never fitted scan 3.
+    wide = ScanSNRSurvey(project_code="p", scan_numbers=[1, 2, 3], scan_sources=["FF", "PC", "FF"],
+                         antennas=["EF", "WB"], snr={"RR": [[NAN, 50], [NAN, 40], [NAN, NAN]]})
+    scans = [Scan(scan_number=n, source=src) for n, src in ((1, "FF"), (2, "PC"), (3, "FF"))]
+    obs = SimpleNamespace(metadata=SimpleNamespace(scans=scans), _snr_surveys={"PC,FF": wide})
+    namespace = CalibrateNamespace.__new__(CalibrateNamespace)
+    namespace._obs = obs
+    assert namespace._wider_survey("FF") is None
+    wide.snr["RR"][2] = [NAN, 30]                          # once scan 3 is fitted the slice is reused
+    assert namespace._wider_survey("FF").scan_numbers == [1, 3]
