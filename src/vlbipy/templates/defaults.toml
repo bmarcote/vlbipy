@@ -109,7 +109,8 @@ zerorates = true             # instrumental delay is constant in time: do not fi
 
 [calibration.bandpass]
 solint = "inf"
-combine = "scan"
+combine = "scan,field"       # one bandpass per antenna from every selected scan and source (a staggered
+                             # array sees each fringe finder with part of the antennas only)
 minsnr = 3.0
 solnorm = true               # normalise: keep the band shape, not the flux scale
 bandtype = 'B'
@@ -120,6 +121,7 @@ solint = "inf"               # one amplitude per antenna and subband for the who
 combine = "scan"
 minsnr = 3.0
 solnorm = true               # keep the a-priori flux scale; level the subbands only
+fill_unsolved = true         # an unsolved antenna/subband gets gain 1 instead of flagging its data
 
 [calibration.mbd]
 solint = "inf"
@@ -129,6 +131,13 @@ channel_fraction = 0.8       # central channels used, as for the SBD: the edges 
                              # carry the least trustworthy phase, so they must not bias the
                              # delay. The solution is still applied across the whole band.
 zerorates = false            # atmospheric residuals vary in time: fit the rate
+retry_minsnr = 3.0           # an antenna solved on fewer than retry_below of the calibrator scans it
+retry_below = 0.5            # observed is re-solved on the rest at this SNR; the new solutions are kept
+                             # only if it then reaches retry_below, otherwise the antenna's unsolved
+                             # data are flagged on apply (retry_minsnr = 0 disables the retry)
+max_delay_step = 0.0         # ...and only if its delays are consistent: median change between solutions
+                             # at most this (ns; 0 = 1/total bandwidth). Noise peaks jump across the
+                             # search window; an antenna failing this is lost (its solutions flagged)
 
 # Time smoothing of the fringe (MBD, MBD2, ...) solutions. Each solution carries the noise
 # of one solution interval, while the residual atmospheric delay and rate it measures drift

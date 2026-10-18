@@ -36,15 +36,24 @@ obs.run()
 | `scan_snr` | short fringe fit per scan: SNR per scan, antenna and polarization |
 | `instrumental` | select antennas and scan(s), then SBD → MBD → bandpass → SBD → MBD again |
 | `flag.edges` | measure the subband roll-off from the bandpass and flag it |
-| `apply` | apply the instrumental chain to every field |
+| `apply` | apply the instrumental chain to every field (deferred on dask-ms, see below) |
 | `flag.outliers` | per-baseline robust outlier flagging on calibrated data |
 | `second_pass` | re-solve the whole chain on the now-clean data |
 | `scalar_bandpass` | one amplitude per antenna and subband, levelling the subbands |
-| `apply` | full calibration |
+| `apply` | full calibration (deferred on dask-ms) |
 | `reweight` | `statwt` from the calibrated scatter; then `flag.outliers` and a third pass |
-| `plot.diagnostics("corrected")` | the same plots on the calibrated data |
 | `export.per_source` | split per source, export UVFITS |
 | `flag.statistics` | flagged fraction per antenna / subband over observable data; goes into the report |
+| `selfcal` | difmapy self-calibration of the calibrators, re-split; ends with the final `apply`, which writes CORRECTED_DATA |
+| `plot.diagnostics("corrected")` | the same plots on the calibrated data, with the final calibration |
+
+On the dask-ms backend every `apply` before the last one is *deferred*: it
+writes the calibration flags, but not CORRECTED_DATA. The steps in between
+read the corrected data through readers that apply the tables to DATA as they
+read it, the way AIPS applies its CL table when a task reads with `DOCAL`.
+CORRECTED_DATA is written once, with the final chain, so the Multi-MS can be
+inspected by hand at the end of the run. See
+[the dask-ms backend](../backends/index.md#deferred-application).
 
 A representative run on a 2.8 h, 14-antenna EVN dataset (8.3 GB) takes about
 25 minutes, dominated by the two fringe-fitting passes.

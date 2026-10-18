@@ -388,3 +388,85 @@ def test_a_sampled_wider_survey_is_not_reused_for_scans_it_never_fitted():
     assert namespace._wider_survey("FF") is None
     wide.snr["RR"][2] = [NAN, 30]                          # once scan 3 is fitted the slice is reused
     assert namespace._wider_survey("FF").scan_numbers == [1, 3]
+
+
+def test_stage_window_follows_the_reference_antenna_data():
+    """On a staggered scan the solve window goes where the stage's reference antenna has data (GL048 scan 362)."""
+    import numpy as np
+    from vlbipy.backends.casa import CasaCalibrationOps
+    from vlbipy.models import Antenna, ObsMetadata, Scan
+
+    start = 5_000_000_000.0
+    times = start + np.arange(0, 760, 2.0)  # 12.7-min scan, 2-s integrations
+    ref_has_data = times >= start + 440  # the reference antenna joins only in the last 5 min
+
+    class Selected:
+        def nrows(self):
+            return len(times)
+
+        def getcol(self, name):
+            return {"TIME": times, "FLAG_ROW": np.zeros(len(times), bool),
+                    "FLAGGED": np.where(ref_has_data, 0.0, 1.0)}[name]
+
+        def close(self):
+            pass
+
+    class Table:
+        def open(self, path):
+            pass
+
+        def query(self, query, columns=""):
+            assert "ANTENNA1==1" in query and "[0]" in query
+            return Selected()
+
+        def close(self):
+            pass
+
+    class Backend:
+        tools = type("Tools", (), {"table": staticmethod(Table)})
+
+        @staticmethod
+        def ms_path(code):
+            return Path("x.ms")
+
+    ops = CasaCalibrationOps(Backend())
+    meta = ObsMetadata(project_code="p", antennas={n: Antenna(name=n) for n in ("KP", "YY")},
+                       scans=[Scan(scan_number=7, source="S", time_start=start, time_end=start + 760)])
+    central = ops._solve_window(meta, 7, 120)
+    window = ops._stage_window("p", meta, 7, "YY", ["YY", "KP"], 120)
+    assert window != central
+    begin = window.split("~")[0]
+    assert begin == ops._timerange(start + 440 - 0.5, start).split("~")[0]
+    # Data everywhere: the central window is kept.
+    ref_has_data[:] = True
+    assert ops._stage_window("p", meta, 7, "YY", ["YY", "KP"], 120) == central
+
+
+def test_later_stage_reference_is_the_least_flagged_solved_antenna(tmp_path):
+    """A planned reference that records half the band (CD on GL048) gives way to a solved full-band antenna."""
+    import numpy as np
+    from vlbipy.backends.casa import CasaCalibrationOps
+
+    flags = np.zeros((8, 1, 6), dtype=bool)
+    flags[..., 0:3] = [True, True, False]      # CD: two of its three subband rows flagged
+    antennas = np.array([0, 0, 0, 1, 1, 1])     # CD, KT
+
+    class Table:
+        def open(self, path):
+            self.path = path
+
+        def getcol(self, name):
+            if self.path.endswith("ANTENNA"):
+                return np.array(["CD", "KT", "UR"])
+            return {"ANTENNA1": antennas, "FLAG": flags}[name]
+
+        def close(self):
+            pass
+
+    class Backend:
+        tools = type("Tools", (), {"table": staticmethod(Table)})
+
+    ops = CasaCalibrationOps(Backend())
+    assert ops._best_solved_reference(tmp_path / "t.sbd", "CD", ["KT", "UR"]) == "KT"
+    flags[:] = False
+    assert ops._best_solved_reference(tmp_path / "t.sbd", "CD", ["KT"]) == "CD"   # tie: keep the plan

@@ -1184,8 +1184,14 @@ class CalibrateNamespace(Namespace):
             return restricted
         return None
 
-    def apply(self, *, force: bool = False, field: str = "") -> None:
-        """Apply the accumulated calibration tables to every source (or one ``field``)."""
+    def apply(self, *, force: bool = False, field: str = "", defer: bool = False) -> None:
+        """Apply the accumulated calibration tables to every source (or one ``field``).
+
+        ``defer=True`` lets a backend that can (dask-ms) record the application without writing
+        CORRECTED_DATA: the calibration flags are written, and the readers of the corrected data apply the
+        tables while they read DATA (see :mod:`vlbipy.solvers.corrected`); :meth:`write_corrected` writes the
+        column. Other backends apply as usual.
+        """
         if not self._obs._state.should_run("apply", force=force):
             return
         # Empty selection = every observed source field: the targets need the
@@ -1193,10 +1199,18 @@ class CalibrateNamespace(Namespace):
         # from raw data.  Per-source calls let the field mapping resolve nearest for
         # calibrators and the phase calibrator for targets.
         cal_cfg = self._obs.config.get("calibration", {})
+        options = {"defer": True} if defer and getattr(self._backend.calibrate, "defers_apply", False) else {}
         self._backend.calibrate.apply(
             self._code, field, list(self._obs.gaintables),
-            callib=cal_cfg.get("callib", False))
+            callib=cal_cfg.get("callib", False), **options)
         self._obs._state.mark_complete("apply")
+
+    def write_corrected(self) -> None:
+        """Write CORRECTED_DATA where an application was deferred (no-op when it is up to date, or on a
+        backend that does not defer)."""
+        ensure = getattr(self._backend.calibrate, "ensure_corrected", None)
+        if ensure is not None:
+            ensure(self._code)
 
 
 class FlagNamespace(Namespace):
@@ -2077,6 +2091,8 @@ class PlotNamespace(Namespace):
                 figures.append(jplot.amp_phase_time(
                     stem(f"{label}.time_evolution.ref{entry['refant']}.spw{entry['subband']}"),
                     refant=entry["refant"], subband=entry["subband"]))
+        if column == "corrected":
+            obs.calibrate.write_corrected()          # jplotter reads the column itself
         result = jplot.draw(self._backend.ms_path(self._code), figures,
                             column={"data": "DATA", "corrected": "CORRECTED_DATA"}[column],
                             log_dir=Path(obs.work_dir) / "logs")
@@ -2472,7 +2488,8 @@ class SelfcalNamespace(Namespace):
         phasecals = [s.name for s in obs.sources.phase_calibrators if s.name in with_data and s.name not in finders]
         for name in finders + phasecals:
             if obs._state.should_run(f"selfcal_{name}", force=force):
-                obs.calibrate.apply(force=True, field=name)
+                # Deferred: only the split reads it, and calibrates while it reads (dask-ms).
+                obs.calibrate.apply(force=True, field=name, defer=True)
                 obs.clean.split_ms(name, force=True)
             results[name] = self.calibrator(name, force=force)
         if results:

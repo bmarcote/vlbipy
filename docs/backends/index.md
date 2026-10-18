@@ -98,11 +98,76 @@ working directory, and CASA tools (`plotms`, `applycal`) can read the tables.
 Each step is cut into jobs — a job reads its part of the data, reduces it and
 returns a small result — and the jobs run inside a persistent pool of worker
 processes. Processes rather than threads are used because casacore I/O does
-not scale with threads.
+not scale with threads. The array work inside a job does: each job gets its
+share of the cores (all of them when fewer jobs than cores run, as with one
+job per sub-MS), which its numpy blocks and compiled loops use as threads.
 
 The calibration application parallelises over the sub-MSs of a Multi-MS (the
 import default, `[import] mms = true`). A plain measurement set is corrected
 by a single worker and is several times slower for that step.
+
+### Deferred application
+
+The pipeline applies its calibration chain after every calibration pass and
+every self-calibration step, but the steps in between only *read* the
+corrected data. Writing CORRECTED_DATA each time copies the whole data set:
+for GL048 (22 M rows, a 66 GB Multi-MS) that is about 60 GB of disk traffic
+per application, 15-25 minutes on a disk array, seven times per run. The
+dask-ms backend defers those applications instead, the way AIPS keeps its
+calibration in CL tables and applies it while a task reads (`DOCAL`):
+
+- `calibrate.apply(defer=True)` writes only the calibration flags (the data
+  without a valid solution, from FLAG and the tables alone: a few hundred MB)
+  and records the chain of every field in `<ms>/.vlbipy_corrected/`, with a
+  copy of each table, since later solves rewrite them in place;
+- the dask-ms readers of the corrected column (the flagging and plot readers,
+  `statwt`, the per-source split) read DATA and apply the recorded chain as
+  they read it, with the code that writes CORRECTED_DATA: they see the same
+  visibilities, flags and weights an `applycal` would have left, bit for bit;
+- CORRECTED_DATA is written by `calibrate.write_corrected()`, which the
+  pipeline calls once, at the end of the calibration, and before anything
+  reads the column itself: a CASA task, the `ms` tool, jplotter.
+
+A `statwt` between two applications is kept: its weights stay those of the
+corrected data until the next application rebuilds them, as on disk.
+
+### Cost of applying calibration
+
+Calibrating rows takes two steps, and both are vectorized:
+
+- **The gains.** A row needs the chain's gains at its two antennas, its
+  subband and its time. Those points are listed once per block, and each
+  table is evaluated at all of them in one pass, with no loop over antennas or
+  subbands: a table's rows are indexed once, and one search finds the
+  solutions around every point. A bandpass is mapped onto the data
+  channels once per distinct solution. Each point is evaluated on its own, so
+  a row gets the same gains in any block it is read with.
+- **The correction.** Feed rotation, division by the gains, flags and weights
+  are one pass over the visibilities.
+
+When numba is installed (it comes with the `daskms` extra), the per-value
+work (multiplying the factors out on every channel, and the correction) runs
+as compiled loops on all the cores of the job, with numpy's own formulas, so
+the results match numpy's (bit for bit on the machine measured below).
+Without numba, numpy does the same work in threads.
+
+Measured on GL048 (the full 12-table chain with fringe, bandpass, Tsys and
+gain-curve tables, 16 subbands x 64 channels, 2 correlations), on a 2010
+Xeon E5620 (no AVX):
+
+| Per row | before (1 core) | numpy (1 core) | numba (1 core) | numba (8 threads) |
+| --- | --- | --- | --- | --- |
+| Gains, 400k-row batch | 24 µs | 5.7 µs | 3.0 µs | 2.0 µs |
+| Gains, one scan (900 rows) | 113 µs | 12 µs | 10 µs | 10 µs |
+| Correction | 7 µs | 4.6 µs | 2.1 µs | 0.75 µs |
+
+A one-scan read pays a fixed cost of about 10 ms per call for the gains.
+
+A GPU does not help here. On this machine's TITAN X the correction kernel takes
+0.02 µs per row, but moving the visibilities, flags and weights over PCIe and
+back takes 0.56 µs per row (6 GB/s), about what this CPU needs with 8 threads.
+A modern laptop CPU is several times faster per core than this one, and the
+disk, not the arithmetic, sets the pace of a pass over the data.
 
 The engine lives in `vlbipy.solvers`:
 
@@ -114,6 +179,8 @@ The engine lives in `vlbipy.solvers`:
 | `solvers/fringefit_task.py`, `solvers/fringe.py` | fringe fitting |
 | `solvers/gain_task.py` | bandpass and gaincal |
 | `solvers/apply_task.py`, `solvers/apply.py` | applycal and calibration-table interpolation |
+| `solvers/kernels.py` | compiled loops of the calibration (numba, optional) |
+| `solvers/corrected.py` | the record of what CORRECTED_DATA holds (deferred applications) |
 | `solvers/parang.py` | parallactic angle |
 | `solvers/caltable.py` | calibration tables |
 
@@ -122,6 +189,8 @@ The engine lives in `vlbipy.solvers`:
 | Setting | Effect |
 | --- | --- |
 | `VLBIPY_WORKERS=N` (environment) | Number of worker processes. Default: the number of CPU cores, capped at 16. `1` runs everything in-process. |
+| `VLBIPY_THREADS=N` (environment) | Threads a job uses for its array work. Default: its share of the cores (the cores divided by the jobs running at once). |
+| `VLBIPY_NUMBA=0` (environment) | Uses numpy for the calibration loops even when numba is installed. |
 | `VLBIPY_TABLE_ENGINE=casacore` or `VLBIPY_TABLE_ENGINE=casatools` (environment) | Forces the table I/O library. By default python-casacore (pulled in by dask-ms) is used when it works on the machine, otherwise `casatools.table` is used automatically (python-casacore is broken on some macOS builds). |
 | `[import] mms` | `true` (default) imports to a Multi-MS, which lets `applycal` run in parallel over its sub-MSs. |
 | `[import] zarr_store` | `true` also writes the zarr store `<code>.zarr` (default `false`). |

@@ -335,30 +335,53 @@ def read_runs(specs: list[dict], columns: list[str], *, engine: str, chans_by_dd
     pieces: dict[str, list] = {}
     handles: dict[str, object] = {}
     try:
-        for spec in specs:
-            handle = handles.get(spec["path"])
+        for span in _adjacent(specs, chans_by_ddid):
+            first = span[0]
+            handle = handles.get(first["path"])
             if handle is None:
-                handle = handles[spec["path"]] = open_table(spec["path"], engine=engine)
-            start, nrow, keep = spec["start"], spec["nrow"], None
+                handle = handles[first["path"]] = open_table(first["path"], engine=engine)
+            counts = np.array([spec["nrow"] for spec in span])
+            start, nrow, keep = first["start"], int(counts.sum()), None
+            spec_columns = {name: np.repeat([spec[key] for spec in span], counts).astype(np.int64)
+                            for name, key in (("FIELD_ID", "field"), ("SCAN_NUMBER", "scan"),
+                                              ("DATA_DESC_ID", "ddid"))}
             if timerange is not None:
                 time = np.asarray(handle.getcol("TIME", start, nrow), dtype=np.float64)
                 inside = np.flatnonzero((time >= timerange[0]) & (time <= timerange[1]))
                 if not inside.size:
                     continue
+                spec_columns = {name: values[inside[0]:inside[-1] + 1] for name, values in spec_columns.items()}
                 start, nrow = start + int(inside[0]), int(inside[-1] - inside[0]) + 1
                 if inside.size != nrow:
                     keep = inside - inside[0]
-            chans = chans_by_ddid.get(spec["ddid"]) if chans_by_ddid is not None else None
+            chans = chans_by_ddid.get(first["ddid"]) if chans_by_ddid is not None else None
             block = read_run(handle, start, nrow, columns, chans=chans, corrs=corrs, nchan=nchan, ncorr=ncorr)
-            block["FIELD_ID"] = np.full(nrow, spec["field"], dtype=np.int64)
-            block["SCAN_NUMBER"] = np.full(nrow, spec["scan"], dtype=np.int64)
-            block["DATA_DESC_ID"] = np.full(nrow, spec["ddid"], dtype=np.int64)
+            block.update(spec_columns)
             for name, values in block.items():
                 pieces.setdefault(name, []).append(values if keep is None else values[keep])
     finally:
         for handle in handles.values():
             handle.close()
     return {name: (values[0] if len(values) == 1 else np.concatenate(values)) for name, values in pieces.items()}
+
+
+def _adjacent(specs: list[dict], chans_by_ddid: Optional[dict]) -> list[list[dict]]:
+    """``specs`` grouped into spans of consecutive rows of one table that are read with the same channel selection.
+
+    A measurement set that interleaves its subbands row by row (a split, an mstransform output) has runs of a
+    single row; reading them one ``getcol`` at a time would take longer than the data.
+    """
+    spans: list[list[dict]] = []
+    for spec in specs:
+        if spans:
+            last = spans[-1][-1]
+            same_channels = chans_by_ddid is None or np.array_equal(
+                np.asarray(chans_by_ddid.get(last["ddid"], [])), np.asarray(chans_by_ddid.get(spec["ddid"], [])))
+            if last["path"] == spec["path"] and last["start"] + last["nrow"] == spec["start"] and same_channels:
+                spans[-1].append(spec)
+                continue
+        spans.append([spec])
+    return spans
 
 
 def split_rows(specs: list[dict], max_rows: int) -> list[list[dict]]:

@@ -142,3 +142,35 @@ def test_import_namespace_skips_when_store_exists(store):
     assert meta.source_names == ["3C345", "J1848+3219"]
     assert obs.data[0].DATA.shape == (3, 2, 2)
     assert obs.state.status("import_data") == "done"
+
+
+def test_casa_tasks_get_a_deferred_calibration_written_before_reading_it(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from vlbipy.backends.dask_ms import NativeFlagTasks
+    from vlbipy.solvers import corrected
+    ms, plain = tmp_path / "deferred.ms", tmp_path / "plain.ms"
+    (ms / corrected.RECORD_DIR).mkdir(parents=True)
+    plain.mkdir()
+    calls = []
+    monkeypatch.setattr(corrected, "write_pending", lambda vis, *a, **k: calls.append("write") or [])
+    monkeypatch.setattr(corrected, "forget", lambda vis: calls.append("forget"))
+    monkeypatch.setattr(corrected, "record_external", lambda vis, fields, label: calls.append(f"external:{label}"))
+    monkeypatch.setattr(corrected, "load_record", lambda vis: {"fields": {0: {}}, "written": {}})
+    tasks = SimpleNamespace(**{name: (lambda name: lambda **kw: calls.append(name))(name)
+                               for name in ("tclean", "flagmanager", "plotms", "clearcal", "applycal", "split")})
+    wrapped = NativeFlagTasks(tasks)
+
+    def run(task, vis=ms, **kwargs):
+        calls.clear()
+        getattr(wrapped, task)(vis=str(vis), **kwargs)
+        return list(calls)
+
+    assert run("tclean") == ["write", "tclean"]                       # tclean reads the corrected data
+    assert run("split", datacolumn="data") == ["split"]
+    assert run("split", datacolumn="corrected") == ["write", "split"]
+    assert run("flagmanager", mode="save") == ["flagmanager"]
+    assert run("plotms") == ["plotms"] and run("plotms", ydatacolumn="corrected") == ["write", "plotms"]
+    assert run("clearcal") == ["clearcal", "forget"]
+    assert run("applycal") == ["write", "applycal", "external:casa"]
+    assert run("tclean", vis=plain) == ["tclean"]                     # no record: nothing deferred there

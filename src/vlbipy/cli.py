@@ -230,16 +230,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_plot.add_argument("--outdir", help="Output directory passed to direct plot operations")
     p_plot.add_argument("--caltable", help="Calibration table path for the direct caltable plot kind")
 
-    p_apply = sub.add_parser("applycal", formatter_class=RichHelpFormatter,
-                             help="Apply CASA calibration directly to an existing measurement set")
-    p_apply.add_argument("ms", metavar="MS", help="Existing CASA measurement set")
-    p_apply.add_argument("caltables", nargs="*", metavar="CALTABLE", help="Calibration table(s) to apply")
-    p_apply.add_argument("--callib", metavar="FILE", help="Existing CASA calibration-library file")
-    for selection in ("field", "spw", "intent", "timerange", "antenna", "scan", "observation"):
-        p_apply.add_argument(f"--{selection}", default="", help=f"CASA {selection} selection")
-    p_apply.add_argument("--parang", action=argparse.BooleanOptionalAction, default=True,
-                         help="Apply parallactic-angle correction (default: true)")
-    p_apply.add_argument("--applymode", help="CASA apply mode")
+    p_apply = sub.add_parser(
+        "applycal", formatter_class=RichHelpFormatter,
+        help="Apply calibration table(s) to any measurement set",
+        description="Apply calibration tables to a measurement set, in any order on the command line "
+                    "(vlbipy applycal MS TABLE... or vlbipy applycal TABLE... MS). On a set that has "
+                    "CORRECTED_DATA the tables are applied on top of it (their corrections multiply what is "
+                    "there, flags are added and weights scaled); otherwise to DATA, written to CORRECTED_DATA. "
+                    "A table solved on another set (a split, a difmapy self-calibration) is matched by antenna "
+                    "name, and --gainfield names are those of the table's fields.")
+    p_apply.add_argument("paths", nargs="+", metavar="MS|CALTABLE",
+                         help="The measurement set and the calibration table(s), in any order")
+    p_apply.add_argument("--callib", metavar="FILE", help="Existing CASA calibration-library file (CASA applycal)")
+    for selection in ("field", "spw", "scan"):
+        p_apply.add_argument(f"--{selection}", default="", help=f"Comma-separated {selection} selection")
+    for selection in ("intent", "timerange", "antenna", "observation"):
+        p_apply.add_argument(f"--{selection}", default="",
+                             help=f"CASA {selection} selection (CASA applycal: needs --from-data on a set "
+                                  "with CORRECTED_DATA)")
+    p_apply.add_argument("--from-data", action="store_true",
+                         help="Apply to DATA even when CORRECTED_DATA exists (replacing it, as CASA's applycal)")
+    p_apply.add_argument("--parang", action="store_true",
+                         help="Apply the parallactic-angle correction (off without it, as in CASA; for data that "
+                              "are not calibrated yet)")
+    p_apply.add_argument("--applymode", help="calflagstrict (default), calflag or calonly")
     p_apply.add_argument("--flagbackup", action=argparse.BooleanOptionalAction, default=None,
                          help="Back up flags before applying calibration")
     p_apply.add_argument("--gainfield", nargs="+", help="Per-table gain field(s); one broadcasts")
@@ -297,20 +311,20 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         return
     if args.command != "applycal":
         return
-    if not args.caltables and not args.callib:
+    for path in args.paths:
+        if not Path(path).is_dir():
+            parser.error(f"not a measurement set or calibration table: {path}")
+    ms, caltables = _ms_and_tables(args.paths)
+    if not caltables and not args.callib:
         parser.error("applycal requires at least one CALTABLE or --callib FILE")
-    if args.caltables and args.callib:
+    if caltables and args.callib:
         parser.error("CALTABLE arguments and --callib are mutually exclusive")
-    if not Path(args.ms).is_dir():
-        parser.error(f"measurement set not found: {args.ms}")
-    paths = [args.callib] if args.callib else args.caltables
-    for path in paths:
-        if not Path(path).exists():
-            parser.error(f"calibration path not found: {path}")
+    if args.callib and not Path(args.callib).exists():
+        parser.error(f"calibration path not found: {args.callib}")
     for name in ("gainfield", "interp", "spwmap", "calwt"):
         values = getattr(args, name)
-        if values and len(values) not in (1, len(args.caltables)):
-            parser.error(f"--{name} accepts one value or exactly {len(args.caltables)} values")
+        if values and len(values) not in (1, len(caltables)):
+            parser.error(f"--{name} accepts one value or exactly {len(caltables)} values")
     for value in args.calwt or []:
         if value.strip().lower() not in ("true", "false"):
             parser.error(f"--calwt values must be true or false, got {value!r}")
@@ -469,28 +483,93 @@ def _cmd_image(obs: VLBIObs, args: argparse.Namespace) -> int:
     return 0
 
 
+def _table_kind(path: str) -> str:
+    """``"ms"``, ``"caltable"`` or ``""`` from the type line of a CASA table's ``table.info``."""
+    info = Path(path) / "table.info"
+    try:
+        first = info.read_text(errors="replace").splitlines()[0].lower()
+    except (OSError, IndexError):
+        return ""
+    if "measurement set" in first:
+        return "ms"
+    return "caltable" if "calibration" in first else ""
+
+
+def _ms_and_tables(paths: list[str]) -> tuple[str, list[str]]:
+    """The measurement set and the calibration tables of the positional arguments, given in any order.
+
+    A calibration table says so in its ``table.info``; the measurement set is the one path that is not one
+    (not every writer labels a measurement set as such).
+    """
+    kinds = [_table_kind(path) for path in paths]
+    sets = [path for path, kind in zip(paths, kinds) if kind == "ms"] or \
+        [path for path, kind in zip(paths, kinds) if kind != "caltable"]
+    if len(sets) != 1:
+        if not any(kinds):                        # nothing recognised: the documented order
+            return paths[0], list(paths[1:])
+        raise SystemExit(f"applycal: expected one measurement set among {', '.join(paths)} "
+                         f"(found {len(sets)})")
+    return sets[0], [path for path in paths if path != sets[0]]
+
+
 def _cmd_applycal(obs: Optional[VLBIObs], args: argparse.Namespace) -> int:
-    """Apply explicit calibration tables or an existing CASA cal-library to an arbitrary MS."""
-    backend, code = _direct_backend(args.ms)
-    task_kwargs = {name: getattr(args, name) for name in
-                   ("spw", "intent", "timerange", "antenna", "scan", "observation", "applymode", "flagbackup")
-                   if getattr(args, name) not in (None, "")}
-    if args.callib:
-        backend.calibrate.apply_callib(code, str(Path(args.callib).resolve()), field=args.field,
-                                       parang=args.parang, **task_kwargs)
+    """Apply calibration tables (natively, on top of CORRECTED_DATA when there is one) or a CASA cal-library."""
+    ms, caltables = _ms_and_tables(args.paths)
+    ms = str(Path(ms).resolve())
+    casa_selection = {name: getattr(args, name) for name in ("intent", "timerange", "antenna", "observation")
+                      if getattr(args, name)}
+    if args.callib or casa_selection:
+        has_corrected = (Path(ms) / "table.dat").exists() and _has_corrected(ms)
+        if has_corrected and not args.from_data:
+            raise SystemExit("applycal: --callib and the --intent/--timerange/--antenna/--observation selections "
+                             "go through CASA's applycal, which replaces CORRECTED_DATA from DATA: add --from-data")
+        backend, code = _direct_backend(ms)
+        task_kwargs = {name: getattr(args, name) for name in
+                       ("spw", "intent", "timerange", "antenna", "scan", "observation", "applymode", "flagbackup")
+                       if getattr(args, name) not in (None, "")}
+        parang = bool(args.parang)
+        if args.callib:
+            backend.calibrate.apply_callib(code, str(Path(args.callib).resolve()), field=args.field,
+                                           parang=parang, **task_kwargs)
+            return 0
+        count = len(caltables)
+        gainfields = _broadcast(args.gainfield, count, "")
+        interps = _broadcast(args.interp, count, "linear")
+        spwmaps = _broadcast(args.spwmap, count, "")
+        calwts = _broadcast(args.calwt, count, "true")
+        tables = [CalTable(Path(path).suffix.lstrip(".") or Path(path).name, path=str(Path(path).resolve()),
+                           gainfield=gainfields[index], interp=interps[index],
+                           spwmap=[int(value) for value in spwmaps[index].split(",") if value.strip()],
+                           calwt=_parse_bool(calwts[index]))
+                  for index, path in enumerate(caltables)]
+        backend.calibrate.apply(code, args.field, tables, parang=parang, **task_kwargs)
         return 0
-    count = len(args.caltables)
-    gainfields = _broadcast(args.gainfield, count, "")
-    interps = _broadcast(args.interp, count, "linear")
-    spwmaps = _broadcast(args.spwmap, count, "")
-    calwts = _broadcast(args.calwt, count, "true")
-    tables = [CalTable(Path(path).suffix.lstrip(".") or Path(path).name, path=str(Path(path).resolve()),
-                       gainfield=gainfields[index], interp=interps[index],
-                       spwmap=[int(value) for value in spwmaps[index].split(",") if value.strip()],
-                       calwt=_parse_bool(calwts[index]))
-              for index, path in enumerate(args.caltables)]
-    backend.calibrate.apply(code, args.field, tables, parang=args.parang, **task_kwargs)
+    if not caltables:
+        raise SystemExit("applycal: no calibration table given")
+    from .solvers.apply_task import applycal
+    if args.flagbackup:
+        import casatasks
+        casatasks.flagmanager(vis=ms, mode="save", versionname="before_applycal", merge="replace")
+    count = len(caltables)
+    try:
+        applycal(ms, [str(Path(path).resolve()) for path in caltables], field=args.field, spw=args.spw,
+                 scan=args.scan, gainfield=_broadcast(args.gainfield, count, ""),
+                 interp=_broadcast(args.interp, count, "linear"), spwmap=_broadcast(args.spwmap, count, ""),
+                 calwt=_broadcast(args.calwt, count, "true"), parang=args.parang,
+                 applymode=args.applymode or "calflagstrict", on_corrected=False if args.from_data else None)
+    except (ValueError, NotImplementedError) as exc:
+        raise SystemExit(f"applycal: {exc}") from exc
     return 0
+
+
+def _has_corrected(ms: str) -> bool:
+    """Whether a measurement set (or Multi-MS) has a CORRECTED_DATA column."""
+    from .solvers.msio import ms_parts, open_table
+    handle = open_table(ms_parts(ms)[0])
+    try:
+        return "CORRECTED_DATA" in handle.colnames()
+    finally:
+        handle.close()
 
 
 def _parse_scans(values: Optional[list[str]]) -> Optional[list[int]]:

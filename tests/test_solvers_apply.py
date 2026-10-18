@@ -522,3 +522,115 @@ def test_real_sbd_flattens_phase_vs_channel():
           f"after {total_after / checked:.3f} rad")
     assert checked > 10
     assert total_after < 0.3 * total_before
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# Compiled loops (numba): the same numbers as the numpy code they replace
+# ----------------------------------------------------------------------------------------------------------------
+TWO_PI_E9 = 2 * np.pi * 1e-9
+
+
+def _compiled():
+    from vlbipy.solvers import kernels
+    if not kernels.available():
+        pytest.skip("numba is not installed")
+    return kernels
+
+
+def _same(compiled, reference):
+    """Equal values, bit for bit where numpy does not use fused multiply-adds (a few ulps otherwise)."""
+    compiled, reference = np.asarray(compiled), np.asarray(reference)
+    if compiled.dtype.kind == "c":
+        np.testing.assert_allclose(compiled, reference, rtol=5e-7, atol=0)
+    else:
+        np.testing.assert_array_equal(compiled, reference)
+
+
+@pytest.mark.parametrize("ncorr", [1, 2, 4])
+@pytest.mark.parametrize("variant", ["plain", "rotated", "channels", "spectral weights", "no weights"])
+def test_compiled_correction_gives_the_numbers_of_numpy(monkeypatch, ncorr, variant):
+    kernels = _compiled()
+    rng = np.random.default_rng(ncorr)
+    npoint, nrow, nchan = 60, 200, NCHAN
+    gain = (rng.normal(size=(npoint, nchan, 2)) + 1j * rng.normal(size=(npoint, nchan, 2))).astype(np.complex64)
+    gain[rng.random(gain.shape) < 0.02] = 1.0
+    grid = {"gain": gain, "gflag": rng.random(gain.shape) < 0.05,
+            "wscale": rng.uniform(0.2, 2.0, (npoint, nchan if variant == "spectral weights" else 1, 2)
+                                  ).astype(np.float32)}
+    chans = np.array([1, 2, 5, 6]) if variant == "channels" else None
+    width = nchan if chans is None else chans.size
+    vis = (rng.normal(size=(nrow, width, ncorr)) + 1j * rng.normal(size=(nrow, width, ncorr))).astype(np.complex64)
+    vis[rng.random(vis.shape) < 0.02] = np.nan
+    flag = rng.random(vis.shape) < 0.05
+    weight = None if variant == "no weights" else rng.uniform(0.5, 2.0, vis.shape).astype(np.float32)
+    point1, point2 = rng.integers(0, npoint, nrow), rng.integers(0, npoint, nrow)
+    rotation = rotate = None
+    if variant == "rotated":
+        rotation = np.exp(1j * rng.uniform(-3, 3, (nrow, ncorr))).astype(np.complex64)
+        rotate = rng.random(nrow) < 0.6
+    results = []
+    for compiled in (True, False):
+        monkeypatch.setattr(kernels, "available", lambda compiled=compiled: compiled)
+        v, f = vis.copy(), flag.copy()
+        w = None if weight is None else weight.copy()
+        ap.apply_point_grid(v, f, w, grid, point1, point2, chans, rotation=rotation, rotate=rotate, invalid=True)
+        results.append((v, f, w))
+    (v1, f1, w1), (v2, f2, w2) = results
+    _same(v1, v2)
+    _same(f1, f2)
+    if weight is not None:
+        _same(w1, w2)
+
+
+@pytest.mark.parametrize("fringe", [False, True])
+@pytest.mark.parametrize("spectral", [False, True])
+def test_compiled_assembly_gives_the_numbers_of_numpy(fringe, spectral):
+    kernels = _compiled()
+    rng = np.random.default_rng(int(fringe) + 2 * int(spectral))
+    npoint, nchan, nspw = 80, NCHAN, 2
+    flat = rng.normal(size=(npoint, 2)) + 1j * rng.normal(size=(npoint, 2))
+    flat[:3] = 0.0                                               # a zero gain is flagged
+    flat[3, 1] = np.nan                                          # so is one that is not finite
+    factors = {"flat": flat, "flat_flag": rng.random((npoint, 2)) < 0.1, "spw_index": rng.integers(0, nspw, npoint),
+               "fringe": None, "offset": TWO_PI_E9 * (MS_CHAN_FREQ - MS_CHAN_FREQ[:, :1]), "kdisp": None,
+               "spectral": None}
+    if fringe:
+        factors["fringe"] = (rng.uniform(-3, 3, (npoint, 2)), rng.uniform(-50, 50, (npoint, 2)),
+                             rng.uniform(-1e-3, 1e-3, (npoint, 2)), rng.random((npoint, 2)) < 0.1)
+        factors["kdisp"] = rng.normal(size=(nspw, nchan))
+    if spectral:
+        nvalue = 7
+        values = rng.normal(size=(nvalue, 2, nchan)) + 1j * rng.normal(size=(nvalue, 2, nchan))
+        factors["spectral"] = (values, rng.random(values.shape) < 0.1, rng.integers(0, nvalue, npoint))
+    gain, gflag = np.empty((npoint, nchan, 2), np.complex64), np.empty((npoint, nchan, 2), bool)
+    kernels.assemble(gain, gflag, factors["flat"], factors["flat_flag"], factors["spw_index"],
+                     fringe=factors["fringe"], offset=factors["offset"], kdisp=factors["kdisp"],
+                     spectral=factors["spectral"])
+    g, f = ap._assemble(factors, nchan)
+    f |= ~np.isfinite(g) | (g == 0)
+    np.copyto(g, 1.0, where=f)
+    _same(gflag, f.transpose(0, 2, 1))
+    _same(gain, g.transpose(0, 2, 1).astype(np.complex64))
+    assert gflag[:3].all() and gflag[3, :, 1].all() and (gain[gflag] == 1).all()
+
+
+
+def test_a_loop_numba_cannot_compile_falls_back_to_numpy(monkeypatch):
+    kernels = _compiled()
+    import numba
+
+    def cannot_compile(*args):
+        raise numba.core.errors.TypingError("not on this machine")
+    monkeypatch.setattr(kernels, "_correct", cannot_compile)
+    monkeypatch.setattr(kernels, "_FAILED", [])
+    rng = np.random.default_rng(7)
+    gain = (rng.normal(size=(20, NCHAN, 2)) + 1j * rng.normal(size=(20, NCHAN, 2))).astype(np.complex64)
+    grid = {"gain": gain, "gflag": rng.random(gain.shape) < 0.1, "wscale": None}
+    vis = (rng.normal(size=(30, NCHAN, 2)) + 1j * rng.normal(size=(30, NCHAN, 2))).astype(np.complex64)
+    point1, point2 = rng.integers(0, 20, 30), rng.integers(0, 20, 30)
+    expected, expected_flag = vis / (gain[point1] * np.conj(gain[point2])), grid["gflag"][point1] | grid["gflag"][point2]
+    flag = np.zeros(vis.shape, bool)
+    ap.apply_point_grid(vis, flag, None, grid, point1, point2)
+    np.testing.assert_array_equal(vis, expected)
+    np.testing.assert_array_equal(flag, expected_flag)
+    assert not kernels.available()

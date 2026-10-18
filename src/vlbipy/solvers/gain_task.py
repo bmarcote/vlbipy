@@ -171,13 +171,20 @@ def solve_antenna_gains(cross: np.ndarray, wsum: np.ndarray, *, mode: str = "ap"
             break
         active &= ~short
     weight = weight * active[None, :] * active[:, None]
+    # Sub-arrays that share no baseline (staggered global VLBI, several scans combined into one solve) are
+    # independent problems: each gets its own starting point and its own misfit below.
+    groups = _connected_groups(weight, active.reshape(nant, -1).any(axis=1)) or [list(range(nant))]
     # Start from the principal eigenvector of the weighted baseline matrix: a unit-gain start can settle in a
-    # wrong phase minimum on the sparse arrays VLBI scans often are.
-    matrix = np.moveaxis(target * (weight > 0), (0, 1), (-2, -1))
-    values, vectors = np.linalg.eigh(matrix)
-    gains = np.moveaxis(vectors[..., -1] * np.sqrt(np.maximum(values[..., -1:], 0.0)), -1, 0)
-    connections = np.maximum((weight > 0).sum(axis=1), 1)
-    gains = gains * np.sqrt(nant / connections) if mode != "p" else gains
+    # wrong phase minimum on the sparse arrays VLBI scans often are. Taken over the whole matrix it would sit on
+    # the strongest sub-array and leave the others near zero, so it is taken per sub-array.
+    gains = np.zeros(cross.shape[:1] + cross.shape[2:], dtype=np.complex128)
+    for group in groups:
+        sub = np.ix_(group, group)
+        matrix = np.moveaxis(target[sub] * (weight[sub] > 0), (0, 1), (-2, -1))
+        values, vectors = np.linalg.eigh(matrix)
+        start = np.moveaxis(vectors[..., -1] * np.sqrt(np.maximum(values[..., -1:], 0.0)), -1, 0)
+        connections = np.maximum((weight[sub] > 0).sum(axis=1), 1)
+        gains[group] = start * np.sqrt(len(group) / connections) if mode != "p" else start
     gains = np.where(np.abs(gains) > 0, gains, 1.0).astype(np.complex128)
     if mode == "a":
         gains = np.abs(gains).astype(np.complex128)
@@ -202,14 +209,70 @@ def solve_antenna_gains(cross: np.ndarray, wsum: np.ndarray, *, mode: str = "ap"
     # CASA reports the formal signal-to-noise scaled by the misfit of the solve: sqrt(chi^2 / (baselines -
     # antennas)). On real data that factor is large (a calibrator is not the unit point source of the model), and
     # minsnr is applied to the scaled value, so the same convention is needed to flag the same solutions.
-    upper = np.triu_indices(nant, 1)
     residual = np.abs(target - gains[:, None] * np.conj(gains[None, :])) ** 2
-    chi2 = (weight * residual)[upper].sum(axis=0)
-    freedom = (weight[upper] > 0).sum(axis=0) - active.sum(axis=0)
-    misfit = np.sqrt(np.divide(chi2, freedom, out=np.ones_like(chi2), where=(freedom > 0) & (chi2 > 0)))
-    snr = snr / misfit[None]
+    for group in groups:
+        upper = tuple(np.asarray(group)[index] for index in np.triu_indices(len(group), 1))
+        chi2 = (weight * residual)[upper].sum(axis=0)
+        freedom = (weight[upper] > 0).sum(axis=0) - active[group].sum(axis=0)
+        misfit = np.sqrt(np.divide(chi2, freedom, out=np.ones_like(chi2), where=(freedom > 0) & (chi2 > 0)))
+        snr[group] = snr[group] / misfit[None]
     flags = ~active | (information <= 0) | (snr < float(minsnr))
     return np.where(flags, 1.0, gains), flags, np.where(flags, 0.0, snr)
+
+
+def divide_by_continuum(cross: np.ndarray, wsum: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Divide each baseline's channel sums (nant, nant, nchan, npol) by its channel-averaged visibility.
+
+    With ``m`` the weighted channel average of a baseline, the sums become ``cross conj(m)`` and
+    ``wsum |m|^2``: the averaged visibility of every channel turns into ``V / m`` and its weight grows with
+    ``|m|^2``, so the signal-to-noise of the solve still reflects the baseline's real signal.
+    """
+    total_w = wsum.sum(axis=2, keepdims=True)
+    mean = np.divide(cross.sum(axis=2, keepdims=True), total_w, out=np.zeros(total_w.shape, np.complex128),
+                     where=total_w > 0)
+    return cross * np.conj(mean), wsum * np.abs(mean) ** 2
+
+
+def _solve_shape_and_continuum(crosses: list, wsums: list, *, minsnr: float, minblperant: int):
+    """Bandpass of several solution intervals as (continuum gain) x (band shape), stacked along the channel axis.
+
+    The shape comes from the spectra divided by their own channel average (:func:`divide_by_continuum`), which
+    no source structure can disturb; the continuum gain, fitted to the channel averages, puts back the
+    per-subband amplitude and phase a CASA bandpass carries, and with every channel in it it is far stronger
+    than any one channel. A channel is flagged when its shape solve is.
+    """
+    cross = np.concatenate(crosses, axis=2)
+    wsum = np.concatenate(wsums, axis=2)
+    bounds = np.cumsum([0] + [c.shape[2] for c in crosses])
+    divided = [divide_by_continuum(c, w) for c, w in zip(crosses, wsums)]
+    shape, shape_flags, shape_snr = solve_antenna_gains(
+        np.concatenate([c for c, _ in divided], axis=2), np.concatenate([w for _, w in divided], axis=2),
+        mode="ap", minsnr=minsnr, minblperant=minblperant)
+    # The channel average of b_i conj(b_j) is not the product of the antennas' averages, so the division leaves
+    # a little of the band shape in the "source" term. Estimating that term against the shape just found and
+    # dividing it out instead removes the bias (one refinement is enough for any realistic band).
+    model = shape[:, None] * np.conj(shape[None, :])
+    valid = ~(shape_flags[:, None] | shape_flags[None, :])
+    numerator = np.where(valid, cross * np.conj(model), 0.0)
+    denominator = np.where(valid, wsum * np.abs(model) ** 2, 0.0)
+    structure = np.zeros(cross.shape[:2] + (len(crosses),) + cross.shape[3:], dtype=np.complex128)
+    for index, (lo, hi) in enumerate(zip(bounds[:-1], bounds[1:])):
+        den = denominator[:, :, lo:hi].sum(axis=2)
+        structure[:, :, index] = np.divide(numerator[:, :, lo:hi].sum(axis=2), den,
+                                           out=np.zeros(den.shape, np.complex128), where=den > 0)
+    structure = np.repeat(structure, np.diff(bounds), axis=2)
+    refined = solve_antenna_gains(cross * np.conj(structure), wsum * np.abs(structure) ** 2, mode="ap",
+                                  minsnr=minsnr, minblperant=minblperant)
+    shape, shape_flags, shape_snr = refined
+    continuum, continuum_flags, _ = solve_antenna_gains(
+        np.concatenate([c.sum(axis=2, keepdims=True) for c in crosses], axis=2),
+        np.concatenate([w.sum(axis=2, keepdims=True) for w in wsums], axis=2), mode="ap", minsnr=minsnr,
+        minblperant=minblperant)
+    continuum = np.repeat(np.where(continuum_flags, 1.0, continuum), np.diff(bounds), axis=1)
+    # A continuum gain the point-source fit cannot give (the resolved-source misfit hits the weak antennas
+    # here too) is left at 1: the shape alone still calibrates the band, and the subband's mean phase and level
+    # are left to the delay and gain solutions that follow.
+    return np.where(shape_flags, 1.0, shape * continuum), shape_flags, np.where(shape_flags, 0.0, shape_snr)
 
 
 def _connected_groups(wsum: np.ndarray, solved: np.ndarray) -> list[list[int]]:
@@ -303,7 +366,7 @@ def normalise_bandpass(gains: np.ndarray, flags: np.ndarray) -> None:
 def _solve(vis, caltable, *, bandpass: bool, field="", spw="", scan="", timerange="", antenna="", solint="inf",
            combine="", refant="", minsnr=3.0, minblperant=4, solnorm=False, fillgaps=0, calmode="ap", parang=False,
            gaintable=None, gainfield=None, interp=None, spwmap=None, docallib=False, workers: Optional[int] = None,
-           data_column: str = "DATA", **ignored) -> Path:
+           data_column: str = "DATA", divide_continuum: bool = False, **ignored) -> Path:
     """Shared driver of :func:`run_bandpass` and :func:`run_gaincal` (see those for the parameters)."""
     if docallib:
         raise NotImplementedError("cal-library files are not supported by the dask-ms solvers; pass gaintable lists")
@@ -372,10 +435,15 @@ def _solve(vis, caltable, *, bandpass: bool, field="", spw="", scan="", timerang
     # Every solution interval is an independent solve of the same shape: stack them along the channel axis and
     # solve them in one vectorised pass.
     nsol = sums[keys[0]]["cross"].shape[2]
-    gains_all, flags_all, snr_all = solve_antenna_gains(
-        np.concatenate([sums[key]["cross"] for key in keys], axis=2),
-        np.concatenate([sums[key]["wsum"] for key in keys], axis=2), mode=solve_mode, minsnr=float(minsnr),
-        minblperant=int(minblperant))
+    if bandpass and divide_continuum:
+        gains_all, flags_all, snr_all = _solve_shape_and_continuum(
+            [sums[key]["cross"] for key in keys], [sums[key]["wsum"] for key in keys], minsnr=float(minsnr),
+            minblperant=int(minblperant))
+    else:
+        gains_all, flags_all, snr_all = solve_antenna_gains(
+            np.concatenate([sums[key]["cross"] for key in keys], axis=2),
+            np.concatenate([sums[key]["wsum"] for key in keys], axis=2), mode=solve_mode, minsnr=float(minsnr),
+            minblperant=int(minblperant))
     for index, key in enumerate(keys):
         total = sums[key]
         spw_id = key[1]
@@ -428,7 +496,7 @@ def _solve(vis, caltable, *, bandpass: bool, field="", spw="", scan="", timerang
     return caltable
 
 
-def run_bandpass(vis: str, caltable: str, *, bandtype="B", **params) -> Path:
+def run_bandpass(vis: str, caltable: str, *, bandtype="B", divide_continuum: bool = True, **params) -> Path:
     """Solve a per-channel bandpass into a CASA "B Jones" table (``casatasks.bandpass`` keyword set).
 
     Honoured: ``field``, ``spw``, ``scan``, ``timerange``, ``antenna``, ``solint``, ``combine``
@@ -436,11 +504,18 @@ def run_bandpass(vis: str, caltable: str, *, bandtype="B", **params) -> Path:
     amplitude per antenna and polarization), ``fillgaps``, ``parang`` and the prior lists
     ``gaintable``/``gainfield``/``interp``/``spwmap``. ``workers`` sets the number of worker processes.
     ``bandtype='BPOLY'`` and cal libraries raise :class:`NotImplementedError`.
+
+    ``divide_continuum`` (not a CASA keyword; default on) divides every baseline's spectrum by its own
+    channel average before the antenna solve, as AIPS BPASS does. The fit then sees only the band shape, not
+    the source: a resolved calibrator (3C279 on GL048's intercontinental baselines falls from 12 Jy to
+    0.02 Jy) no longer fails the point-source model, whose misfit scales every antenna's signal-to-noise down
+    and flags the weakest antennas. The per-subband phase and amplitude level are left to the delay and gain
+    solutions (the pipeline normalises the bandpass anyway).
     """
     if str(bandtype).upper() != "B":
         raise NotImplementedError("the dask-ms bandpass solver supports only bandtype='B'")
     params.pop("calmode", None)
-    return _solve(vis, caltable, bandpass=True, **params)
+    return _solve(vis, caltable, bandpass=True, divide_continuum=bool(divide_continuum), **params)
 
 
 def run_gaincal(vis: str, caltable: str, *, gaintype="G", calmode="ap", **params) -> Path:

@@ -10,3 +10,5 @@ rsm07_run
 uv.lock
 build
 .gitignore
+*.nbi
+*.nbc

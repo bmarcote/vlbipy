@@ -18,11 +18,23 @@ a process that already has CASA loaded.
 
 A job is ``(function path, kwargs)`` with the function given as
 ``"package.module:name"``; arguments and results travel pickled, so they must be
-small (selections, solutions) — never visibility cubes.
+small (selections, solutions) — never visibility cubes. The one large kind of
+argument, a calibration table loaded in memory (a Tsys table is 57 MB pickled),
+is marked ``_worker_shared``: it is sent to each worker once, keyed by a digest
+of its content, and every other job refers to the worker's cached copy (see
+:func:`_share`). Without that, a fringe fit of 700 scans moved 40 GB through
+the sockets.
+
+Inside a job, array work that is cut into independent blocks runs in threads
+(:func:`thread_map`): numpy releases the GIL in its array loops, so those scale
+with the cores even though the table I/O does not. Every job gets its share of
+the cores (all of them when fewer jobs than cores run), so a few long jobs, as
+one per Multi-MS part, still use the whole machine.
 """
 from __future__ import annotations
 
 import atexit
+import hashlib
 import importlib
 import os
 import queue
@@ -30,9 +42,12 @@ import subprocess
 import sys
 import threading
 import traceback
+from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from multiprocessing.connection import Client, Listener
 from typing import Optional
+
+import numpy as np
 
 #: Environment variable overriding the number of worker processes.
 WORKERS_ENV = "VLBIPY_WORKERS"
@@ -40,9 +55,18 @@ WORKERS_ENV = "VLBIPY_WORKERS"
 MAX_DEFAULT_WORKERS = 16
 #: Seconds to wait for the worker processes to start and connect back.
 START_TIMEOUT = 120.0
+#: Shared objects (calibration tables) a worker keeps; the least recently used one is dropped beyond that.
+WORKER_CACHE_SIZE = 32
+#: Environment variable overriding the number of threads a job uses for its array work (:func:`thread_map`).
+THREADS_ENV = "VLBIPY_THREADS"
 
 _POOL: Optional["WorkerPool"] = None
 _POOL_LOCK = threading.Lock()
+#: Threads the job running in this worker process may use (set by the pool with every job).
+_JOB_THREADS: Optional[int] = None
+_EXECUTOR: Optional[tuple] = None                # (executor, number of threads)
+_EXECUTOR_LOCK = threading.Lock()
+_IN_THREAD = threading.local()
 
 
 def default_workers() -> int:
@@ -51,6 +75,55 @@ def default_workers() -> int:
     if configured:
         return max(1, int(configured))
     return max(1, min(os.cpu_count() or 1, MAX_DEFAULT_WORKERS))
+
+
+def job_threads() -> int:
+    """Threads the array work of the running job may use (:func:`thread_map`).
+
+    ``$VLBIPY_THREADS`` when set; in a worker process, its share of the cores for the jobs running alongside
+    it (set by the pool); otherwise (the main process) every core.
+    """
+    configured = os.environ.get(THREADS_ENV, "").strip()
+    if configured:
+        return max(1, int(configured))
+    if _JOB_THREADS is not None:
+        return _JOB_THREADS
+    return max(1, os.cpu_count() or 1)
+
+
+def in_thread_map() -> bool:
+    """True inside one of the threads of :func:`thread_map` (which then share the cores among them)."""
+    return bool(getattr(_IN_THREAD, "active", False))
+
+
+def thread_map(function, items) -> list:
+    """``[function(item) for item in items]``, in up to :func:`job_threads` threads.
+
+    For blocks of numpy work that do not depend on each other (numpy releases the GIL in its array loops,
+    so they run on several cores at once). Each thread takes every n-th item; the results come back in
+    order and an exception in any of them is raised here. A call from inside one of these threads runs
+    its items one after the other.
+    """
+    items = list(items)
+    threads = min(job_threads(), len(items))
+    if threads <= 1 or in_thread_map():
+        return [function(item) for item in items]
+
+    def share(first: int) -> list:
+        _IN_THREAD.active = True
+        try:
+            return [function(item) for item in items[first::threads]]
+        finally:
+            _IN_THREAD.active = False
+
+    global _EXECUTOR
+    with _EXECUTOR_LOCK:
+        if _EXECUTOR is None or _EXECUTOR[1] < threads:
+            size = max(threads, os.cpu_count() or 1)
+            _EXECUTOR = (ThreadPoolExecutor(max_workers=size, thread_name_prefix="vlbipy-array"), size)
+        executor = _EXECUTOR[0]
+    shares = [future.result() for future in [executor.submit(share, first) for first in range(threads)]]
+    return [shares[index % threads][index // threads] for index in range(len(items))]
 
 
 def resolve(function_path: str):
@@ -63,6 +136,76 @@ def resolve(function_path: str):
 
 class WorkerError(RuntimeError):
     """A job raised inside a worker process; the message carries the remote traceback."""
+
+
+class SharedRef:
+    """Placeholder for a shared object in a job: the worker substitutes its cached copy."""
+
+    __slots__ = ("digest",)
+
+    def __init__(self, digest: str) -> None:
+        self.digest = digest
+
+    def __reduce__(self):
+        return (SharedRef, (self.digest,))
+
+
+def _digest(value) -> str:
+    """Content digest of a shared object (its arrays and plain attributes)."""
+    hasher = hashlib.blake2b(digest_size=20)
+    hasher.update(type(value).__qualname__.encode())
+    for name, item in sorted(vars(value).items()):
+        if name.startswith("_"):
+            continue      # caches built on the object (row indices) are not content
+        hasher.update(name.encode())
+        if isinstance(item, np.ndarray):
+            hasher.update(str((item.dtype, item.shape)).encode())
+            hasher.update(np.ascontiguousarray(item).view(np.uint8).reshape(-1) if item.dtype != object
+                          else repr(item.tolist()).encode())
+        else:
+            hasher.update(repr(item).encode())
+    return hasher.hexdigest()
+
+
+def _share(value, digests: dict, held: set, outgoing: dict, depth: int = 0):
+    """Replace every ``_worker_shared`` object in ``value`` (dicts, lists, tuples) by a :class:`SharedRef`.
+
+    ``digests`` caches the digest per object id for one map call, ``held`` holds the digests the target worker
+    already has, and objects it lacks are put in ``outgoing`` to travel with the job.
+    """
+    if getattr(type(value), "_worker_shared", False):
+        key = id(value)
+        if key not in digests:
+            digests[key] = _digest(value)
+        digest = digests[key]
+        if digest not in held:
+            outgoing[digest] = value
+        return SharedRef(digest)
+    if depth > 6:
+        return value
+    if isinstance(value, dict):
+        return {k: _share(v, digests, held, outgoing, depth + 1) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_share(v, digests, held, outgoing, depth + 1) for v in value]
+    if isinstance(value, tuple) and not hasattr(value, "_fields"):
+        return tuple(_share(v, digests, held, outgoing, depth + 1) for v in value)
+    return value
+
+
+def _unshare(value, cache: "OrderedDict", depth: int = 0):
+    """Inverse of :func:`_share` inside a worker: substitute the cached objects."""
+    if isinstance(value, SharedRef):
+        cache.move_to_end(value.digest)
+        return cache[value.digest]
+    if depth > 6:
+        return value
+    if isinstance(value, dict):
+        return {k: _unshare(v, cache, depth + 1) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_unshare(v, cache, depth + 1) for v in value]
+    if isinstance(value, tuple) and not hasattr(value, "_fields"):
+        return tuple(_unshare(v, cache, depth + 1) for v in value)
+    return value
 
 
 class WorkerPool:
@@ -99,15 +242,31 @@ class WorkerPool:
         self._idle: queue.LifoQueue = queue.LifoQueue()
         for index in reversed(range(self.size)):
             self._idle.put(index)
+        # Digests of the shared objects each worker holds (mirrors the worker's LRU cache).
+        self._held: list[OrderedDict] = [OrderedDict() for _ in range(self.size)]
+        self._digests: dict = {}
         self._threads = ThreadPoolExecutor(max_workers=self.size)
+        self._job_threads = 1
         self.closed = False
 
-    def _run(self, job: tuple) -> object:
-        """Send one job to an idle worker and return its result (raises :class:`WorkerError` on failure)."""
+    def _run(self, job: tuple, digests: Optional[dict] = None) -> object:
+        """Send one job to an idle worker and return its result (raises :class:`WorkerError` on failure).
+
+        ``digests`` caches shared-object digests by object id; it defaults to the one of the running map call.
+        """
         index = self._idle.get()
         try:
             connection = self._connections[index]
-            connection.send(job)
+            function_path, kwargs = job
+            held, outgoing = self._held[index], {}
+            kwargs = _share(kwargs, self._digests if digests is None else digests, held, outgoing)
+            for digest in outgoing:
+                held[digest] = True
+            for digest in kwargs_digests(kwargs):
+                held.move_to_end(digest)
+            while len(held) > WORKER_CACHE_SIZE:
+                held.popitem(last=False)
+            connection.send((function_path, kwargs, outgoing, self._job_threads))
             ok, payload = connection.recv()
         except (EOFError, OSError) as exc:
             # The worker died (out of memory, a crash in a C library): the pool cannot be trusted any more.
@@ -121,13 +280,19 @@ class WorkerPool:
 
     def run(self, function_path: str, kwargs: dict) -> object:
         """Run ``function(**kwargs)`` in an idle worker (waiting for one) and return its result."""
-        return self._run((function_path, kwargs))
+        return self._run((function_path, kwargs), digests={})
 
     def map(self, function_path: str, jobs: list[dict]) -> list:
         """Run ``function(**kwargs)`` for every kwargs dict of ``jobs``; results come back in job order."""
         if self.closed:
             raise RuntimeError("the worker pool is closed")
-        return list(self._threads.map(self._run, [(function_path, kwargs) for kwargs in jobs]))
+        self._digests = {}     # object ids are only stable while the caller holds the jobs
+        # The cores are shared among the jobs that run at the same time (see :func:`thread_map`).
+        self._job_threads = max(1, (os.cpu_count() or 1) // max(1, min(len(jobs), self.size)))
+        try:
+            return list(self._threads.map(self._run, [(function_path, kwargs) for kwargs in jobs]))
+        finally:
+            self._digests = {}
 
     def close(self) -> None:
         """Stop the workers (closing a connection ends that worker's loop)."""
@@ -196,15 +361,35 @@ def submit_jobs(function_path: str, jobs: list[dict], workers: int) -> list[Futu
     return futures
 
 
+def kwargs_digests(value, depth: int = 0) -> list[str]:
+    """Digests of the :class:`SharedRef` placeholders in a job (to refresh their place in the LRU order)."""
+    if isinstance(value, SharedRef):
+        return [value.digest]
+    if depth > 6:
+        return []
+    if isinstance(value, dict):
+        return [d for v in value.values() for d in kwargs_digests(v, depth + 1)]
+    if isinstance(value, (list, tuple)):
+        return [d for v in value for d in kwargs_digests(v, depth + 1)]
+    return []
+
+
 def _serve(address: str) -> None:
-    """Worker main loop: receive ``(function path, kwargs)``, reply ``(True, result)`` or ``(False, traceback)``."""
+    """Worker main loop: receive ``(function path, kwargs, shared objects, threads)``, reply ``(True, result)``
+    or ``(False, traceback)``; shared objects are kept for later jobs (see :func:`_share`)."""
+    global _JOB_THREADS
     connection = Client(address, authkey=bytes.fromhex(os.environ["VLBIPY_WORKER_AUTHKEY"]))
+    cache: OrderedDict = OrderedDict()
     while True:
         try:
-            function_path, kwargs = connection.recv()
+            function_path, kwargs, shared, _JOB_THREADS = connection.recv()
         except (EOFError, OSError):
             return
         try:
+            cache.update(shared)
+            kwargs = _unshare(kwargs, cache)
+            while len(cache) > WORKER_CACHE_SIZE:
+                cache.popitem(last=False)
             reply = (True, resolve(function_path)(**kwargs))
         except BaseException:  # noqa: BLE001 - every failure must travel back to the caller
             reply = (False, traceback.format_exc())
@@ -212,4 +397,7 @@ def _serve(address: str) -> None:
 
 
 if __name__ == "__main__":
-    _serve(sys.argv[1])
+    # Serve from the imported module, not from __main__: the jobs unpickle vlbipy.solvers.workers.SharedRef,
+    # which must be the class the loop checks against.
+    from vlbipy.solvers.workers import _serve as serve
+    serve(sys.argv[1])
