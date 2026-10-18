@@ -127,6 +127,14 @@ Uses a CASA cal library rather than parallel `gaintable`/`interp`/`spwmap`
 lists — see [The cal libraries](usage/index.md#the-cal-libraries) for the
 format.
 
+`apply(defer=True)`, which the pipeline uses for every application before
+the last one, lets the dask-ms backend skip writing CORRECTED_DATA: it writes
+the calibration flags and records the chain, and the readers of the corrected
+data calibrate DATA as they read it (see
+[Deferred application](backends/index.md#deferred-application)).
+`calibrate.write_corrected()` writes the column; the pipeline calls it before
+the calibrated diagnostics. Other backends apply as usual.
+
 ### `calibrate.fringefit`
 
 The global (multi-band delay) fringe fit, on every calibrator. Below
@@ -190,8 +198,9 @@ apply.
 before any flagging or solve (scan SNR matrix, full-Stokes cross-correlation
 spectra on the fringe-finder scans, spectra and time series on baselines to
 the reference antenna, corner plots, radplot, uv coverage) and again on the
-calibrated data. A failing plot is reported as a warning; it never aborts
-the reduction.
+calibrated data, after self-calibration, from CORRECTED_DATA written with the
+final chain. A failing plot is reported as a warning; it never aborts the
+reduction.
 
 The raw set also holds the time evolution of the whole observation
 (`plot.time_evolution()`): amplitude and phase against time on every baseline

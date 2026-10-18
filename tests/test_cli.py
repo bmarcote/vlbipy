@@ -66,11 +66,38 @@ def test_callib_flag_is_store_true_default_none():
 
 def test_applycal_parser_accepts_parallel_gainfields():
     args = parse(["applycal", "data.ms", "one.G", "two.K", "--gainfield", "A", "B"])
-    assert args.caltables == ["one.G", "two.K"]
+    assert args.paths == ["data.ms", "one.G", "two.K"]
     assert args.gainfield == ["A", "B"]
 
 
-def test_applycal_broadcasts_values_and_builds_tables(tmp_path, monkeypatch):
+def _casa_table(path, kind):
+    """A directory that looks like a CASA table of ``kind`` (its table.info)."""
+    path.mkdir()
+    (path / "table.info").write_text(f"Type = {kind}\nSubType = \n")
+    return path
+
+
+def test_applycal_runs_natively_with_broadcast_values_in_any_order(tmp_path, monkeypatch):
+    ms = _casa_table(tmp_path / "data.ms", "Measurement Set")
+    first = _casa_table(tmp_path / "one.G", "Calibration")
+    second = _casa_table(tmp_path / "two.K", "Calibration")
+    native = MagicMock(return_value={})
+    monkeypatch.setattr("vlbipy.solvers.apply_task.applycal", native)
+    # The tables first and the set last: recognised by their table type.
+    assert main(["applycal", str(first), str(second), str(ms), "--gainfield", "A",
+                 "--interp", "nearest", "--spwmap", "0,0", "--calwt", "false"]) == 0
+    args, kwargs = native.call_args
+    assert args[0] == str(ms.resolve()) and args[1] == [str(first.resolve()), str(second.resolve())]
+    assert kwargs["gainfield"] == ["A", "A"] and kwargs["interp"] == ["nearest", "nearest"]
+    assert kwargs["spwmap"] == ["0,0", "0,0"] and kwargs["calwt"] == ["false", "false"]
+    assert kwargs["parang"] is False and kwargs["on_corrected"] is None     # the defaults: off, and by the set
+    main(["applycal", str(ms), str(first), "--from-data", "--parang"])
+    assert native.call_args.kwargs["on_corrected"] is False and native.call_args.kwargs["parang"] is True
+    with pytest.raises(SystemExit):
+        main(["applycal", str(ms), str(first), "--no-parang"])                 # on only with --parang
+
+
+def test_applycal_casa_selections_build_tables_for_casa(tmp_path, monkeypatch):
     ms = tmp_path / "data.ms"
     first = tmp_path / "one.G"
     second = tmp_path / "two.K"
@@ -79,13 +106,14 @@ def test_applycal_broadcasts_values_and_builds_tables(tmp_path, monkeypatch):
     second.mkdir()
     backend = SimpleNamespace(data=MagicMock(), calibrate=MagicMock())
     monkeypatch.setattr("vlbipy.cli.get_backend", MagicMock(return_value=backend))
-    assert main(["applycal", str(ms), str(first), str(second), "--gainfield", "A",
+    assert main(["applycal", str(ms), str(first), str(second), "--gainfield", "A", "--timerange", "10:00~11:00",
                  "--interp", "nearest", "--spwmap", "0,0", "--calwt", "false"]) == 0
     tables = backend.calibrate.apply.call_args.args[2]
     assert [table.gainfield for table in tables] == ["A", "A"]
     assert [table.interp for table in tables] == ["nearest", "nearest"]
     assert [table.spwmap for table in tables] == [[0, 0], [0, 0]]
     assert [table.calwt for table in tables] == [False, False]
+    assert backend.calibrate.apply.call_args.kwargs["timerange"] == "10:00~11:00"
 
 
 def test_applycal_rejects_parallel_length_mismatch(tmp_path):

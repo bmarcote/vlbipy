@@ -17,7 +17,9 @@ for baseline (i, j) with i = ANTENNA1, j = ANTENNA2 and dchi = angle_i - angle_j
 RR -> V exp(+1j dchi), LL -> V exp(-1j dchi), RL -> V exp(+1j (angle_i + angle_j)), LR -> V exp(-1j (angle_i + angle_j)).
 
 The source is taken to the true equator and equinox of date before the hour angle is formed from the apparent
-sidereal time (``apparent_direction``), as casacore's measures do.  No Python loop over times.
+sidereal time (``_directions_of_date``), as casacore's measures do.  No Python loop over times; both are
+interpolated between nodes fixed in absolute time, so the angle of an integration does not depend on which
+other integrations it is computed with.
 """
 
 from __future__ import annotations
@@ -42,6 +44,26 @@ BWG_L_MOUNTS = {"BWG-L", "ALT-AZ+BWG-L"}
 
 #: Spacing of the nodes the apparent sidereal time is evaluated on before interpolating [s].
 _GAST_NODE_SPACING = 600.0
+#: Spacing of the nodes the direction of date is evaluated on before interpolating [s].
+_DATE_NODE_SPACING = 3600.0
+
+
+def _absolute_nodes(t_s, spacing):
+    """Nodes at the multiples of ``spacing`` seconds that bracket ``t_s``.
+
+    They are fixed in time, so a value interpolated between them does not depend on which other times are
+    asked for in the same call: an integration gets the same feed angle whichever block it is read in.
+    """
+    first = np.floor(t_s.min() / spacing) * spacing
+    last = max(np.ceil(t_s.max() / spacing) * spacing, first + spacing)
+    return np.arange(first, last + 0.5 * spacing, spacing)
+
+
+def _between_nodes(t_s, nodes, values):
+    """Angles ``values`` at ``nodes`` interpolated linearly to ``t_s``, each from the two nodes around it."""
+    index = np.clip(np.searchsorted(nodes, t_s, side="right") - 1, 0, nodes.size - 2)
+    step = np.mod(values[index + 1] - values[index] + np.pi, 2.0 * np.pi) - np.pi
+    return values[index] + step * (t_s - nodes[index]) / (nodes[index + 1] - nodes[index])
 
 
 def _apparent_sidereal_time(time_mjd_s):
@@ -50,19 +72,33 @@ def _apparent_sidereal_time(time_mjd_s):
     The rigorous evaluation (precession-nutation series) costs ~25 us per epoch, which adds up over the
     thousands of integrations of an observation. Sidereal time advances at a constant rate apart from the
     equation of the equinoxes, which drifts by well under a microarcsecond per minute, so it is evaluated on
-    nodes every :data:`_GAST_NODE_SPACING` seconds and interpolated linearly (error < 1e-10 rad).
+    nodes every :data:`_GAST_NODE_SPACING` seconds of absolute time and interpolated linearly (error < 1e-10 rad).
     """
     t_s = np.atleast_1d(np.asarray(time_mjd_s, dtype=float))
-    start, stop = float(t_s.min()), float(t_s.max())
-    if t_s.size <= 8 or stop <= start:
-        nodes = t_s
-    else:
-        nodes = np.linspace(start, stop, int(np.ceil((stop - start) / _GAST_NODE_SPACING)) + 1)
+    nodes = _absolute_nodes(t_s, _GAST_NODE_SPACING)
     times = Time(nodes / 86400.0, format="mjd", scale="utc")
     gast = times.sidereal_time("apparent", longitude=0.0 * u.deg).to_value(u.rad)
-    if nodes is t_s:
-        return gast
-    return np.interp(t_s, nodes, np.unwrap(gast))
+    return _between_nodes(t_s, nodes, gast)
+
+
+def _directions_of_date(ra_rad, dec_rad, t_s):
+    """The direction of date (true equator and equinox) [rad] of an ICRS/J2000 direction at every time of ``t_s``.
+
+    Evaluated on nodes every :data:`_DATE_NODE_SPACING` seconds of absolute time and interpolated: the direction
+    moves by under 0.1 arcsec per hour, almost linearly.
+
+    Returns
+    -------
+    (ra, dec)
+        Arrays of shape (ntime,).
+    """
+    from astropy.coordinates import TETE, SkyCoord
+    nodes = _absolute_nodes(t_s, _DATE_NODE_SPACING)
+    epochs = Time(nodes / 86400.0, format="mjd", scale="utc")
+    of_date = SkyCoord(np.full(nodes.size, float(ra_rad)) * u.rad, np.full(nodes.size, float(dec_rad)) * u.rad,
+                       frame="icrs").transform_to(TETE(obstime=epochs))
+    return (_between_nodes(t_s, nodes, of_date.ra.to_value(u.rad)),
+            _between_nodes(t_s, nodes, of_date.dec.to_value(u.rad)))
 
 
 def apparent_direction(ra_rad, dec_rad, time_mjd_s):
@@ -86,8 +122,8 @@ def _hour_angle_and_latitude(antenna_xyz, ra_rad, time_mjd_s):
     ----------
     antenna_xyz : array (nant, 3)
         ITRF antenna positions in metres (MS ANTENNA.POSITION).
-    ra_rad : float
-        Source right ascension of date in radians (see :func:`apparent_direction`).
+    ra_rad : float or array (ntime,)
+        Source right ascension of date in radians (see :func:`_directions_of_date`).
     time_mjd_s : array (ntime,)
         Times in MJD seconds, UTC (MS TIME).
 
@@ -104,7 +140,7 @@ def _hour_angle_and_latitude(antenna_xyz, ra_rad, time_mjd_s):
     lon = np.arctan2(xyz[:, 1], xyz[:, 0])
     lat = np.arctan2(xyz[:, 2], np.hypot(xyz[:, 0], xyz[:, 1]))
     gast = _apparent_sidereal_time(t_s)
-    hour_angle = gast[np.newaxis, :] + lon[:, np.newaxis] - float(ra_rad)
+    hour_angle = gast[np.newaxis, :] + lon[:, np.newaxis] - np.asarray(ra_rad, dtype=float)
     hour_angle = (hour_angle + np.pi) % (2.0 * np.pi) - np.pi
     return hour_angle, lat
 
@@ -116,15 +152,18 @@ _GEOMETRY_CACHE: dict = {}
 
 def _local_geometry(antenna_xyz, ra_rad, dec_rad, time_mjd_s):
     """Return (H, lat, dec) for an ICRS/J2000 source: hour angle (nant, ntime), geocentric latitude (nant,) and the
-    declination of date (float), all in radians."""
+    declination of date (ntime,), all in radians."""
     xyz = np.atleast_2d(np.asarray(antenna_xyz, dtype=float))
     t_s = np.atleast_1d(np.asarray(time_mjd_s, dtype=float))
     key = (xyz.tobytes(), float(ra_rad), float(dec_rad), t_s.tobytes())
-    if _GEOMETRY_CACHE.get("key") != key:
-        ra_date, dec_date = apparent_direction(ra_rad, dec_rad, t_s)
-        hour_angle, lat = _hour_angle_and_latitude(xyz, ra_date, t_s)
-        _GEOMETRY_CACHE.update(key=key, value=(hour_angle, lat, dec_date))
-    return _GEOMETRY_CACHE["value"]
+    # One entry, read and replaced as a whole: threads asking for other times never see each other's values.
+    cached = _GEOMETRY_CACHE.get("entry")
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    ra_date, dec_date = _directions_of_date(ra_rad, dec_rad, t_s)
+    hour_angle, lat = _hour_angle_and_latitude(xyz, ra_date, t_s)
+    _GEOMETRY_CACHE["entry"] = (key, (hour_angle, lat, dec_date))
+    return hour_angle, lat, dec_date
 
 
 def parallactic_angle(antenna_xyz, ra_rad, dec_rad, time_mjd_s):
@@ -330,6 +369,21 @@ def apply_parang(vis, antenna1, antenna2, row_time, angle, antenna_index=None, *
     vis = np.asarray(vis)
     if vis.ndim != 3 or vis.shape[2] not in (1, 2, 4):
         raise ValueError(f"vis must be (nrow, nchan, ncorr) with ncorr in (1, 2, 4); got shape {vis.shape}")
+    rotation = parang_rotation(antenna1, antenna2, row_time, angle, vis.shape[2],
+                               vis.dtype if np.iscomplexobj(vis) else np.complex128, antenna_index=antenna_index,
+                               time_index=time_index)
+    out = vis * rotation[:, np.newaxis, :]
+    logger.debug(f"apply_parang: rotated {vis.shape[0]} rows, ncorr={vis.shape[2]}, nant={np.shape(angle)[0]}, "
+                 f"ntime={np.shape(angle)[1]}")
+    return out
+
+
+def parang_rotation(antenna1, antenna2, row_time, angle, ncorr, dtype=np.complex128, antenna_index=None, *,
+                    time_index=None):
+    """The factor :func:`apply_parang` multiplies every row and correlation by: (nrow, ncorr) of ``dtype``.
+
+    Same arguments as :func:`apply_parang`, with the number of correlations ``ncorr`` in place of the data.
+    """
     angle = np.asarray(angle, dtype=float)
     antenna1 = np.asarray(antenna1, dtype=int)
     antenna2 = np.asarray(antenna2, dtype=int)
@@ -347,18 +401,14 @@ def apply_parang(vis, antenna1, antenna2, row_time, angle, antenna_index=None, *
     a_j = angle[row_a2, col]
     diff = a_i - a_j
     total = a_i + a_j
-    ncorr = vis.shape[2]
-    phase = np.zeros((vis.shape[0], ncorr), dtype=float)
+    phase = np.zeros((antenna1.shape[0], ncorr), dtype=float)
     phase[:, 0] = diff
     if ncorr >= 2:
         phase[:, ncorr - 1] = -diff
     if ncorr == 4:
         phase[:, 1] = total
         phase[:, 2] = -total
-    rotation = np.exp(1j * phase).astype(vis.dtype if np.iscomplexobj(vis) else np.complex128)
-    out = vis * rotation[:, np.newaxis, :]
-    logger.debug(f"apply_parang: rotated {vis.shape[0]} rows, ncorr={ncorr}, nant={nant}, ntime={ntime}")
-    return out
+    return np.exp(1j * phase).astype(dtype)
 
 
 def _row_time_column(row_time, ntime, time_index):

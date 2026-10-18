@@ -20,10 +20,15 @@ between the two bracketing solutions (CASA interpolates amp/phase, not re/im) an
 the ends.  Flagged solutions are NOT skipped: as in CASA, a time whose nearest solution (or either bracketing
 solution) is flagged is flagged.  For "Fringe Jones" the rate extrapolates the phase from the solution time, and
 "linear" interpolates the parameters between the bracketing rows with a rate-aware phase unwrap (see
-`_gains_fringe`, CASA CTRateAwareTimeInterp1).
+`_fringe_grid`, CASA CTRateAwareTimeInterp1).
 
 Frequency interpolation (second token of ``interp``, default "linear"): flagged channels of a solution are
-interpolated across from its unflagged ones; the ``...flag`` modes keep them flagged (see `_interp_freq`).
+interpolated across from its unflagged ones; the ``...flag`` modes keep them flagged (see `_interp_freqs`).
+
+Evaluation: a table is evaluated on the whole (subband, antenna, time, hand) grid of a block in one pass, with
+no loop over antennas or subbands. Its rows are indexed once (`_lookup`), and a single search then finds the
+solutions around every grid point (`_brackets`). Every grid value depends only on its own subband, antenna,
+time and channel, so a row is corrected the same way whichever block it is evaluated in.
 
 casatools is imported lazily; getcol returns Fortran order so array columns are transposed (see caltable.py).
 """
@@ -31,7 +36,8 @@ from __future__ import annotations
 
 import logging
 import time as _time
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
+from typing import ClassVar
 from pathlib import Path
 
 import numpy as np
@@ -48,6 +54,9 @@ WEIGHT_CAL_KINDS = ("B TSYS", "EPowerCurve", "EGainCurve", "G Jones", "T Jones")
 NEAREST_FIELD = "nearest"
 GAIN_CURVE_KINDS = ("EPowerCurve", "EGainCurve")
 FRINGE_NPARAM_PER_POL = 4
+#: Grid values (subband x antenna x time x channel x hand) evaluated together: a few complex arrays of this size
+#: are the memory an evaluation needs, whatever the size of the block.
+GRID_VALUES = 1 << 21
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -75,6 +84,9 @@ class CalTableData:
     antenna_names, field_names : str arrays
     nant : int
         Number of rows of the ANTENNA subtable.
+
+    The rows are indexed on first use (:func:`_lookup`), so the arrays must not be modified after the table
+    has been applied once.
     """
 
     path: str
@@ -94,6 +106,9 @@ class CalTableData:
     antenna_names: np.ndarray
     field_names: np.ndarray
     nant: int
+    _row_index: dict = field(default_factory=dict, repr=False, compare=False)
+    #: Sent once to each worker process and cached there (see :mod:`vlbipy.solvers.workers`).
+    _worker_shared: ClassVar[bool] = True
 
     @property
     def nrow(self):
@@ -109,6 +124,10 @@ class CalTableData:
     def npar(self):
         """Number of parameters per channel (npol, or 8 for Fringe Jones)."""
         return int(self.param.shape[2])
+
+    def __getstate__(self):
+        """Pickled without the row indices (rebuilt where the table is applied), which can outweigh the table."""
+        return dict(vars(self), _row_index={})
 
 
 def _row_major_column(values, nrow, name, path) -> np.ndarray:
@@ -258,13 +277,92 @@ def _mapped_spw(spw, spwmap):
     return int(spwmap[spw])
 
 
-def _select_rows(table, ant, spw_t, field_id):
-    """Return the row indices (sorted by time) for antenna `ant`, caltable spw `spw_t` and the field selection."""
-    mask = (table.antenna1 == ant) & (table.spw_id == spw_t)
-    if field_id is not None:
-        mask &= np.isin(table.field_id, np.asarray(field_id, dtype=np.int64).reshape(-1))
-    rows = np.nonzero(mask)[0]
-    return rows[np.argsort(table.time[rows], kind="stable")]
+def _lookup(table, field_id=None, flag_column=None):
+    """The rows of ``table`` in a field selection sorted by (antenna, spw, time), and the keys that find them.
+
+    A table is applied to every block of every antenna and subband, and masking its rows each time costs more
+    than the whole correction (a phase self-calibration table has millions of rows). The rows are therefore
+    sorted once; each (antenna, spw) group is a run of them, and the key of a row is its group times (number
+    of distinct table times + 1) plus the rank of its time. One ``searchsorted`` of integer keys then finds
+    the solutions of every antenna, subband and time at once, in exactly the order a search of each group's
+    own times gives (:func:`_brackets`). Cached on the table per selection.
+
+    Parameters
+    ----------
+    field_id : int or sequence of int, optional
+        FIELD_ID selection on the rows (None = all fields).
+    flag_column : int, optional
+        Keep only the rows whose flag of that parameter is not set (gain curves skip flagged solutions).
+    """
+    fields = None if field_id is None else tuple(sorted({int(f) for f in np.asarray(field_id).reshape(-1)}))
+    key = ("lookup", fields, flag_column)
+    found = table._row_index.get(key)
+    if found is not None:
+        return found
+    utimes = table._row_index.get("times")
+    if utimes is None:
+        utimes = table._row_index["times"] = np.unique(table.time)
+    keep = (table.antenna1 >= 0) & (table.spw_id >= 0)
+    if fields is not None:
+        keep &= np.isin(table.field_id, fields)
+    if flag_column is not None:
+        keep &= ~table.flag[:, 0, flag_column]
+    rows = np.flatnonzero(keep)
+    rows = rows[np.lexsort((table.time[rows], table.spw_id[rows], table.antenna1[rows]))]
+    nspw = int(max(table.spw_chan_freq.shape[0], table.spw_id.max(initial=-1) + 1))
+    nant = int(max(table.nant, table.antenna1.max(initial=-1) + 1))
+    group = table.antenna1[rows] * nspw + table.spw_id[rows]
+    found = {"rows": rows, "time": table.time[rows], "times": utimes, "stride": utimes.size + 1,
+             "keys": group * (utimes.size + 1) + np.searchsorted(utimes, table.time[rows]),
+             "bounds": np.searchsorted(group, np.arange(nant * nspw + 1)), "nspw": nspw, "nant": nant}
+    table._row_index[key] = found
+    return found
+
+
+def _brackets(look, antenna, spw_t, times, interp):
+    """The solutions every point takes: :func:`_bracket` in the rows of its antenna and spw, for all points at once.
+
+    Parameters
+    ----------
+    look : dict
+        From :func:`_lookup`.
+    antenna, spw_t, times : arrays (npoint,)
+        Antenna, caltable spw and time [s] of every point.
+    interp : {"nearest", "linear"}
+
+    Returns
+    -------
+    (i0, i1, w, found)
+        Positions in ``look["rows"]`` and weights (npoint,), such that the value is (1 - w) v[i0] + w v[i1];
+        ``found`` is False where the table has no row for the antenna and spw (i0 and i1 are then some valid
+        position).
+    """
+    antenna = np.asarray(antenna, dtype=np.int64).reshape(-1)
+    spw = np.asarray(spw_t, dtype=np.int64).reshape(-1)
+    times = np.asarray(times, dtype=np.float64).reshape(-1)
+    valid = (antenna >= 0) & (antenna < look["nant"]) & (spw >= 0) & (spw < look["nspw"])
+    group = np.where(valid, antenna * look["nspw"] + spw, 0)
+    bounds = look["bounds"]
+    count = np.where(valid, bounds[group + 1] - bounds[group], 0)
+    nrow = look["rows"].size
+    start = np.minimum(bounds[group], max(nrow - 1, 0))
+    weight = np.zeros(times.shape)
+    if not nrow:
+        nowhere = np.zeros(times.shape, dtype=np.int64)
+        return nowhere, nowhere, weight, count > 0
+    index = np.searchsorted(look["keys"], group * look["stride"] + np.searchsorted(look["times"], times))
+    several = count >= 2
+    hi = np.where(several, np.minimum(np.maximum(index, start + 1), start + count - 1), start)
+    lo = np.where(several, hi - 1, start)
+    row_time = look["time"]
+    if interp == "nearest":
+        near = np.where(np.abs(times - row_time[lo]) <= np.abs(row_time[hi] - times), lo, hi)
+        return near, near, weight, count > 0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        w = np.clip((times - row_time[lo]) / (row_time[hi] - row_time[lo]), 0.0, 1.0)
+    # A time at (or beyond) the upper row uses that row alone, so the lower row's flag cannot reach it.
+    at_hi = (w >= 1.0) | ~several
+    return np.where(at_hi, hi, lo), hi, np.where(at_hi, 0.0, w), count > 0
 
 
 def _bracket(row_times, times, interp):
@@ -312,83 +410,147 @@ def parse_interp(interp):
     return time_mode, freq_mode, keep_flags
 
 
-def _interp_freq(values, flags, table_freq, chan_freq, mode="linear", keep_flags=False):
-    """Bring gains from the table channels `table_freq` (nchan_t,) to the data channels `chan_freq` (nchan,).
+def _interp_freqs(values, flags, pair, table_freq, chan_freq, mode="linear", keep_flags=False):
+    """Bring solutions from their table channels to the data channels, every solution on its own.
 
-    `values` complex and `flags` bool, both (ntime, nchan_t). Like CASA, flagged table channels are *interpolated
-    across*: each data channel takes the nearest unflagged table channel ("nearest") or the amp/phase
-    interpolation of the two unflagged channels around it ("linear", nearest beyond the ends), and is flagged only
-    when the solution has no unflagged channel at all. With `keep_flags` (CASA's ``...flag`` modes) a data channel
-    whose nearest table channel is flagged stays flagged. Returns (values (ntime, nchan), flags (ntime, nchan)).
+    Row k of ``values`` (complex) and ``flags`` (bool), both (K, nchan_t), goes from the table channels
+    ``table_freq[pair[k]]`` (npair, nchan_t) to the data channels ``chan_freq[pair[k]]`` (npair, nchan) [Hz].
+    Like CASA, flagged table channels are *interpolated across*: each data channel takes the nearest
+    unflagged table channel ("nearest") or the amp/phase interpolation of the two unflagged channels around
+    it ("linear", nearest beyond the ends), and is flagged only when the solution has no unflagged channel at
+    all. With ``keep_flags`` (CASA's ``...flag`` modes) a data channel whose nearest table channel is flagged
+    stays flagged. A solution without flags on the data's own channel grid is kept as it is.
+
+    Returns
+    -------
+    (values, flags)
+        Each (K, nchan).
     """
     table_freq = np.asarray(table_freq, dtype=np.float64)
     chan_freq = np.asarray(chan_freq, dtype=np.float64)
-    ntime, nchan_t = values.shape
-    nchan = chan_freq.size
-    same_grid = table_freq.shape == chan_freq.shape and np.allclose(table_freq, chan_freq, rtol=0, atol=1.0)
-    if same_grid and not flags.any():
-        return values, flags
-    if nchan_t == 1:
-        return np.broadcast_to(values, (ntime, nchan)), np.broadcast_to(flags, (ntime, nchan))
-    order = np.argsort(table_freq)
-    tf, vals, fl = table_freq[order], values[:, order], flags[:, order]
-    out = np.ones((ntime, nchan), dtype=np.complex128)
-    out_flag = np.ones((ntime, nchan), dtype=bool)
-    # Solutions rarely differ in which channels they flag (a bandpass is one row per antenna), so the channel
-    # mapping is built once per distinct flag pattern.
-    if (fl == fl[0]).all():
-        patterns, member = fl[:1], np.zeros(ntime, dtype=np.int64)
+    nrow, nchan_t = values.shape
+    nchan = chan_freq.shape[1]
+    order = np.argsort(table_freq, axis=1)
+    table_sorted = np.take_along_axis(table_freq, order, axis=1)
+    # Per (table, data) channel pair: the table channels below every data channel, the nearest table channel.
+    below_all = np.stack([np.searchsorted(t, c) for t, c in zip(table_sorted, chan_freq)])
+    nearest_all = np.stack([_bracket(t, c, "nearest")[0] for t, c in zip(table_sorted, chan_freq)])
+    same_grid = np.array([nchan_t == nchan and np.allclose(t, c, rtol=0, atol=1.0)
+                          for t, c in zip(table_freq, chan_freq)])
+    order = order[pair]
+    vals = np.take_along_axis(values, order, axis=1)
+    fl = np.take_along_axis(flags, order, axis=1)
+    count = np.zeros((nrow, nchan_t + 1), dtype=np.int64)
+    np.cumsum(~fl, axis=1, out=count[:, 1:])
+    ngood = count[:, -1:]
+    below = np.take_along_axis(count, below_all[pair], axis=1)       # unflagged table channels below each channel
+    good = np.argsort(fl, axis=1, kind="stable")                      # unflagged channels first, in frequency order
+    several = ngood >= 2
+    rank = np.where(several, np.minimum(np.maximum(below, 1), ngood - 1), 0)
+    lo = np.take_along_axis(good, np.where(several, rank - 1, 0), axis=1)
+    hi = np.take_along_axis(good, rank, axis=1)
+    freq, row_freq = chan_freq[pair], table_sorted[pair]
+    f_lo, f_hi = np.take_along_axis(row_freq, lo, axis=1), np.take_along_axis(row_freq, hi, axis=1)
+    w = None
+    if mode == "nearest":
+        i0 = i1 = np.where(np.abs(freq - f_lo) <= np.abs(f_hi - freq), lo, hi)
     else:
-        patterns, member = np.unique(fl, axis=0, return_inverse=True)
-    nearest_all = _bracket(tf, chan_freq, "nearest")[0]
-    for index, pattern in enumerate(patterns):
-        rows = np.flatnonzero(member == index)
-        good = np.flatnonzero(~pattern)
-        if not good.size:
-            continue
-        lo, hi, w = _bracket(tf[good], chan_freq, mode)
-        picked = vals[np.ix_(rows, good[lo])]
-        blend = np.flatnonzero((hi != lo) & (w > 0))
-        if blend.size:
-            picked[:, blend] = _interp_amp_phase(picked[:, blend], vals[np.ix_(rows, good[hi[blend]])], w[blend])
-        out[rows] = picked
-        out_flag[rows] = pattern[nearest_all][None, :] if keep_flags else False
+        with np.errstate(divide="ignore", invalid="ignore"):
+            w = np.clip((freq - f_lo) / (f_hi - f_lo), 0.0, 1.0)
+        at_hi = (w >= 1.0) | ~several
+        i0, i1, w = np.where(at_hi, hi, lo), hi, np.where(at_hi, 0.0, w)
+    out = np.take_along_axis(vals, i0, axis=1)
+    if w is not None:
+        blend = (i1 != i0) & (w > 0)
+        if blend.any():
+            row, chan = np.nonzero(blend)
+            out[row, chan] = _interp_amp_phase(out[row, chan], vals[row, i1[row, chan]], w[row, chan])
+    out_flag = (np.take_along_axis(fl, nearest_all[pair], axis=1) if keep_flags
+                else np.zeros((nrow, nchan), dtype=bool))
+    none = ngood[:, 0] == 0
+    out[none], out_flag[none] = 1.0, True
+    as_is = same_grid[pair] & ~flags.any(axis=1)              # only possible on the same number of channels
+    if as_is.any():
+        out[as_is], out_flag[as_is] = values[as_is], False
     return out, out_flag
 
 
-def _gains_generic(table, rows, times, interp, pol):
-    """Time-interpolated gains for one antenna/pol: returns (values (ntime, nchan_t), flags (ntime, nchan_t)).
+def _interpolated_solutions(table, row0, row1, w, pols):
+    """Solutions of a G/T/B Jones or Tsys table interpolated in time: (values, flags), each (npoint, nchan_t, 2).
 
-    G/T/B Jones: amp/phase interpolation of CPARAM.  B TSYS: Tsys interpolated, gain = 1/sqrt(Tsys).
+    Point k lies between the table rows ``row0[k]`` and ``row1[k]`` with weight ``w[k]`` (``row0 == row1`` or
+    ``w == 0``: that row alone); ``pols`` are the parameters of the two hands. Gains: amplitude and phase
+    interpolated separately, flagged where a solution used is flagged or zero. Tsys: interpolated itself (as
+    CASA does), gain 1/sqrt(Tsys), flagged where a Tsys used is flagged or not positive.
     """
-    ntime = len(times)
-    nchan_t = table.nchan_t
-    if rows.size == 0:
-        return np.ones((ntime, nchan_t), dtype=np.complex128), np.ones((ntime, nchan_t), dtype=bool)
-    i0, i1, w = _bracket(table.time[rows], times, interp)
-    p = table.param[rows][:, :, pol]
-    f = table.flag[rows][:, :, pol]
+    blend = (row1 != row0) & (w > 0)
+    p0 = table.param[row0][:, :, pols]
+    f0 = table.flag[row0][:, :, pols]
     if table.kind == "B TSYS":
-        # CASA interpolates the system temperature itself and then takes 1 / sqrt(Tsys).
-        tsys = np.real(p).astype(np.float64)
-        bad = ~(tsys > 0)
-        used_hi = ((i1 != i0) & (w > 0))[:, None]
-        value = (1.0 - w)[:, None] * tsys[i0] + w[:, None] * tsys[i1]
-        flags = f[i0] | bad[i0] | (used_hi & (f[i1] | bad[i1])) | ~(value > 0)
+        tsys0 = np.real(p0).astype(np.float64)
+        tsys1 = np.real(table.param[row1][:, :, pols]).astype(np.float64)
+        f1 = table.flag[row1][:, :, pols]
+        frac = w[:, None, None]
+        value = (1.0 - frac) * tsys0 + frac * tsys1
+        flags = f0 | ~(tsys0 > 0) | (blend[:, None, None] & (f1 | ~(tsys1 > 0))) | ~(value > 0)
         return (1.0 / np.sqrt(np.where(flags, 1.0, value))).astype(np.complex128), flags
-    cp = p.astype(np.complex128)
-    zero = cp == 0
-    values = cp[i0]
-    flags = f[i0] | zero[i0]
-    blend = np.flatnonzero((i1 != i0) & (w > 0))
-    if blend.size:
-        values[blend] = _interp_amp_phase(values[blend], cp[i1[blend]], w[blend][:, None])
-        flags[blend] |= f[i1[blend]] | zero[i1[blend]]
+    values = p0.astype(np.complex128)
+    flags = f0 | (values == 0)
+    if blend.any():
+        b = np.flatnonzero(blend)
+        other = table.param[row1[b]][:, :, pols].astype(np.complex128)
+        values[b] = _interp_amp_phase(values[b], other, w[b][:, None, None])
+        flags[b] |= table.flag[row1[b]][:, :, pols] | (other == 0)
     return values, flags
 
 
-def _gains_fringe(table, rows, times, chan_freq, interp, pol, f_ref_hz):
-    """Time-interpolated Fringe Jones unit gains for one antenna/pol: (values (ntime, nchan), flags (ntime, nchan)).
+def _table_gains(table, antenna, times, spw_index, spw_t, chan_freq, *, field_id=None, interp="linear"):
+    """Gains (1 where flagged) and flags of a G/T/B Jones or Tsys table at points.
+
+    Point k is ``antenna[k]`` at ``times[k]`` in the data spw ``spw_index[k]``, whose caltable spw is
+    ``spw_t[spw_index[k]]`` and whose channels are ``chan_freq[spw_index[k]]`` ((nspw, nchan) [Hz]).
+
+    Returns
+    -------
+    (values, flags, index)
+        A table without a frequency axis: values and flags (npoint, 2) and ``index`` None. A bandpass: values
+        and flags (nsolution, 2, nchan) of every distinct solution the points take (a solution is the same at
+        every time between the same rows: each is brought to the data channels once) and ``index`` (npoint,),
+        the solution of every point.
+    """
+    time_mode, freq_mode, keep_chan_flags = parse_interp(interp)
+    pols = [0, min(1, table.npar - 1)]
+    look = _lookup(table, field_id)
+    i0, i1, w, found = _brackets(look, antenna, spw_t[spw_index], times, time_mode)
+    rows = look["rows"]
+    if table.nchan_t == 1:
+        if not rows.size:
+            return np.ones((i0.size, 2), dtype=np.complex128), np.ones((i0.size, 2), dtype=bool), None
+        values, flags = _interpolated_solutions(table, rows[i0], rows[i1], w, pols)
+        flags = flags[:, 0] | ~found[:, None]
+        return np.where(flags, 1.0, values[:, 0]), flags, None
+    nchan = chan_freq.shape[1]
+    if not rows.size:
+        return np.ones((1, 2, nchan), dtype=np.complex128), np.ones((1, 2, nchan), dtype=bool), \
+            np.zeros(i0.size, dtype=np.int64)
+    key = ((spw_index * (rows.size + 1) + i0) * (rows.size + 1) + i1) * 2 + found
+    if (w != 0).any():
+        _, first, index = np.unique(np.stack([key, w.view(np.int64)], axis=1), axis=0, return_index=True,
+                                    return_inverse=True)
+    else:
+        _, first, index = np.unique(key, return_index=True, return_inverse=True)
+    values, flags = _interpolated_solutions(table, rows[i0[first]], rows[i1[first]], w[first], pols)
+    count = first.size
+    values, flags = _interp_freqs(values.transpose(0, 2, 1).reshape(2 * count, -1),
+                                  flags.transpose(0, 2, 1).reshape(2 * count, -1),
+                                  np.repeat(spw_index[first], 2), table.spw_chan_freq[spw_t], chan_freq,
+                                  freq_mode, keep_chan_flags)
+    flags = flags.reshape(count, 2, nchan) | ~found[first, None, None]
+    return np.where(flags, 1.0, values.reshape(count, 2, nchan)), flags, index.reshape(-1)
+
+
+def _fringe_grid(table, antenna, times, spw_index, spw_t, *, field_id=None, interp="linear"):
+    """Fringe Jones parameters of both hands at points (as for :func:`_table_gains`), zero where flagged.
 
     Follows CASA's rate-aware interpolation (``CTRateAwareTimeInterp1``), which works on the parameters:
 
@@ -398,32 +560,112 @@ def _gains_fringe(table, rows, times, chan_freq, interp, pol, f_ref_hz):
       phase the argument of the weighted mean of the two unit phasors obtained by advancing each solution's
       phase to that time with its own rate (so the result does not depend on how many turns apart they are).
 
-    The rate always multiplies the table's reference frequency ``f_ref_hz``.
+    The rate always multiplies the table's reference frequency.
+
+    Returns
+    -------
+    (phase, delay, disp, flag, f_ref)
+        Arrays (npoint, 2) such that the phase at frequency ``f`` is ``phase + 2 pi 1e-9 delay (f - f_ref) +
+        disp k_disp(f)``, and the reference frequency of each data spw (nspw,) [Hz].
     """
-    ntime, nchan = len(times), len(chan_freq)
-    if rows.size == 0:
-        return np.ones((ntime, nchan), dtype=np.complex128), np.ones((ntime, nchan), dtype=bool)
-    i0, i1, w = _bracket(table.time[rows], times, interp)
-    block = slice(FRINGE_NPARAM_PER_POL * pol, FRINGE_NPARAM_PER_POL * (pol + 1))
-    params = np.real(table.param[rows, 0, block]).astype(np.float64)              # (nrow, 4): phase, delay, rate, disp
-    row_time = table.time[rows]
-    lo = params[i0]
-    phase = lo[:, 0] + TWO_PI * f_ref_hz * lo[:, 2] * (times - row_time[i0])
-    delay, disp = lo[:, 1].copy(), lo[:, 3].copy()
+    if table.npar != 2 * FRINGE_NPARAM_PER_POL:
+        raise ValueError(f"{table.path}: Fringe Jones tables must have 8 parameters, got {table.npar}")
+    times = np.asarray(times, dtype=np.float64).reshape(-1)
+    f_ref = table.spw_chan_freq[spw_t, table.spw_chan_freq.shape[1] // 2].astype(np.float64)
+    look = _lookup(table, field_id)
+    i0, i1, w, found = _brackets(look, antenna, spw_t[spw_index], times, interp)
+    shape = i0.shape + (2,)
+    phase, delay, disp = np.zeros(shape), np.zeros(shape), np.zeros(shape)
+    flag = np.ones(shape, dtype=bool)
+    if not look["rows"].size:
+        return phase, delay, disp, flag, f_ref
+    row0, row1 = look["rows"][i0], look["rows"][i1]
+    turn = (TWO_PI * f_ref)[spw_index]                   # rate -> phase change per second at the reference frequency
+    elapsed = times - look["time"][i0]
     blend = np.flatnonzero((i1 != i0) & (w > 0))
-    if blend.size:
-        first, second, frac = params[i0[blend]], params[i1[blend]], w[blend]
-        later = second[:, 0] + TWO_PI * f_ref_hz * second[:, 2] * (times[blend] - row_time[i1[blend]])
-        phase[blend] = np.angle((1.0 - frac) * np.exp(1j * phase[blend]) + frac * np.exp(1j * later))
-        delay[blend] = (1.0 - frac) * first[:, 1] + frac * second[:, 1]
-        disp[blend] = (1.0 - frac) * first[:, 3] + frac * second[:, 3]
-    theta = phase[:, None] + delay[:, None] * (TWO_PI * (chan_freq - f_ref_hz) * 1e-9)[None, :]
-    if np.any(disp):
-        theta = theta + disp[:, None] * k_disp(chan_freq, float(np.min(chan_freq)), float(np.max(chan_freq)))[None, :]
-    rowflag = table.flag[rows, 0, FRINGE_NPARAM_PER_POL * pol]
-    flagged = rowflag[i0].copy()
-    flagged[blend] |= rowflag[i1[blend]]
-    return np.exp(1j * theta), np.broadcast_to(flagged[:, None], (ntime, nchan))
+    frac = w[blend]
+    later_elapsed = times[blend] - look["time"][i1[blend]]
+    for hand in range(2):
+        block = slice(FRINGE_NPARAM_PER_POL * hand, FRINGE_NPARAM_PER_POL * (hand + 1))
+        lo = np.real(table.param[row0, 0, block]).astype(np.float64)               # phase, delay, rate, disp
+        p = lo[:, 0] + turn * lo[:, 2] * elapsed
+        d, x = lo[:, 1].copy(), lo[:, 3].copy()
+        rowflag = table.flag[:, 0, FRINGE_NPARAM_PER_POL * hand]
+        f = rowflag[row0]
+        if blend.size:
+            first = lo[blend]
+            second = np.real(table.param[row1[blend], 0, block]).astype(np.float64)
+            later = second[:, 0] + turn[blend] * second[:, 2] * later_elapsed
+            p[blend] = np.angle((1.0 - frac) * np.exp(1j * p[blend]) + frac * np.exp(1j * later))
+            d[blend] = (1.0 - frac) * first[:, 1] + frac * second[:, 1]
+            x[blend] = (1.0 - frac) * first[:, 3] + frac * second[:, 3]
+            f[blend] |= rowflag[row1[blend]]
+        f |= ~found
+        phase[:, hand] = np.where(f, 0.0, p)
+        delay[:, hand] = np.where(f, 0.0, d)
+        disp[:, hand] = np.where(f, 0.0, x)
+        flag[:, hand] = f
+    return phase, delay, disp, flag, f_ref
+
+
+def _gain_curve_gains(table, antenna, times, spw_index, spw_t, elevation, *, field_id=None, interp="linear"):
+    """Gains (1 where flagged) and flags (npoint, 2) of a gain-curve table at points (as for :func:`_table_gains`).
+
+    The power polynomial of each hand is evaluated in zenith angle [deg] (EPowerCurve/EGainCurve::calcPar of
+    CASA) at the ``elevation`` of every point [rad], its coefficients interpolated in time between the
+    unflagged solutions; EPowerCurve gives the square root of the power.
+    """
+    shape = (np.size(times), 2)
+    gains, flags = np.ones(shape, dtype=np.complex128), np.ones(shape, dtype=bool)
+    ncoef = table.npar // 2                                  # npar = 2 pols x ncoef polynomial coefficients
+    if ncoef < 1:
+        return gains, flags
+    x = 90.0 - np.degrees(np.asarray(elevation, dtype=np.float64))
+    for hand in range(2):
+        pol = min(hand, table.npar - 1)
+        # The flag of a polarization sits with the first coefficient of its block of npar.
+        look = _lookup(table, field_id, flag_column=pol * ncoef)
+        if not look["rows"].size:
+            continue
+        i0, i1, w, found = _brackets(look, antenna, spw_t[spw_index], times, interp)
+        coefficients = slice(pol * ncoef, (pol + 1) * ncoef)
+        frac = w[:, None]
+        coeff = ((1.0 - frac) * table.param[look["rows"][i0], 0, coefficients]
+                 + frac * table.param[look["rows"][i1], 0, coefficients])
+        power = np.zeros(i0.shape, dtype=np.float64)
+        for degree in range(ncoef - 1, -1, -1):
+            power = power * x + np.real(coeff[:, degree])
+        gain = np.sqrt(np.maximum(power, 0.0)) if table.kind == "EPowerCurve" else power
+        bad = ~np.isfinite(gain) | (gain <= 0) | ~found
+        gains[:, hand] = np.where(bad, 1.0, gain)
+        flags[:, hand] = bad
+    return gains, flags
+
+
+def _grid_points(antenna_ids, times):
+    """The (antenna, time) points of a dense grid, antenna-major: (antenna (npoint,), time (npoint,))."""
+    antenna_ids = np.asarray(antenna_ids, dtype=np.int64).reshape(-1)
+    times = np.asarray(times, dtype=np.float64).reshape(-1)
+    return np.repeat(antenna_ids, times.size), np.tile(times, antenna_ids.size)
+
+
+def fringe_phase_terms(table, antenna_ids, times, spw, *, field_id=None, interp="linear", spwmap=None):
+    """The Fringe Jones phase of every (antenna, time, hand) as parameters, on no channel grid.
+
+    Returns ``(phase, delay, disp, flag, f_ref_hz)``: arrays (nant_sel, ntime, 2) such that the phase at
+    frequency ``f`` is ``phase + 2 pi 1e-9 delay (f - f_ref_hz) + disp k_disp(f)`` (zero where flagged), as
+    :func:`antenna_gains` evaluates it. Several fringe tables therefore add up before a single exponential.
+    """
+    spw_t = _mapped_spw(int(spw), spwmap)
+    if spw_t >= table.spw_chan_freq.shape[0]:
+        raise ValueError(f"{table.path}: caltable spw {spw_t} (data spw {spw}) does not exist")
+    antenna, time = _grid_points(antenna_ids, times)
+    phase, delay, disp, flag, f_ref = _fringe_grid(table, antenna, time, np.zeros(antenna.size, dtype=np.int64),
+                                                   np.array([spw_t]), field_id=field_id,
+                                                   interp=parse_interp(interp)[0])
+    shape = (np.size(antenna_ids), np.size(times), 2)
+    return (phase.reshape(shape), delay.reshape(shape), disp.reshape(shape), flag.reshape(shape),
+            float(f_ref[0]))
 
 
 def antenna_gains(table, antenna_ids, times, spw, chan_freq, *, field_id=None, interp="linear", spwmap=None,
@@ -444,6 +686,8 @@ def antenna_gains(table, antenna_ids, times, spw, chan_freq, *, field_id=None, i
     interp : {"linear", "nearest"}
     spwmap : sequence of int, optional
         Data spw -> caltable spw (empty/None = identity).
+    elevation_grid : float array (nant_sel, ntime), optional
+        Elevations [rad]; required by gain-curve tables.
 
     Returns
     -------
@@ -455,62 +699,44 @@ def antenna_gains(table, antenna_ids, times, spw, chan_freq, *, field_id=None, i
         table = load_caltable(table)
     if table.kind in GAIN_CURVE_KINDS and elevation_grid is None:
         raise ValueError("gain-curve application requires elevations for every selected antenna and time")
-    interp, freq_interp, keep_chan_flags = parse_interp(interp)
-    antenna_ids = np.asarray(antenna_ids, dtype=np.int64).reshape(-1)
-    times = np.asarray(times, dtype=np.float64).reshape(-1)
     chan_freq = np.asarray(chan_freq, dtype=np.float64).reshape(-1)
     spw_t = _mapped_spw(int(spw), spwmap)
     if spw_t >= table.spw_chan_freq.shape[0]:
         raise ValueError(f"{table.path}: caltable spw {spw_t} (data spw {spw}) does not exist")
-    nant_sel, ntime, nchan = antenna_ids.size, times.size, chan_freq.size
-    gains = np.ones((nant_sel, ntime, nchan, 2), dtype=np.complex128)
-    gflag = np.ones((nant_sel, ntime, nchan, 2), dtype=bool)
-    is_fringe = table.kind == "Fringe Jones"
-    npol_t = table.npar // FRINGE_NPARAM_PER_POL if is_fringe else table.npar
-    if is_fringe and table.npar != 2 * FRINGE_NPARAM_PER_POL:
-        raise ValueError(f"{table.path}: Fringe Jones tables must have 8 parameters, got {table.npar}")
+    _check_kind(table)
+    shape = (np.size(antenna_ids), np.size(times), chan_freq.size, 2)
+    if table.kind == "Fringe Jones":
+        phase, delay, disp, flag, f_ref = fringe_phase_terms(table, antenna_ids, times, spw_t, field_id=field_id,
+                                                             interp=interp)
+        theta = phase[:, :, None, :] + delay[:, :, None, :] * (TWO_PI * (chan_freq - f_ref) * 1e-9)[:, None]
+        if np.any(disp):
+            theta = theta + disp[:, :, None, :] * k_disp(chan_freq, float(np.min(chan_freq)),
+                                                         float(np.max(chan_freq)))[:, None]
+        flags = np.broadcast_to(flag[:, :, None, :], shape)
+        return np.where(flags, 1.0, np.exp(1j * theta)), flags.copy()
+    antenna, time = _grid_points(antenna_ids, times)
+    spw_index, spw_ts = np.zeros(antenna.size, dtype=np.int64), np.array([spw_t])
+    if table.kind in GAIN_CURVE_KINDS:
+        gains, flags = _gain_curve_gains(table, antenna, time, spw_index, spw_ts,
+                                         np.asarray(elevation_grid, dtype=np.float64).reshape(-1),
+                                         field_id=field_id, interp=parse_interp(interp)[0])
+        index = None
+    else:
+        gains, flags, index = _table_gains(table, antenna, time, spw_index, spw_ts, chan_freq[None],
+                                           field_id=field_id, interp=interp)
+    if index is None:
+        gains, flags = gains[:, None, :], flags[:, None, :]
+    else:
+        gains, flags = gains[index].transpose(0, 2, 1), flags[index].transpose(0, 2, 1)
+    dense = shape[:2] + gains.shape[1:]
+    return (np.broadcast_to(gains.reshape(dense), shape).copy(), np.broadcast_to(flags.reshape(dense), shape).copy())
+
+
+def _check_kind(table):
+    """Warn about a table kind that is applied as a plain gain without being one of those known to be."""
     if table.kind not in ("G Jones", "T Jones", "B Jones", "B TSYS", "Fringe Jones", *GAIN_CURVE_KINDS):
-        log.warning("antenna_gains: table kind %r not explicitly supported, applying as a G-like gain", table.kind)
-    f_ref_hz = float(table.spw_chan_freq[spw_t, table.spw_chan_freq.shape[1] // 2])
-    for k, ant in enumerate(antenna_ids):
-        rows = _select_rows(table, int(ant), spw_t, field_id)
-        if table.kind in GAIN_CURVE_KINDS:
-            ncoef = table.npar // 2                          # npar = 2 pols x ncoef polynomial coefficients
-            if ncoef < 1:
-                continue
-            for hand in range(2):
-                pol = min(hand, npol_t - 1)
-                # The flag of a polarization sits with the first coefficient of its block of npar.
-                good_rows = rows[~table.flag[rows, 0, pol * ncoef]] if rows.size else rows
-                if not good_rows.size:
-                    continue
-                i0, i1, w = _bracket(table.time[good_rows], times, interp)
-                coefficients = table.param[good_rows, 0, pol * ncoef:(pol + 1) * ncoef]
-                coeff = (1.0 - w[:, None]) * coefficients[i0] + w[:, None] * coefficients[i1]
-                # CASA evaluates the curve in zenith angle [deg] (EPowerCurve/EGainCurve::calcPar).
-                x = 90.0 - np.degrees(np.asarray(elevation_grid[k], dtype=np.float64))
-                power = np.zeros(times.size, dtype=np.float64)
-                for degree in range(ncoef - 1, -1, -1):
-                    power = power * x + np.real(coeff[:, degree])
-                if table.kind == "EPowerCurve":
-                    gain = np.sqrt(np.maximum(power, 0.0))
-                else:
-                    gain = power
-                bad = ~np.isfinite(gain) | (gain <= 0)
-                gains[k, :, :, hand] = np.where(bad[:, None], 1.0, gain[:, None])
-                gflag[k, :, :, hand] = np.broadcast_to(bad[:, None], (ntime, nchan))
-            continue
-        for hand in range(2):
-            pol = min(hand, npol_t - 1)
-            if is_fringe:
-                values, flags = _gains_fringe(table, rows, times, chan_freq, interp, pol, f_ref_hz)
-            else:
-                values, flags = _gains_generic(table, rows, times, interp, pol)
-                values, flags = _interp_freq(values, flags, table.spw_chan_freq[spw_t], chan_freq, freq_interp,
-                                             keep_chan_flags)
-            gains[k, :, :, hand] = np.where(flags, 1.0, values)
-            gflag[k, :, :, hand] = flags
-    return gains, gflag
+        log.warning("table kind %r of %s not explicitly supported, applying as a G-like gain", table.kind,
+                    table.path)
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -549,6 +775,36 @@ def _normalise_entry(entry, cache):
     elif gainfield is not None and len(gainfield) > 0:
         field_id = [int(x) for x in gainfield]
     return table, interp, spwmap, field_id, bool(entry.get("calwt", False))
+
+
+def adapt_table(table: CalTableData, antenna_names) -> CalTableData:
+    """``table`` with its antennas numbered as in the antenna list ``antenna_names`` of a measurement set.
+
+    A table numbers the antennas of its own ANTENNA subtable, copied from the set it was solved on: one
+    solved on another set (another epoch, a set with a different array) is matched by antenna name, and its
+    rows for antennas the set does not have are dropped. Returned unchanged when the numbering agrees.
+    """
+    wanted = [str(name).strip().upper() for name in antenna_names]
+    own = [str(name).strip().upper() for name in table.antenna_names]
+    if own == wanted[:len(own)]:
+        return table
+    lookup = {name: index for index, name in enumerate(wanted)}
+    mapping = np.array([lookup.get(name, -1) for name in own] + [-1], dtype=np.int64)   # [-1]: out of range
+
+    def renumber(ids):
+        ids = np.asarray(ids, dtype=np.int64)
+        return np.where(ids >= 0, mapping[np.clip(ids, 0, len(own))], ids)
+
+    antenna1, antenna2 = renumber(table.antenna1), renumber(table.antenna2)
+    keep = antenna1 >= 0
+    missing = sorted({own[i] for i in np.unique(np.asarray(table.antenna1)[~keep]) if 0 <= i < len(own)})
+    if missing:
+        log.info("%s: no antenna %s in the measurement set; their solutions are not applied", table.path,
+                 ", ".join(missing))
+    rows = {name: getattr(table, name)[keep] for name in ("time", "interval", "field_id", "spw_id", "scan_number",
+                                                           "param", "flag", "snr")}
+    return replace(table, antenna1=antenna1[keep], antenna2=antenna2[keep], antenna_names=np.asarray(antenna_names),
+                   nant=len(antenna_names), _row_index={}, **rows)
 
 
 def nearest_table_field(table, field_dirs, target_field):
@@ -590,6 +846,164 @@ def normalise_entries(tables, *, phase_only=False, calwt=False, cache=None, fiel
     return entries
 
 
+def _known_antennas(table, antenna, spw_t):
+    """Whether ``table`` has any solution, flagged or not, for every point's antenna in its caltable spw."""
+    known = table._row_index.get("known")
+    if known is None:
+        known = np.zeros((int(max(table.nant, table.antenna1.max(initial=-1) + 1)),
+                          int(max(table.spw_chan_freq.shape[0], table.spw_id.max(initial=-1) + 1))), dtype=bool)
+        listed = (table.antenna1 >= 0) & (table.spw_id >= 0)
+        known[table.antenna1[listed], table.spw_id[listed]] = True
+        table._row_index["known"] = known
+    antenna = np.asarray(antenna, dtype=np.int64)
+    spw = np.asarray(spw_t, dtype=np.int64)
+    inside = (antenna >= 0) & (antenna < known.shape[0]) & (spw >= 0) & (spw < known.shape[1])
+    return inside & known[np.where(inside, antenna, 0), np.where(inside, spw, 0)]
+
+
+def _point_elevations(antenna, times, antenna_xyz, field_dir):
+    """Elevation [rad] of the source ``field_dir`` (ra, dec) [rad] at every point (``antenna[k]``, ``times[k]``)."""
+    if antenna_xyz is None or field_dir is None:
+        raise ValueError("gain-curve application requires antenna positions and field direction")
+    from .parang import elevation
+    utimes, at_time = np.unique(times, return_inverse=True)
+    return elevation(antenna_xyz, float(field_dir[0]), float(field_dir[1]), utimes)[antenna, at_time.reshape(-1)]
+
+
+def _chain_factors(entries, antenna, times, spw_index, spws, chan_freq, *, antenna_xyz=None, field_dir=None,
+                   elevation=None):
+    """The factors of a table chain at points: point k is ``antenna[k]`` at ``times[k]`` in the data spw
+    ``spws[spw_index[k]]``, whose channels are ``chan_freq[spw_index[k]]`` ((nspw, nchan) [Hz]). Gain curves
+    need the source ``elevation`` at every point [rad] (computed from ``antenna_xyz`` and ``field_dir`` when
+    None).
+
+    The chain is evaluated in factors, each on the smallest grid it needs: tables without a frequency axis
+    (Tsys, gain curves, G/T Jones) multiplied per point and hand, the fringe tables as summed phase parameters
+    (to be exponentiated once), and channel-dependent tables (bandpasses) per distinct solution. :func:`_assemble`
+    (or :func:`vlbipy.solvers.kernels.assemble`) multiplies them out on every channel.
+
+    Returns
+    -------
+    dict
+        ``flat``/``flat_flag`` (npoint, 2); ``fringe`` (phase, delay, disp, flags) each (npoint, 2), or None;
+        ``dispersive`` (whether a fringe table has a dispersive term); ``spectral`` (values, flags, index): the
+        bandpass product (nvalue, 2, nchan) and the row of every point in it, or None; ``offset`` (nspw, nchan):
+        2 pi 1e-9 (f - f0) of every channel from the first one; ``kdisp`` (nspw, nchan) or None; ``wscale`` the
+        product of |g|^2 of the entries with ``calwt`` whose kind is in :data:`WEIGHT_CAL_KINDS` and ``wflag``
+        their flags where the table knows the antenna ((npoint, 2), or (npoint, 2, nchan) when one of them has
+        channels), or None.
+    """
+    antenna = np.asarray(antenna, dtype=np.int64).reshape(-1)
+    times = np.asarray(times, dtype=np.float64).reshape(-1)
+    spw_index = np.asarray(spw_index, dtype=np.int64).reshape(-1)
+    spws = np.asarray(spws, dtype=np.int64).reshape(-1)
+    chan_freq = np.asarray(chan_freq, dtype=np.float64).reshape(spws.size, -1)
+    npoint = times.size
+    flat = np.ones((npoint, 2), dtype=np.complex128)
+    flat_flag = np.zeros((npoint, 2), dtype=bool)
+    spectral = []
+    phase = delay = disp = fringe_flag = None
+    dispersive = False
+    f0 = chan_freq[:, 0]
+    wscale, wflag = None, None
+    for table, interp, spwmap, field_id, entry_calwt in entries:
+        spw_t = np.array([_mapped_spw(int(spw), spwmap) for spw in spws], dtype=np.int64)
+        missing = spw_t >= table.spw_chan_freq.shape[0]
+        if missing.any():
+            raise ValueError(f"{table.path}: caltable spw {int(spw_t[missing][0])} (data spw "
+                             f"{int(spws[missing][0])}) does not exist")
+        if table.kind in GAIN_CURVE_KINDS and elevation is None:
+            elevation = _point_elevations(antenna, times, antenna_xyz, field_dir)
+        if table.kind == "Fringe Jones":
+            p, d, x, f, f_ref = _fringe_grid(table, antenna, times, spw_index, spw_t, field_id=field_id,
+                                             interp=parse_interp(interp)[0])
+            # Referenced to the first channel, so that tables with different reference frequencies add up.
+            p = p + np.where(f, 0.0, TWO_PI * 1e-9 * d * (f0 - f_ref)[spw_index][:, None])
+            if phase is None:
+                phase, delay, disp, fringe_flag = p, d, x, f
+            else:
+                phase, delay, disp, fringe_flag = phase + p, delay + d, disp + x, fringe_flag | f
+            # A property of the tables, not of the points: a point never depends on the others.
+            dispersive = dispersive or bool(np.any(table.param[:, 0, 3::FRINGE_NPARAM_PER_POL]))
+            continue
+        _check_kind(table)
+        if table.kind in GAIN_CURVE_KINDS:
+            values, flags = _gain_curve_gains(table, antenna, times, spw_index, spw_t, elevation,
+                                              field_id=field_id, interp=parse_interp(interp)[0])
+            index = None
+        else:
+            values, flags, index = _table_gains(table, antenna, times, spw_index, spw_t, chan_freq,
+                                                field_id=field_id, interp=interp)
+        if index is None:
+            flat *= values
+            flat_flag |= flags
+        else:
+            spectral.append((values, flags, index))
+        if entry_calwt and table.kind in WEIGHT_CAL_KINDS:
+            power = np.abs(values) ** 2 if index is None else np.abs(values[index]) ** 2
+            # An antenna the table does not know at all leaves the weight alone (its data are flagged, but CASA
+            # scales the weight by 1); only a solution that exists and is flagged zeroes it.
+            known = _known_antennas(table, antenna, spw_t[spw_index])
+            flagged = flags & known[:, None] if index is None else flags[index] & known[:, None, None]
+            if wscale is not None and wscale.ndim < power.ndim:           # the first such table with channels
+                wscale, wflag = wscale[:, :, None], wflag[:, :, None]
+            elif wscale is not None and power.ndim < wscale.ndim:
+                power, flagged = power[:, :, None], flagged[:, :, None]
+            wscale = power if wscale is None else wscale * power
+            wflag = flagged if wflag is None else wflag | flagged
+    if len(spectral) > 1:
+        # Several bandpass-like tables: their product at every point, in the order of the chain.
+        values = spectral[0][0][spectral[0][2]]
+        flags = spectral[0][1][spectral[0][2]]
+        for more, more_flags, index in spectral[1:]:
+            values *= more[index]
+            flags = flags | more_flags[index]
+        spectral = [(values, flags, np.arange(npoint))]
+    kdisp = None
+    if dispersive:
+        kdisp = np.stack([k_disp(freq, float(freq.min()), float(freq.max())) for freq in chan_freq])
+    return {"flat": flat, "flat_flag": flat_flag, "spw_index": spw_index,
+            "fringe": None if phase is None else (phase, delay, disp, fringe_flag), "dispersive": dispersive,
+            "offset": TWO_PI * 1e-9 * (chan_freq - f0[:, None]), "kdisp": kdisp,
+            "spectral": spectral[0] if spectral else None, "wscale": wscale, "wflag": wflag}
+
+
+def _assemble(factors, nchan):
+    """The gains and flags (npoint, 2, nchan) of every point, channel and hand from :func:`_chain_factors`."""
+    flat, spw_index = factors["flat"], factors["spw_index"]
+    shape = flat.shape + (nchan,)
+    gflag = np.broadcast_to(factors["flat_flag"][:, :, None], shape).copy()
+    if factors["fringe"] is not None:
+        phase, delay, disp, fringe_flag = factors["fringe"]
+        theta = delay[:, :, None] * factors["offset"][spw_index][:, None, :]
+        theta += phase[:, :, None]
+        if factors["kdisp"] is not None:
+            theta += disp[:, :, None] * factors["kdisp"][spw_index][:, None, :]
+        gain = np.exp(1j * theta)
+        gain *= flat[:, :, None]
+        gflag |= fringe_flag[:, :, None]
+    else:
+        gain = np.broadcast_to(flat[:, :, None], shape).copy()
+    if factors["spectral"] is not None:
+        values, flags, index = factors["spectral"]
+        gain *= values[index]
+        gflag |= flags[index]
+    return gain, gflag
+
+
+def _chain_gains(entries, antenna, times, spw_index, spws, chan_freq, *, antenna_xyz=None, field_dir=None):
+    """:func:`combined_gains` at points (see :func:`_chain_factors`): (gain, gflag, wscale, wflag), the first two
+    (npoint, nchan, 2), the last two (npoint, 1 or nchan, 2) or None."""
+    factors = _chain_factors(entries, antenna, times, spw_index, spws, chan_freq, antenna_xyz=antenna_xyz,
+                             field_dir=field_dir)
+    gain, gflag = _assemble(factors, np.shape(chan_freq)[-1])
+    wscale, wflag = factors["wscale"], factors["wflag"]
+    if wscale is not None:
+        wscale = wscale.transpose(0, 2, 1) if wscale.ndim == 3 else wscale[:, None, :]
+        wflag = wflag.transpose(0, 2, 1) if wflag.ndim == 3 else wflag[:, None, :]
+    return gain.transpose(0, 2, 1), gflag.transpose(0, 2, 1), wscale, wflag
+
+
 def combined_gains(entries, antenna_ids, times, spw, chan_freq, *, antenna_xyz=None, field_dir=None):
     """Multiply the antenna gains of a whole chain of tables on one (antenna, time, channel, hand) grid.
 
@@ -612,37 +1026,17 @@ def combined_gains(entries, antenna_ids, times, spw, chan_freq, *, antenna_xyz=N
     Returns
     -------
     (gain, gflag, wscale, wflag)
-        ``gain`` complex128 and ``gflag`` bool, shape (nant_sel, ntime, nchan, 2); ``wscale`` float64 of that
-        shape holding the product of |g|^2 over the entries with ``calwt`` whose kind is in
-        :data:`WEIGHT_CAL_KINDS`, and ``wflag`` the flags of those same entries (both None when there is none).
+        ``gain`` complex128 and ``gflag`` bool, shape (nant_sel, ntime, nchan, 2); ``wscale`` float64 holding the
+        product of |g|^2 over the entries with ``calwt`` whose kind is in :data:`WEIGHT_CAL_KINDS`, and ``wflag``
+        the flags of those same entries (both None when there is none), broadcastable to that shape: their
+        channel axis has length 1 when no channel-dependent table calibrates the weights.
     """
-    antenna_ids = np.asarray(antenna_ids, dtype=np.int64)
-    shape = (antenna_ids.size, len(times), len(chan_freq), 2)
-    gain = np.ones(shape, dtype=np.complex128)
-    gflag = np.zeros(shape, dtype=bool)
-    wscale, wflag = None, None
-    elevation_grid = None
-    for table, interp, spwmap, field_id, entry_calwt in entries:
-        if table.kind in GAIN_CURVE_KINDS and elevation_grid is None:
-            if antenna_xyz is None or field_dir is None:
-                raise ValueError(f"{table.kind} application requires antenna positions and field direction")
-            from .parang import elevation
-            elevation_grid = elevation(antenna_xyz, float(field_dir[0]), float(field_dir[1]), times)[antenna_ids]
-        gains, flags = antenna_gains(table, antenna_ids, times, int(spw), chan_freq, field_id=field_id,
-                                     interp=interp, spwmap=spwmap,
-                                     elevation_grid=elevation_grid if table.kind in GAIN_CURVE_KINDS else None)
-        gain *= gains
-        gflag |= flags
-        if entry_calwt and table.kind in WEIGHT_CAL_KINDS:
-            power = np.abs(gains) ** 2
-            wscale = power if wscale is None else wscale * power
-            # An antenna the table does not know at all leaves the weight alone (its data are flagged, but CASA
-            # scales the weight by 1); only a solution that exists and is flagged zeroes it.
-            spw_t = _mapped_spw(int(spw), spwmap)
-            known = np.isin(antenna_ids, table.antenna1[table.spw_id == spw_t])
-            flagged = flags & known[:, None, None, None]
-            wflag = flagged if wflag is None else wflag | flagged
-    return gain, gflag, wscale, wflag
+    antenna, time = _grid_points(antenna_ids, times)
+    dense = (np.size(antenna_ids), np.size(times))
+    values = _chain_gains(entries, antenna, time, np.zeros(antenna.size, dtype=np.int64), [spw],
+                          np.asarray(chan_freq, dtype=np.float64).reshape(1, -1), antenna_xyz=antenna_xyz,
+                          field_dir=field_dir)
+    return tuple(None if value is None else value.reshape(dense + value.shape[1:]) for value in values)
 
 
 def calibrates_weights(entries):
@@ -690,57 +1084,300 @@ def apply_tables(vis, flag, weight, antenna1, antenna2, time, spw, chan_freq, ta
     vis = np.array(vis, copy=copy)
     flag = np.array(flag, dtype=bool, copy=copy)
     nrow, nchan, ncorr = vis.shape
-    if weight is not None:
-        weight = np.asarray(weight)
-        wtype = np.float32 if weight.dtype.kind == "f" and weight.itemsize <= 4 else np.float64
-        if weight.ndim == 2:
-            weight = np.array(np.broadcast_to(weight[:, None, :], vis.shape), dtype=wtype)
-        else:
-            weight = np.array(weight, dtype=wtype, copy=copy)
+    weight = _weight_cube(weight, vis.shape, copy)
     antenna1 = np.asarray(antenna1, dtype=np.int64)
     antenna2 = np.asarray(antenna2, dtype=np.int64)
     time = np.asarray(time, dtype=np.float64)
     spw = np.asarray(spw, dtype=np.int64)
     chan_freq = np.asarray(chan_freq, dtype=np.float64)
-    hand1, hand2 = _corr_hands(ncorr)
     entries = tables if tables and isinstance(tables[0], tuple) else normalise_entries(tables, phase_only=phase_only,
                                                                                          calwt=calwt)
-    gain_type = np.complex64 if vis.dtype == np.complex64 else np.complex128
-    spws = np.unique(spw)
-    for s in spws if entries else []:
-        # A block of a single spw (the usual chunk) is corrected through a plain slice: no row copies.
-        rows = slice(None) if spws.size == 1 else np.nonzero(spw == s)[0]
-        utimes, t_idx = np.unique(time[rows], return_inverse=True)
-        nsel = t_idx.size
-        uants, a_idx = np.unique(np.concatenate([antenna1[rows], antenna2[rows]]), return_inverse=True)
-        a1_idx, a2_idx = a_idx[:nsel], a_idx[nsel:]
-        gain, gflag, wscale, wflag = combined_gains(entries, uants, utimes, int(s), chan_freq[s],
-                                                    antenna_xyz=antenna_xyz, field_dir=field_dir)
+    if entries:
+        # The gains at every (spw, antenna, time) the rows use, then one division for all rows.
+        points, point1, point2 = row_points(antenna1, antenna2, time, spw)
+        grid = point_grid(entries, points["groups"][0], points["antenna"], points["time"], chan_freq,
+                          antenna_xyz=antenna_xyz, field_dir=field_dir, vis_dtype=vis.dtype,
+                          weight_dtype=None if weight is None else weight.dtype)
+        apply_point_grid(vis, flag, weight, grid, point1, point2)
+    log.debug("apply_tables: %d tables applied to %d rows x %d chan x %d corr (%d spws) in %.3f s", len(entries), nrow,
+              nchan, ncorr, np.unique(spw).size, _time.perf_counter() - t_start)
+    return vis, flag, weight
+
+
+def _weight_cube(weight, shape, copy):
+    """Weights as a writable (nrow, nchan, ncorr) float array (a per-row (nrow, ncorr) array is broadcast)."""
+    if weight is None:
+        return None
+    weight = np.asarray(weight)
+    wtype = np.float32 if weight.dtype.kind == "f" and weight.itemsize <= 4 else np.float64
+    if weight.ndim == 2:
+        return np.array(np.broadcast_to(weight[:, None, :], shape), dtype=wtype)
+    return np.array(weight, dtype=wtype, copy=copy)
+
+
+def row_points(antenna1, antenna2, time, *groups):
+    """The points a set of rows needs gains at, and the two points of every row.
+
+    A point is one antenna at one time, apart for every value of each array of ``groups`` (int, (nrow,): the
+    field, the spw...). Returns ``(points, point1, point2)``: ``points`` a dict of the arrays (npoint,)
+    ``"groups"`` (a list, one array per group), ``"antenna"`` and ``"time"``, sorted by (groups..., antenna,
+    time), and the index of the point of every row's ANTENNA1 and ANTENNA2 (nrow,).
+    """
+    time = np.asarray(time, dtype=np.float64).reshape(-1)
+    nrow = time.size
+    antenna = np.concatenate([np.asarray(antenna1, dtype=np.int64).reshape(-1),
+                              np.asarray(antenna2, dtype=np.int64).reshape(-1)])
+    groups = [np.tile(np.asarray(group, dtype=np.int64).reshape(-1), 2) for group in groups]
+    utimes, at_time = np.unique(time, return_inverse=True)
+    # One integer per (groups..., antenna, time): every value shifted to start at 0, times as their rank.
+    key = np.zeros(2 * nrow, dtype=np.int64)
+    for values in groups + [antenna]:
+        low = int(values.min()) if values.size else 0
+        key = key * ((int(values.max()) - low + 1) if values.size else 1) + (values - low)
+    key = key * max(utimes.size, 1) + np.tile(at_time.reshape(-1), 2)
+    _, first, inverse = np.unique(key, return_index=True, return_inverse=True)
+    inverse = inverse.reshape(-1)
+    points = {"groups": [values[first] for values in groups], "antenna": antenna[first],
+              "time": utimes[np.tile(at_time.reshape(-1), 2)[first]]}
+    return points, inverse[:nrow], inverse[nrow:]
+
+
+def point_grid(entries, spw, antenna, time, chan_freq, *, antenna_xyz=None, field_dir=None,
+               vis_dtype=np.complex64, weight_dtype=np.float32):
+    """The combined gains of a table chain at points, ready to apply (:func:`apply_point_grid`).
+
+    Parameters
+    ----------
+    entries : list of tuple
+        Output of :func:`normalise_entries`.
+    spw, antenna, time : arrays (npoint,)
+        Data spw, antenna and time [s] of every point (:func:`row_points`).
+    chan_freq : float array (nspw_ms, nchan)
+        Channel frequencies of every spw of the set [Hz].
+    vis_dtype, weight_dtype : numpy dtypes
+        Types of the visibilities and weights the gains will be applied to.
+
+    Returns
+    -------
+    dict
+        ``gain`` (npoint, nchan, 2) with 1 where flagged, ``gflag``, and ``wscale`` (npoint, 1 or nchan, 2), 0
+        where a weight-calibrating solution is flagged, or None when no entry calibrates the weights.
+    """
+    spws, spw_index = np.unique(np.asarray(spw, dtype=np.int64).reshape(-1), return_inverse=True)
+    freqs = np.asarray(chan_freq, dtype=np.float64)[spws]
+    nchan = freqs.shape[1]
+    grid = empty_grid(spw_index.size, nchan, vis_dtype, weight_dtype, weight_channels(entries, nchan))
+    fill_grid(grid, slice(None), entries, antenna, time, spw_index.reshape(-1), spws, freqs, antenna_xyz=antenna_xyz,
+              field_dir=field_dir)
+    return grid
+
+
+def weight_channels(entries, nchan):
+    """Channels of the weight scale of a chain: None when no entry calibrates the weights, else 1, or ``nchan``
+    when one that does depends on frequency."""
+    weighting = [table for table, _, _, _, calwt in entries if calwt and table.kind in WEIGHT_CAL_KINDS]
+    if not weighting:
+        return None
+    return nchan if any(t.kind not in GAIN_CURVE_KINDS and t.nchan_t > 1 for t in weighting) else 1
+
+
+def empty_grid(npoint, nchan, vis_dtype, weight_dtype, weights):
+    """Arrays of a point grid of ``npoint`` points, with a ``wscale`` of ``weights`` channels (None: without)."""
+    gain_type = np.complex64 if np.dtype(vis_dtype) == np.complex64 else np.complex128
+    return {"gain": np.empty((npoint, nchan, 2), dtype=gain_type), "gflag": np.empty((npoint, nchan, 2), dtype=bool),
+            "wscale": None if weights is None else np.empty((npoint, weights, 2), dtype=weight_dtype or np.float64)}
+
+
+def fill_grid(grid, points, entries, antenna, time, spw_index, spws, chan_freq, *, antenna_xyz, field_dir):
+    """Evaluate a chain at points into the slice ``points`` of the arrays of ``grid`` (see :func:`point_grid`).
+
+    The points are evaluated in blocks of at most :data:`GRID_VALUES` values, which bounds the memory of the
+    intermediate arrays without changing any value (every point is evaluated on its own). The factors of the
+    blocks (:func:`_chain_factors`, numpy) are evaluated in parallel threads
+    (:func:`vlbipy.solvers.workers.thread_map`); with numba, each block is then multiplied out by
+    :func:`vlbipy.solvers.kernels.assemble` on all the cores of the job, otherwise by numpy in those threads.
+    A grid with a ``wscale`` gets 1 at points whose chain does not calibrate the weights.
+    """
+    from . import kernels
+    from .workers import thread_map
+    antenna = np.asarray(antenna, dtype=np.int64).reshape(-1)
+    time = np.asarray(time, dtype=np.float64).reshape(-1)
+    gain, gflag = grid["gain"][points], grid["gflag"][points]
+    wscale = None if grid["wscale"] is None else grid["wscale"][points]
+    nchan = chan_freq.shape[1]
+    step = max(GRID_VALUES // max(2 * nchan, 1), 1)
+    blocks = [slice(k, min(k + step, time.size)) for k in range(0, time.size, step)]
+    # The source elevations of gain curves once for all points, before the threads (astropy underneath).
+    elevation = (_point_elevations(antenna, time, antenna_xyz, field_dir)
+                 if any(table.kind in GAIN_CURVE_KINDS for table, *_ in entries) else None)
+
+    def factors_of(block):
+        return _chain_factors(entries, antenna[block], time[block], spw_index[block], spws, chan_freq,
+                              antenna_xyz=antenna_xyz, field_dir=field_dir,
+                              elevation=None if elevation is None else elevation[block])
+
+    def scale_weights(block, factors):
+        if wscale is None:
+            return
+        scale = factors["wscale"]
+        if scale is None:
+            wscale[block] = 1.0
+        else:
+            # A flagged solution of a weight-calibrating table scales the weight to 0 (as CASA writes it).
+            scale = np.where(factors["wflag"], 0.0, scale)
+            wscale[block] = scale[:, None, :] if scale.ndim == 2 else scale.transpose(0, 2, 1)
+
+    def assemble(block, factors):
+        g, f = _assemble(factors, nchan)
         # A solution that is zero or not finite without being flagged (a Tsys of 0, an interpolation
         # between a valid and an invalid value) cannot calibrate anything: dividing by it would leave
         # NaN or infinite visibilities that are not flagged. Treat it as the flagged solution it is.
-        gflag = gflag | ~np.isfinite(gain) | (gain == 0)
-        gain = np.where(gflag, 1.0, gain).astype(gain_type)
-        g1, g2 = gain[a1_idx, t_idx], np.conj(gain[a2_idx, t_idx])            # (nrow_spw, nchan, 2)
-        f1, f2 = gflag[a1_idx, t_idx], gflag[a2_idx, t_idx]
-        vis_s, flag_s = vis[rows], flag[rows]
-        for c in range(ncorr):
-            vis_s[:, :, c] /= g1[:, :, hand1[c]] * g2[:, :, hand2[c]]
-            flag_s[:, :, c] |= f1[:, :, hand1[c]] | f2[:, :, hand2[c]]
-        if spws.size > 1:
-            vis[rows], flag[rows] = vis_s, flag_s
-        if weight is not None and wscale is not None:
-            # A flagged solution of a weight-calibrating table scales the weight to 0 (as CASA writes it).
-            wscale = np.where(wflag, 0.0, wscale).astype(weight.dtype)
-            w1, w2 = wscale[a1_idx, t_idx], wscale[a2_idx, t_idx]
-            weight_s = weight[rows]
-            for c in range(ncorr):
-                weight_s[:, :, c] *= w1[:, :, hand1[c]] * w2[:, :, hand2[c]]
-            if spws.size > 1:
-                weight[rows] = weight_s
-    log.debug("apply_tables: %d tables applied to %d rows x %d chan x %d corr (%d spws) in %.3f s", len(entries), nrow,
-              nchan, ncorr, spws.size, _time.perf_counter() - t_start)
-    return vis, flag, weight
+        f |= ~np.isfinite(g) | (g == 0)
+        np.copyto(g, 1.0, where=f)
+        gain[block] = g.transpose(0, 2, 1)
+        gflag[block] = f.transpose(0, 2, 1)
+
+    def evaluate(block):
+        factors = factors_of(block)
+        assemble(block, factors)
+        scale_weights(block, factors)
+
+    if not kernels.available():
+        thread_map(evaluate, blocks)
+        return
+    for block, factors in zip(blocks, thread_map(factors_of, blocks)):
+        if not kernels.assemble(gain[block], gflag[block], factors["flat"], factors["flat_flag"],
+                                factors["spw_index"], fringe=factors["fringe"], offset=factors["offset"],
+                                kdisp=factors["kdisp"], spectral=factors["spectral"]):
+            assemble(block, factors)
+        scale_weights(block, factors)
+
+
+def gain_grid(entries, antenna_ids, times, spw, chan_freq, *, antenna_xyz=None, field_dir=None,
+              vis_dtype=np.complex64, weight_dtype=np.float32):
+    """The combined gains of a table chain on the (antenna, time, channel, hand) grid of a block, ready to apply.
+
+    The grid can serve any set of rows of one spw whose antennas and times are on it: computing it once for
+    the union of many (scan, spw) runs and applying it run by run (:func:`apply_gain_grid`) gives exactly the
+    result of calibrating each run on its own, with the table lookups done once instead of once per run.
+
+    Parameters
+    ----------
+    entries : list of tuple
+        Output of :func:`normalise_entries`.
+    antenna_ids, times : arrays
+        Antennas and times to cover (duplicates allowed).
+    spw : int
+    chan_freq : float array (nchan,)
+    vis_dtype, weight_dtype : numpy dtypes
+        Types of the visibilities and weights the grid will be applied to.
+
+    Returns
+    -------
+    dict
+        ``antennas`` and ``times`` (sorted unique), ``gain`` (nant, ntime, nchan, 2) with 1 where flagged,
+        ``gflag``, and ``wscale`` (0 where a weight-calibrating solution is flagged; None when no entry
+        calibrates the weights; broadcastable to the shape of ``gain``, see :func:`combined_gains`).
+    """
+    uants = np.unique(np.asarray(antenna_ids, dtype=np.int64))
+    utimes = np.unique(np.asarray(times, dtype=np.float64))
+    antenna, time = _grid_points(uants, utimes)
+    chan_freq = np.asarray(chan_freq, dtype=np.float64).reshape(1, -1)
+    grid = empty_grid(antenna.size, chan_freq.shape[1], vis_dtype, weight_dtype,
+                      weight_channels(entries, chan_freq.shape[1]))
+    fill_grid(grid, slice(None), entries, antenna, time, np.zeros(antenna.size, dtype=np.int64), np.array([int(spw)]),
+              chan_freq, antenna_xyz=antenna_xyz, field_dir=field_dir)
+    dense = (uants.size, utimes.size)
+    return {"antennas": uants, "times": utimes, "gain": grid["gain"].reshape(dense + grid["gain"].shape[1:]),
+            "gflag": grid["gflag"].reshape(dense + grid["gflag"].shape[1:]),
+            "wscale": None if grid["wscale"] is None else grid["wscale"].reshape(dense + grid["wscale"].shape[1:])}
+
+
+def _grid_index(grid, antenna1, antenna2, time):
+    """Points of the rows' antennas and time on a grid of :func:`gain_grid` (ValueError when a row is not on it)."""
+    lookup = np.full(int(grid["antennas"].max()) + 1, -1, dtype=np.int64)
+    lookup[grid["antennas"]] = np.arange(grid["antennas"].size)
+    antenna1, antenna2 = np.asarray(antenna1, dtype=np.int64), np.asarray(antenna2, dtype=np.int64)
+    if (antenna1 >= lookup.size).any() or (antenna2 >= lookup.size).any():
+        raise ValueError("apply_gain_grid: rows outside the antennas/times of the gain grid")
+    a1_idx, a2_idx = lookup[antenna1], lookup[antenna2]
+    t_idx = np.searchsorted(grid["times"], np.asarray(time, dtype=np.float64))
+    if (a1_idx < 0).any() or (a2_idx < 0).any() or (t_idx >= grid["times"].size).any() or \
+            (grid["times"][np.minimum(t_idx, grid["times"].size - 1)] != time).any():
+        raise ValueError("apply_gain_grid: rows outside the antennas/times of the gain grid")
+    ntime = grid["times"].size
+    return a1_idx * ntime + t_idx, a2_idx * ntime + t_idx
+
+
+def _as_points(grid):
+    """The arrays of a :func:`gain_grid` grid with one point per (antenna, time), as :func:`point_grid` has them."""
+    return {name: None if grid[name] is None else grid[name].reshape((-1,) + grid[name].shape[2:])
+            for name in ("gain", "gflag", "wscale")}
+
+
+def _per_corr(values, hands):
+    """``values`` (nrow, nchan, 2 hands) for the correlations of ``hands`` (as is when they are the two hands)."""
+    return values if hands.size == 2 and hands[0] == 0 and hands[1] == 1 else values[:, :, hands]
+
+
+def apply_point_flags(flag, grid, point1, point2, chans=None):
+    """Flag in place, as :func:`apply_point_grid` does, the data whose solution is flagged or missing (FLAG only)."""
+    hand1, hand2 = _corr_hands(flag.shape[2])
+    gflag = grid["gflag"]
+    f1, f2 = gflag[point1], gflag[point2]
+    if chans is not None:
+        f1, f2 = f1[:, chans], f2[:, chans]
+    flag |= _per_corr(f1, hand1) | _per_corr(f2, hand2)
+
+
+def apply_point_grid(vis, flag, weight, grid, point1, point2, chans=None, *, rotation=None, rotate=None,
+                     invalid=False):
+    """Correct rows in place with the gains of a point grid (:func:`point_grid`).
+
+    Row k is corrected with the gains of the points ``point1[k]`` (its ANTENNA1) and ``point2[k]`` (its
+    ANTENNA2), on the channels ``chans`` of the grid when the rows were read with a channel selection.
+    ``vis``/``flag`` (nrow, nchan, ncorr) and ``weight`` (same shape, or None) are modified in place.
+
+    With ``invalid``, values that are not finite are first zeroed and flagged; ``rotation`` (nrow, ncorr)
+    then multiplies the rows ``rotate`` (the feed rotation) before the division. The work is done by
+    :func:`vlbipy.solvers.kernels.correct` in one parallel pass when numba is installed.
+    """
+    from . import kernels
+    hand1, hand2 = _corr_hands(vis.shape[2])
+    if kernels.available() and kernels.correct(vis, flag, weight, grid["gain"], grid["gflag"], grid["wscale"],
+                                               point1, point2, hand1, hand2, chans=chans, rotation=rotation,
+                                               rotate=rotate, invalid=invalid):
+        return
+    if invalid:
+        bad = ~np.isfinite(vis)
+        if bad.any():
+            vis[bad] = 0
+            flag |= bad
+    if rotation is not None and rotate is not None and rotate.any():
+        if rotate.all():
+            vis *= rotation[:, None, :]
+        else:
+            vis[rotate] *= rotation[rotate][:, None, :]
+    gain = grid["gain"]
+    g1, g2 = gain[point1], np.conj(gain[point2])                                  # (nrow, nchan, 2)
+    if chans is not None:
+        g1, g2 = g1[:, chans], g2[:, chans]
+    vis /= _per_corr(g1, hand1) * _per_corr(g2, hand2)
+    apply_point_flags(flag, grid, point1, point2, chans)
+    if weight is not None and grid["wscale"] is not None:
+        wscale = grid["wscale"]
+        w1, w2 = wscale[point1], wscale[point2]
+        if chans is not None and wscale.shape[1] > 1:
+            w1, w2 = w1[:, chans], w2[:, chans]
+        weight *= _per_corr(w1, hand1) * _per_corr(w2, hand2)
+
+
+def apply_gain_grid(vis, flag, weight, antenna1, antenna2, time, grid):
+    """Correct rows in place with a grid from :func:`gain_grid` (every row's antennas and time must be on it).
+
+    ``vis``/``flag`` (nrow, nchan, ncorr) and ``weight`` (same shape, or None) are modified in place.
+    """
+    apply_point_grid(vis, flag, weight, _as_points(grid), *_grid_index(grid, antenna1, antenna2, time))
 
 
 def caltable_entries_from_vlbipy(tables, field_ids_by_name=None):

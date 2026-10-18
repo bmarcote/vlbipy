@@ -275,7 +275,15 @@ class EVNObservatory(ObservatoryHandler):
             cvt = _import_casavlbitools()
             if cvt is not None:
                 logger.info("converting AIPS flags {} -> {}", uvflg.name, flagfile.name)
-                cvt.convert_flags(infile=str(uvflg), idifiles=files, outfile=str(flagfile))
+                # Written aside and renamed once complete: a conversion that fails must not leave an empty
+                # flag file behind, which the next run would take for the converted flags.
+                partial = flagfile.with_name(flagfile.name + ".partial")
+                try:
+                    with open(partial, "w") as out:
+                        cvt.convert_flags(infile=str(uvflg), idifiles=files, outfp=out)
+                    partial.replace(flagfile)
+                finally:
+                    partial.unlink(missing_ok=True)
         return list(files)
 
     def manual_download_instructions(self) -> str:

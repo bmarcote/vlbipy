@@ -15,6 +15,7 @@ vlbipy <command> -p <project> [-t TARGET] [--phasecal NAME] [--fringe-finder NAM
 | `flag` | run flagging modes |
 | `plot` | produce diagnostic plots |
 | `export` | split per source and export |
+| `applycal` | apply calibration tables to any measurement set (see [below](#applying-tables-to-any-measurement-set)) |
 | `report` | rebuild the HTML report and `summary.md` from the products on disk (see [below](#the-report)) |
 | `notebook` | write the reduction notebook `<work_dir>/<code>.ipynb` (see [below](#the-reduction-notebook)) |
 
@@ -45,6 +46,35 @@ vlbipy calibrate apply -p rsm07 ...
 vlbipy plot corner spectrum -p rsm07 ...
 vlbipy export -p rsm07 ...
 ```
+
+## Applying tables to any measurement set
+
+`vlbipy applycal` applies calibration tables to a measurement set without a
+project: a self-calibration table from difmapy, or a table solved on another
+set. The set and the tables can be given in any order.
+
+```bash
+vlbipy applycal GL048.mms selfcal/GL048.J1305-1033.phase
+vlbipy applycal sbd.K bpass.B target.ms --interp linear nearest,linear --gainfield J1305-1033 ''
+```
+
+- On a set that has CORRECTED_DATA, the tables are applied **on top of it**:
+  their corrections multiply what the column holds, their flags are added and
+  the weights are scaled. Without one, they are applied to DATA and written
+  to a new CORRECTED_DATA, as CASA's `applycal` does. `--from-data` forces
+  the latter on a set that has the column, replacing it.
+- The parallactic-angle correction is off by default, as in CASA: tables
+  applied this way usually go on calibrated data (CORRECTED_DATA, or the
+  DATA of a split), which have it already. `--parang` turns it on for data
+  that are not calibrated yet.
+- A table solved on another set (a split, another epoch) is matched to this
+  one by antenna name, and `--gainfield` names the table's own fields.
+- `--gainfield`, `--interp`, `--spwmap` and `--calwt` take one value per table
+  (one value is used for all); `--field`, `--spw` and `--scan` restrict what
+  is corrected. The `--intent`, `--timerange`, `--antenna` and
+  `--observation` selections and `--callib` go through CASA's `applycal`,
+  which always starts from DATA (`--from-data` is then required on a set
+  with CORRECTED_DATA).
 
 ## Controlling what re-runs
 

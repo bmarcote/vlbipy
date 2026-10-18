@@ -179,6 +179,33 @@ def test_evn_antab_and_flag_lookup(tmp_path):
     assert Path(evn.get_flag_file(PROJECT, str(tmp_path))).name == f"{PROJECT}.flag"
 
 
+def test_uvflg_ending_with_a_station_section_without_flags():
+    """The JIVE archive's .uvflg can end with the header lines of a station that has no flag (no '/'): AIPS
+    never acts on them, and reading the file must not fail on them."""
+    from io import StringIO
+    from vlbipy.casavlbitools import key
+    text = ("opcode='FLAG'\ndtimrang = 1   timeoff=0\n"
+            "ant_name='TR' timerang=309,12,53,19, 309,12,53,57 reason='Antenna off source' /\n"
+            "! The following is flagging information for YS\nopcode='FLAG'\ndtimrang = 1   timeoff=0\n")
+    chunks = key.read_keyfile(StringIO(text))
+    assert len(chunks) == 1
+    assert dict(chunks[0])["ANT_NAME"] == "TR"
+
+
+def test_evn_flag_conversion_that_fails_leaves_no_flag_file(idi_dir, monkeypatch):
+    from vlbipy.casavlbitools import fitsidi as cvt_fitsidi
+    monkeypatch.setattr(cvt_fitsidi, "find_first_dobs", lambda idifiles: dt.datetime(2024, 3, 1))
+    files = [str(path) for path in sorted(idi_dir.glob(f"{PROJECT}_1_1.IDI*"))]
+    uvflg, flag = idi_dir / f"{PROJECT}.uvflg", idi_dir / f"{PROJECT}.flag"
+    uvflg.write_text("ant_name='EF' timerang=61,10,00,00, 61,10,01,00 reason='x' /\nant_name='EF' = = /\n")
+    with pytest.raises(RuntimeError):
+        EVNObservatory().prepare_for_import(files, str(idi_dir), project_code=PROJECT)
+    assert not flag.exists() and not list(idi_dir.glob("*.partial"))
+    uvflg.write_text("opcode='FLAG'\nant_name='EF' timerang=61,10,00,00, 61,10,01,00 reason='x' /\n")
+    EVNObservatory().prepare_for_import(files, str(idi_dir), project_code=PROJECT)
+    assert flag.read_text().startswith("antenna='EF' timerange='2024/03/01/10:00:00~2024/03/01/10:01:00'")
+
+
 # -- import_data namespace orchestration --
 
 class RecordingDataOps(DataOps):

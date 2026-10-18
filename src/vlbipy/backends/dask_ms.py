@@ -43,7 +43,7 @@ from ..errors import BackendError
 from ..logging_utils import get_logger, warnings
 from ..models import Antenna, FreqSetup, ObsMetadata, Scan, Stokes
 from ..solvers.msio import table_engine
-from .casa import CasaBackend, CasaCalibrationOps, CasaDataOps, CasaFlagOps
+from .casa import CasaBackend, CasaCalibrationOps, CasaDataOps, CasaExportOps, CasaFlagOps
 
 logger = get_logger()
 
@@ -359,6 +359,142 @@ class DaskMsPlotReads:
         return out
 
 
+    def read_baseline_timeline(self, project_code: str, *, field: str, column: str = "corrected",
+                               delay_search: bool = False, scans: Optional[list] = None,
+                               metadata: Optional[ObsMetadata] = None) -> dict:
+        """The band-averaged amplitude per baseline and integration, read in parallel (same output as
+        :meth:`CasaDataOps.read_baseline_timeline`; 26 min there for a phase calibrator of GL048)."""
+        from ..solvers.plot_read import read_baseline_timeline
+        from .casa import parallel_hand_indices
+        meta = metadata or self.get_metadata(project_code, [], "")
+        wanted = {int(number) for number in scans} if scans else None
+        field_scans = [s.scan_number for s in meta.scans if s.source == field and (wanted is None or
+                                                                                    s.scan_number in wanted)]
+        if not field_scans:
+            raise BackendError(f"{project_code}: no scans on {field!r}")
+        pol_indices, _ = parallel_hand_indices(meta)
+        antenna_names = list(meta.antennas)
+        n_antenna = len(antenna_names)
+        try:
+            result = read_baseline_timeline(self.backend.ms_path(project_code), field=field,
+                                            column={"corrected": "CORRECTED_DATA", "data": "DATA"}[column],
+                                            corrs=list(pol_indices), scans=field_scans, nant=n_antenna,
+                                            delay_search=delay_search)
+        except RuntimeError as exc:
+            raise BackendError(f"{project_code}: could not read {column}: {exc}") from exc
+        if not result["time"].size:
+            raise BackendError(f"{project_code}: no unflagged {column} data on {field!r}")
+        times = np.unique(result["time"])
+        index = np.searchsorted(times, result["time"])
+        low, high = np.divmod(result["baseline"], n_antenna)
+        sums = np.zeros((n_antenna, n_antenna, times.size), dtype=complex)
+        counts = np.zeros((n_antenna, n_antenna, times.size))
+        np.add.at(sums, (low, high, index), result["sum"])          # one vote per subband
+        np.add.at(counts, (low, high, index), result["count"])
+        with np.errstate(invalid="ignore", divide="ignore"):
+            amplitude = np.where(counts > 0, np.abs(sums) / np.maximum(counts, 1.0), np.nan)
+        amplitude = np.fmax(amplitude, np.transpose(amplitude, (1, 0, 2)))
+        scan_of_time = np.zeros(times.size, dtype=int)
+        scan_of_time[index] = result["scan"]
+        steps = np.diff(times)
+        integration = float(np.min(steps[steps > 0])) if (steps > 0).any() else 0.0
+        logger.info("read_baseline_timeline[dask-ms]: {} on {}: {} integration(s) of {:.1f} s in {} scan(s), {:.1f}s",
+                    column, field, times.size, integration, np.unique(scan_of_time).size, result["seconds"])
+        return {"antennas": antenna_names, "times": times, "scans": scan_of_time, "amplitude": amplitude,
+                "integration": integration, "field": field, "column": column}
+
+    def read_total_visibility(self, project_code: str, *, fields: Optional[list[str]] = None,
+                              column: str = "corrected", metadata: Optional[ObsMetadata] = None) -> dict:
+        """The light curve of every source, read in one parallel pass (see :meth:`CasaDataOps.read_total_visibility`).
+
+        The CASA reader selects every scan and subband separately through the ``ms`` tool: 22 000 selections
+        and six hours on GL048 (a 22 M-row Multi-MS), against minutes here.
+        """
+        from ..solvers.plot_read import read_total_visibility
+        from .casa import parallel_hand_indices
+        meta = metadata or self.get_metadata(project_code, [], "")
+        wanted = list(fields or meta.source_names)
+        pol_indices, _ = parallel_hand_indices(meta)
+        try:
+            result = read_total_visibility(self.backend.ms_path(project_code), fields=wanted,
+                                           column={"corrected": "CORRECTED_DATA", "data": "DATA"}[column],
+                                           corrs=list(pol_indices))
+        except RuntimeError as exc:
+            raise BackendError(f"{project_code}: could not read {column}: {exc}") from exc
+        names = result["field_names"]
+        sources = {}
+        keep = result["count"] > 0
+        for field_id in np.unique(result["field"][keep]):
+            rows = keep & (result["field"] == field_id)
+            sources[names[int(field_id)]] = {"times": result["time"][rows], "vis_sum": result["sum"][rows],
+                                             "n_vis": result["count"][rows].astype(float),
+                                             "scans": result["scan"][rows].astype(np.int64)}
+        time_start = min((float(e["times"].min()) for e in sources.values()),
+                         default=float(meta.time_range[0]) if meta.time_range else 0.0)
+        logger.info("read_total_visibility[dask-ms]: {} source(s), {} integration(s) from the {} column in {:.1f}s",
+                    len(sources), sum(e["times"].size for e in sources.values()), column, result["seconds"])
+        return {"sources": sources, "column": column, "time_start": time_start}
+
+
+    def read_timeseries(self, project_code: str, *, field: str = "", scans: Optional[list] = None,
+                        refant: str = "", column: str = "corrected", max_time_bins: int = 300,
+                        metadata: Optional[ObsMetadata] = None) -> dict:
+        """Amplitude/phase against time of the baselines to ``refant``, read in parallel (same output as
+        :meth:`CasaDataOps.read_timeseries`, which reads every subband through the ``ms`` tool)."""
+        from ..solvers.plot_read import read_timeseries
+        from .casa import parallel_hand_indices
+        meta = metadata or self.get_metadata(project_code, [], "")
+        refant = refant or self.backend.calibrate.refant_chain(meta, "").split(",")[0]
+        antenna_names = list(meta.antennas)
+        if refant not in antenna_names:
+            raise BackendError(f"{project_code}: reference antenna {refant!r} is not in the array")
+        wanted = [f for f in field.split(",") if f]
+        wanted_scans = {int(number) for number in (scans or [])}
+        selected_scans = [s for s in meta.scans
+                          if (not wanted or s.source in wanted)
+                          and (not wanted_scans or s.scan_number in wanted_scans)]
+        if not selected_scans:
+            raise BackendError(f"{project_code}: no scans matching field={field!r}, scans={scans or 'all'}")
+        # The bins of the CASA reader: within scans, never across a scan boundary.
+        span = max(s.time_end for s in selected_scans) - min(s.time_start for s in selected_scans)
+        bin_width = max(span / max(int(max_time_bins), 1), 1.0)
+        edges: list[float] = []
+        for scan in sorted(selected_scans, key=lambda s: s.time_start):
+            n_scan_bins = max(1, int(np.ceil(scan.duration_sec / bin_width)))
+            edges.extend(np.linspace(scan.time_start, scan.time_end, n_scan_bins + 1)[:-1])
+            edges.append(scan.time_end)
+        edges = np.asarray(edges, dtype=float)
+        pol_indices, pol_labels = parallel_hand_indices(meta)
+        result = read_timeseries(self.backend.ms_path(project_code), fields=wanted or None,
+                                 scans=sorted(wanted_scans) or None,
+                                 column={"corrected": "CORRECTED_DATA", "data": "DATA"}[column],
+                                 corrs=list(pol_indices), refant=antenna_names.index(refant), edges=edges)
+        baselines = {f"{refant}-{antenna_names[other]}": values for other, values in result["baselines"].items()
+                     if other < len(antenna_names)}
+        logger.info("read_timeseries[dask-ms]: {} baseline(s) to {} over {} time bins in {:.1f}s",
+                    len(baselines), refant, len(edges) - 1, result["seconds"])
+        return {"baselines": dict(sorted(baselines.items())), "times": ((edges[:-1] + edges[1:]) / 2.0).tolist(),
+                "polarizations": pol_labels, "refant": refant, "field": field, "column": column}
+
+    # The CASA readers below read the corrected column through the ``ms`` tool: a deferred calibration
+    # (vlbipy.solvers.corrected) is written first.
+    def _corrected_written(self, project_code: str, column: str) -> None:
+        if column == "corrected":
+            self.backend.calibrate.ensure_corrected(project_code)
+
+    def read_spectrum(self, project_code: str, **kwargs) -> dict:
+        self._corrected_written(project_code, kwargs.get("column", "corrected"))
+        return super().read_spectrum(project_code, **kwargs)
+
+    def read_subband_phases(self, project_code: str, **kwargs) -> dict:
+        self._corrected_written(project_code, kwargs.get("column", "corrected"))
+        return super().read_subband_phases(project_code, **kwargs)
+
+    def read_autocorr_spectrum(self, project_code: str, **kwargs) -> dict:
+        self._corrected_written(project_code, kwargs.get("column", "data"))
+        return super().read_autocorr_spectrum(project_code, **kwargs)
+
+
 class DaskMsDataOps(DaskMsPlotReads, CasaDataOps):
     """CASA data operations plus lazy dask-ms access and the optional zarr store."""
 
@@ -583,6 +719,15 @@ class DaskMsCalibrationOps(CasaCalibrationOps):
         from ..solvers.fringefit_task import run_fringefit
         self._run_fast("fringefit", run_fringefit, params, super()._run_fringefit_task)
 
+    def _run_gencal_task(self, params: dict) -> None:
+        """``gencal(caltype='tsys')`` with :func:`vlbipy.solvers.apriori_task.write_tsys_table` (22 min -> 26 s on
+        GL048); the other caltypes, and a Tsys spectrum, with CASA."""
+        if params.get("caltype") != "tsys" or params.get("uniform", True):
+            return super()._run_gencal_task(params)
+        from ..solvers.apriori_task import write_tsys_table
+        self._run_fast("gencal tsys", lambda vis, caltable, **_: write_tsys_table(vis, caltable), params,
+                       super()._run_gencal_task)
+
     def _run_bandpass_task(self, params: dict) -> None:
         """Solve the bandpass with :func:`vlbipy.solvers.gain_task.run_bandpass` (CASA "B Jones" output)."""
         from ..solvers.gain_task import run_bandpass
@@ -594,28 +739,34 @@ class DaskMsCalibrationOps(CasaCalibrationOps):
         self._run_fast("gaincal", run_gaincal, params, super()._run_gaincal_task)
 
     def apply(self, project_code: str, field: str, tables: list, *, gainfield: str = "", parang: bool = True,
-              flagbackup: bool = False, callib: bool = False, **kwargs) -> None:
+              flagbackup: bool = False, callib: bool = False, defer: bool = False, **kwargs) -> None:
         """Apply the calibration tables to the measurement set (CORRECTED_DATA, flags, weights) in one pass.
 
         Same contract as :meth:`CasaCalibrationOps.apply`: ``field`` empty corrects every observed source,
         each with the table chain and field mapping resolved for it. All of them are corrected in a single
         pass over the data by :func:`vlbipy.solvers.apply_task.apply_to_ms`. A cal library (``callib=True``) or
         an applycal keyword the fast path does not know is handed to CASA instead.
+
+        ``defer=True`` writes only the calibration flags and records the chains
+        (:func:`vlbipy.solvers.apply_task.defer_to_ms`): the readers of the corrected column then calibrate
+        DATA as they read it, and CORRECTED_DATA is written when something needs the column itself
+        (:meth:`ensure_corrected`).
         """
-        from ..solvers.apply_task import APPLY_MODES, apply_to_ms
+        from ..solvers.apply_task import APPLY_MODES, apply_to_ms, defer_to_ms
         from ..solvers.fringefit_task import _prior_entries
         from ..solvers.msio import read_setup
 
         unknown = sorted(set(kwargs) - set(self._FAST_APPLY_KEYWORDS))
         mode = str(kwargs.get("applymode", "calflagstrict") or "calflagstrict").lower()
+        ms = self.backend.ms_path(project_code)
         if callib or unknown or mode not in APPLY_MODES:
             reason = "a cal library" if callib else (f"keyword(s) {', '.join(unknown)}" if unknown
                                                      else f"applymode={mode!r}")
             warnings.warn(f"{project_code}: the dask-ms apply does not cover {reason}; using CASA applycal")
+            # backend.tasks writes the deferred chains before CASA's applycal and records what it wrote.
             return super().apply(project_code, field, tables, gainfield=gainfield, parang=parang,
                                  flagbackup=flagbackup, callib=callib,
                                  **{k: v for k, v in kwargs.items() if k not in ("workers", "chunk_rows")})
-        ms = self.backend.ms_path(project_code)
         usable = [t for t in tables if t.path and Path(t.path).exists()]
         missing = [t.cal_type for t in tables if t not in usable]
         if missing:
@@ -646,8 +797,54 @@ class DaskMsCalibrationOps(CasaCalibrationOps):
                         ", ".join(t.cal_type for t in applied))
         if flagbackup or kwargs.get("flagbackup"):
             self.backend.tasks.flagmanager(vis=str(ms), mode="save", versionname="before_applycal", merge="replace")
+        if defer:
+            defer_to_ms(ms, entries_by_field, parang=parang, applymode=mode, workers=kwargs.get("workers"))
+            return
         apply_to_ms(ms, entries_by_field, parang=parang, applymode=mode, workers=kwargs.get("workers"),
                     **({"chunk_rows": int(kwargs["chunk_rows"])} if "chunk_rows" in kwargs else {}))
+
+    #: ``apply(defer=True)`` is understood (see :meth:`apply`).
+    defers_apply = True
+
+    def ensure_corrected(self, project_code: str) -> list[int]:
+        """Write CORRECTED_DATA of every field whose calibration was deferred; returns those fields.
+
+        For anything that reads the column itself rather than through the native readers: CASA tasks and
+        tools, jplotter, a look at the data by hand.
+        """
+        from ..solvers.corrected import write_pending
+        return write_pending(self.backend.ms_path(project_code))
+
+    def reweight(self, project_code: str, *, column: str = "corrected", timebin: str = "",
+                 minsamp: int = 2, flagbackup: bool = True, **kwargs) -> dict:
+        """statwt with its default binning (one integration, a whole spw), computed natively in parallel.
+
+        Same weights, flags and report as :meth:`CasaCalibrationOps.reweight` (see
+        :mod:`vlbipy.solvers.statwt_task`); a coarser time binning or any other statwt option goes to CASA.
+        """
+        from ..solvers.statwt_task import statwt_ms
+        options = {k: v for k, v in kwargs.items() if v not in (None, "")}
+        single_integration = str(timebin).strip() in ("", "1")
+        if options or not single_integration or column not in ("corrected", "data"):
+            # CASA's statwt reads the column itself (backend.tasks writes a deferred calibration first).
+            return super().reweight(project_code, column=column, timebin=timebin, minsamp=minsamp,
+                                    flagbackup=flagbackup, **kwargs)
+        ms = self.backend.ms_path(project_code)
+        logger.info("statwt[dask-ms]: datacolumn={!r} minsamp={} flagbackup={}", column, minsamp, flagbackup)
+        if flagbackup:
+            # CASA's statwt names its backups statwt_1, statwt_2, ...
+            listing = Path(f"{ms}.flagversions") / "FLAG_VERSION_LIST"
+            names = [line.split(":")[0].strip() for line in listing.read_text().splitlines()] if listing.is_file() else []
+            number = 1 + max([int(n.split("_")[1]) for n in names if n.startswith("statwt_") and n[7:].isdigit()],
+                             default=0)
+            self.backend.tasks.flagmanager(vis=str(ms), mode="save", versionname=f"statwt_{number}")
+        try:
+            report = statwt_ms(ms, column={"corrected": "CORRECTED_DATA", "data": "DATA"}[column],
+                               minsamp=int(minsamp))
+        except RuntimeError as exc:
+            raise BackendError(f"{project_code}: statwt failed: {exc}") from exc
+        logger.info("statwt: new weights mean={} variance={}", report.get("mean"), report.get("variance"))
+        return report
 
     def a_priori(self, project_code: str, field: str, *, needs_eop: bool = False,
                  eop_file: Optional[str] = None, **kwargs) -> list:
@@ -671,20 +868,61 @@ class DaskMsCalibrationOps(CasaCalibrationOps):
                            "set; re-run import_data(force=True) to regenerate them")
 
 
+#: casatasks that never read CORRECTED_DATA: they need no deferred calibration written first.
+_TASKS_WITHOUT_CORRECTED = {"flagmanager", "listobs", "gencal", "fringefit", "gaincal", "bandpass", "smoothcal",
+                            "accor", "importfitsidi", "importuvfits", "setjy", "ft", "plotants", "applycal",
+                            "clearcal", "flagdata"}
+#: casatasks whose data column defaults to DATA (the others default to the corrected data).
+_TASKS_READING_DATA = {"plotms", "visstat"}
+
+
+def _reads_corrected(task: str, kwargs: dict) -> bool:
+    """Whether a casatasks call may read CORRECTED_DATA (its data column, or its default one)."""
+    if task in _TASKS_WITHOUT_CORRECTED:
+        return False
+    columns = [str(kwargs[key]).lower() for key in ("datacolumn", "xdatacolumn", "ydatacolumn") if kwargs.get(key)]
+    if not columns:
+        return task not in _TASKS_READING_DATA      # tclean, mstransform, split, exportuvfits, statwt, partition...
+    return any(c not in ("data", "model", "model_data", "float_data") for c in columns)
+
+
 class NativeFlagTasks:
-    """``casatasks`` with ``flagdata`` answered natively where it can be (see :mod:`vlbipy.solvers.flag_task`).
+    """``casatasks`` with ``flagdata`` answered natively where it can be (see :mod:`vlbipy.solvers.flag_task`),
+    and the deferred calibrations written before a task reads CORRECTED_DATA.
 
     Every flagging call of the CASA flag operations goes through ``backend.tasks.flagdata``, so wrapping it
     here moves all of them (a-priori file, autocorrelations, quack, band edges, bandpass gaps, off-source and
     outlier commands) off ``casatasks.flagdata`` at once. A call the native engine does not reproduce exactly
     (tfcrop, rflag, an unusual selection) is passed to CASA unchanged; every other attribute is casatasks'.
+
+    A measurement set whose calibration was deferred (:mod:`vlbipy.solvers.corrected`) has a CORRECTED_DATA
+    that is out of date: any other task that may read it gets it written first, and after CASA's applycal or
+    clearcal the record says what the column holds.
     """
 
     def __init__(self, tasks) -> None:
         self._tasks = tasks
 
     def __getattr__(self, name):
-        return getattr(self._tasks, name)
+        task = getattr(self._tasks, name)
+        if not callable(task) or name.startswith("_"):
+            return task
+
+        def guarded(*args, **kwargs):
+            from ..solvers import corrected
+            vis = kwargs.get("vis", args[0] if args else None)
+            if not isinstance(vis, (str, Path)) or not (Path(vis) / corrected.RECORD_DIR).is_dir():
+                return task(*args, **kwargs)
+            if name == "applycal" or _reads_corrected(name, kwargs):
+                corrected.write_pending(vis)
+            result = task(*args, **kwargs)
+            if name == "clearcal":
+                corrected.forget(vis)
+            elif name == "applycal":
+                corrected.record_external(vis, list(corrected.load_record(vis)["fields"]), "casa")
+            return result
+
+        return guarded
 
     def flagdata(self, **kwargs):
         """Run ``flagdata`` natively when the call is a supported selection, otherwise through CASA."""
@@ -706,6 +944,9 @@ class NativeFlagTasks:
                             stats["rows"], stats["cells_changed"], stats["parts"], stats["seconds"])
                 return {}
             from ..solvers.flag_task import parallel_casa_flagdata
+            if "corrected" in str(kwargs.get("datacolumn", "")).lower():
+                from ..solvers.corrected import write_pending
+                write_pending(vis)
             if kwargs.get("flagbackup"):
                 self._tasks.flagmanager(vis=str(vis), mode="save", versionname=f"flagdata_{int(time.time())}")
             try:
@@ -717,6 +958,9 @@ class NativeFlagTasks:
                 logger.info("flagdata[casa x{}]: mode={} run on every part in parallel, {:.1f}s", stats["parts"],
                             kwargs.get("mode", "manual"), stats["seconds"])
                 return {}
+        if vis and Path(str(vis)).is_dir() and "corrected" in str(kwargs.get("datacolumn", "")).lower():
+            from ..solvers.corrected import write_pending
+            write_pending(vis)
         return self._tasks.flagdata(**kwargs)
 
 
@@ -738,6 +982,8 @@ class DaskMsFlagOps(CasaFlagOps):
                       column_name: str, pol_indices: list[int]) -> dict:
         """Same series as the CASA reader, read in parallel over the table parts (one pass, wanted fields only)."""
         from ..solvers.flag_task import read_row_amplitudes
+        if column_name.lower() == "corrected_data":
+            self.backend.calibrate.ensure_corrected(project_code)     # read as it is on disk
         ncorr = len(meta.freq_setup.polarizations)
         rows = read_row_amplitudes(self.backend.ms_path(project_code), fields=wanted or None,
                                    column=column_name.upper(),
@@ -800,6 +1046,65 @@ class DaskMsFlagOps(CasaFlagOps):
         return report
 
 
+def _timebin_seconds(timebin) -> Optional[float]:
+    """``"10s"``, ``"1min"``, ``"10"`` or ``""`` in seconds (0 = no averaging); None when not understood."""
+    text = str(timebin or "").strip().lower()
+    if not text:
+        return 0.0
+    for unit, factor in (("min", 60.0), ("s", 1.0), ("h", 3600.0)):
+        if text.endswith(unit):
+            text, scale = text[: -len(unit)].strip(), factor
+            break
+    else:
+        scale = 1.0
+    try:
+        return float(text) * scale
+    except ValueError:
+        return None
+
+
+class DaskMsExportOps(CasaExportOps):
+    """CASA export with the per-source split done natively (see :mod:`vlbipy.solvers.split_task`)."""
+
+    def ms(self, project_code: str, source: str, *, datacolumn: str = "corrected",
+           chanbin: int = -1, timebin: str = "", keepflags: bool = True,
+           outputvis: str = "", metadata: Optional[ObsMetadata] = None, **kwargs) -> str:
+        """Split one source like :meth:`CasaExportOps.ms`, as a plain measurement set written in parallel.
+
+        mstransform took 12 minutes per source on GL048 (one read thread over a 66 GB Multi-MS); the
+        averaging here gives the same rows (checked column by column). Options it does not reproduce
+        (dropping flagged rows, other columns, extra mstransform keywords) go to mstransform.
+        """
+        from ..solvers.split_task import split_field
+        seconds = _timebin_seconds(timebin)
+        column = {"corrected": "CORRECTED_DATA", "data": "DATA"}.get(str(datacolumn).lower())
+        # The output table is created with python-casacore; where it is broken (some macOS builds) use CASA.
+        if kwargs or not keepflags or seconds is None or column is None or table_engine() != "casacore":
+            return super().ms(project_code, source, datacolumn=datacolumn, chanbin=chanbin, timebin=timebin,
+                              keepflags=keepflags, outputvis=outputvis, metadata=metadata, **kwargs)
+        ms = self.backend.ms_path(project_code)
+        outdir = self.work_dir / "calibrated_data"
+        outdir.mkdir(parents=True, exist_ok=True)
+        target = Path(outputvis) if outputvis else outdir / f"{project_code}_{source}.ms"
+        n_channels = (metadata or self.backend.data.get_metadata(project_code, [], "")).freq_setup.n_channels
+        chanbin = int(chanbin)
+        if chanbin > n_channels:
+            logger.info("split: {} has {} channel(s) per subband, fewer than chanbin={}; keeping them all",
+                        source, n_channels, chanbin)
+            chanbin = 1
+        width = n_channels if chanbin == -1 else max(chanbin, 1)
+        try:
+            split_field(ms, target, source, column=column, chanbin=width, timebin=seconds)
+        except (RuntimeError, ValueError) as exc:
+            raise BackendError(f"{project_code}: split of {source!r} failed: {exc}") from exc
+        try:
+            from ..interactive import snapshot_flags
+            snapshot_flags(str(target))      # reference for flag.from_split after difmapy editing
+        except Exception as exc:  # noqa: BLE001 - the snapshot is a convenience, not a product
+            logger.debug("could not snapshot the flags of {}: {}", target, exc)
+        return str(target)
+
+
 class DaskMsBackend(CasaBackend):
     """CASA backend with numpy/dask-ms calibration (fringe fits, bandpass, gains, applycal) and difmapy imaging.
 
@@ -817,6 +1122,7 @@ class DaskMsBackend(CasaBackend):
     data_ops = DaskMsDataOps
     calibration_ops = DaskMsCalibrationOps
     flag_ops = DaskMsFlagOps
+    export_ops = DaskMsExportOps
 
     def __init__(self, work_dir: str = ".") -> None:
         try:

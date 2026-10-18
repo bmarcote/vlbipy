@@ -243,3 +243,15 @@ def test_feed_angles_for_ms_is_fast():
     assert out.shape == (14, 150)
     assert np.all(np.isfinite(out))
     assert elapsed < 2.0, f"feed_angles_for_ms took {elapsed:.2f} s"
+
+
+def test_feed_angles_do_not_depend_on_the_other_times_asked_for():
+    """An integration gets the same angle in any block: applycal and the readers that calibrate while they read
+    must agree to the bit."""
+    from vlbipy.solvers.parang import feed_angles_for_ms
+    xyz = 6.371e6 * np.array([[0.6, 0.1, 0.79], [0.2, 0.7, 0.68]])
+    times = 5.27e9 + np.arange(0.0, 20 * 3600.0, 7.0)
+    whole = feed_angles_for_ms(xyz, ["ALT-AZ", "ALT-AZ"], 2.1, 0.4, times)
+    for block in (slice(0, 1), slice(500, 517), slice(3000, None, 13)):
+        np.testing.assert_array_equal(feed_angles_for_ms(xyz, ["ALT-AZ", "ALT-AZ"], 2.1, 0.4, times[block]),
+                                      whole[:, block])

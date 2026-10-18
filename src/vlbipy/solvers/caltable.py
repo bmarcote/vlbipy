@@ -264,11 +264,12 @@ def write_fringe_table(path, ms_path, *, times, field_ids, spw_ids, antenna_ids,
 
 
 def write_jones_table(path, ms_path, *, viscal, times, field_ids, spw_ids, antenna_ids, scan_numbers,
-                      cparam, flag, snr, paramerr=None, intervals=None, refant_ids=None, spw_chan_freq=None,
-                      spw_chan_width=None):
+                      cparam=None, flag, snr, paramerr=None, intervals=None, refant_ids=None, spw_chan_freq=None,
+                      spw_chan_width=None, fparam=None):
     """Write standard CASA B/G Jones table rows from complex antenna solutions.
 
-    ``cparam``, ``flag`` and ``snr`` use row-major ``(nrow, nchan, npol)`` arrays.
+    ``cparam``, ``flag`` and ``snr`` use row-major ``(nrow, nchan, npol)`` arrays. A table of real parameters
+    (``ParType='Float'``, such as ``B TSYS``) is written from ``fparam`` instead of ``cparam``.
     A per-channel (B Jones) table copies the MS spectral-window grid verbatim. A
     channel-averaged (G Jones) table must describe one channel per subband or CASA
     aborts reading it: pass ``spw_chan_freq`` / ``spw_chan_width`` (one value per
@@ -279,10 +280,14 @@ def write_jones_table(path, ms_path, *, viscal, times, field_ids, spw_ids, anten
     import casatools
 
     path, ms_path = Path(path).absolute(), Path(ms_path).absolute()
-    values = np.asarray(cparam, dtype=np.complex64)
+    if (cparam is None) == (fparam is None):
+        raise ValueError("give exactly one of cparam and fparam")
+    real = fparam is not None
+    values = np.asarray(fparam, dtype=np.float32) if real else np.asarray(cparam, dtype=np.complex64)
+    param_column = "FPARAM" if real else "CPARAM"
     nrow = int(np.asarray(times).size)
     if values.ndim != 3 or values.shape[0] != nrow:
-        raise ValueError(f"cparam must have shape (nrow, nchan, npol), got {values.shape}")
+        raise ValueError(f"{param_column.lower()} must have shape (nrow, nchan, npol), got {values.shape}")
     nchan, npol = values.shape[1:]
     flags = np.asarray(flag, dtype=bool)
     snrs = np.asarray(snr, dtype=np.float32)
@@ -308,7 +313,7 @@ def write_jones_table(path, ms_path, *, viscal, times, field_ids, spw_ids, anten
             "ANTENNA1": _scalar_column("int", option=5), "ANTENNA2": _scalar_column("int", option=5),
             "INTERVAL": _scalar_column("double", keywords={"QuantumUnits": np.array(["s"])}, option=5),
             "SCAN_NUMBER": _scalar_column("int", option=5), "OBSERVATION_ID": _scalar_column("int", option=5),
-            "CPARAM": _array_column("complex", ndim=2, shape=[npol, nchan]),
+            param_column: _array_column("float" if real else "complex", ndim=2, shape=[npol, nchan]),
             "PARAMERR": _array_column("float", ndim=2, shape=[npol, nchan]),
             "FLAG": _array_column("boolean", ndim=2, shape=[npol, nchan]),
             "SNR": _array_column("float", ndim=2, shape=[npol, nchan]),
@@ -321,11 +326,11 @@ def write_jones_table(path, ms_path, *, viscal, times, field_ids, spw_ids, anten
     tb.addrows(nrow)
     for name, column in vectors.items():
         tb.putcol(name, column)
-    for name, column in (("CPARAM", values), ("PARAMERR", errors), ("FLAG", flags), ("SNR", snrs),
+    for name, column in ((param_column, values), ("PARAMERR", errors), ("FLAG", flags), ("SNR", snrs),
                          ("WEIGHT", np.where(flags, 0.0, 1.0).astype(np.float32))):
         tb.putcol(name, np.asfortranarray(column.transpose(2, 1, 0)))
     tb.putinfo({"type": "Calibration", "subType": viscal, "readme": ""})
-    for key, value in {"ParType": "Complex", "MSName": ms_path.name, "VisCal": viscal,
+    for key, value in {"ParType": "Float" if real else "Complex", "MSName": ms_path.name, "VisCal": viscal,
                        "PolBasis": "unknown", "CASA_Version": "vlbipy"}.items():
         tb.putkeyword(key, value)
     tb.close()

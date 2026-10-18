@@ -103,6 +103,11 @@ def p_chunk():
     global tok
     entries = []
     while tok[0] != 'end_chunk':
+        if tok == 'EOF':
+            # Settings after the last '/' (the header lines of a .uvflg station section without a single
+            # flag): AIPS acts on a chunk only at its '/', so they are dropped.
+            logging.info("key: ignoring settings after the last '/': %s", entries)
+            raise StopIteration
         entries.append(p_item())
     logging.debug("p_chunk %s", str(tok))
     tok = next(tokIt)

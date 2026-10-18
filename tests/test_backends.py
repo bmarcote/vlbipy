@@ -1,6 +1,7 @@
 """Tests for the backend registry, component interface, dummy and stub backends."""
 import math
 
+import numpy as np
 import pytest
 
 from vlbipy.backends import DummyBackend, get_backend
@@ -596,11 +597,138 @@ def test_scalar_bandpass_is_normalised_per_antenna(tmp_path, monkeypatch):
     ops = CasaCalibrationOps.__new__(CasaCalibrationOps)
     ops._backend = type("B", (), {"tools": type("T", (), {"table": staticmethod(FakeTable)})()})()
     monkeypatch.setattr(ops, "_table_antenna_names", lambda path: ["AA", "BB"])
-    dropped = ops._normalise_per_antenna(tmp_path, max_factor=2.0)
+    dropped, filled = ops._normalise_per_antenna(tmp_path, max_factor=2.0)
     gains, flags = np.abs(FakeTable.store["CPARAM"][0, 0]), FakeTable.store["FLAG"][0, 0]
     assert np.allclose(gains[:4], [1.0, 1.1, 0.9, 1.0])               # antenna level 0.40 removed, steps kept
     assert not flags[:7].any() and flags[7]                            # 0.3 against ~1.22 is a factor 4: flagged
-    assert dropped == ["BB spw 3 pol 0", "BB spw 3 pol 1"]
+    assert dropped == ["BB spw 3 pol 0", "BB spw 3 pol 1"] and filled == []
+
+
+def test_scalar_bandpass_leaves_unsolved_solutions_at_one(tmp_path, monkeypatch):
+    """An antenna/subband the solver flagged gets gain 1, unflagged; a wholly unsolved antenna too."""
+    import numpy as np
+    from vlbipy.backends.casa import CasaCalibrationOps
+
+    class FakeTable:
+        store: dict = {}
+
+        def open(self, path, nomodify=True):
+            return True
+
+        def getcol(self, name):
+            return FakeTable.store[name].copy()
+
+        def putcol(self, name, value):
+            FakeTable.store[name] = np.array(value)
+
+        def close(self):
+            pass
+
+    amplitude = np.array([0.40, 0.44, 0.0, 0.40, 0.0, 0.0, 0.0, 0.0])
+    flags = np.zeros((2, 1, 8), bool)
+    flags[:, 0, 2] = True                                             # AA spw 2 unsolved
+    flags[:, 0, 4:] = True                                            # BB unsolved everywhere
+    FakeTable.store.update(CPARAM=np.tile(amplitude.astype(complex), (2, 1, 1)), FLAG=flags,
+                           ANTENNA1=np.repeat([0, 1], 4), SPECTRAL_WINDOW_ID=np.tile(np.arange(4), 2))
+    ops = CasaCalibrationOps.__new__(CasaCalibrationOps)
+    ops._backend = type("B", (), {"tools": type("T", (), {"table": staticmethod(FakeTable)})()})()
+    monkeypatch.setattr(ops, "_table_antenna_names", lambda path: ["AA", "BB"])
+    dropped, filled = ops._normalise_per_antenna(tmp_path, fill_unsolved=True)
+    gains = FakeTable.store["CPARAM"][0, 0]
+    assert not FakeTable.store["FLAG"].any() and dropped == []
+    assert np.allclose(np.abs(gains[[0, 1, 3]]), [0.40 / 0.40, 1.1, 1.0])  # solved ones levelled as before
+    assert np.allclose(gains[[2, 4, 5, 6, 7]], 1.0)
+    assert len(filled) == 10 and "AA spw 2 pol 0" in filled and "BB spw 3 pol 1" in filled
+    assert CasaCalibrationOps._summarise_labels(filled) == "AA (2), BB (8)"
+
+
+class _FakeCalTables:
+    """casatools-like ``table`` over in-memory columns, one store per path."""
+    stores: dict = {}
+
+    def open(self, path, nomodify=True):
+        self.path = str(path)
+        return self.path in _FakeCalTables.stores
+
+    def colnames(self):
+        return list(_FakeCalTables.stores[self.path])
+
+    def getcol(self, name):
+        return _FakeCalTables.stores[self.path][name].copy()
+
+    def putcol(self, name, value):
+        _FakeCalTables.stores[self.path][name] = np.array(value)
+
+    def close(self):
+        pass
+
+
+def _fringe_store(antennas, scans, solved, fparam=0.0, delays=None):
+    """Columns of a fringe table with one row per (antenna, scan); ``solved`` is a boolean per row.
+
+    The scan number doubles as the solution time; ``delays`` (ns, one per row) go into both polarizations.
+    """
+    nrow = len(antennas)
+    flag = np.broadcast_to(~np.asarray(solved, bool), (8, 1, nrow)).copy()
+    fpar = np.full((8, 1, nrow), fparam, dtype=float)
+    if delays is not None:
+        fpar[[1, 5], 0] = np.asarray(delays, float)
+    return {"ANTENNA1": np.asarray(antennas), "ANTENNA2": np.zeros(nrow, int), "SCAN_NUMBER": np.asarray(scans),
+            "TIME": np.asarray(scans, float) * 600.0, "FIELD_ID": np.zeros(nrow, int),
+            "SPECTRAL_WINDOW_ID": np.zeros(nrow, int), "FLAG": flag, "FPARAM": fpar,
+            "SNR": np.where(flag, 0.0, 9.0)}
+
+
+def _fringe_ops(monkeypatch):
+    from vlbipy.backends.casa import CasaCalibrationOps
+    ops = CasaCalibrationOps.__new__(CasaCalibrationOps)
+    ops._backend = type("B", (), {"tools": type("T", (), {"table": staticmethod(_FakeCalTables)})()})()
+    monkeypatch.setattr(ops, "_table_antenna_names", lambda path: ["AA", "BB", "CC"])
+    return ops
+
+
+def test_fringe_retry_adopts_an_antenna_it_recovers_and_drops_one_it_does_not(tmp_path, monkeypatch):
+    """BB (1 of 4 scans at SNR 5) reaches 3 of 4 at SNR 3 and is adopted; CC stays at 1 of 4 and is not."""
+    from vlbipy.models import ObsMetadata, Scan
+    ops = _fringe_ops(monkeypatch)
+    main, retry = tmp_path / "X.mbd", tmp_path / "X.mbd.retry"
+    scans = [1, 2, 3, 4]
+    antennas = np.repeat([0, 1, 2], 4)
+    _FakeCalTables.stores = {str(main): _fringe_store(antennas, scans * 3, [1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 0, 0],
+                                                      fparam=1.0)}
+    meta = ObsMetadata.__new__(ObsMetadata)
+    meta.scans = [Scan(scan_number=n, source="CAL", antennas=["AA", "BB", "CC"]) for n in scans]
+    meta.scans.append(Scan(scan_number=9, source="TARGET", antennas=["AA", "BB", "CC"]))
+    calls = []
+
+    def fake_fringefit(project_code, params, gaintable, *, field="", callib=False):
+        calls.append(params)
+        # Scans 2, 3 and 4 re-solved: BB gains scans 2 and 3, CC nothing; AA's rows differ but must not be used.
+        retry.mkdir()
+        _FakeCalTables.stores[str(retry)] = _fringe_store(np.repeat([0, 1, 2], 3), [2, 3, 4] * 3,
+                                                          [1, 1, 1, 1, 1, 0, 0, 0, 0], fparam=2.0)
+
+    monkeypatch.setattr(ops, "_fringefit", fake_fringefit)
+    adopted = ops._retry_weak_antennas("X", {"caltable": str(main), "minsnr": 5.0}, [], meta, field="CAL",
+                                       callib=False, minsnr=3.0, keep_fraction=0.5, max_delay_step=2.0)
+    assert adopted == ["BB"]
+    assert calls[0]["minsnr"] == 3.0 and calls[0]["scan"] == "1,2,3,4" and not retry.exists()
+    store = _FakeCalTables.stores[str(main)]
+    solved = ~store["FLAG"].reshape(-1, 12).all(axis=0)
+    assert list(solved) == [1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0]
+    assert list(store["FPARAM"][0, 0]) == [1.0] * 5 + [2.0, 2.0] + [1.0] * 5   # only BB's recovered rows copied
+
+
+def test_fringe_retry_does_nothing_when_every_antenna_is_mostly_solved(tmp_path, monkeypatch):
+    from vlbipy.models import ObsMetadata, Scan
+    ops = _fringe_ops(monkeypatch)
+    main = tmp_path / "X.mbd"
+    _FakeCalTables.stores = {str(main): _fringe_store([0, 0, 1, 1], [1, 2, 1, 2], [1, 1, 1, 0])}
+    meta = ObsMetadata.__new__(ObsMetadata)
+    meta.scans = [Scan(scan_number=n, source="CAL", antennas=["AA", "BB"]) for n in (1, 2)]
+    monkeypatch.setattr(ops, "_fringefit", lambda *a, **k: pytest.fail("no retry expected"))
+    assert ops._retry_weak_antennas("X", {"caltable": str(main), "minsnr": 5.0}, [], meta, field="CAL",
+                                    callib=False, minsnr=3.0, keep_fraction=0.5) == []
 
 
 def test_baseline_coherence_separates_signal_from_noise():
@@ -659,3 +787,35 @@ def test_gain_record_lists_every_station_per_if(tmp_path):
     assert record["gain_median"] == {"EF": 1.0, "HH": 1.2} and record["p_correction"]["HH"] == 0.99
     assert len(record["if_freqs_hz"]) == 4 and "multiplied" in record["convention"]
     assert difmap.IMAGE_PIXELS == 8192
+
+
+def test_fringe_retry_rejects_noise_detections_and_flags_the_antenna(tmp_path, monkeypatch):
+    """BB "solved" on every scan at SNR 3, but its delays jump ~100 ns: noise. It is lost - all flagged."""
+    from vlbipy.models import ObsMetadata, Scan
+    ops = _fringe_ops(monkeypatch)
+    main, retry = tmp_path / "X.mbd", tmp_path / "X.mbd.retry"
+    scans = list(range(1, 9))
+    good_delays = 1.0 + 0.05 * np.arange(8)                           # AA: smooth
+    noise = np.array([80.0, -120.0, 30.0, 140.0, -60.0, 10.0, -150.0, 95.0])
+    _FakeCalTables.stores = {str(main): _fringe_store(np.repeat([0, 1], 8), scans * 2, [1] * 8 + [1, 1, 1, 0, 0, 0, 0, 0],
+                                                      delays=np.concatenate([good_delays, noise]))}
+    meta = ObsMetadata.__new__(ObsMetadata)
+    meta.scans = [Scan(scan_number=n, source="CAL", antennas=["AA", "BB"]) for n in scans]
+
+    def fake_fringefit(project_code, params, gaintable, *, field="", callib=False):
+        retry.mkdir()
+        _FakeCalTables.stores[str(retry)] = _fringe_store(np.repeat([0, 1], 5), scans[3:] * 2, [1] * 10,
+                                                          delays=np.concatenate([good_delays[3:], noise[3:]]))
+
+    monkeypatch.setattr(ops, "_fringefit", fake_fringefit)
+    adopted = ops._retry_weak_antennas("X", {"caltable": str(main), "minsnr": 5.0}, [], meta, field="CAL",
+                                       callib=False, minsnr=3.0, keep_fraction=0.5, max_delay_step=2.0)
+    assert adopted == []
+    flags = _FakeCalTables.stores[str(main)]["FLAG"].reshape(-1, 16).all(axis=0)
+    assert not flags[:8].any() and flags[8:].all()                    # AA untouched; every BB solution flagged
+
+
+def test_median_delay_step_ignores_too_short_series():
+    from vlbipy.backends.casa import CasaCalibrationOps
+    assert CasaCalibrationOps._median_delay_step({("A", 0): [(0.0, 1.0), (1.0, 9.0)]}) == float("inf")
+    assert abs(CasaCalibrationOps._median_delay_step({("A", 0): [(2.0, 1.2), (0.0, 1.0), (1.0, 1.1)]}) - 0.1) < 1e-9

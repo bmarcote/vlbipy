@@ -417,15 +417,18 @@ class VLBIObs:
         self.flag.initial(force=force)                                 # step 8
         # Steps 9-11: SBD -> MBD -> bandpass -> SBD -> MBD, then trim the band edges the
         # bandpass has revealed and put the instrumental chain onto every field.
+        # Every application before the last one is deferred where the backend can (dask-ms): the
+        # steps in between read the corrected data through readers that calibrate DATA as they
+        # read it, and CORRECTED_DATA is written once, with the final chain (write_corrected).
         self.calibrate.instrumental(force=force)
         self.flag.edges(force=force)
-        self.calibrate.apply(force=True)
+        self.calibrate.apply(force=True, defer=True)
         # Step 12: deeper flagging on calibrated data, then re-solve on the cleaner data
         # and level the subband amplitudes.
         self.flag.outliers(force=force)
         self.calibrate.second_pass(force=force)
         self.calibrate.scalar_bandpass(force=force)
-        self.calibrate.apply(force=True)                               # step 13
+        self.calibrate.apply(force=True, defer=True)                   # step 13
         # Step 14: weights from the calibrated scatter expose more bad data; flag it and
         # re-run the whole chain from the a-priori tables.
         if self.config.get("calibration", {}).get("reweight", {}).get("enabled", True):
@@ -433,13 +436,13 @@ class VLBIObs:
             self.flag.outliers(force=force, step="flag_outliers_reweighted")
             self.calibrate.second_pass(force=force, step="third_pass")
             self.calibrate.scalar_bandpass(force=force)
-            self.calibrate.apply(force=True)
+            self.calibrate.apply(force=True, defer=True)
         self._survey_all_sources()                                      # final calibrated SNR coverage
-        self.plot.diagnostics(column="corrected", label="calibrated")  # step 15
         if self._per_epoch_products:
             images = self._finish_campaign(force=force)
         else:
             if len(self._observations) > 1:
+                self.calibrate.write_corrected()                       # merge copies the column itself
                 self.merge(force=force)
             # Step 16: calibrated, per-source measurement sets — the deliverable of the
             # calibration. After merge() for a campaign, so the split covers the combined data.
@@ -447,6 +450,7 @@ class VLBIObs:
             self.flag.statistics()                                         # step 20 (report)
 
             self._selfcal_all(force=force)                                 # step 17a (difmapy)
+            self._calibrated_diagnostics()                                 # step 15
             images = self._image_all(force=force)                          # step 17b
             self._final_plots()                                            # step 18
         self.report()
@@ -468,6 +472,7 @@ class VLBIObs:
             obs.export.per_source(force=force)
             obs.flag.statistics()
             self._selfcal_all(obs, force=force)
+            self._calibrated_diagnostics(obs)
             images[obs.project_code] = self._image_all(obs, force=force)
             self._final_plots(obs)
         try:
@@ -475,6 +480,17 @@ class VLBIObs:
         except Exception as exc:  # noqa: BLE001 - the per-epoch products are complete and must survive
             warnings.warn(f"multi-epoch combination failed: {exc}")
         return images
+
+    def _calibrated_diagnostics(self, obs: Optional[Observation] = None) -> None:
+        """Step 15, the diagnostic plots of the calibrated data, on CORRECTED_DATA written with the final chain.
+
+        They come after self-calibration: the corrected column is written once, at the end of the
+        calibration (a backend that defers its applications writes it here), and the jplotter figures read
+        it from disk.
+        """
+        for each in [obs] if obs is not None else self._observations:
+            each.calibrate.write_corrected()
+            each.plot.diagnostics(column="corrected", label="calibrated")
 
     def _survey_all_sources(self) -> None:
         """Measure final per-scan SNR on every observed source without changing solve selection."""
