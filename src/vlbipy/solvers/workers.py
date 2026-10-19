@@ -55,10 +55,23 @@ from typing import Optional
 
 import numpy as np
 
+from ..logging_utils import get_logger
+from ..resources import available_memory, describe, parse_size, usable_cpus
+
+logger = get_logger()
+
 #: Environment variable overriding the number of worker processes.
 WORKERS_ENV = "VLBIPY_WORKERS"
 #: Upper bound on the default pool size (the Multi-MS parts and scans rarely feed more).
 MAX_DEFAULT_WORKERS = 16
+#: Memory planned per worker process when sizing the pool. Measured on LBA data (32 channels, 4
+#: correlations): 0.13 GB idle, 0.45 GB for a split job, up to 0.9 GB with the calibration tables it keeps.
+WORKER_MEMORY = 1 << 30
+#: Environment variable overriding :data:`WORKER_MEMORY` (e.g. ``2G`` for data with many more channels).
+WORKER_MEMORY_ENV = "VLBIPY_WORKER_MEMORY"
+#: Share of the available memory the pool is sized to fill; the rest is for the main process (CASA, the
+#: concatenated results of a task, plots) and whatever else runs on the machine.
+POOL_MEMORY_FRACTION = 0.75
 #: Seconds to wait for the worker processes to start and connect back.
 START_TIMEOUT = 120.0
 #: Shared objects (calibration tables) a worker keeps; the least recently used one is dropped beyond that.
@@ -75,14 +88,38 @@ _JOB_THREADS: Optional[int] = None
 _EXECUTOR: Optional[tuple] = None                # (executor, number of threads)
 _EXECUTOR_LOCK = threading.Lock()
 _IN_THREAD = threading.local()
+_CPUS: Optional[int] = None
+
+
+def _cpus() -> int:
+    """CPUs this process may use (:func:`vlbipy.resources.usable_cpus`, read once per process)."""
+    global _CPUS
+    if _CPUS is None:
+        _CPUS = usable_cpus()
+    return _CPUS
+
+
+def worker_memory() -> int:
+    """Bytes planned per worker process: ``$VLBIPY_WORKER_MEMORY`` or :data:`WORKER_MEMORY`."""
+    configured = os.environ.get(WORKER_MEMORY_ENV, "").strip()
+    return max(1, parse_size(configured)) if configured else WORKER_MEMORY
 
 
 def default_workers() -> int:
-    """Number of worker processes to use: ``$VLBIPY_WORKERS`` or the CPU count capped at 16."""
+    """Number of worker processes to use: ``$VLBIPY_WORKERS``, else as many as the machine can run.
+
+    That is the CPUs this process may use (its affinity and any cgroup CPU quota), at most 16, and no more
+    than fit in :data:`POOL_MEMORY_FRACTION` of the available memory (the system's, or what a container,
+    batch job or ``systemd-run -p MemoryMax=`` unit leaves) at :func:`worker_memory` each.
+    """
     configured = os.environ.get(WORKERS_ENV, "").strip()
     if configured:
         return max(1, int(configured))
-    return max(1, min(os.cpu_count() or 1, MAX_DEFAULT_WORKERS))
+    by_cpu = min(_cpus(), MAX_DEFAULT_WORKERS)
+    free = available_memory()
+    if free is None:
+        return max(1, by_cpu)
+    return max(1, min(by_cpu, int(free * POOL_MEMORY_FRACTION // worker_memory())))
 
 
 def in_worker() -> bool:
@@ -102,7 +139,7 @@ def job_threads() -> int:
         return max(1, int(configured))
     if _JOB_THREADS is not None:
         return _JOB_THREADS
-    return max(1, os.cpu_count() or 1)
+    return _cpus()
 
 
 def in_thread_map() -> bool:
@@ -133,7 +170,7 @@ def thread_map(function, items) -> list:
     global _EXECUTOR
     with _EXECUTOR_LOCK:
         if _EXECUTOR is None or _EXECUTOR[1] < threads:
-            size = max(threads, os.cpu_count() or 1)
+            size = max(threads, _cpus())
             _EXECUTOR = (ThreadPoolExecutor(max_workers=size, thread_name_prefix="vlbipy-array"), size)
         executor = _EXECUTOR[0]
     shares = [future.result() for future in [executor.submit(share, first) for first in range(threads)]]
@@ -228,6 +265,8 @@ class WorkerPool:
     def __init__(self, size: int) -> None:
         """Start ``size`` workers and wait until every one has connected back."""
         self.size = int(size)
+        logger.debug("worker pool: starting {} process(es) ({}; {:.1f} GB planned per worker)", self.size,
+                     describe(), worker_memory() / 2**30)
         authkey = os.urandom(32)
         listener = Listener(authkey=authkey)
         environment = dict(os.environ)
@@ -269,7 +308,7 @@ class WorkerPool:
 
     def threads_for(self, together: int) -> int:
         """Threads each of ``together`` jobs running at once may use for its array work (its share of the cores)."""
-        return max(1, (os.cpu_count() or 1) // max(1, min(int(together), self.size)))
+        return max(1, _cpus() // max(1, min(int(together), self.size)))
 
     def _run(self, job: tuple, digests: Optional[dict] = None, threads: int = 1) -> object:
         """Send one job to an idle worker and return its result (raises :class:`WorkerError` on failure).

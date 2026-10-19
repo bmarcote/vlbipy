@@ -226,7 +226,11 @@ lightcurve_averaging = [0, 30, 120, -1]  # averaging scales (s) in the total lig
 [plotting]
 engine = "auto"              # standard plots (spectra, time series, time evolution): "jplotter" (jiveplot,
                              # fast), "matplotlib", or "auto" = jplotter when jiveplot is installed
-workers = 8                  # most plots of the diagnostic and final-data sets drawn at the same time, each in
-                             # its own worker process reading its own data; never more than the CPUs, and only
-                             # as many as their estimated peak memory allows (below). 1 = one after another.
-memory_fraction = 0.8        # share of the free memory the plots drawn together may take
+workers = "auto"             # most plots of the diagnostic and final-data sets drawn at the same time, each in
+                             # its own worker process reading its own data. "auto" = every CPU vlbipy may use
+                             # (its affinity and any container/batch-job CPU quota); a number caps it. Either
+                             # way only as many as their estimated peak memory allows (below), and never more
+                             # than the worker pool, which is sized to the CPUs and the available memory
+                             # (override with $VLBIPY_WORKERS / $VLBIPY_WORKER_MEMORY). 1 = one after another.
+memory_fraction = 0.8        # share of the available memory (the system's, or what a container, batch job or
+                             # systemd-run -p MemoryMax= limit leaves) the plots drawn together may take

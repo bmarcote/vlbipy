@@ -24,7 +24,7 @@ from ..diagnostics import write_summary
 from ..errors import BackendError, StepError
 from ..logging_utils import get_logger, warnings
 from ..models import CalTable, QualityMetrics
-from ..plot_jobs import PlotJob, draw, run_plot_jobs
+from ..plot_jobs import PlotJob, draw, plot_workers, run_plot_jobs
 from ..results import Image, ImageSet, SelfcalResult
 from ..sources import Source
 from ..tools import natsort_key
@@ -1621,7 +1621,7 @@ class PlotNamespace(Namespace):
         Returns the paths written, in job order.
         """
         cfg = self._obs.config.get("plotting", {})
-        return run_plot_jobs(self._backend, self._code, jobs, max_workers=int(cfg.get("workers", 1) or 1),
+        return run_plot_jobs(self._backend, self._code, jobs, max_workers=plot_workers(cfg.get("workers", "auto")),
                              memory_fraction=float(cfg.get("memory_fraction", 0.8)), label=label)
 
     def _draw(self, job: PlotJob):
