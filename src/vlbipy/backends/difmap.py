@@ -71,7 +71,11 @@ def _load_difmapy():
     try:
         import difmapy  # noqa: WPS433 - optional dependency
     except ImportError as exc:
-        raise BackendError("imaging and self-calibration need difmapy: pip install vlbipy[difmap]") from exc
+        # Say why: an installed difmapy whose compiled core does not load (built for another platform, a
+        # missing library) is not the same problem as a missing package.
+        raise BackendError(f"imaging and self-calibration need difmapy, which could not be imported ({exc}); "
+                           "install it with pip install vlbipy[difmap] (or rebuild it: maturin develop "
+                           "--release in its checkout)") from exc
     # A directory called "difmapy" on sys.path (a source checkout next to the project) imports as an empty
     # namespace package: say so instead of failing later with "module has no attribute 'load'".
     if not hasattr(difmapy, "load"):

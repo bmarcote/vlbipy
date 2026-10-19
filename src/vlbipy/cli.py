@@ -738,6 +738,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _HANDLERS[args.command](obs, args)
     except Exception as exc:  # noqa: BLE001 - top-level CLI guard
         logger.error("{} failed: {}", args.command, exc)
+        logger.opt(exception=exc).debug("{} failed with this traceback:", args.command)   # to the run logs
         return 1
 
 

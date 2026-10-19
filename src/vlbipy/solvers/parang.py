@@ -372,7 +372,9 @@ def apply_parang(vis, antenna1, antenna2, row_time, angle, antenna_index=None, *
     rotation = parang_rotation(antenna1, antenna2, row_time, angle, vis.shape[2],
                                vis.dtype if np.iscomplexobj(vis) else np.complex128, antenna_index=antenna_index,
                                time_index=time_index)
-    out = vis * rotation[:, np.newaxis, :]
+    # Flagged samples can hold NaN/inf (empty correlator cells); rotating them is harmless.
+    with np.errstate(invalid="ignore"):
+        out = vis * rotation[:, np.newaxis, :]
     logger.debug(f"apply_parang: rotated {vis.shape[0]} rows, ncorr={vis.shape[2]}, nant={np.shape(angle)[0]}, "
                  f"ntime={np.shape(angle)[1]}")
     return out

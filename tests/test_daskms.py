@@ -15,7 +15,14 @@ daskms = pytest.importorskip("daskms")
 import dask  # noqa: E402
 import dask.array as da  # noqa: E402
 from daskms import Dataset  # noqa: E402
+from daskms.experimental import zarr as daskms_zarr  # noqa: E402
 from daskms.experimental.zarr import xds_to_zarr  # noqa: E402
+
+# dask-ms 0.2 supports only zarr 2: with zarr 3 installed every store write fails, so say why and skip.
+pytestmark = pytest.mark.skipif(
+    getattr(daskms_zarr, "zarr_import_error", None) is not None,
+    reason=f"dask-ms cannot use the installed zarr ({getattr(daskms_zarr, 'zarr_import_error', '')}): "
+           "install 'zarr<3' 'numcodecs<0.16' (dask-ms 0.2) or dask-ms>=0.3 (zarr 3)")
 
 from vlbipy import load_config  # noqa: E402
 from vlbipy.backends.dask_ms import DaskMsBackend, _zero_pad_cells  # noqa: E402

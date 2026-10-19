@@ -238,7 +238,14 @@ def ms_to_daskms(ms, store, chunk_rows: int = _DEFAULT_CHUNK_ROWS) -> Path:
         The store path.
     """
     import dask
+    from daskms.experimental import zarr as daskms_zarr
     from daskms.experimental.zarr import xds_to_zarr
+
+    # dask-ms 0.2 needs zarr 2 (its zarr.convenience is gone in zarr 3); say so before converting anything.
+    if getattr(daskms_zarr, "zarr_import_error", None) is not None:
+        raise BackendError(f"the dask-ms zarr store needs a zarr that this dask-ms supports "
+                           f"({daskms_zarr.zarr_import_error}): install 'zarr<3' 'numcodecs<0.16' for dask-ms 0.2, "
+                           f"or dask-ms>=0.3 for zarr 3; or set [import].zarr_store = false")
 
     ms, store = Path(ms), Path(store)
     if not ms.is_dir():

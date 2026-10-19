@@ -4241,8 +4241,11 @@ class CasaFlagOps(FlagOps):
         from ..statistics import mad_sigma, running_median
 
         empty = (np.zeros(0, dtype=int), np.full(amplitude.shape[0], np.nan))
+        # Time bins with no usable sample stay NaN (nanmedian would warn about every one of them).
+        rows = np.asarray(finite).any(axis=1)
+        profile = np.full(amplitude.shape[0], np.nan)
         with np.errstate(invalid="ignore", divide="ignore"):
-            profile = np.nanmedian(np.where(finite, amplitude, np.nan), axis=1)
+            profile[rows] = np.nanmedian(np.where(finite, amplitude, np.nan)[rows], axis=1)
             level = running_median(profile, window=smooth_bins)
             level = np.where(np.isfinite(level) & (level > 0.0), level, np.nan)
             if not np.isfinite(level).any():
@@ -4264,6 +4267,7 @@ class CasaFlagOps(FlagOps):
         channel amplitude; the median over the bins. Noise averages down across the
         channels while a calibrated source does not.
         """
+        values = values[np.isfinite(values).any(axis=1)]       # an all-NaN bin has no ratio (and nanmean warns)
         with np.errstate(invalid="ignore", divide="ignore"):
             ratio = np.abs(np.nanmean(values, axis=1)) / np.nanmean(np.abs(values), axis=1)
         ratio = ratio[np.isfinite(ratio)]
