@@ -37,6 +37,10 @@ _HIGH_FLAG_FRACTION = 0.3
 TargetLike = Union[str, Source, Image, None]
 
 
+#: The instrumental calibration steps in solving order (:meth:`CalibrateNamespace.instrumental`); each is
+#: solved through the tables of the steps before it.
+INSTRUMENTAL_STEPS = ("initial_calibration", "fringefit", "bandpass", "initial_calibration_sbd2", "fringefit_mbd2")
+
 class Namespace:
     """Base class for operation namespaces bound to one observation.
 
@@ -852,24 +856,40 @@ class CalibrateNamespace(Namespace):
         logger.info("instrumental calibration: {} antenna(s) {} on scan(s) {}",
                     len(antennas), ",".join(antennas), scans)
 
+        # Each solve is made through the tables before it in this sequence and none after it. So
+        # from the first step that has to run, that step and every later one come out of the chain
+        # and are solved again; finished steps before it are kept (a resumed run skips them all).
+        sequence = INSTRUMENTAL_STEPS
+        pending = [force or obs._state.status(name) != "done" for name in sequence]
+        first = pending.index(True) if True in pending else len(sequence)
+        if first < len(sequence):
+            stale = obs.drop_gaintables(sequence[first:])
+            if stale:
+                logger.info("instrumental calibration: re-solving from {}; dropped {} from the chain",
+                            sequence[first], ", ".join(stale))
+        rerun = [index >= first for index in range(len(sequence))]
+
         # Pass 1: rough delays, so the bandpass is solved on delay-corrected data.
-        first_sbd = self.initial_calibration(force=force, scans=scans, antennas=antennas)
-        first_mbd = self.fringefit(force=force, plot=False)
+        first_sbd = self.initial_calibration(force=rerun[0], scans=scans, antennas=antennas)
+        first_mbd = self.fringefit(force=rerun[1], plot=False)
 
         # Bandpass, now that both delays are removed.
-        bandpass = self.bandpass(force=force, scans=scans, antennas=antennas)
+        bandpass = self.bandpass(force=rerun[2], scans=scans, antennas=antennas)
 
         # Pass 2: re-solve both delays *through* everything already in the chain. These
         # are incremental corrections on top of the first pass, not replacements — the
         # first-pass tables stay, and all of them are applied together.
-        refined_sbd = self.initial_calibration(force=True, scans=scans, antennas=antennas,
+        refined_sbd = self.initial_calibration(force=rerun[3], scans=scans, antennas=antennas,
                                                suffix="sbd2")
-        refined_mbd = self.fringefit(force=True, suffix="mbd2", plot=plot)
+        refined_mbd = self.fringefit(force=rerun[4], suffix="mbd2", plot=plot)
 
-        self.verify_solutions(refined_sbd, antennas)
+        # Checked and plotted when solved: a resumed run that keeps the tables has already reported them.
+        if rerun[3]:
+            self.verify_solutions(refined_sbd, antennas)
         if plot:
-            for table in (bandpass, refined_sbd):
-                obs.plot.caltable(table)
+            for table, solved in ((bandpass, rerun[2]), (refined_sbd, rerun[3])):
+                if solved:
+                    obs.plot.caltable(table)
         logger.info("instrumental: chain is now {}",
                     " -> ".join(t.cal_type for t in obs.gaintables))
         return [first_sbd, first_mbd, bandpass, refined_sbd, refined_mbd]
