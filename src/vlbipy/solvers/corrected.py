@@ -167,7 +167,9 @@ def record_deferred(ms, entries_by_field: dict, *, parang: bool, write_flags: bo
             version = hashlib.blake2b(json.dumps([item["path"], signature]).encode(), digest_size=8).hexdigest()
             frozen = frozen_root / version / Path(item["path"]).name
             if not frozen.is_dir():
-                shutil.copytree(item["path"], frozen, ignore=shutil.ignore_patterns("table.lock"))
+                # With table.lock: a table CASA left open after writing (the SPECTRAL_WINDOW importfitsidi
+                # and partition give a Multi-MS) records its rows there only, so a copy without it is empty.
+                shutil.copytree(item["path"], frozen)
             plain.append(dict(item, frozen=str(frozen.relative_to(Path(ms)))))
         record["fields"][int(field_id)] = {"digest": chain_digest(entries, parang=parang, write_flags=write_flags),
                                            "entries": plain, "parang": bool(parang),

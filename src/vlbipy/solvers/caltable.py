@@ -115,14 +115,19 @@ def _dminfo(columns):
 
 
 def _copy_subtable(ms_path, name, dest_dir):
-    """Deep-copy MS subtable `name` into `dest_dir`/`name` and return its absolute path."""
+    """Deep-copy MS subtable `name` into `dest_dir`/`name` and return its absolute path.
+
+    Copied value by value: a plain deep copy of the subtable of a Multi-MS (a link into its first part)
+    leaves the rows recorded only in the copy's ``table.lock``, and a copy of the caltable that leaves that
+    file out (as the deferred apply freezes it) then reads with no rows.
+    """
     import casatools
 
     src = Path(ms_path) / name
     dest = Path(dest_dir) / name
     tb = casatools.table()
     tb.open(str(src))
-    copied = tb.copy(str(dest), deep=True)
+    copied = tb.copy(str(dest), deep=True, valuecopy=True)
     copied.close()
     tb.close()
     return dest

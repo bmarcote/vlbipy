@@ -323,3 +323,62 @@ def test_fringe_smoothing_can_be_switched_off_in_the_configuration():
     obs.import_data()
     table = obs["RSM07"].calibrate.fringefit(plot=False)
     assert not table.path.endswith("_smooth")
+
+
+# -- tables CASA leaves with their rows recorded only in table.lock (the Multi-MS SPECTRAL_WINDOW) --
+
+def _lock_only_table(path, nrow=8):
+    """A table whose ``table.dat`` says 0 rows while ``table.lock`` holds the real ``nrow``: written by a
+    process that never closed it, as importfitsidi + partition leave the SPECTRAL_WINDOW of a Multi-MS."""
+    import subprocess
+    import sys
+
+    import casacore.tables as ct
+    ct.table(str(path), ct.maketabdesc([ct.makescacoldesc("NUM_CHAN", 0)]), nrow=0, ack=False).close()
+    code = (f"import os, numpy as np, casacore.tables as ct\n"
+            f"t = ct.table({str(path)!r}, readonly=False, ack=False); t.addrows({nrow}); "
+            f"t.putcol('NUM_CHAN', np.full({nrow}, 32)); t.unlock(); os._exit(0)")
+    subprocess.run([sys.executable, "-I", "-c", code], check=True)
+
+
+def _rows_without_lock(path, scratch):
+    """Rows of the table at ``path`` as read from its files without ``table.lock``."""
+    import shutil
+
+    import casacore.tables as ct
+    copy = Path(scratch) / "without_lock"
+    shutil.rmtree(copy, ignore_errors=True)
+    shutil.copytree(path, copy, ignore=shutil.ignore_patterns("table.lock"))
+    table = ct.table(str(copy), ack=False)
+    try:
+        return table.nrows()
+    finally:
+        table.close()
+
+
+def test_copied_subtable_keeps_rows_recorded_only_in_the_lock(tmp_path):
+    ms = tmp_path / "x.ms"
+    ms.mkdir()
+    _lock_only_table(ms / "SPECTRAL_WINDOW")
+    assert _rows_without_lock(ms / "SPECTRAL_WINDOW", tmp_path) == 0           # the state the MMS is in
+    dest = tmp_path / "cal"
+    dest.mkdir()
+    copied = caltable._copy_subtable(ms, "SPECTRAL_WINDOW", dest)
+    assert _rows_without_lock(copied, tmp_path) == 8
+
+
+def test_frozen_table_keeps_rows_recorded_only_in_the_lock(tmp_path):
+    from vlbipy.solvers import corrected
+
+    ms = tmp_path / "x.ms"
+    ms.mkdir()
+    table = tmp_path / "x.bpass"
+    _lock_only_table(table)
+    corrected.record_deferred(ms, {0: [{"path": str(table)}]}, parang=False, write_flags=False)
+    frozen = ms / corrected.load_record(ms)["fields"][0]["entries"][0]["frozen"]
+    import casacore.tables as ct
+    copy = ct.table(str(frozen), ack=False)
+    try:
+        assert copy.nrows() == 8
+    finally:
+        copy.close()
