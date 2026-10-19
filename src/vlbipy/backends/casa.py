@@ -5999,8 +5999,10 @@ class CasaBackend(Backend):
         # The old file is closed now that the logger moved: fold it in, then sweep.
         # The project directory is swept too — a log loose beside the data is as
         # much clutter as one in the shell's cwd.
+        # A previous log already inside another epoch's ``logs`` directory (a campaign
+        # redirects once per epoch in the same process) belongs to that epoch: leave it.
         search_dirs = {Path.cwd(), self.work_dir}
-        if previous:
+        if previous and Path(previous).parent.name != log_dir.name:
             search_dirs.add(Path(previous).parent)
         collect_casa_logs(log_dir, search_dirs=search_dirs)
         logger.info("CASA log -> {}", target)
