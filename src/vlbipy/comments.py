@@ -9,8 +9,11 @@ comments can be rebuilt after the measurement set has been deleted.
 A comment is a plain dict:
 
 * ``severity``: ``"problem"`` (something is wrong), ``"warning"`` (look at it) or ``"note"``;
-* ``category``: ``"calibration"``, ``"result"``, ``"antenna"`` or ``"pipeline"``;
+* ``category``: ``"calibration"``, ``"result"``, ``"source"``, ``"antenna"`` or ``"pipeline"``;
 * ``antenna``: station code, ``""`` when the comment is not about one station;
+* ``source`` and ``role`` (``"source"`` comments only): the source the comment is about and its role
+  (``fringefinder``, ``phasecal``, ``target``...). The sentence does not repeat the source name: it is
+  shown once as the header of that source's group;
 * ``text``: the sentence;
 * ``when`` (warnings recorded by the pipeline only): UTC time the warning was first seen.
 
@@ -102,12 +105,23 @@ TEXT_WIDTH: int = 100
 
 # -- small helpers -----------------------------------------------------------------------------
 
-def make_comment(severity: str, category: str, text: str, antenna: str = "", when: str = "") -> dict:
-    """Build one comment dict (see the module docstring); ``when`` is only stored when given."""
+def make_comment(severity: str, category: str, text: str, antenna: str = "", when: str = "",
+                 source: str = "") -> dict:
+    """Build one comment dict (see the module docstring); ``when`` and ``source`` are only stored when given.
+
+    The ``role`` of a source comment is filled in by :func:`build_comments`, which knows every source.
+    """
     comment = {"severity": severity, "category": category, "antenna": antenna, "text": text}
     if when:
         comment["when"] = when
+    if source:
+        comment["source"] = source
     return comment
+
+
+def _sentence(text: str) -> str:
+    """``text`` with its first letter upper-cased (the rest untouched, so source and antenna names keep their case)."""
+    return text[:1].upper() + text[1:]
 
 
 def _finite(value) -> Optional[float]:
@@ -602,22 +616,22 @@ def gain_comments(context: dict) -> list[dict]:
         if len(off) >= MIN_UNFIXED_FOR_SOURCE and len(off) >= 0.5 * len(solved):
             wanted = ", ".join(f"{name} x{values['naive']:.{GAIN_DECIMALS}f}" for name, values in off.items())
             comments.append(make_comment(
-                "warning", "calibration", f"The amplitude self-calibration of {source} is poorly constrained: an "
-                f"unconstrained gscale would change {len(off)} of its {len(solved)} antennas by more than "
+                "warning", "source", f"The amplitude self-calibration is poorly constrained: an unconstrained "
+                f"gscale would change {len(off)} of its {len(solved)} antennas by more than "
                 f"{GAIN_WARN_DEVIATION:.0%} ({wanted}), but the corrections applied stayed within "
                 f"{GAIN_UNFIXED_DEVIATION:.0%} of 1. Treat the amplitude scale of this source, and its model, "
-                "with care."))
+                "with care.", source=source))
         else:
             for name, values in off.items():
                 if not any(name in other["trusted"] for _, other in readings if other is not reading):
                     unfixed.setdefault(name, []).append((source, values))
         if entry.get("applied") is False:
-            comments.append(make_comment("warning", "calibration", f"The amplitude corrections of {source} were "
-                                         "computed but not applied to the data."))
+            comments.append(make_comment("warning", "source", "The amplitude corrections were computed but not "
+                                         "applied to the data.", source=source))
         findings = _general_findings(entry)
         if findings:
-            comments.append(make_comment("note", "calibration",
-                                         f"Amplitude self-calibration of {source}: {'; '.join(findings)}."))
+            comments.append(make_comment("note", "source", f"Amplitude self-calibration: {'; '.join(findings)}.",
+                                         source=source))
     for name, values in medians.items():
         large = any(level == "bad" for _, _, level in values)
         listed = ", ".join(f"x{median:.{GAIN_DECIMALS}f} on {source}" for source, median, _ in values)
@@ -672,7 +686,10 @@ def _search_text(search: dict, with_peak: bool) -> str:
 
 
 def source_comments(context: dict) -> list[dict]:
-    """What came out per source: the search result and the statistics of its CLEAN image (robust 0 if made)."""
+    """What came out per source: the search result and the statistics of its CLEAN image (robust 0 if made).
+
+    One ``"source"`` comment per source, its sentence without the source name.
+    """
     comments = []
     for entry in context.get("source_results") or []:
         role = entry.get("role") or "other"
@@ -695,8 +712,8 @@ def source_comments(context: dict) -> list[dict]:
                     severity = "warning"
             parts.append(text)
         if parts:
-            comments.append(make_comment(severity, "result",
-                                         f"{entry.get('source', '')} ({role}): {'; '.join(parts)}."))
+            comments.append(make_comment(severity, "source", _sentence(f"{'; '.join(parts)}."),
+                                         source=str(entry.get("source", ""))))
     return comments
 
 
@@ -782,9 +799,10 @@ def build_comments(context: dict) -> list[dict]:
     Returns
     -------
     list of dict
-        Comments (see the module docstring): calibration and results first, then the antennas in the order
-        of the context with one closing line naming those with nothing to report, then the pipeline. Within
-        a group and an antenna the most serious comments come first.
+        Comments (see the module docstring): data and calibration first, then the sources in the order of
+        the context (each source comment carrying its ``role``), then the antennas in the order of the
+        context with one closing line naming those with nothing to report, then the pipeline. Within a
+        group, a source and an antenna the most serious comments come first.
     """
     general = (instrumental_delay_comments(context) + gain_comments(context) + flagging_comments(context)
                + source_comments(context) + table_comments(context) + step_comments(context)
@@ -796,6 +814,12 @@ def build_comments(context: dict) -> list[dict]:
     rank = SEVERITIES.index
     shared = sorted((c for c in everything if c["category"] in ("calibration", "result")),
                     key=lambda c: rank(c["severity"]))
+    roles = source_roles(context)
+    source_order = {name: index for index, name in enumerate(roles)}
+    per_source = sorted((c for c in everything if c["category"] == "source"),
+                        key=lambda c: (source_order.get(c.get("source", ""), len(source_order)), rank(c["severity"])))
+    for comment in per_source:
+        comment["role"] = roles.get(comment.get("source", ""), "other")
     stations = sorted((c for c in everything if c["category"] == "antenna"),
                       key=lambda c: (order.get(c["antenna"], len(order)), rank(c["severity"])))
     pipeline = sorted((c for c in everything if c["category"] == "pipeline"), key=lambda c: rank(c["severity"]))
@@ -803,7 +827,20 @@ def build_comments(context: dict) -> list[dict]:
     quiet = [name for name in order if name not in commented]
     if quiet:
         stations.append(make_comment("note", "antenna", f"Nothing to report for: {', '.join(quiet)}."))
-    return shared + stations + pipeline
+    return shared + per_source + stations + pipeline
+
+
+def source_roles(context: dict) -> dict[str, str]:
+    """Role of every source, in the order of the context's source table.
+
+    The role recorded with the source results wins over the source table, since it is the one the
+    reduction used; sources only known from the results come last.
+    """
+    roles = {str(s.get("name", "")): str(s.get("type") or "other") for s in context.get("sources") or []}
+    for entry in context.get("source_results") or []:
+        if entry.get("source") and entry.get("role"):
+            roles[str(entry["source"])] = str(entry["role"])
+    return roles
 
 
 def group_comments(comments: list[dict]) -> dict:
@@ -812,15 +849,19 @@ def group_comments(comments: list[dict]) -> dict:
     Returns
     -------
     dict
-        ``general`` (calibration and result comments), ``antennas`` (``[(station, [comments])]`` in order of
-        first appearance), ``antenna_notes`` (antenna comments about no single station, e.g. the closing
-        "nothing to report" line) and ``pipeline``.
+        ``general`` (calibration and result comments about no single source), ``sources``
+        (``[(source, role, [comments])]`` in order of first appearance), ``antennas``
+        (``[(station, [comments])]`` in order of first appearance), ``antenna_notes`` (antenna comments about
+        no single station, e.g. the closing "nothing to report" line) and ``pipeline``.
     """
-    groups = {"general": [], "antennas": [], "antenna_notes": [], "pipeline": []}
+    groups = {"general": [], "sources": [], "antennas": [], "antenna_notes": [], "pipeline": []}
     by_station: dict[str, list[dict]] = {}
+    by_source: dict[str, list[dict]] = {}
     for comment in comments or []:
         category = comment.get("category")
-        if category == "antenna" and comment.get("antenna"):
+        if category == "source":
+            by_source.setdefault(str(comment.get("source", "")), []).append(comment)
+        elif category == "antenna" and comment.get("antenna"):
             by_station.setdefault(comment["antenna"], []).append(comment)
         elif category == "antenna":
             groups["antenna_notes"].append(comment)
@@ -828,6 +869,7 @@ def group_comments(comments: list[dict]) -> dict:
             groups["pipeline"].append(comment)
         else:
             groups["general"].append(comment)
+    groups["sources"] = [(name, str(items[0].get("role") or "other"), items) for name, items in by_source.items()]
     groups["antennas"] = list(by_station.items())
     return groups
 
@@ -867,9 +909,15 @@ def comments_text(comments: Optional[list[dict]], project_code: str, width: int 
     if not any(groups.values()):
         return "\n".join(lines + ["  Nothing to report."])
     if groups["general"]:
-        lines.append("Calibration and results")
+        lines.append("Data and calibration")
         for comment in groups["general"]:
             lines.extend(_text_line("  ", comment, width))
+    if groups["sources"]:
+        lines.append("Sources")
+        for name, role, items in groups["sources"]:
+            lines.append(f"  {name} ({role})")
+            for comment in items:
+                lines.extend(_text_line("    ", comment, width))
     if groups["antennas"] or groups["antenna_notes"]:
         lines.append("Antennas")
         name_width = max([len(name) for name, _ in groups["antennas"]] + [2])

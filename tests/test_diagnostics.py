@@ -79,7 +79,7 @@ def test_general_comments_are_the_first_section_of_the_summary(tmp_path):
     out = write_summary(_metadata(), tmp_path / "summary.md", comments=comments)
     lines = out.read_text().splitlines()
     block = lines[lines.index("General Comments for TEST"):lines.index("Source Summary for TEST")]
-    assert block[2] == "Calibration and results"
+    assert block[2] == "Data and calibration"
     assert block[3] == "  note     Scan 1 (3C345) was selected for the instrumental delay (reference antenna EF)."
     assert block[4:7] == ["Antennas", "  HH  WARNING  no data in scan 2", "  Nothing to report for: EF, WB."]
     assert "filled in once the pipeline has run" not in "\n".join(block)
