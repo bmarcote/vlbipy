@@ -41,6 +41,10 @@ logger = get_logger()
 
 #: Input rows per worker job (whole scans are never split between jobs).
 SPLIT_ROWS = 200_000
+#: Input rows reduced at a time inside a job: the full-resolution float64/complex128 temporaries of the
+#: channel averaging exist for this many rows only, not for the whole job (16 jobs of 200 000 rows at
+#: 32 channels and 4 correlations held about 0.7 GB each).
+REDUCE_ROWS = 20_000
 #: Main-table scalar columns copied from the first integration of a bin.
 _CARRIED = ("ANTENNA1", "ANTENNA2", "ARRAY_ID", "FEED1", "FEED2", "OBSERVATION_ID", "PROCESSOR_ID", "STATE_ID")
 #: Tolerance on bin edges [s] (TIME values are not exact multiples of the integration time).
@@ -84,21 +88,31 @@ def split_job(*, specs: list[dict], engine: str, column: str, columns: list[str]
     order = np.lexsort((tbin, ant2, ant1, ddid, scan))
     keys = np.stack([scan, ddid, ant1, ant2, tbin], axis=1)[order]
     starts = np.flatnonzero(np.concatenate([[True], np.any(keys[1:] != keys[:-1], axis=1)]))
+    bin_of_row = np.empty(nrow, dtype=np.int64)
+    bin_of_row[order] = np.repeat(np.arange(starts.size), np.diff(np.concatenate([starts, [nrow]])))
 
     def rows_sum(values):
         return np.add.reduceat(values[order], starts, axis=0)
 
-    # Channel bins first (per row), then time bins (rows of a bin).
+    # Channel bins first (per row), then time bins (rows of a bin), REDUCE_ROWS input rows at a time so
+    # that only output-sized sums are kept for the whole job.
     chan_starts = _channel_bins(nchan, chanbin)
-    ok = ~flag
-    w_ok = np.where(ok, ws, 0.0)
-    num_ok = np.add.reduceat(w_ok * vis, chan_starts, axis=1)
-    den_ok = np.add.reduceat(w_ok, chan_starts, axis=1)
-    cnt_ok = np.add.reduceat(ok.astype(np.int64), chan_starts, axis=1)
-    num_all = np.add.reduceat(ws * vis, chan_starts, axis=1)
-    den_all = np.add.reduceat(ws, chan_starts, axis=1)
-    num_ok, den_ok, cnt_ok = rows_sum(num_ok), rows_sum(den_ok), rows_sum(cnt_ok)
-    num_all, den_all = rows_sum(num_all), rows_sum(den_all)
+    shape = (starts.size, chan_starts.size, ncorr)
+    num_ok, num_all = np.zeros(shape, dtype=np.complex128), np.zeros(shape, dtype=np.complex128)
+    den_ok, den_all = np.zeros(shape), np.zeros(shape)
+    cnt_ok = np.zeros(shape, dtype=np.int64)
+    for first in range(0, nrow, REDUCE_ROWS):
+        rows = slice(first, first + REDUCE_ROWS)
+        v, w, ok = vis[rows], ws[rows], ~flag[rows]
+        w_ok = np.where(ok, w, 0.0)
+        # The rows of this block by output bin: one sum per bin present, added to that bin.
+        bins = bin_of_row[rows]
+        by_bin = np.argsort(bins, kind="stable")
+        firsts = np.flatnonzero(np.concatenate([[True], bins[by_bin][1:] != bins[by_bin][:-1]]))
+        present = bins[by_bin][firsts]
+        for total, values in ((num_ok, w_ok * v), (den_ok, w_ok), (cnt_ok, ok.astype(np.int64)),
+                              (num_all, w * v), (den_all, w)):
+            total[present] += np.add.reduceat(np.add.reduceat(values, chan_starts, axis=1)[by_bin], firsts, axis=0)
     out_flag = cnt_ok == 0
     with np.errstate(invalid="ignore", divide="ignore"):
         data = np.where(out_flag, num_all / np.where(den_all > 0, den_all, 1.0),
@@ -114,7 +128,7 @@ def split_job(*, specs: list[dict], engine: str, column: str, columns: list[str]
     out_sigma = np.where(has_good, np.where(good_chan, out_ss, 0).sum(axis=1) / np.maximum(n_good, 1),
                          out_ss.mean(axis=1))
     # Row (integration) level: what had an unflagged sample, weighted by its summed WEIGHT.
-    row_ok = ok.any(axis=(1, 2))
+    row_ok = ~flag.all(axis=(1, 2))
     row_w = np.where(row_ok, weight.sum(axis=1), 0.0)
     count = rows_sum(np.ones(nrow))
     n_row_ok = rows_sum(row_ok.astype(np.float64))
@@ -127,8 +141,6 @@ def split_job(*, specs: list[dict], engine: str, column: str, columns: list[str]
     exposure = np.asarray(block["EXPOSURE"], dtype=np.float64)
     # TIME and INTERVAL cover the integrations of a bin up to its last one with data: flagged integrations
     # before it count, flagged ones after it do not (all of them when the bin has no data at all).
-    bin_of_row = np.empty(nrow, dtype=np.int64)
-    bin_of_row[order] = np.repeat(np.arange(starts.size), np.diff(np.concatenate([starts, [nrow]])))
     last_ok = np.maximum.reduceat(np.where(row_ok, time, -np.inf)[order], starts)
     upto = (time <= last_ok[bin_of_row]) | ~np.isfinite(last_ok[bin_of_row])
     n_upto = rows_sum(upto.astype(np.float64))

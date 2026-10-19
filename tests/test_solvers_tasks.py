@@ -546,9 +546,15 @@ def _split_reference(ms, column, chanbin, timebin):
     return out
 
 
-def test_split_field_averages_like_mstransform(sim, tmp_path):
+@pytest.mark.parametrize("reduce_rows", [None, 7], ids=["whole-job", "7-row-blocks"])
+def test_split_field_averages_like_mstransform(sim, tmp_path, monkeypatch, reduce_rows):
+    from vlbipy.solvers import split_task
     from vlbipy.solvers.split_task import split_field
     pytest.importorskip("casacore.tables")
+    if reduce_rows:
+        # Blocks far smaller than a time bin's rows: every bin is summed across several blocks. The jobs run
+        # in this process (workers=1) so that the patched block size applies.
+        monkeypatch.setattr(split_task, "REDUCE_ROWS", reduce_rows)
     tb = casatools.table()
     tb.open(str(sim["ms"]), nomodify=False)
     nrow = tb.nrows()
@@ -568,7 +574,7 @@ def test_split_field_averages_like_mstransform(sim, tmp_path):
     tb.putcol("TIME_CENTROID", sim["time"] + 0.1)
     tb.close()
     target = tmp_path / "split.ms"
-    report = split_field(sim["ms"], target, "CAL", chanbin=4, timebin=3 * DT, workers=2)
+    report = split_field(sim["ms"], target, "CAL", chanbin=4, timebin=3 * DT, workers=1 if reduce_rows else 2)
     expected = _split_reference(sim["ms"], "CORRECTED_DATA", 4, 3 * DT)
     assert report["rows_out"] == len(expected)
     got = _columns(target, "SCAN_NUMBER", "DATA_DESC_ID", "ANTENNA1", "ANTENNA2", "TIME", "INTERVAL", "EXPOSURE",
