@@ -20,6 +20,7 @@ import json
 from pathlib import Path
 from typing import Optional, Union
 
+from .. import phaseref
 from ..diagnostics import write_summary
 from ..errors import BackendError, StepError
 from ..logging_utils import get_logger, warnings
@@ -989,14 +990,20 @@ class CalibrateNamespace(Namespace):
         obs.drop_gaintables({"scalar_bandpass"})
         cal_cfg = obs.config.get("calibration", {})
         cfg = dict(cal_cfg.get("scalar_bandpass", {}))
-        # Solve on the phase calibrator: gaincal assumes a point source, so a resolved
-        # fringe finder would have its structure absorbed into the antenna gains.
-        compact = obs.sources.phase_calibrators or obs.sources.calibrators
+        # Solve on the phase-reference sources (the phase calibrators, or the targets with inverse phase
+        # referencing): gaincal assumes a point source, so a resolved fringe finder would have its
+        # structure absorbed into the antenna gains.
+        compact = obs.phaseref_plan().references or [s.name for s in obs.sources.calibrators]
         try:
             table = self._backend.calibrate.scalar_bandpass(
-                self._code, ",".join(s.name for s in compact) or obs.calibrator_field,
+                self._code, ",".join(compact) or obs.calibrator_field,
                 obs.refant, gaintable=list(obs.gaintables), metadata=obs.metadata,
                 callib=cal_cfg.get("callib", False), **cfg)
+            # The solve compares the two hands of every antenna on amplitudes: a much weaker one goes now,
+            # before the next pass re-solves and the Stokes I self-calibration averages it in.
+            hands = Path(table.path).with_name(f"{self._code}.scalar_bp.hands.json")
+            if hands.is_file():
+                obs.flag.weak_polarizations_from_gains(json.loads(hands.read_text()))
         except BackendError as exc:
             # Optional subband levelling: a re-solve on heavily-flagged data can fail. Keep
             # the previous pass's table if there is one; otherwise skip it rather than abort
@@ -1039,34 +1046,60 @@ class CalibrateNamespace(Namespace):
 
     def fringefit(self, *, force: bool = False, plot: bool = True,
                   suffix: str = "mbd") -> CalTable:
-        """Global (multi-band delay) fringe fit on all calibrators."""
+        """Global (multi-band delay) fringe fit on the fringe finders and the phase-reference sources.
+
+        The reference sources (:meth:`Observation.phaseref_plan`: the phase calibrators, or the targets with
+        inverse phase referencing) are solved together and their solutions are what the other fields take.
+        With the ``sequential`` strategy only the first (brightest) one is solved with the fringe finders and
+        goes to every field; each next one is then solved on its own, on data corrected by the tables before
+        it, into ``<suffix>_<source>``, which goes to itself, the later references and the receivers.
+        """
         obs = self._obs
         step = "fringefit" if suffix == "mbd" else f"fringefit_{suffix}"
         if not obs._state.should_run(step, force=force):
             return obs._table(suffix)
-        cals = obs.sources.calibrators or obs.sources.targets
-        field = ",".join(s.name for s in cals)
+        plan = obs.phaseref_plan()
+        finders = [s.name for s in obs.sources.fringe_finders]
+        first = plan.references[:1] if plan.strategy == "sequential" else plan.references
+        names = list(dict.fromkeys(finders + first)) or [s.name for s in obs.sources.targets]
         obs.drop_gaintables({step})
         cal_cfg = obs.config.get("calibration", {})
         mbd_cfg = dict(cal_cfg.get("mbd", {}))
         mbd_cfg.setdefault("dispersive", self._solve_dispersive(cal_cfg))
+        # The fringe solutions are what gets transferred to the other fields: tie them to the
+        # reference source(s) so applycal maps those solutions onto every field.
+        applied = self._fringefit_table(",".join(names), suffix, cal_cfg, mbd_cfg, gainfield=",".join(first),
+                                        plot=plot, step=step)
+        outputs = [suffix]
+        if plan.strategy == "sequential":
+            observed = obs.metadata.source_names if obs.metadata else list(obs.sources.names)
+            for name in plan.references[1:]:
+                logger.info("fringefit: {} solved on data already corrected by {} (sequential phase referencing)",
+                            name, ", ".join(plan.references[:plan.references.index(name)]))
+                self._fringefit_table(name, f"{suffix}_{name}", cal_cfg, mbd_cfg, gainfield=name,
+                                      apply_to=plan.apply_to(name, observed) or "", plot=plot, step=step)
+                outputs.append(f"{suffix}_{name}")
+        obs._state.mark_complete(step, outputs=outputs)
+        return applied
+
+    def _fringefit_table(self, field: str, suffix: str, cal_cfg: dict, mbd_cfg: dict, *, gainfield: str,
+                         step: str, apply_to: str = "", plot: bool = True) -> CalTable:
+        """Solve one fringe table on ``field``, smooth it and append it to the chain; return the applied table."""
+        obs = self._obs
         table = self._backend.calibrate.fringefit(
             self._code, field, obs.refant, gaintable=list(obs.gaintables),
             metadata=obs.metadata, suffix=suffix,
             callib=cal_cfg.get("callib", False), **mbd_cfg)
-        # The fringe solutions are what gets transferred to the target: tie them to the
-        # phase calibrator(s) so applycal maps those solutions onto every field.
-        phase_cals = obs.sources.phase_calibrators
-        if phase_cals:
-            table.gainfield = ",".join(s.name for s in phase_cals)
+        if gainfield:
+            table.gainfield = gainfield
             logger.info("fringefit: solutions will be applied from {}", table.gainfield)
+        table.apply_to = apply_to
         if plot:
             obs.plot.caltable(table)
         applied = self._smooth_fringe_table(table)
         obs.add_gaintable(applied, step)
         if plot and applied.path != table.path:
             obs.plot.caltable(applied)
-        obs._state.mark_complete(step, outputs=[suffix])
         return applied
 
     def _smooth_fringe_table(self, table: CalTable) -> CalTable:
@@ -1127,7 +1160,10 @@ class CalibrateNamespace(Namespace):
         """
         obs = self._obs
         cal_cfg = obs.config.get("calibration", {})
-        calibrators = obs.sources.calibrators or obs.sources.targets
+        calibrators = list(obs.sources.calibrators or obs.sources.targets)
+        if obs.phaseref_settings.inverse:
+            # Inverse phase referencing solves on the targets: their brightness decides the strategy.
+            calibrators += [s for s in obs.sources.targets if s not in calibrators]
         selection = field or ",".join(s.name for s in calibrators)
         cached = obs._snr_surveys.get(selection)
         if cached is not None and not force:
@@ -1221,9 +1257,25 @@ class CalibrateNamespace(Namespace):
         cal_cfg = self._obs.config.get("calibration", {})
         options = {"defer": True} if defer and getattr(self._backend.calibrate, "defers_apply", False) else {}
         self._backend.calibrate.apply(
-            self._code, field, list(self._obs.gaintables),
+            self._code, field, self.transfer_chain(),
             callib=cal_cfg.get("callib", False), **options)
         self._obs._state.mark_complete("apply")
+
+    def transfer_chain(self) -> list[CalTable]:
+        """The apply chain with the phase-reference transfer resolved (:func:`vlbipy.phaseref.transfer_chain`).
+
+        With the ``interpolate`` strategy every receiver (target, check source; the phase calibrators with
+        inverse phase referencing) takes tables interpolated between the two reference sources nearest to it,
+        rebuilt whenever a table they come from changed; otherwise this is the chain as solved.
+        """
+        obs = self._obs
+        tables = list(obs.gaintables)
+        if not self._backend.requires_data_files:
+            return tables
+        plan = obs.phaseref_plan()
+        if plan.strategy != "interpolate":
+            return tables
+        return phaseref.transfer_chain(tables, plan, obs.metadata, Path(obs.work_dir) / "caltables" / "phaseref")
 
     def write_corrected(self) -> None:
         """Write CORRECTED_DATA where an application was deferred (no-op when it is up to date, or on a
@@ -1600,6 +1652,84 @@ class FlagNamespace(Namespace):
     def manual(self, *, force: bool = False, **selection) -> float:
         """Apply a manual flag selection (e.g. antenna/spw/timerange)."""
         return self._run("manual", force=force, **selection)
+
+    def weak_polarizations(self, *, force: bool = False) -> dict[str, str]:
+        """Flag the receptor of an antenna that shows no signal while its other one does (before any solve).
+
+        Decided on the fringe-SNR survey of the calibrators (:meth:`ScanSNRSurvey.dead_hands`). A receptor
+        that is detected but weak is caught later, on amplitudes, when the scalar bandpass has solved both
+        hands of every antenna (:meth:`weak_polarizations_from_gains`). ``[flagging].weak_polarization_ratio
+        = 0`` turns both off.
+
+        Returns
+        -------
+        dict
+            ``{antenna: flagged hand}``.
+        """
+        obs = self._obs
+        step = "flag_weak_polarization"
+        if not obs._state.should_run(step, force=force):
+            return {}
+        if float(obs.config.get("flagging", {}).get("weak_polarization_ratio", 5.0) or 0.0) <= 0 or \
+                not self._backend.supports("calibrate", "scan_snr"):
+            obs._state.mark_complete(step, outputs=[])
+            return {}
+        detection = float(obs.config.get("calibration", {}).get("detection_snr", 7.0))
+        dead = obs.calibrate.scan_snr().dead_hands(detection=detection)
+        flagged = {}
+        for antenna, (hand, weak_snr, strong_snr) in dead.items():
+            flagged[antenna] = self._flag_hand(antenna, hand, f"has no fringes (median SNR {weak_snr:.1f} on the "
+                                                              f"calibrator scans where the other hand has "
+                                                              f"{strong_snr:.0f})")
+        if not flagged:
+            logger.info("flag[weak_polarization]: both hands of every antenna have fringes")
+        obs._state.mark_complete(step, outputs=[f"{a}:{h}" for a, h in flagged.items()])
+        return flagged
+
+    def weak_polarizations_from_gains(self, levels: dict) -> dict[str, str]:
+        """Flag the receptor of an antenna whose amplitude is much below that of its other one.
+
+        ``levels`` compares the two hands of every antenna in the scalar-bandpass solutions, before they are
+        normalised (:meth:`CasaCalibrationOps._hand_levels`): one amplitude per hand, subband and calibrator.
+        A hand ``[flagging].weak_polarization_ratio`` (5) times weaker in the median over the solutions both
+        have, or solved nowhere while the other is solved in three or more, loses its parallel hand and both
+        cross hands. Left in, a Stokes I calibration averages its near-zero signal with the good hand:
+        V589A's CD, with an LCP 11 times below its RCP, had every baseline at ~0.55 of its RR.
+
+        Returns
+        -------
+        dict
+            ``{antenna: flagged hand}`` (only the ones flagged now).
+        """
+        ratio = float(self._obs.config.get("flagging", {}).get("weak_polarization_ratio", 5.0) or 0.0)
+        flagged = {}
+        if ratio <= 0:
+            return flagged
+        for antenna, level in (levels or {}).items():
+            solved, value = level.get("solved", {}), level.get("ratio")
+            if solved.get("LL", 0) == 0 and solved.get("RR", 0) >= 3:
+                hand, how = "LL", "has no amplitude solution in any subband while its RCP has"
+            elif solved.get("RR", 0) == 0 and solved.get("LL", 0) >= 3:
+                hand, how = "RR", "has no amplitude solution in any subband while its LCP has"
+            elif value and level.get("pairs", 0) >= 3 and (value >= ratio or value <= 1.0 / ratio):
+                hand = "LL" if value >= ratio else "RR"
+                how = f"is {max(value, 1.0 / value):.1f} times weaker than its {'RCP' if hand == 'LL' else 'LCP'} " \
+                      "in amplitude (scalar bandpass)"
+            else:
+                continue
+            flagged[antenna] = self._flag_hand(antenna, hand, how)
+        return flagged
+
+    def _flag_hand(self, antenna: str, hand: str, why: str) -> str:
+        """Flag one receptor of ``antenna``: its parallel hand and both cross hands, on every baseline."""
+        correlations = ",".join([hand, "RL", "LR"])
+        self._backend.flag.run(self._code, "manual", antenna=antenna, correlation=correlations)
+        done = self._obs.__dict__.setdefault("_flagged_hands", set())
+        if (antenna, hand) not in done:
+            done.add((antenna, hand))
+            warnings.anomaly(f"{self._code}: {antenna} {'LCP' if hand == 'LL' else 'RCP'} {why}; flagged its "
+                             f"{correlations} data")
+        return hand
 
 
 class PlotNamespace(Namespace):
@@ -2396,13 +2526,19 @@ class SelfcalNamespace(Namespace):
         return dict(self._obs.config.get("selfcal", {}))
 
     def _apply_to(self, source: str) -> str:
-        """Fields a calibrator's solutions are applied to: FF -> all; others -> everything but the FFs."""
+        """Fields a calibrator's solutions are applied to: FF -> all; others -> everything but the FFs.
+
+        A phase-reference source follows the plan (:meth:`vlbipy.phaseref.PhaseRefPlan.apply_to`):
+        ``sequential`` leaves out the references solved before it, ``interpolate`` every other reference.
+        """
         obs = self._obs
         finders = {s.name for s in obs.sources.fringe_finders}
         if source in finders:
             return ""
-        names = obs.metadata.source_names if obs.metadata else list(obs.sources.names)
-        return ",".join(n for n in names if n not in finders)
+        names = [n for n in (obs.metadata.source_names if obs.metadata else list(obs.sources.names))
+                 if n not in finders]
+        planned = obs.phaseref_plan().apply_to(source, names)
+        return ",".join(names) if planned is None else planned
 
     def calibrator(self, target: TargetLike = None, *, force: bool = False, transfer_phases: Optional[bool] = None,
                    **kwargs) -> SelfcalResult:
@@ -2417,7 +2553,8 @@ class SelfcalNamespace(Namespace):
         from ..backends import difmap
         obs = self._obs
         src = self._resolve_source_name(target) if target is not None else \
-            (obs.sources.fringe_finders or obs.sources.phase_calibrators or obs.sources.targets)[0].name
+            ([s.name for s in obs.sources.fringe_finders] or obs.phaseref_plan().references
+             or [s.name for s in obs.sources.targets])[0]
         step = f"selfcal_{src}"
         if not obs._state.should_run(step, force=force):
             return obs._selfcal_results.get(src) or SelfcalResult(src, [], True)
@@ -2441,7 +2578,8 @@ class SelfcalNamespace(Namespace):
             min_improvement=float(cfg.get("min_improvement", 0.002)),
             max_bad_fraction=float(cfg.get("max_bad_fraction", 0.25)),
             bayes_models=tuple(cfg.get("bayes_models", ["clean", "gauss1", "gauss2", "gauss3"])),
-            prior_sigma=float(cfg.get("prior_sigma", 0.1)), workers=cfg.get("workers") or None,
+            prior_sigma=float(cfg.get("prior_sigma", 0.1)), outlier_sigma=float(cfg.get("outlier_sigma", 1.0)),
+            workers=cfg.get("workers") or None,
             imagename=str(image_dir / f"{self._code}_{src}"), niter=int(img_cfg.get("niter", 4000)),
             gain=float(img_cfg.get("clean_gain", 0.05)), threshold_sigma=float(img_cfg.get("threshold_sigma", 3.0)),
             **{**_search_settings(img_cfg), **kwargs})
@@ -2485,15 +2623,18 @@ class SelfcalNamespace(Namespace):
         1. fringe finder(s), one after the other: difmapy sequence; the amplitude table
            goes to every field, the phases stay local (a fringe finder is too far from
            the target for its phases to transfer);
-        2. phase calibrator(s): difmapy sequence on data that already carry those
-           amplitudes; amplitude + phase tables -> the phase calibrator, the targets and
-           the check sources, never the fringe finders;
+        2. phase-reference sources (the phase calibrators, or the targets with inverse
+           phase referencing), in the order of the plan (:meth:`Observation.phaseref_plan`):
+           difmapy sequence on data that already carry those amplitudes; amplitude + phase
+           tables -> the fields of :meth:`_apply_to`, never the fringe finders;
         3. apply the whole chain to every field, then re-split every source (and
            UVFITS) so imaging sees the final calibration.
 
         Each calibrator is re-calibrated and re-split on its own just before its
-        session, so it sees the gains of the ones before it: its table is then a
-        refinement on top of theirs rather than a second copy of the same correction.
+        session, so it sees the gains of the ones before it that apply to it: with the
+        ``sequential`` strategy (and ``time``) its table is then a refinement on top of
+        theirs; with ``interpolate`` every reference is self-calibrated independently and
+        the receivers take the interpolation of their tables.
         """
         obs = self._obs
         results: dict[str, SelfcalResult] = {}
@@ -2505,8 +2646,8 @@ class SelfcalNamespace(Namespace):
             return results
         with_data = set(obs.metadata.source_names) if obs.metadata else set(obs.sources.names)
         finders = [s.name for s in obs.sources.fringe_finders if s.name in with_data]
-        phasecals = [s.name for s in obs.sources.phase_calibrators if s.name in with_data and s.name not in finders]
-        for name in finders + phasecals:
+        references = [name for name in obs.phaseref_plan().references if name in with_data and name not in finders]
+        for name in finders + references:
             if obs._state.should_run(f"selfcal_{name}", force=force):
                 # Deferred: only the split reads it, and calibrates while it reads (dask-ms).
                 obs.calibrate.apply(force=True, field=name, defer=True)

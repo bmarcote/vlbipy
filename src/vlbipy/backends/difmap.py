@@ -187,14 +187,16 @@ def phase_selfcal(obs, solints: list[str], *, min_improvement: float = 0.002,
 
 
 def amplitude_calibration(obs, prefix: str, parent_ms: str, *, models=("clean", "gauss1", "gauss2", "gauss3"),
-                          prior_sigma: float = 0.1, workers: Optional[int] = None) -> dict:
+                          prior_sigma: float = 0.1, outlier_sigma: float = 1.0,
+                          workers: Optional[int] = None) -> dict:
     """Bayesian station amplitude calibration; writes ``<prefix>.json``, ``.png`` and the CASA table.
 
     The table refers to ``parent_ms`` (the multi-source measurement set), so
     CASA can apply the corrections to every field. Returns the JSON-able summary
     with the table path under ``"caltable"``.
     """
-    result = obs.bayes_gscale(models=tuple(models), prior_sigma=prior_sigma, prefix=str(prefix),
+    result = obs.bayes_gscale(models=tuple(models), prior_sigma=prior_sigma, outlier_sigma=outlier_sigma,
+                              prefix=str(prefix),
                               outformat="CASA", ms=str(parent_ms), workers=workers, plot=False, quiet=True)
     raw_files = dict(getattr(result, "files", {}) or {})
     files = {k: [str(x) for x in v] if isinstance(v, (list, tuple)) else str(v) for k, v in raw_files.items()}
@@ -351,7 +353,8 @@ def image_all_robust(obs, imagename: str, robust_values, **clean_kwargs) -> dict
 def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_values=(-2.0, 0.0, 2.0),
                      solints: Optional[list[str]] = None, min_improvement: float = 0.002,
                      max_bad_fraction: float = 0.25, bayes_models=("clean", "gauss1", "gauss2", "gauss3"),
-                     prior_sigma: float = 0.1, workers: Optional[int] = None, imagename: Optional[str] = None,
+                     prior_sigma: float = 0.1, outlier_sigma: float = 1.0, workers: Optional[int] = None,
+                     imagename: Optional[str] = None,
                      search_fov_mas: float = 0.0, search_sigma: float = 10.0, recentre_min_beams: float = 10.0,
                      mapsize: int = IMAGE_PIXELS, **clean_kwargs) -> dict:
     """Full difmapy calibrator sequence: model, phase ladder, amplitude gains, images, tables.
@@ -380,7 +383,7 @@ def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_value
     phase_table = export_phase_table(obs, f"{prefix}.phase", parent_ms, snapshot) if any(r["accepted"] for r in rounds) \
         else {}
     amplitude = amplitude_calibration(obs, f"{prefix}.amp", parent_ms, models=bayes_models, prior_sigma=prior_sigma,
-                                      workers=workers)
+                                      outlier_sigma=outlier_sigma, workers=workers)
     gains = write_gain_record(obs, f"{prefix}.gains.json", amplitude)
     obs.auto_mapsize(npix=int(mapsize))
     images = image_all_robust(obs, imagename or prefix, robust_values, **clean_kwargs)
@@ -453,18 +456,27 @@ def scale_model_file(model_path: str, out_path: str, factor: float) -> str:
 
 def refine_against_model(split_ms: str, parent_ms: str, prefix: str, model_path: str, *,
                          solints: Optional[list[str]] = None, min_improvement: float = 0.002,
-                         max_bad_fraction: float = 0.25, amplitude: bool = True) -> dict:
+                         max_bad_fraction: float = 0.25, amplitude: bool = True, prior_sigma: float = 0.1,
+                         outlier_sigma: float = 1.0, model_sigma: Optional[dict] = None,
+                         workers: Optional[int] = None) -> dict:
     """Self-calibrate one epoch of a calibrator against a fixed model; write ``<prefix>.G``.
 
     The model (a ``.mod`` file, e.g. the multi-epoch one of :func:`joint_model`
     scaled to this epoch's flux density) is not touched: only the antenna gains
     move. Phases go down the same accept/revert ladder as the calibrator
-    sequence; then one amplitude factor per station and IF (``gscale``, which
-    keeps the flux scale of the data) is kept if it improves the fit. The gains
-    accumulated here are exported as one CASA table for ``parent_ms``.
+    sequence; then the station amplitudes (one factor per station and IF) are
+    solved against the same model by ``bayes_gscale``, as in the epoch's own
+    amplitude step: the median station holds the flux scale of every IF, a
+    station within ``prior_sigma`` of it is left alone and one clearly off is
+    corrected (``<prefix>.amp.json`` and ``.png``). The model is not rebuilt
+    without each station, so how much a station's gain depends on it comes
+    from outside: ``model_sigma`` (station -> per-IF log-gain uncertainty, the
+    epoch's own amplitude step's). The gains accumulated here are exported as
+    one CASA table for ``parent_ms``.
 
-    Returns a JSON-able report: ``caltable`` ("" when no step was accepted),
-    ``rounds``, ``amplitude`` (the accepted station factors) and the fit
+    Returns a JSON-able report: ``caltable`` ("" when nothing was accepted),
+    ``rounds``, ``amplitude`` (station -> correction, median over IFs, for the
+    stations corrected by more than 0.5%), ``amplitude_files`` and the fit
     ``chisq_before`` / ``chisq_after``.
     """
     obs = load(split_ms, average_channels=True)
@@ -476,24 +488,23 @@ def refine_against_model(split_ms: str, parent_ms: str, prefix: str, model_path:
     obs, rounds = phase_selfcal(obs, ladder, min_improvement=min_improvement, max_bad_fraction=max_bad_fraction,
                                 refit=False)
     gains: dict = {}
+    amplitude_files: dict = {}
     if amplitude:
-        trial = obs.copy()
-        result = trial.gscale(quiet=True)
-        before, after = float(result["fit_before"]["chisq"]), float(result["fit_after"]["chisq"])
-        accepted = math.isfinite(after) and before > 0 and (before - after) / before >= min_improvement
-        logger.info("difmapy gscale against the joint model: chisq {:.4g} -> {:.4g} -> {}", before, after,
-                    "accepted" if accepted else "rejected")
-        if accepted:
-            obs = trial
-            gains = {name: float(value) for name, value in result.get("gains", {}).items()
-                     if math.isfinite(float(value))}
+        # "current": the fixed model, so every station is measured against the structure all epochs constrain.
+        result = obs.bayes_gscale(models=("current",), prior_sigma=prior_sigma, outlier_sigma=outlier_sigma,
+                                  model_sigma=model_sigma, workers=workers, plot=False, quiet=True)
+        amplitude_files = {key: str(path) for key, path in result.write(f"{prefix}.amp", quiet=True).items()}
+        gains = {row["station"]: float(row["correction"]) for row in result.station_table()
+                 if row["has_data"] and abs(math.log(row["correction"])) > 0.005}
+        logger.info("difmapy bayes_gscale against the joint model: {}",
+                    ", ".join(f"{name} x{value:.3f}" for name, value in gains.items()) or "no station off")
     table = ""
     if gains or any(r["accepted"] for r in rounds):
         info = obs.savecaltable(f"{prefix}", outformat="CASA", ms=str(parent_ms), since=snapshot, quiet=True)
         table = str(info.get("path", f"{prefix}"))
     report = {"source": obs.source, "split_ms": str(split_ms), "model": str(model_path), "caltable": table,
-              "ladder": ladder, "rounds": rounds, "amplitude": gains, "chisq_before": start,
-              "chisq_after": float(obs.moddif()["chisq"])}
+              "ladder": ladder, "rounds": rounds, "amplitude": gains, "amplitude_files": amplitude_files,
+              "chisq_before": start, "chisq_after": float(obs.moddif()["chisq"])}
     Path(f"{prefix}.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     return report
 

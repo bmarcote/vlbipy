@@ -16,6 +16,7 @@ from astropy import units as u
 from .errors import SourceNotFoundError
 from .logging_utils import get_logger
 from .models import SourceType
+from .phaseref import SETTING_KEYS
 
 logger = get_logger()
 
@@ -114,7 +115,8 @@ class SourceSet:
             Keys are role names (``targets``, ``phase_calibrators`` ...); values
             are a source name or list of names.
         phaseref_cfg : dict, optional
-            Mapping target name -> calibrator name or list of names.
+            The ``[phase_referencing]`` section: mapping target name -> calibrator name or list of names,
+            next to the strategy settings (:data:`vlbipy.phaseref.SETTING_KEYS`), which are left out.
 
         Returns
         -------
@@ -128,7 +130,7 @@ class SourceSet:
                     continue
                 seen.add(name)
                 sources.append(Source(name=name, source_type=stype))
-        phaseref = {str(t): _as_list(c) for t, c in (phaseref_cfg or {}).items()}
+        phaseref = {str(t): _as_list(c) for t, c in (phaseref_cfg or {}).items() if t not in SETTING_KEYS}
         return cls(sources, phase_referencing=phaseref)
 
     # -- role accessors --

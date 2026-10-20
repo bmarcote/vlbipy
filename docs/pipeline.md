@@ -237,13 +237,24 @@ are then combined (`combine()`, see [Full pipeline — Campaigns](usage/pipeline
    constrains structure that no single track does;
 2. each epoch of that calibrator is self-calibrated against the joint model
    (scaled back to that epoch's flux density, and never re-fitted): the phase
-   ladder, each step kept only if it improves the fit. Station amplitudes are
-   left as the epoch's own self-calibration set them unless
-   `[selfcal].joint_amplitude = true` (the model is built from other epochs of
-   a variable source; amplitudes fitted to it made the V589 targets worse). The gains become a `joint_<source>` table in that
-   epoch's chain, applied to the fields the calibrator's own self-calibration
-   goes to;
-3. every epoch is re-applied, re-split and re-imaged;
+   ladder, each step kept only if it improves the fit, then the station
+   amplitudes with `bayes_gscale` against the same model: the median station
+   holds the flux scale of every subband, a station within `prior_sigma` of it
+   is left alone and one clearly off is corrected. The joint model is not
+   rebuilt without each station, so the uncertainty of each station's gain
+   due to the model is the one the epoch's own amplitude step measured (a
+   station whose baselines no other station constrains, such as HH in V589,
+   is not corrected on the strength of the model alone). A calibrator that a single
+   track models poorly (V589: J1346-6024, reduced chi-squared 200-440 with its
+   own models) gives amplitude corrections that absorb its structure; against
+   the joint model all epochs are calibrated on the same one.
+   `[selfcal].joint_amplitude = false` keeps the epochs' own amplitudes. The
+   gains become a `joint_<source>` table in that epoch's chain, applied to the
+   fields the calibrator's own self-calibration goes to (with the
+   `interpolate` strategy, the target gets the two calibrators' tables
+   combined by its position);
+3. every epoch is re-applied, re-split and re-imaged, and its plots of the
+   calibrated data (and its HTML pages) are redone with the final calibration;
 4. the epochs of every source are concatenated and imaged together.
 
 A source declared for the campaign but absent from an epoch is ignored in that

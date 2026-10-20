@@ -108,13 +108,17 @@ Both apply to anything correlated with DiFX (LBA and VLBA), and both tables are 
 
 Most LBA stations come with nominal values (`Tsys = 1.0` and a `DPFU` that stands for the
 SEFD), and phased ATCA is recorded in its own units. After the a-priori calibration the
-amplitudes are therefore off by factors of a few per antenna, not by the ~10% the
-self-calibration assumes by default. Widen the prior of the Bayesian amplitude step for LBA
-data, or it will correct only a fraction of the error:
+amplitudes are therefore off by factors of a few for some antennas. The Bayesian amplitude
+step handles that by itself: a station within the a-priori accuracy (`prior_sigma`) of the
+median station is left alone, and one clearly beyond it gets its correction almost in full
+(`outlier_sigma`, a factor of a few in log amplitude). On V589A, KE (x7), WA (x0.46) and PA
+(x2) were corrected while AT, MP and YG stayed within 10% of 1. With nominal SEFDs a looser
+a-priori accuracy can be declared, so that 20% offsets are not touched either:
 
 ```toml
 [selfcal]
-prior_sigma = 1.0      # width of the prior on the log-amplitude corrections (default 0.1)
+prior_sigma = 0.2      # a-priori accuracy: stations within it of the median are left alone (default 0.1)
+outlier_sigma = 1.0    # spread of a station that is off, corrected almost in full (default 1.0)
 ```
 
 The flux scale is then only as good as the average of the nominal values.

@@ -11,11 +11,17 @@ that day. :func:`combine_epochs` uses all of them together:
 2. each epoch of that calibrator is self-calibrated again against the joint
    model, scaled back to the epoch's own flux density; the resulting gains go
    into that epoch's calibration chain as one more table (``joint_<source>``),
-   applied to the same fields as the calibrator's own self-calibration. Phases
-   only by default: station amplitudes fitted to a model made from other
-   epochs of a variable source made the target images worse where they were
-   accepted (V589A, V589B); ``[selfcal].joint_amplitude = true`` enables them;
-3. every epoch is re-split and re-imaged with the refined calibration;
+   applied to the same fields as the calibrator's own self-calibration. The
+   phase ladder first, then the station amplitudes with ``bayes_gscale``
+   against the same fixed model: a calibrator that one track models poorly
+   gives amplitude corrections that absorb its structure, and the joint model
+   puts every epoch on the same one. Only stations clearly off are corrected
+   (``[selfcal].prior_sigma``), and how much each station depends on the model
+   is the uncertainty the epoch's own amplitude step measured (the joint model
+   is not rebuilt without each station); ``[selfcal].joint_amplitude = false``
+   keeps the epochs' own amplitudes;
+3. every epoch is re-split and re-imaged with the refined calibration, and its
+   plots of the calibrated data are redrawn;
 4. the epochs of every source are concatenated and imaged together, which for
    the target is the deep image of the campaign.
 
@@ -85,6 +91,24 @@ def _epoch_flux(obs, source: str) -> Optional[float]:
         return None
     fluxes = [float(info["model_flux"]) for info in images.values() if float(info.get("model_flux", 0.0)) > 0]
     return float(np.median(fluxes)) if fluxes else None
+
+
+def _own_model_sigma(obs, source: str) -> dict:
+    """Station -> per-IF log-gain uncertainty that the epoch's own amplitude step found for ``source``.
+
+    That step rebuilt its models without each station in turn, so it measured how much each station's gain
+    depends on the source model (large for one whose baselines no other station constrains). Against the fixed
+    joint model nothing measures it, so :func:`refine_calibrator` carries it over. Empty when there is no report.
+    """
+    path = Path(obs.work_dir) / "selfcal" / f"{obs.project_code}.{source}.amp.json"
+    try:
+        report = json.loads(path.read_text())
+        sigma, names = report["log_gain"]["sigma"], report["antennas"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+    if sigma and isinstance(sigma[0], list):
+        return {name: [row[a] for row in sigma] for a, name in enumerate(names)}
+    return dict(zip(names, sigma))
 
 
 def _epochs_changed_since(observations: list, report_path: Path) -> list[str]:
@@ -173,8 +197,11 @@ def refine_calibrator(observations: list, source: str, root: Path, name: str, co
         epoch_model = difmap.scale_model_file(model["model"], f"{prefix}.mod", flux / reference)
         try:
             report = difmap.refine_against_model(split, str(obs._backend.ms_path(code)), str(prefix), epoch_model,
-                                                 solints=solints, amplitude=bool(cfg.get("joint_amplitude", False)),
-                                                 **limits)
+                                                 solints=solints, amplitude=bool(cfg.get("joint_amplitude", True)),
+                                                 prior_sigma=float(cfg.get("prior_sigma", 0.1)),
+                                                 outlier_sigma=float(cfg.get("outlier_sigma", 1.0)),
+                                                 model_sigma=_own_model_sigma(obs, source),
+                                                 workers=cfg.get("workers") or None, **limits)
         except Exception as exc:  # noqa: BLE001 - one epoch failing must not lose the others
             warnings.warn(f"{code}: refinement of {source} against the joint model failed ({exc})")
             obs._state.mark_failed(step, str(exc))
@@ -182,9 +209,11 @@ def refine_calibrator(observations: list, source: str, root: Path, name: str, co
             continue
         accepted = [r["solint"] for r in report["rounds"] if r["accepted"]]
         record["refinement"][code] = {"accepted_phase_solints": accepted, "amplitude": report["amplitude"],
+                                      "amplitude_report": report["amplitude_files"].get("json", ""),
                                       "chisq_before": report["chisq_before"], "chisq_after": report["chisq_after"]}
+        amplitudes = ", ".join(f"{name} x{value:.2f}" for name, value in report["amplitude"].items())
         logger.info("[{}] {} against the joint model: phase steps accepted {}; amplitudes {}; chisq {:.4g} -> {:.4g}",
-                    code, source, ", ".join(accepted) or "none", "adjusted" if report["amplitude"] else "kept",
+                    code, source, ", ".join(accepted) or "none", amplitudes or "kept",
                     report["chisq_before"], report["chisq_after"])
         if report["caltable"] and Path(report["caltable"]).is_dir():
             obs.add_gaintable(CalTable(cal_type=f"joint_{source}", path=report["caltable"], field=source,
@@ -257,11 +286,12 @@ def combine_epochs(vlbi, *, force: bool = False) -> dict:
     # A previous combination left its tables in the chains: the joint model must be built from the
     # per-epoch calibration alone, so they come out first (and the splits are redone without them).
     stale: set[str] = set()
+    # The phase-reference sources in each epoch's solve order (the targets with inverse phase referencing).
     calibrators: list[str] = []
     for obs in observations:
-        for source in obs.sources.phase_calibrators:
-            if source.name not in calibrators:
-                calibrators.append(source.name)
+        for source in obs.phaseref_plan().references:
+            if source not in calibrators:
+                calibrators.append(source)
     for obs in observations:
         if obs.drop_gaintables({_joint_step(source) for source in calibrators}):
             stale.add(obs.project_code)
@@ -301,6 +331,9 @@ def combine_epochs(vlbi, *, force: bool = False) -> dict:
         obs.calibrate.apply(force=True)
         obs.export.per_source(force=True)
         vlbi._image_all(obs, force=True, reimage=True)
+        # The epoch's plots of its calibrated data (and so its pages) show the final calibration.
+        vlbi._calibrated_diagnostics(obs)
+        vlbi._final_plots(obs)
     report["images_after"] = {obs.project_code: epoch_image_statistics(obs) for obs in observations}
 
     sources: list[str] = []
