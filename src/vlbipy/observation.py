@@ -50,6 +50,11 @@ STEP_ORDER = [
     "apply", "flag_aoflagger", "flag_outliers",
     "second_pass", "scalar_bandpass", "reweight", "flag_outliers_reweighted", "third_pass", "split",
 ]
+#: The stages after the split, recorded once per source (``<prefix><source>``) or once per run. They are
+#: not resumed from, but they work on the calibration of every step above: resuming from any of those
+#: redoes them too (and drops the tables they added to the chain).
+LATE_STEP_PREFIXES = ("selfcal_", "joint_", "clean_")
+LATE_STEPS = ("final_plots",)
 
 
 class Observation:
@@ -607,6 +612,10 @@ class Observation:
                                 f"{', '.join(STEP_ORDER)}")
             logger.info("[{}] resuming from {}", self.project_code, from_step)
             self._state.invalidate_downstream(from_step, STEP_ORDER)
+            late = [name for name in self._state.completed()
+                    if name in LATE_STEPS or name.startswith(LATE_STEP_PREFIXES)]
+            for name in late:
+                self._state.invalidate_downstream(name, [name])
             # The tables those steps produced are about to be re-derived: keeping them
             # in the chain would apply the stale solution alongside its replacement.
             # Redoing the survey or the first instrumental solve means deciding again which
@@ -616,7 +625,7 @@ class Observation:
             # The phase-referencing decision is the fringe fit's: redoing it decides again.
             if STEP_ORDER.index(from_step) <= STEP_ORDER.index("fringefit"):
                 self.clear_phaseref()
-            stale = self.drop_gaintables(STEP_ORDER[STEP_ORDER.index(from_step):])
+            stale = self.drop_gaintables(STEP_ORDER[STEP_ORDER.index(from_step):] + late)
             if stale:
                 logger.info("[{}] dropped from the calibration chain: {}",
                             self.project_code, ", ".join(stale))
