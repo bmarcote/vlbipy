@@ -161,7 +161,7 @@ def _options_epilog(sub: argparse._SubParsersAction, common: argparse.ArgumentPa
                               if action.option_strings)
     lines.append(f"  {common_detail}")
     lines.append("")
-    lines.append("For more information, visit: https://vlbipy.readthedocs.io/")
+    lines.append("For more information, visit: https://bmarcote.github.io/vlbipy")
     return "\n".join(lines)
 
 
