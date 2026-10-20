@@ -2410,26 +2410,60 @@ class CleanNamespace(Namespace):
                                                 metadata=obs.metadata))
         return str(path)
 
-    def _image_with_difmap(self, src: str, robust_values: list[float], img_cfg: dict, weighting: str,
-                           niter: int, **kwargs) -> list[Image]:
-        """CLEAN ``src`` with difmapy at every robust value (see :mod:`vlbipy.backends.difmap`).
+    def difmap_sources(self, sources: list[str], *, robust=None, weighting: Optional[str] = None,
+                       **overrides) -> dict[str, Union[Image, ImageSet, Exception]]:
+        """Image ``sources`` with difmapy at every robust value, several at once (see :mod:`vlbipy.backends.difmap`).
 
-        The source is first searched for in a wide dirty map and re-centred only when a
+        Each source is first searched for in a wide dirty map and re-centred only when a
         significant peak lies far from the phase centre (``[imaging].search_fov``,
-        ``search_sigma``, ``recentre_min_beams``).
+        ``search_sigma``, ``recentre_min_beams``), then imaged with ``[imaging].method``
+        (``overrides`` replace its settings, e.g. ``niter=``). The sources are imaged side by
+        side in worker processes (:func:`~vlbipy.backends.difmap.run_image_jobs`); each one's
+        PNG grid, image report and ``clean_<source>`` step are written as it is done here.
+
+        Returns
+        -------
+        dict
+            Source -> its :class:`Image` (one robust value) or :class:`ImageSet`, or the exception
+            that stopped it (the step is then recorded as failed).
         """
         from ..backends import difmap
         obs = self._obs
-        split = self.split_ms(src)
+        img_cfg = obs.config.get("imaging", {})
+        weighting = weighting or img_cfg.get("weighting", "briggs")
+        if robust is None:
+            robust = img_cfg.get("robust", [0.0])
+        robust_values = [float(r) for r in (robust if isinstance(robust, (list, tuple)) else [robust])]
+        settings = difmap.imaging_settings(img_cfg)
+        settings.update({key: value for key, value in overrides.items() if key in settings and value is not None})
         image_dir = Path(obs.work_dir) / "images"
         image_dir.mkdir(parents=True, exist_ok=True)
-        report = difmap.image_source(split, str(image_dir / f"{self._code}_{src}"), robust_values=robust_values,
-                                     niter=int(niter), gain=float(img_cfg.get("clean_gain", 0.05)),
-                                     threshold_sigma=float(kwargs.get("threshold_sigma", 3.0)),
-                                     average_channels=bool(img_cfg.get("average_channels", True)),
-                                     **_search_settings(img_cfg))
-        _write_search_report(image_dir / f"{self._code}_{src}.search.json", report)
-        return [_image_from_difmap(src, info, weighting) for info in report["images"].values()]
+        jobs = [{"split_ms": self.split_ms(src), "imagename": str(image_dir / f"{self._code}_{src}"),
+                 "robust_values": robust_values, "average_channels": bool(img_cfg.get("average_channels", True)),
+                 **_search_settings(img_cfg), **settings} for src in sources]
+        results: dict = {}
+        for src, report in zip(sources, difmap.run_image_jobs(jobs)):
+            if isinstance(report, Exception):
+                obs._state.mark_failed(f"clean_{src}", str(report))
+                results[src] = report
+                continue
+            _write_image_report(image_dir / f"{self._code}_{src}.search.json", report, settings)
+            images = [_image_from_difmap(src, info, weighting) for info in report["images"].values()]
+            results[src] = self._finish_images(src, images, produce_png=img_cfg.get("produce_png", True))
+        return results
+
+    def _finish_images(self, src: str, images: list[Image], *, produce_png: bool = True) -> Union[Image, ImageSet]:
+        """Render the PNG grid of a source's images, record its ``clean_<source>`` step and return them."""
+        fits_paths = {img.robust: img.paths["fits"] for img in images if img.paths.get("fits")}
+        if produce_png and fits_paths and self._backend.supports("plot", "image_grid"):
+            try:
+                png = self._backend.plot.image_grid(self._code, {src: fits_paths})
+                for img in images:
+                    img.paths["png"] = png[0] if png else img.paths.get("png", "")
+            except Exception as exc:  # noqa: BLE001 - a missing preview must not lose the images
+                warnings.warn(f"{self._code}: image preview of {src} failed ({exc})")
+        self._obs._state.mark_complete(f"clean_{src}", outputs=[img.paths.get("fits", "") for img in images])
+        return images[0] if len(images) == 1 else ImageSet(images)
 
     def _image(self, target, robust, imager, *, imsize=None, weighting=None, niter=None,
                **kwargs) -> Union[Image, ImageSet]:
@@ -2444,32 +2478,24 @@ class CleanNamespace(Namespace):
         src = self._resolve_source_name(target)
         imager = self._backend_imager(imager)
         img_cfg = obs.config.get("imaging", {})
-        weighting = weighting or img_cfg.get("weighting", "briggs")
-        niter = img_cfg.get("niter", 0) if niter is None else niter
         if robust is None:
             robust = img_cfg.get("robust", [0.0])
+        if imager == "difmap":
+            result = self.difmap_sources([src], robust=robust, weighting=weighting, niter=niter, **kwargs)[src]
+            if isinstance(result, Exception):
+                raise result
+            return result
+        weighting = weighting or img_cfg.get("weighting", "briggs")
+        niter = img_cfg.get("niter", 0) if niter is None else niter
         robust_values = list(robust) if isinstance(robust, (list, tuple)) else [robust]
         kwargs.setdefault("threshold_sigma", img_cfg.get("threshold_sigma", 3.0))
         kwargs.setdefault("produce_fits", img_cfg.get("produce_fits", True))
         kwargs.setdefault("produce_png", img_cfg.get("produce_png", True))
         kwargs.setdefault("metadata", obs.metadata)
-        if imager == "difmap":
-            images = self._image_with_difmap(src, [float(r) for r in robust_values], img_cfg, weighting, niter,
-                                             **kwargs)
-        else:
-            images = [self._backend.image.clean(self._code, src, robust=float(r), imager=imager,
-                                                imsize=imsize, weighting=weighting, niter=niter, **kwargs)
-                      for r in robust_values]
-        fits_paths = {img.robust: img.paths["fits"] for img in images if img.paths.get("fits")}
-        if kwargs["produce_png"] and fits_paths and self._backend.supports("plot", "image_grid"):
-            try:
-                png = self._backend.plot.image_grid(self._code, {src: fits_paths})
-                for img in images:
-                    img.paths["png"] = png[0] if png else img.paths.get("png", "")
-            except Exception as exc:  # noqa: BLE001 - a missing preview must not lose the images
-                warnings.warn(f"{self._code}: image preview of {src} failed ({exc})")
-        obs._state.mark_complete(f"clean_{src}", outputs=[img.paths.get("fits", "") for img in images])
-        return images[0] if len(images) == 1 else ImageSet(images)
+        images = [self._backend.image.clean(self._code, src, robust=float(r), imager=imager,
+                                            imsize=imsize, weighting=weighting, niter=niter, **kwargs)
+                  for r in robust_values]
+        return self._finish_images(src, images, produce_png=kwargs["produce_png"])
 
 
 def _search_settings(img_cfg: dict) -> dict:
@@ -2480,11 +2506,23 @@ def _search_settings(img_cfg: dict) -> dict:
             "recentre_min_beams": float(img_cfg.get("recentre_min_beams", 10.0))}
 
 
-def _write_search_report(path: Path, report: dict) -> None:
-    """Save the source search of a difmapy report (peak, significance, offset, shift) as JSON, when there is one."""
-    if report.get("search"):
-        Path(path).write_text(json.dumps({"search": report["search"], "shift_mas": report.get("shift_mas", [0, 0])},
-                                         indent=2), encoding="utf-8")
+def _write_image_report(path: Path, report: dict, settings: Optional[dict] = None) -> None:
+    """Save what imaging a source with difmapy found, as JSON (``images/<code>_<source>.search.json``).
+
+    The source search (peak, significance, offset) and the shift applied, the statistics of every image
+    (the dashboard shows these: they are the latest images, also when a campaign re-imaged the epoch
+    after its self-calibration), the model the images are made of, and the imaging ``settings`` (the
+    keywords that matter for the method), by which a campaign tells whether images on disk were made
+    the way it would make them.
+    """
+    from ..backends.difmap import method_keywords
+    images = {str(robust): {key: value for key, value in info.items() if key != "fits"}
+              for robust, info in (report.get("images") or {}).items()}
+    model = report.get("model") if isinstance(report.get("model"), dict) else report.get("image_model") or {}
+    Path(path).write_text(json.dumps({"search": report.get("search") or {}, "shift_mas": report.get("shift_mas", [0, 0]),
+                                      "images": images, "model": model,
+                                      "imaging": method_keywords(settings) if settings else {}},
+                                     indent=2, default=str), encoding="utf-8")
 
 
 def _image_from_difmap(source: str, info: dict, weighting: str = "briggs") -> Image:
@@ -2580,10 +2618,9 @@ class SelfcalNamespace(Namespace):
             bayes_models=tuple(cfg.get("bayes_models", ["clean", "gauss1", "gauss2", "gauss3"])),
             prior_sigma=float(cfg.get("prior_sigma", 0.1)), outlier_sigma=float(cfg.get("outlier_sigma", 1.0)),
             workers=cfg.get("workers") or None,
-            imagename=str(image_dir / f"{self._code}_{src}"), niter=int(img_cfg.get("niter", 4000)),
-            gain=float(img_cfg.get("clean_gain", 0.05)), threshold_sigma=float(img_cfg.get("threshold_sigma", 3.0)),
-            **{**_search_settings(img_cfg), **kwargs})
-        _write_search_report(image_dir / f"{self._code}_{src}.search.json", report)
+            imagename=str(image_dir / f"{self._code}_{src}"),
+            **{**_search_settings(img_cfg), **difmap.imaging_settings(img_cfg), **kwargs})
+        _write_image_report(image_dir / f"{self._code}_{src}.search.json", report, difmap.imaging_settings(img_cfg))
         apply_to = self._apply_to(src)
         amp_path = report["amplitude"].get("caltable", "")
         if amp_path and Path(amp_path).is_dir():

@@ -336,11 +336,16 @@ robust values.
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
+| `method` | string | `"modelfit"` | difmapy imaging. `"modelfit"`: the source is modelled with circular Gaussians (flux, position and size free), added one at a time near the brightest emission; what they leave is CLEANed in windows; the one model is restored at every robust value. `"clean"`: Högbom CLEAN alone, each robust value on its own, over the whole map. See [Imaging](pipeline.md#imaging) |
+| `max_components` | int | `10` | Modelfit: most Gaussians per source |
+| `component_sigma` | float | `5.0` | Modelfit: a Gaussian is kept only when the fit improves by this many sigma (the drop of chi-squared, in units of the reduced chi-squared, is at least its square) |
+| `component_improvement` | float | `0.01` | Modelfit: ... and, after the first, when it removes this fraction of the chi-squared. On a bright source the calibration errors of the most sensitive baselines make any extra component pass the first test |
+| `clean_residual_sigma` | float | `5.0` | Modelfit: residual emission above this many times the noise is CLEANed, in windows around it (and around the Gaussians) |
 | `weighting` | string | `"briggs"` | Visibility weighting scheme |
 | `robust` | list[float] | `[-2, -1, 0, 1, 2]` | Briggs robust values to image at (−2 = uniform, +2 = natural) |
 | `pixels_per_beam` | int | `10` | Used to auto-compute cell size from the synthesised beam |
-| `niter` | int | `4000` | Number of CLEAN deconvolution iterations |
-| `threshold_sigma` | float | `3.0` | CLEAN stops when the residual peak is below this many times the residual rms *and* the last batch of components lowered that rms by less than 1% (while it is still falling it is made of the sidelobes of uncleaned flux, not of noise); also when the rms starts to rise, or at `niter` |
+| `niter` | int | `4000` | Most CLEAN components (with `modelfit`, of the CLEAN of the residual) |
+| `threshold_sigma` | float | `3.0` | CLEAN stops when the residual peak (with `modelfit`, inside its windows) is below this many times the residual rms *and* the last batch of components lowered that rms by less than 1% (while it is still falling it is made of the sidelobes of uncleaned flux, not of noise); also when the rms starts to rise, or at `niter` |
 | `deconvolver` | string | `"hogbom"` | CLEAN deconvolution algorithm (`hogbom`, `clark`, `multiscale`) |
 | `search_fov` | float | `1000.0` | Width (mas) of the dirty map searched for each source before difmapy images or self-calibrates it. `0` disables the search. |
 | `search_sigma` | float | `10.0` | A peak in that map counts as the source only above this many rms. |

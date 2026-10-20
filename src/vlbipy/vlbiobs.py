@@ -562,9 +562,11 @@ class VLBIObs:
         """Image every source of :meth:`imaging_sources` at the configured robust values.
 
         Imaging is the last stage and must not throw away the calibration the
-        run just produced (split MSs and UVFITS are already on disk): a clean that
+        run just produced (split MSs and UVFITS are already on disk): an image that
         fails on one source is a warning recorded as a failed ``clean_<source>``
-        step, not a failed run. A backend without imaging skips the step.
+        step, not a failed run. A backend without imaging skips the step. With
+        difmapy the sources are imaged side by side in worker processes
+        (:meth:`~vlbipy.namespaces.CleanNamespace.difmap_sources`).
         """
         obs = obs or self._imaging_target()
         images: dict = {}
@@ -575,14 +577,23 @@ class VLBIObs:
             logger.warning("imaging skipped: backend {} does not implement image.clean", obs._backend.kind)
             return images
         robust = self.config.get("imaging", {}).get("robust", [-2, 0, 2])
+        pending = []
         for name in self.imaging_sources(obs):
             # ``reimage``: the calibration changed since the self-cal session made its images.
             if not reimage and name in obs._selfcal_results and obs._selfcal_results[name].images:
                 images[name] = ImageSet(obs._selfcal_results[name].images)   # imaged in its difmapy session
                 obs._state.mark_complete(f"clean_{name}", outputs=[i.paths.get("fits", "") for i in images[name]])
                 continue
-            if not obs._state.should_run(f"clean_{name}", force=force):
-                continue
+            if obs._state.should_run(f"clean_{name}", force=force):
+                pending.append(name)
+        if difmap_imager:
+            for name, result in obs.clean.difmap_sources(pending, robust=robust).items():
+                if isinstance(result, Exception):
+                    warnings.warn(f"imaging {name} failed: {result}")
+                else:
+                    images[name] = result
+            return images
+        for name in pending:
             try:
                 images[name] = obs.clean(target=name, robust=robust)
             except Exception as exc:  # noqa: BLE001 - imaging failure must not abort the run

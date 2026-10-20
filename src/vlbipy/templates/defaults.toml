@@ -218,7 +218,13 @@ mapsize = 8192               # difmapy: width in pixels of the map the images ar
                              # valid inner half, 4096 px); cell = resolution / 10
 average_channels = true      # difmapy: average each subband to one channel before CLEAN (much faster; set
                              # false for fields wider than ~1 arcsec, where bandwidth smearing matters)
-imager = "difmap"            # "difmap" (difmapy CLEAN on the per-source split) | "tclean"; dask-ms: always difmap
+imager = "difmap"            # "difmap" (difmapy on the per-source split) | "tclean"; dask-ms: always difmap
+method = "modelfit"          # difmapy: "modelfit" = circular Gaussians, CLEAN only for what they leave, one model
+                             # restored at every robust value | "clean" = CLEAN alone, each robust value on its own
+max_components = 10          # modelfit: most Gaussians per source
+component_sigma = 5.0        # modelfit: a Gaussian is kept only when the fit improves by this many sigma ...
+component_improvement = 0.01 # ... and (after the first) removes this fraction of the chi-squared
+clean_residual_sigma = 5.0   # modelfit: residual emission above this many sigma is CLEANed, in windows
 weighting = "briggs"
 clean_gain = 0.05            # difmapy CLEAN loop gain
 robust = [-2, 0, 2]          # one image per robust value, shown side by side in the PNG preview

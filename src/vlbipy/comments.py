@@ -85,7 +85,7 @@ CONDENSE_FROM_IFS: int = 3
 
 #: Median solution SNR below which a calibration table is pointed out (0 means "not measured").
 POOR_TABLE_SNR: float = 10.0
-#: Dynamic range of the CLEAN image below which a self-calibrated calibrator is pointed out.
+#: Dynamic range of the image below which a self-calibrated calibrator is pointed out.
 LOW_CALIBRATOR_DYNAMIC_RANGE: float = 50.0
 #: A source found closer than this (mas) to the phase centre in the search map is said to be "at" it.
 CENTRED_OFFSET_MAS: float = 0.05
@@ -670,7 +670,7 @@ def flagging_comments(context: dict) -> list[dict]:
 def _search_text(search: dict, with_peak: bool) -> str:
     """Words for the result of the source search in the wide dirty map.
 
-    ``with_peak`` adds the peak of that map: worth saying only when no CLEAN image statistics are on record.
+    ``with_peak`` adds the peak of that map: worth saying only when no image statistics are on record.
     """
     snr, fov = _finite(search.get("snr")), _finite(search.get("fov_mas"))
     if not search.get("detected"):
@@ -686,7 +686,7 @@ def _search_text(search: dict, with_peak: bool) -> str:
 
 
 def source_comments(context: dict) -> list[dict]:
-    """What came out per source: the search result and the statistics of its CLEAN image (robust 0 if made).
+    """What came out per source: the search result and the statistics of its image (robust 0 if made).
 
     One ``"source"`` comment per source, its sentence without the source name.
     """
@@ -703,7 +703,7 @@ def source_comments(context: dict) -> list[dict]:
         if images:
             image = next((i for i in images if _finite(i.get("robust")) == 0.0), images[0])
             peak, rms, dynamic = _finite(image["peak"]), _finite(image.get("rms")), _finite(image.get("dynamic_range"))
-            text = f"CLEAN image (robust {float(image.get('robust') or 0.0):g}): peak {format_flux(peak)}/beam"
+            text = f"image (robust {float(image.get('robust') or 0.0):g}): peak {format_flux(peak)}/beam"
             text += f", rms {format_flux(rms)}/beam" if rms is not None else ""
             if dynamic is not None:
                 text += f", dynamic range {dynamic:.0f}"

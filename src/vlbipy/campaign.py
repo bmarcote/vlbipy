@@ -146,11 +146,34 @@ def _joint_step(source: str) -> str:
     return f"joint_{source}"
 
 
-def _imaging_settings(config: dict) -> dict:
-    """difmapy CLEAN keywords from ``[imaging]``."""
-    img_cfg = config.get("imaging", {})
-    return {"niter": int(img_cfg.get("niter", 4000)), "gain": float(img_cfg.get("clean_gain", 0.05)),
-            "threshold_sigma": float(img_cfg.get("threshold_sigma", 3.0))}
+def _reimage_reason(obs, steps: set[str], settings: dict) -> str:
+    """Why the images an epoch has on disk cannot be its images before the combination ("" when they can).
+
+    They can when none of them was made after ``steps`` (the ``joint_<source>`` tables just dropped from its
+    chain) completed, and all were made with the imaging ``settings`` in force (as their image reports,
+    ``images/<code>_<source>.search.json``, record). A combination interrupted after it refined the epochs
+    leaves its tables in the chains but its images untouched: those are then the "before" images already,
+    and only the calibrated data are redone.
+    """
+    from .backends.difmap import method_keywords
+    state = obs._state.as_dict()
+    joint = [entry["timestamp"] for step in steps if (entry := state.get(step, {})).get("status") == "done"
+             and entry.get("timestamp")]
+    wanted = json.loads(json.dumps(method_keywords(settings)))
+    image_dir = Path(obs.work_dir) / "images"
+    for name in (obs.metadata.source_names if obs.metadata else obs.sources.names):
+        entry = state.get(f"clean_{name}", {})
+        if entry.get("status") != "done":
+            continue
+        if joint and str(entry.get("timestamp", "")) > min(joint):
+            return f"the images of {name} were made with the joint calibration"
+        try:
+            recorded = json.loads((image_dir / f"{obs.project_code}_{name}.search.json").read_text()).get("imaging")
+        except (OSError, ValueError, AttributeError):
+            recorded = None
+        if recorded != wanted:
+            return f"the images of {name} were made with other imaging settings"
+    return ""
 
 
 def refine_calibrator(observations: list, source: str, root: Path, name: str, config: dict) -> dict:
@@ -182,10 +205,11 @@ def refine_calibrator(observations: list, source: str, root: Path, name: str, co
     (root / "selfcal").mkdir(parents=True, exist_ok=True)
     model = difmap.joint_model(combined, str(root / "selfcal" / f"{name}.{source}.joint"),
                                robust_values=robust_values, solints=solints,
-                               mapsize=int(img_cfg.get("mapsize", 8192)), **limits, **_imaging_settings(config))
+                               mapsize=int(img_cfg.get("mapsize", 8192)), **limits, **difmap.imaging_settings(img_cfg))
     record = {"epochs": codes, "flux_jy": dict(zip(codes, fluxes)), "reference_flux_jy": reference,
               "model": model["model"], "model_flux_jy": model["model_flux"], "joint_rounds": model["rounds"],
               "joint_images": {str(robust): info for robust, info in model["images"].items()},
+              "joint_model": model.get("image_model", {}),
               "refinement": {}, "tables": {}, "failed_epochs": []}
     step = _joint_step(source)
     for obs, split, flux in zip(observations, splits, fluxes):
@@ -224,34 +248,57 @@ def refine_calibrator(observations: list, source: str, root: Path, name: str, co
     return record
 
 
-def image_combined(observations: list, source: str, root: Path, name: str, config: dict) -> dict:
-    """Concatenate the epochs of ``source`` and image them together; return the image reports."""
+def image_combined(by_source: dict[str, list], root: Path, name: str, config: dict) -> dict:
+    """Concatenate the epochs of every source and image each concatenation; return the image reports.
+
+    ``by_source`` maps a source to the observations that have it. The concatenations are made one after
+    the other, then imaged side by side (:func:`vlbipy.backends.difmap.run_image_jobs`).
+
+    Returns
+    -------
+    dict
+        Source -> its record (``epochs``, ``ms``, ``png``, ``shift_mas``, ``search``, ``model``, ``images``),
+        or the exception that stopped it.
+    """
     from .backends import difmap
-    from .namespaces import _search_settings, _write_search_report
+    from .namespaces import _search_settings, _write_image_report
     from .plotting import plot_image_grid
 
     img_cfg = config.get("imaging", {})
-    backend = observations[0]._backend
-    codes = [obs.project_code for obs in observations]
-    splits = [obs.clean.split_ms(source) for obs in observations]
-    combined = backend.export.merge(codes, [source], inputs=splits,
-                                    outputvis=str(root / "data" / f"{name}_{source}.ms"))
+    settings = difmap.imaging_settings(img_cfg)
     image_dir = root / "images"
     image_dir.mkdir(parents=True, exist_ok=True)
-    report = difmap.image_source(combined, str(image_dir / f"{name}_{source}"),
-                                 robust_values=[float(r) for r in img_cfg.get("robust", [-2, 0, 2])],
-                                 average_channels=bool(img_cfg.get("average_channels", True)),
-                                 **_imaging_settings(config), **_search_settings(img_cfg))
-    _write_search_report(image_dir / f"{name}_{source}.search.json", report)
-    try:
-        png = plot_image_grid({source: {robust: info["fits"] for robust, info in report["images"].items()}},
-                              image_dir, name)
-    except Exception as exc:  # noqa: BLE001 - a preview must not lose the images
-        warnings.warn(f"{name}: image preview of {source} failed ({exc})")
-        png = []
-    return {"epochs": codes, "ms": combined, "png": png[0] if png else "",
-            "shift_mas": report.get("shift_mas", [0.0, 0.0]), "search": report.get("search"),
-            "images": {str(robust): info for robust, info in report["images"].items()}}
+    results: dict = {}
+    jobs: dict = {}
+    for source, observations in by_source.items():
+        codes = [obs.project_code for obs in observations]
+        try:
+            splits = [obs.clean.split_ms(source) for obs in observations]
+            combined = observations[0]._backend.export.merge(codes, [source], inputs=splits,
+                                                             outputvis=str(root / "data" / f"{name}_{source}.ms"))
+        except Exception as exc:  # noqa: BLE001 - one source failing must not lose the rest
+            results[source] = exc
+            continue
+        results[source] = {"epochs": codes, "ms": combined}
+        jobs[source] = {"split_ms": combined, "imagename": str(image_dir / f"{name}_{source}"),
+                        "robust_values": [float(r) for r in img_cfg.get("robust", [-2, 0, 2])],
+                        "average_channels": bool(img_cfg.get("average_channels", True)),
+                        **settings, **_search_settings(img_cfg)}
+    for source, report in zip(jobs, difmap.run_image_jobs(list(jobs.values()))):
+        if isinstance(report, Exception):
+            results[source] = report
+            continue
+        _write_image_report(image_dir / f"{name}_{source}.search.json", report, settings)
+        try:
+            png = plot_image_grid({source: {robust: info["fits"] for robust, info in report["images"].items()}},
+                                  image_dir, name)
+        except Exception as exc:  # noqa: BLE001 - a preview must not lose the images
+            warnings.warn(f"{name}: image preview of {source} failed ({exc})")
+            png = []
+        results[source].update(png=png[0] if png else "", shift_mas=report.get("shift_mas", [0.0, 0.0]),
+                               search=report.get("search"), model=report.get("model", {}),
+                               images={str(robust): info for robust, info in report["images"].items()})
+    return results
 
 
 def combine_epochs(vlbi, *, force: bool = False) -> dict:
@@ -292,13 +339,20 @@ def combine_epochs(vlbi, *, force: bool = False) -> dict:
         for source in obs.phaseref_plan().references:
             if source not in calibrators:
                 calibrators.append(source)
+    from .backends.difmap import imaging_settings
+    settings = imaging_settings(config.get("imaging", {}))
+    joint_steps = {_joint_step(source) for source in calibrators}
     for obs in observations:
-        if obs.drop_gaintables({_joint_step(source) for source in calibrators}):
+        dropped = obs.drop_gaintables(joint_steps)
+        if dropped:
             stale.add(obs.project_code)
             obs.calibrate.apply(force=True)
             obs.export.per_source(force=True, uvfits=False)
-            # The images on disk were made with those tables: redo them, or the "before" of the
-            # comparison below would already contain a previous combination.
+        # The "before" of the comparison below must not contain a previous combination, and must be
+        # imaged the way the "after" will be; images that already are stay.
+        reason = _reimage_reason(obs, joint_steps if dropped else set(), settings)
+        if reason:
+            logger.info("campaign {}: imaging {} again before the combination: {}", name, obs.project_code, reason)
             vlbi._image_all(obs, force=True, reimage=True)
     report["images_before"] = {obs.project_code: epoch_image_statistics(obs) for obs in observations}
 
@@ -342,13 +396,13 @@ def combine_epochs(vlbi, *, force: bool = False) -> dict:
         for source in ordered:
             if source not in sources and (obs.metadata is None or source in obs.metadata.source_names):
                 sources.append(source)
-    for source in sources:
-        having = [obs for obs in observations if source in obs.sources.names]
-        try:
-            report["combined"][source] = image_combined(having, source, root, name, config)
-        except Exception as exc:  # noqa: BLE001 - one source failing must not lose the rest
-            warnings.warn(f"campaign {name}: combined image of {source} failed ({exc})")
+    by_source = {source: [obs for obs in observations if source in obs.sources.names] for source in sources}
+    for source, result in image_combined(by_source, root, name, config).items():
+        if isinstance(result, Exception):
+            warnings.warn(f"campaign {name}: combined image of {source} failed ({result})")
             report["failed"].append(f"combined image of {source}")
+        else:
+            report["combined"][source] = result
 
     report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     _log_summary(report)

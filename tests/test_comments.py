@@ -321,7 +321,7 @@ def test_flagged_fraction_is_given_with_and_without_the_dead_antennas():
     assert cm.flagging_comments(context([], flagging={"fraction": None})) == []
 
 
-def test_source_results_combine_the_search_and_the_clean_image():
+def test_source_results_combine_the_search_and_the_image():
     results = [
         {"source": "TGT", "role": "target", "images": [],
          "search": {"detected": True, "recentred": True, "snr": 26.6, "peak": 1.36e-4, "fov_mas": 1000.0,
@@ -338,9 +338,9 @@ def test_source_results_combine_the_search_and_the_clean_image():
     assert texts(comments) == [
         "Detected at 27 sigma in the search map (dirty-map peak 136 uJy/beam), 120.0 mas (41.0 beams) "
         "from the phase centre and re-centred on the peak.",
-        "Detected at 425 sigma in the search map, at the phase centre; CLEAN image (robust 0): peak "
+        "Detected at 425 sigma in the search map, at the phase centre; image (robust 0): peak "
         "136 mJy/beam, rms 62.3 uJy/beam, dynamic range 2175.",
-        "CLEAN image (robust 0): peak 3.24 mJy/beam, rms 147 uJy/beam, dynamic range 22 - low for "
+        "Image (robust 0): peak 3.24 mJy/beam, rms 147 uJy/beam, dynamic range 22 - low for "
         "a calibrator, check its calibration and model.",
         "Not detected in the 1000 mas search map (brightest peak at 4.2 sigma)."]
     assert [c["severity"] for c in comments] == ["note", "note", "warning", "warning"]
@@ -441,7 +441,7 @@ def test_comments_text_is_a_fixed_width_block_grouped_like_the_page():
             < lines.index("Warnings raised by the pipeline"))
     # Each source is a header line with its role, its comments indented below it without the name.
     at = lines.index("  CAL (phasecal)")
-    assert lines[at + 1].startswith("    note     CLEAN image (robust 0): peak 136 mJy/beam")
+    assert lines[at + 1].startswith("    note     Image (robust 0): peak 136 mJy/beam")
     assert lines[lines.index("  TGT (target)") + 1].startswith("    WARNING  Not detected in the 1000 mas search map")
     assert "  JB  WARNING  no data from 10:06 UTC to the end of the observation (scans 6-10)" in lines
     assert "  WB  WARNING  shows no usable fringes on CAL [first seen 2026-10-10 12:07:00 UTC]" in lines

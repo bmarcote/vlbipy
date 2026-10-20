@@ -370,7 +370,7 @@ def test_final_results_downloads_list_products_found_on_disk(tmp_path):
     context = json.loads((work / "html" / "dashboard.json").read_text())
     entries = context["downloads"]["3C395"]
     assert [e["kind"] for e in entries] == ["uvfits", "ms", "fits", "fits"]
-    assert [e["label"] for e in entries][2:] == ["CLEAN image FITS (robust -2)", "CLEAN image FITS (robust 0)"]
+    assert [e["label"] for e in entries][2:] == ["Image FITS (robust -2)", "Image FITS (robust 0)"]
     assert entries[0]["size_human"] == "2.00 MiB" and entries[1]["is_dir"] is True
     assert entries[1]["size_human"] == "" and entries[1]["relpath"] == "calibrated_data/db01_3C395.ms"
     assert context["downloads"]["J1848+3219"] == []
@@ -819,7 +819,7 @@ def test_collect_gathers_what_the_comments_need_from_the_caches(tmp_path):
     per_source = {(c["source"], c["role"], c["text"]) for c in context["comments"] if c["category"] == "source"}
     assert ("3C395", "target", "Detected at 27 sigma in the search map (dirty-map peak 136 uJy/beam), 0.8 mas "
             "(0.3 beams) from the phase centre.") in per_source
-    assert ("J1848+3219", "phasecal", "CLEAN image (robust 0): peak 308 mJy/beam, rms 330 uJy/beam, dynamic "
+    assert ("J1848+3219", "phasecal", "Image (robust 0): peak 308 mJy/beam, rms 330 uJy/beam, dynamic "
             "range 933.") in per_source
 
     page = render_pages(context, tmp_path / "replay")
