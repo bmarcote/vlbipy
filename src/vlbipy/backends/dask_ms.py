@@ -1050,8 +1050,8 @@ def _reads_corrected(task: str, kwargs: dict) -> bool:
 
 class NativeFlagTasks:
     """``casatasks`` with ``flagdata`` answered natively where it can be (see :mod:`vlbipy.solvers.flag_task`),
-    ``flagmanager`` always native (:mod:`vlbipy.solvers.flagversions`), and the deferred calibrations written
-    before a task reads CORRECTED_DATA.
+    ``flagmanager`` always native (:mod:`vlbipy.solvers.flagversions`), ``clearcal``, ``accor`` and ``smoothcal``
+    native where they can be, and the deferred calibrations written before a task reads CORRECTED_DATA.
 
     Every flagging call of the CASA flag operations goes through ``backend.tasks.flagdata``, so wrapping it
     here moves all of them (a-priori file, autocorrelations, quack, band edges, bandpass gaps, off-source and
@@ -1086,6 +1086,26 @@ class NativeFlagTasks:
             return result
 
         return guarded
+
+    def accor(self, **kwargs):
+        """``accor`` natively (:func:`vlbipy.solvers.accor_task.run_accor`: CASA's table, cell for cell); a request
+        it does not reproduce is run by CASA."""
+        from ..solvers.accor_task import run_accor
+        try:
+            run_accor(**kwargs)
+        except NotImplementedError as exc:
+            warnings.warn(f"accor: {exc}; running the CASA task instead")
+            return self.__getattr__("accor")(**kwargs)
+
+    def smoothcal(self, **kwargs):
+        """``smoothcal`` of an accor table natively (:func:`vlbipy.solvers.accor_task.smooth_caltable`); anything
+        else with CASA."""
+        from ..solvers.accor_task import smooth_caltable
+        try:
+            smooth_caltable(**kwargs)
+        except NotImplementedError as exc:
+            warnings.warn(f"smoothcal: {exc}; running the CASA task instead")
+            return self.__getattr__("smoothcal")(**kwargs)
 
     def clearcal(self, **kwargs):
         """``clearcal`` natively (:mod:`vlbipy.solvers.clearcal_task`) without a selection; with one, CASA's."""

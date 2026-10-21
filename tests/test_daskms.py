@@ -197,3 +197,25 @@ def test_native_tables_are_the_default_only_under_the_dask_ms_backend(tmp_path, 
     assert msio.table_engine() == msio.compiled_engine()
     monkeypatch.setenv(msio.ENGINE_ENV, "native")                     # the explicit choice wins
     assert msio.table_engine() == "native"
+
+
+def test_accor_and_smoothcal_run_natively_and_fall_back_to_casa(monkeypatch):
+    from types import SimpleNamespace
+
+    from vlbipy.backends.dask_ms import NativeFlagTasks
+    from vlbipy.solvers import accor_task
+    calls = []
+    tasks = NativeFlagTasks(SimpleNamespace(accor=lambda **kw: calls.append("casa accor"),
+                                            smoothcal=lambda **kw: calls.append("casa smoothcal")))
+    monkeypatch.setattr(accor_task, "run_accor", lambda **kw: calls.append("native accor"))
+    monkeypatch.setattr(accor_task, "smooth_caltable", lambda **kw: calls.append("native smoothcal"))
+    tasks.accor(vis="x.ms", caltable="x.accor", solint="30s", corrdepflags=True)
+    tasks.smoothcal(vis="x.ms", tablein="x.accor", caltable="x.accor_smooth", smoothtype="median", smoothtime=1800.0)
+    assert calls == ["native accor", "native smoothcal"]
+
+    def unsupported(**kw):
+        raise NotImplementedError("a selection")
+    monkeypatch.setattr(accor_task, "run_accor", unsupported)
+    calls.clear()
+    tasks.accor(vis="x.ms", caltable="x.accor", field="3C84")
+    assert calls == ["casa accor"]

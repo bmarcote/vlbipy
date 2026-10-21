@@ -92,6 +92,7 @@ pip install "vlbipy[casa,daskms]"
 | `flagdata` (`manual`, `list`, `quack`, `unflag`; the flag statistics) | `solvers/flag_task.py` | every flagging step except `tfcrop` |
 | `flagmanager` | `solvers/flagversions.py` | flag versions (same files as CASA's) |
 | `statwt` (default binning) | `solvers/statwt_task.py` | `reweight` |
+| `accor`, `smoothcal` (of the accor table) | `solvers/accor_task.py` | the correlator amplitude correction (VLBA, LBA) |
 | `clearcal` (no selection) | `solvers/clearcal_task.py` | resetting a dataset for a `--scratch` run |
 | `mstransform`/`split` | `solvers/split_task.py` | the per-source splits |
 | `exportuvfits` | `solvers/uvfits_task.py` | the UVFITS files for difmap |
@@ -99,7 +100,7 @@ pip install "vlbipy[casa,daskms]"
 | `casatools.table`, python-casacore | `vlbipy/casacore_format/` | every table read and write |
 
 Still CASA: `tfcrop`, `rflag` and `clip` flagging (run on every sub-MS in parallel),
-`listobs`, `accor`/`smoothcal` (VLBA, LBA), `importuvfits` and `concat`. A call the native code does not reproduce exactly (an unusual
+`listobs`, `importuvfits` and `concat`. A call the native code does not reproduce exactly (an unusual
 selection, a cal library, `bandtype='BPOLY'`...) is handed to the CASA task
 with a warning.
 
