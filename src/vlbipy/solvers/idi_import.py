@@ -345,9 +345,8 @@ def _gather(tables: list[dict], maps: dict, index: dict, block: np.ndarray, setu
 def _declare_empty_cube_rank(path: Path, column: str, template: str) -> None:
     """Rewrite the TiledShapeStMan header of ``column``, whose cells are all undefined, with the rank casacore
     expects (the column's ndim + 1) and partition's default tile shape (``template``'s tile with a unit axis
-    inserted before the row axis: (ncorr, nchan, 1, rows) for FLAG_CATEGORY). Without it casacore refuses to
-    open the table ("TiledStMan::headerFileGet: mismatch in nrdim"): an empty manager written by
-    :func:`vlbipy.casacore_format.tsm.create_tiled_shape_manager` declares rank 1."""
+    inserted before the row axis: (ncorr, nchan, 1, rows) for FLAG_CATEGORY), so that the part is the one
+    partition writes (:func:`vlbipy.casacore_format.tsm.create_tiled_shape_manager` declares a unit tile)."""
     from ..casacore_format.table import Table
     from ..casacore_format.tsm import Cube, write_header
     with Table(path) as table:

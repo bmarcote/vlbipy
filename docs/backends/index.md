@@ -83,6 +83,7 @@ pip install "vlbipy[casa,daskms]"
 
 | CASA task or tool | Native replacement | Where it is used |
 | --- | --- | --- |
+| `importfitsidi` + `partition` | `solvers/idi_import.py`, `solvers/idi_subtables.py` | the import: FITS-IDI straight to the Multi-MS, one worker per sub-MS (`VLBIPY_NATIVE_IMPORT=0` uses CASA) |
 | `fringefit` | `solvers/fringefit_task.py` | single-band delay (`initial_calibration`), multi-band delay (`fringefit`), the per-scan SNR survey (`scan_snr`) |
 | `bandpass` | `solvers/gain_task.py` | the instrumental bandpass |
 | `gaincal` | `solvers/gain_task.py` | the pipeline's `scalar_bandpass` |
@@ -98,8 +99,7 @@ pip install "vlbipy[casa,daskms]"
 | `casatools.table`, python-casacore | `vlbipy/casacore_format/` | every table read and write |
 
 Still CASA: `tfcrop`, `rflag` and `clip` flagging (run on every sub-MS in parallel),
-`importfitsidi` + `partition`, `listobs`, `accor`/`smoothcal` (VLBA, LBA)
-and `concat`. A call the native code does not reproduce exactly (an unusual
+`listobs`, `accor`/`smoothcal` (VLBA, LBA), `importuvfits` and `concat`. A call the native code does not reproduce exactly (an unusual
 selection, a cal library, `bandtype='BPOLY'`...) is handed to the CASA task
 with a warning.
 
@@ -207,6 +207,7 @@ The engine lives in `vlbipy.solvers`:
 | `VLBIPY_THREADS=N` (environment) | Threads a job uses for its array work. Default: its share of the cores (the cores divided by the jobs running at once). |
 | `VLBIPY_NUMBA=0` (environment) | Uses numpy for the calibration loops even when numba is installed. |
 | `VLBIPY_TABLE_ENGINE=native`, `casacore` or `casatools` (environment) | Forces the table I/O library. By default the native reader/writer (`vlbipy.casacore_format`) is used; a table it cannot handle (an unusual storage manager) is opened with python-casacore when it works on the machine, otherwise with `casatools.table`. |
+| `VLBIPY_NATIVE_IMPORT=0` (environment) | Imports the FITS-IDI files with CASA's `importfitsidi` + `partition` instead of the native import. The native import also hands over to CASA by itself for data it does not cover (DiFX/VLBA weights, files whose tables do not match one to one, Stokes I/Q/U/V). |
 | `[import] mms` | `true` (default) imports to a Multi-MS, which lets `applycal` run in parallel over its sub-MSs. |
 | `[import] zarr_store` | `true` also writes the zarr store `<code>.zarr` (default `false`). |
 

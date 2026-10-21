@@ -285,3 +285,18 @@ def test_flag_versions_interoperate_with_casa(tmp_path):
     with Table(vis) as table:
         np.testing.assert_array_equal(table.getcol("FLAG"), original)
     assert [n for n, _ in flagversions.list_versions(vis)] == ["native", "casa"]
+
+
+def test_tiled_column_without_defined_cells_opens_in_casacore(tmp_path):
+    casatools = pytest.importorskip("casatools")
+    columns = [scalar_column("TIME", "double"), array_column("DATA", "complex", ndim=2),
+               array_column("FLAG_CATEGORY", "boolean", ndim=3)]
+    create_table(tmp_path / "t.ms", columns, 3, {"TIME": np.arange(3.0)},
+                 tiled={"DATA": (8, 2), "FLAG_CATEGORY": [None] * 3})
+    tb = casatools.table()
+    tb.open(str(tmp_path / "t.ms"))
+    try:
+        assert tb.nrows() == 3 and not tb.iscelldefined("FLAG_CATEGORY", 0)
+        assert np.asarray(tb.getcol("DATA")).shape == (2, 8, 3)
+    finally:
+        tb.close()

@@ -449,6 +449,7 @@ def create_tiled_shape_manager(table_path, seqnr: int, column: ColumnDesc, row_s
         with open(Path(table_path) / f"table.f{seqnr}_TSM{index}", "wb") as handle:
             handle.truncate(length)
         files[index] = length
-    default_tile = cubes[1].tile_shape if len(cubes) > 1 else ()
+    # Without a defined cell the header still declares the rank casacore checks (cell ndim + the row axis).
+    default_tile = cubes[1].tile_shape if len(cubes) > 1 else (1,) * (max(int(column.ndim), 0) + 1)
     write_header(table_path, seqnr, "TiledShapeStMan", [column], big_endian, nrow, cubes, files, hypercolumn,
                  default_tile, row_map, cube_map, pos_map)
