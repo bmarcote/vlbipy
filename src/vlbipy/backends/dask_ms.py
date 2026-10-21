@@ -879,11 +879,16 @@ class DaskMsCalibrationOps(CasaCalibrationOps):
 
     def _run_gencal_task(self, params: dict) -> None:
         """``gencal(caltype='tsys')`` with :func:`vlbipy.solvers.apriori_task.write_tsys_table` (22 min -> 26 s on
-        GL048) and ``gencal(caltype='gc')`` with :func:`vlbipy.solvers.gaincurve_task.write_gain_curve_table`
-        (bit-identical to CASA); the other caltypes, and a Tsys spectrum, with CASA."""
+        GL048), ``gencal(caltype='gc')`` with :func:`vlbipy.solvers.gaincurve_task.write_gain_curve_table`
+        (bit-identical to CASA) and ``gencal(caltype='eop')`` with :func:`vlbipy.solvers.eop_task.write_eop_table`;
+        the other caltypes, and a Tsys spectrum, with CASA."""
         if params.get("caltype") == "gc":
             from ..solvers.gaincurve_task import write_gain_curve_table
             return self._run_fast("gencal gc", write_gain_curve_table, params, super()._run_gencal_task)
+        if params.get("caltype") == "eop":
+            # Interpolates the EOPs between the right entries, where CASA's eop.py extrapolates (see eop_task).
+            from ..solvers.eop_task import write_eop_table
+            return self._run_fast("gencal eop", write_eop_table, params, super()._run_gencal_task)
         if params.get("caltype") != "tsys" or params.get("uniform", True):
             return super()._run_gencal_task(params)
         from ..solvers.apriori_task import write_tsys_table

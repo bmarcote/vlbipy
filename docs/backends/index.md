@@ -88,7 +88,7 @@ pip install "vlbipy[casa,daskms]"
 | `bandpass` | `solvers/gain_task.py` | the instrumental bandpass |
 | `gaincal` | `solvers/gain_task.py` | the pipeline's `scalar_bandpass` |
 | `applycal` | `solvers/apply_task.py` | `calibrate.apply` |
-| `gencal` (`tsys`, `gc`) | `solvers/apriori_task.py`, `solvers/gaincurve_task.py` | the a-priori amplitude calibration |
+| `gencal` (`tsys`, `gc`, `eop`) | `solvers/apriori_task.py`, `solvers/gaincurve_task.py`, `solvers/eop_task.py` | the a-priori calibration (the EOP delays are interpolated between the right daily entries, where CASA's `eop.py` extrapolates from the second and third entry for any time after the fourth) |
 | `flagdata` (`manual`, `list`, `quack`, `unflag`; the flag statistics) | `solvers/flag_task.py` | every selection-based flagging step |
 | `flagdata(mode='tfcrop')` | `solvers/tfcrop_task.py` | the `flag_tfcrop` autoflagging (CASA's flags, cell for cell) |
 | `flagmanager` | `solvers/flagversions.py` | flag versions (same files as CASA's) |

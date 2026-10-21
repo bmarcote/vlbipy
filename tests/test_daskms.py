@@ -242,3 +242,14 @@ def test_tfcrop_runs_natively_and_falls_back_to_casa(tmp_path, monkeypatch):
     calls.clear()
     tasks.flagdata(vis=str(vis), mode="tfcrop", ntime="60s", flagbackup=False)     # not reproduced natively
     assert calls == ["casa"]
+
+
+def test_gencal_eop_is_written_natively(monkeypatch, tmp_path):
+    from vlbipy.backends.dask_ms import DaskMsBackend
+    from vlbipy.solvers import eop_task
+    monkeypatch.chdir(tmp_path)
+    calls = []
+    monkeypatch.setattr(eop_task, "write_eop_table", lambda vis, caltable, **kw: calls.append((vis, caltable, kw)))
+    DaskMsBackend(str(tmp_path)).calibrate._run_gencal_task({"vis": "x.ms", "caltable": "x.eop", "caltype": "eop",
+                                                             "infile": "usno_finals.erp"})
+    assert calls == [("x.ms", "x.eop", {"caltype": "eop", "infile": "usno_finals.erp"})]
