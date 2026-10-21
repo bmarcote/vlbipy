@@ -97,11 +97,12 @@ pip install "vlbipy[casa,daskms]"
 | `clearcal` (no selection) | `solvers/clearcal_task.py` | resetting a dataset for a `--scratch` run |
 | `mstransform`/`split` | `solvers/split_task.py` | the per-source splits |
 | `exportuvfits` | `solvers/uvfits_task.py` | the UVFITS files for difmap |
+| `concat` (+ the epoch scaling) | `solvers/concat_task.py` | combining the epochs of a campaign (`merge`) |
 | `msmetadata`, the `ms` tool readers | `solvers/ms_metadata.py`, `solvers/plot_read.py` | metadata, the diagnostic and final plots |
 | `casatools.table`, python-casacore | `vlbipy/casacore_format/` | every table read and write |
 
 Still CASA: `rflag` and `clip` flagging (run on every sub-MS in parallel),
-`listobs`, `importuvfits` and `concat`. A call the native code does not reproduce exactly (an unusual
+`listobs` and `importuvfits`. A call the native code does not reproduce exactly (an unusual
 selection, a cal library, `bandtype='BPOLY'`...) is handed to the CASA task
 with a warning.
 

@@ -1291,7 +1291,35 @@ def _timebin_seconds(timebin) -> Optional[float]:
 
 
 class DaskMsExportOps(CasaExportOps):
-    """CASA export with the per-source split done natively (see :mod:`vlbipy.solvers.split_task`)."""
+    """CASA export with the per-source split, the epoch merge and the UVFITS export done natively."""
+
+    def merge(self, project_codes: list[str], source_names: list[str], *, inputs: Optional[list[str]] = None,
+              outputvis: str = "", scales: Optional[list[float]] = None, **kwargs) -> str:
+        """Concatenate the per-source splits of several epochs like :meth:`CasaExportOps.merge`, natively
+        (:func:`vlbipy.solvers.concat_task.concat_ms`: CASA's ``concat`` and the epoch scaling, cell for cell).
+
+        A single input, Multi-MS inputs (CASA's ``split(keepmms=False)`` re-sorts them first) and anything else
+        ``concat_ms`` does not reproduce are merged by CASA.
+        """
+        if not inputs or len(inputs) < 2 or not outputvis or any(not Path(p).is_dir() for p in inputs):
+            return super().merge(project_codes, source_names, inputs=inputs, outputvis=outputvis, scales=scales,
+                                 **kwargs)
+        from ..solvers.concat_task import concat_ms
+        target = Path(outputvis)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            shutil.rmtree(target)
+        logger.info("concat[dask-ms]: {} [{}] -> {}", ",".join(source_names), ", ".join(project_codes), target.name)
+        try:
+            concat_ms([str(p) for p in inputs], str(target), respectname=True, copypointing=False,
+                      scales=[float(s) for s in scales] if scales else None)
+            return str(target)
+        except NotImplementedError as exc:
+            warnings.warn(f"concat: {exc}; merging with CASA instead")
+            if target.exists():
+                shutil.rmtree(target)
+        return super().merge(project_codes, source_names, inputs=inputs, outputvis=outputvis, scales=scales,
+                             **kwargs)
 
     def ms(self, project_code: str, source: str, *, datacolumn: str = "corrected",
            chanbin: int = -1, timebin: str = "", keepflags: bool = True,

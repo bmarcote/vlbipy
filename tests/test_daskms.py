@@ -253,3 +253,26 @@ def test_gencal_eop_is_written_natively(monkeypatch, tmp_path):
     DaskMsBackend(str(tmp_path)).calibrate._run_gencal_task({"vis": "x.ms", "caltable": "x.eop", "caltype": "eop",
                                                              "infile": "usno_finals.erp"})
     assert calls == [("x.ms", "x.eop", {"caltype": "eop", "infile": "usno_finals.erp"})]
+
+
+def test_merge_concatenates_epochs_natively_and_falls_back_to_casa(tmp_path, monkeypatch):
+    from vlbipy.backends.casa import CasaExportOps
+    from vlbipy.backends.dask_ms import DaskMsBackend
+    from vlbipy.solvers import concat_task
+    monkeypatch.chdir(tmp_path)
+    inputs = [tmp_path / "e1.ms", tmp_path / "e2.ms"]
+    for path in inputs:
+        path.mkdir()
+    calls = []
+    monkeypatch.setattr(concat_task, "concat_ms", lambda paths, out, **kw: calls.append(("native", kw["scales"])))
+    monkeypatch.setattr(CasaExportOps, "merge", lambda self, codes, names, **kw: calls.append("casa") or "x")
+    export = DaskMsBackend(str(tmp_path)).export
+    out = str(tmp_path / "all.ms")
+    assert export.merge(["A", "B"], ["SRC"], inputs=[str(p) for p in inputs], outputvis=out, scales=[1, 0.5]) == out
+    export.merge(["A"], ["SRC"], inputs=[str(inputs[0])], outputvis=out)          # one epoch: CASA's copy path
+
+    def unsupported(paths, out, **kw):
+        raise NotImplementedError("Multi-MS input")
+    monkeypatch.setattr(concat_task, "concat_ms", unsupported)
+    export.merge(["A", "B"], ["SRC"], inputs=[str(p) for p in inputs], outputvis=out)
+    assert calls == [("native", [1.0, 0.5]), "casa", "casa"]
