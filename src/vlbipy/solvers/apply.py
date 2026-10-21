@@ -213,11 +213,11 @@ def load_caltable(path) -> CalTableData:
 
     CPARAM tables give complex `param`, FPARAM tables float64.  All spws must have the same number of channels.
     """
-    import casatools
+    from ..casacore_format.compat import table as casa_table
 
     t_start = _time.perf_counter()
     path = Path(path).absolute()
-    tb = casatools.table()
+    tb = casa_table()
     tb.open(str(path))
     keywords = tb.getkeywords()
     kind = str(keywords.get("VisCal", tb.info().get("subType", "")))
@@ -230,7 +230,7 @@ def load_caltable(path) -> CalTableData:
                                                                "ANTENNA1", "ANTENNA2", "SCAN_NUMBER")}
     if nrow == 0:
         raise ValueError(f"calibration table {path} has no rows")
-    # casatools returns Fortran order (npar, nchan_t, nrow); transpose to (nrow, nchan_t, npar).
+    # The casatools-style table returns Fortran order (npar, nchan_t, nrow); transpose to (nrow, nchan_t, npar).
     param = _row_major_column(tb.getcol(param_col), nrow, param_col, path)
     flag = _row_major_column(tb.getcol("FLAG"), nrow, "FLAG", path)
     snr = _row_major_column(tb.getcol("SNR"), nrow, "SNR", path)

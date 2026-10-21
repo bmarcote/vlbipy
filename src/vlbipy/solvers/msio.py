@@ -14,9 +14,11 @@ make that fast:
 * visibility columns are read **sliced** (:func:`read_run`): a fringe fit needs
   the parallel hands of the central channels, a third of the bytes.
 
-Table engine: python-casacore when it works on this machine, ``casatools.table``
-otherwise (python-casacore segfaults on import on some macOS builds, so its health
-is probed once in a subprocess; ``$VLBIPY_TABLE_ENGINE`` overrides the choice).
+Table engine: ``native`` by default — :mod:`vlbipy.casacore_format` reads ``table.dat`` and the storage managers
+itself and memory-maps the tiled columns, with no casacore library in the process. A table it cannot handle
+(an unusual storage manager) is opened with the compiled engine instead: python-casacore when it works on this
+machine, ``casatools.table`` otherwise (python-casacore segfaults on import on some macOS builds, so its health is
+probed once in a subprocess). ``$VLBIPY_TABLE_ENGINE`` (``native``, ``casacore``, ``casatools``) forces one.
 All arrays returned here are row-major ``(nrow, nchan, ncorr)`` in the on-disk
 dtype, whichever engine read them.
 """
@@ -43,10 +45,20 @@ _CASATOOLS_DTYPES = {"DATA": np.complex64, "CORRECTED_DATA": np.complex64, "MODE
 
 @functools.cache
 def table_engine() -> str:
-    """Return the table engine to use: ``"casacore"`` when python-casacore imports cleanly, else ``"casatools"``.
+    """Return the table engine to use: ``"native"`` unless ``$VLBIPY_TABLE_ENGINE`` names another."""
+    forced = os.environ.get(ENGINE_ENV, "").strip().lower()
+    if forced in ("native", "casacore", "casatools"):
+        return forced
+    return "native"
 
-    The import is probed in a subprocess because a broken python-casacore wheel
-    segfaults, which cannot be caught in-process.
+
+@functools.cache
+def compiled_engine() -> str:
+    """The casacore-library engine: ``"casacore"`` when python-casacore imports cleanly, else ``"casatools"``.
+
+    Used for tables the native engine does not handle, and by the code that still creates tables with casacore.
+    The import is probed in a subprocess because a broken python-casacore wheel segfaults, which cannot be caught
+    in-process. ``$VLBIPY_TABLE_ENGINE=casatools`` forces casatools here too.
     """
     forced = os.environ.get(ENGINE_ENV, "").strip().lower()
     if forced in ("casacore", "casatools"):
@@ -156,8 +168,21 @@ class _CasatoolsTable:
 
 
 def open_table(path, *, readonly: bool = True, engine: Optional[str] = None):
-    """Open a casacore table with the selected engine; the handle reads and writes row-major arrays."""
+    """Open a casacore table with the selected engine; the handle reads and writes row-major arrays.
+
+    With the native engine a table that uses a storage manager :mod:`vlbipy.casacore_format` does not implement
+    is opened with :func:`compiled_engine` instead (logged at debug level).
+    """
     engine = engine or table_engine()
+    if engine == "native":
+        from ..casacore_format.table import Table
+        from ..casacore_format.tabledat import UnsupportedTable
+        try:
+            return Table(path, readonly=readonly)
+        except UnsupportedTable as exc:
+            from ..logging_utils import get_logger
+            get_logger().debug("native table engine: {} ({}); using {}", Path(path).name, exc, compiled_engine())
+            engine = compiled_engine()
     return _CasacoreTable(str(path), readonly) if engine == "casacore" else _CasatoolsTable(str(path), readonly)
 
 

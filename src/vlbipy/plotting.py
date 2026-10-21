@@ -1,6 +1,6 @@
 """Diagnostic plots of calibration tables (matplotlib -> PNG).
 
-:class:`CalTablePlotter` reads CASA calibration tables (via casatools) and
+:class:`CalTablePlotter` reads CASA calibration tables (natively, :mod:`vlbipy.casacore_format`) and
 renders per-antenna diagnostic figures. It dispatches on the table's ``VisCal``
 keyword, so the same class serves every present and future caltable:
 
@@ -1393,8 +1393,8 @@ class CalTablePlotter:
     # -- table access --
     def _read(self, caltable: Union[str, Path]) -> dict:
         """Read a caltable into a dict of row-major arrays plus antenna names/VisCal."""
-        import casatools
-        table = casatools.table()
+        from .casacore_format.compat import table as casa_table
+        table = casa_table()
         if not table.open(str(caltable)):
             raise ValueError(f"could not open calibration table {caltable}")
         try:
@@ -1427,8 +1427,8 @@ class CalTablePlotter:
     @staticmethod
     def viscal(caltable: Union[str, Path]) -> str:
         """Return the ``VisCal`` keyword of a calibration table (e.g. ``"EPowerCurve"``, ``"B TSYS"``)."""
-        import casatools
-        table = casatools.table()
+        from .casacore_format.compat import table as casa_table
+        table = casa_table()
         if not table.open(str(caltable)):
             raise ValueError(f"could not open calibration table {caltable}")
         try:

@@ -165,7 +165,7 @@ def test_casa_tasks_get_a_deferred_calibration_written_before_reading_it(tmp_pat
     monkeypatch.setattr(corrected, "record_external", lambda vis, fields, label: calls.append(f"external:{label}"))
     monkeypatch.setattr(corrected, "load_record", lambda vis: {"fields": {0: {}}, "written": {}})
     tasks = SimpleNamespace(**{name: (lambda name: lambda **kw: calls.append(name))(name)
-                               for name in ("tclean", "flagmanager", "plotms", "clearcal", "applycal", "split")})
+                               for name in ("tclean", "gencal", "plotms", "clearcal", "applycal", "split")})
     wrapped = NativeFlagTasks(tasks)
 
     def run(task, vis=ms, **kwargs):
@@ -176,8 +176,8 @@ def test_casa_tasks_get_a_deferred_calibration_written_before_reading_it(tmp_pat
     assert run("tclean") == ["write", "tclean"]                       # tclean reads the corrected data
     assert run("split", datacolumn="data") == ["split"]
     assert run("split", datacolumn="corrected") == ["write", "split"]
-    assert run("flagmanager", mode="save") == ["flagmanager"]
+    assert run("gencal", caltype="gc") == ["gencal"]                  # never reads the corrected data
     assert run("plotms") == ["plotms"] and run("plotms", ydatacolumn="corrected") == ["write", "plotms"]
-    assert run("clearcal") == ["clearcal", "forget"]
+    assert run("clearcal", field="3C345") == ["clearcal", "forget"]  # a selection: CASA's clearcal
     assert run("applycal") == ["write", "applycal", "external:casa"]
     assert run("tclean", vis=plain) == ["tclean"]                     # no record: nothing deferred there

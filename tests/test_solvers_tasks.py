@@ -897,3 +897,15 @@ def test_pool_jobs_share_the_cores(monkeypatch):
         assert workers.job_threads() == max(1, os.cpu_count() or 1)          # this process is no worker
     finally:
         workers.close_pool()
+
+
+def test_clearcal_sets_corrected_to_data_and_drops_the_deferred_record(sim):
+    from vlbipy.solvers import corrected
+    from vlbipy.solvers.clearcal_task import clearcal_ms
+    (sim["ms"] / corrected.RECORD_DIR).mkdir()
+    report = clearcal_ms(sim["ms"], addmodel=True, workers=1)
+    assert report["rows"] == len(sim["time"]) and report["model"]
+    corrected_data, model = _columns(sim["ms"], "CORRECTED_DATA", "MODEL_DATA")
+    assert np.array_equal(corrected_data, sim["data"])
+    assert np.all(model == 1.0)
+    assert not (sim["ms"] / corrected.RECORD_DIR).exists()
