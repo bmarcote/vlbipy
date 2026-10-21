@@ -128,6 +128,16 @@ Steps already recorded as complete are skipped:
 --scratch              # forget all progress and reset the data
 ```
 
+## What the terminal shows
+
+The terminal shows one bold line per step, the anomalies (in yellow: an antenna
+with no data, a table that failed) and errors, and at the end the number of
+warnings and where to read them. Everything else — the parameters of every task,
+the selected antennas and scans, each warning as it happens — is written to the
+run log `<work_dir>/logs/vlbipy_<code>_<time>.log`, and the warnings are also
+collected in `summary.md` and the report's *General comments*. `-v` shows all of it
+on the terminal as well.
+
 ## The ionosphere
 
 Below 6 GHz the fringe fit also solves for the dispersive (ionospheric) delay,

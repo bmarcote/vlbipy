@@ -1917,6 +1917,7 @@ def render_pages(ctx: dict, work_dir: Path) -> Path:
     (html_dir / "style.css").write_text(CSS, encoding="utf-8")
     (html_dir / "dashboard.js").write_text(JS, encoding="utf-8")
     (html_dir / "dashboard.json").write_text(json.dumps(ctx, indent=2, default=str), encoding="utf-8")
+    logger.bind(headline=True).info("report: {}", html_dir / "index.html")
     logger.info("dashboard: wrote {} page(s) to {}", len(pages), html_dir)
     return html_dir / "index.html"
 

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Iterator, Optional, Union
 from .errors import ConfigError
 from .config import _deep_merge, kwargs_to_overrides, load_config
-from .logging_utils import get_logger, warnings
+from .logging_utils import get_logger, headline, run_logs, warnings
 from .observation import Observation
 from .results import ImageSet
 
@@ -471,6 +471,10 @@ class VLBIObs:
             self._final_plots()                                            # step 18
         self.report()
         summary = warnings.summary()
+        anomalies = sum(1 for item in summary if item.startswith("ANOMALY"))
+        logs = ", ".join(str(path) for path in run_logs()) or "the run log"
+        headline("run finished: {} warning(s){}; details in {} and summary.md", len(summary),
+                 f", {anomalies} anomal{'y' if anomalies == 1 else 'ies'}" if anomalies else "", logs)
         if summary:
             logger.warning("run finished with {} warning(s):", len(summary))
             for item in summary:
