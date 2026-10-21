@@ -219,3 +219,26 @@ def test_accor_and_smoothcal_run_natively_and_fall_back_to_casa(monkeypatch):
     calls.clear()
     tasks.accor(vis="x.ms", caltable="x.accor", field="3C84")
     assert calls == ["casa accor"]
+
+
+def test_tfcrop_runs_natively_and_falls_back_to_casa(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from vlbipy.backends.dask_ms import NativeFlagTasks
+    from vlbipy.solvers import flag_task, tfcrop_task
+    vis = tmp_path / "x.ms"
+    vis.mkdir()
+    calls = []
+    tasks = NativeFlagTasks(SimpleNamespace(flagdata=lambda **kw: calls.append("casa")))
+    monkeypatch.setattr(tfcrop_task, "tfcrop_ms", lambda ms, **kw: calls.append(("native", sorted(kw))) or
+                        {"parts": 1, "newly_flagged": 0, "seconds": 0.0})
+
+    def unsupported(*args, **kwargs):
+        raise flag_task.Unsupported("not a selection")
+    monkeypatch.setattr(flag_task, "read_flag_setup", unsupported)
+    tasks.flagdata(vis=str(vis), mode="tfcrop", datacolumn="data", timecutoff=4.0, freqcutoff=3.0,
+                   extendflags=False, flagbackup=False)
+    assert calls == [("native", ["datacolumn", "extendflags", "freqcutoff", "mode", "timecutoff"])]
+    calls.clear()
+    tasks.flagdata(vis=str(vis), mode="tfcrop", ntime="60s", flagbackup=False)     # not reproduced natively
+    assert calls == ["casa"]

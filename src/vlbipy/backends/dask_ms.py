@@ -1055,8 +1055,9 @@ class NativeFlagTasks:
 
     Every flagging call of the CASA flag operations goes through ``backend.tasks.flagdata``, so wrapping it
     here moves all of them (a-priori file, autocorrelations, quack, band edges, bandpass gaps, off-source and
-    outlier commands) off ``casatasks.flagdata`` at once. A call the native engine does not reproduce exactly
-    (tfcrop, rflag, an unusual selection) is passed to CASA unchanged; every other attribute is casatasks'.
+    outlier commands) and the tfcrop autoflagging (:mod:`vlbipy.solvers.tfcrop_task`) off ``casatasks.flagdata``
+    at once. A call the native engine does not reproduce exactly (rflag, clip, an unusual selection) is passed to
+    CASA unchanged; every other attribute is casatasks'.
 
     A measurement set whose calibration was deferred (:mod:`vlbipy.solvers.corrected`) has a CORRECTED_DATA
     that is out of date: any other task that may read it gets it written first, and after CASA's applycal or
@@ -1120,11 +1121,36 @@ class NativeFlagTasks:
         from ..solvers.flagversions import flagmanager
         return flagmanager(**kwargs)
 
+    def _tfcrop_natively(self, vis, kwargs: dict) -> bool:
+        """Run ``flagdata(mode='tfcrop')`` with :func:`vlbipy.solvers.tfcrop_task.tfcrop_ms` (CASA's flags, cell for
+        cell); False when the call is one it does not reproduce (nothing is written then) and CASA must run it."""
+        from ..solvers.tfcrop_task import check_tfcrop_kwargs, tfcrop_ms
+        options = {k: v for k, v in kwargs.items() if k not in ("vis", "flagbackup")}
+        try:
+            # The keywords are checked first, so the backup below is made only for a run that goes native.
+            check_tfcrop_kwargs({k: v for k, v in options.items()
+                                 if k not in ("datacolumn", "field", "timecutoff", "freqcutoff")})
+        except NotImplementedError as exc:
+            logger.debug("flagdata[tfcrop]: {}; using casatasks.flagdata", exc)
+            return False
+        if kwargs.get("flagbackup"):
+            self._tasks.flagmanager(vis=str(vis), mode="save", versionname=f"flagdata_{int(time.time())}")
+        try:
+            stats = tfcrop_ms(vis, **options)
+        except NotImplementedError as exc:
+            logger.debug("flagdata[tfcrop]: {}; using casatasks.flagdata", exc)
+            return False
+        logger.info("flagdata[native]: tfcrop on {} part(s), {} cell(s) newly flagged, {:.1f}s", stats["parts"],
+                    stats["newly_flagged"], stats["seconds"])
+        return True
+
     def flagdata(self, **kwargs):
-        """Run ``flagdata`` natively when the call is a supported selection, otherwise through CASA."""
+        """Run ``flagdata`` natively when the call is a supported selection or a tfcrop, otherwise through CASA."""
         from ..solvers.flag_task import Unsupported, apply_flag_selections, compile_flagdata, read_flag_setup
         vis = kwargs.get("vis")
         if vis and Path(str(vis)).is_dir():
+            if str(kwargs.get("mode", "")).strip().lower() == "tfcrop" and self._tfcrop_natively(vis, kwargs):
+                return {}
             try:
                 setup = read_flag_setup(vis)
                 selections = compile_flagdata(kwargs, setup)

@@ -89,7 +89,8 @@ pip install "vlbipy[casa,daskms]"
 | `gaincal` | `solvers/gain_task.py` | the pipeline's `scalar_bandpass` |
 | `applycal` | `solvers/apply_task.py` | `calibrate.apply` |
 | `gencal` (`tsys`, `gc`) | `solvers/apriori_task.py`, `solvers/gaincurve_task.py` | the a-priori amplitude calibration |
-| `flagdata` (`manual`, `list`, `quack`, `unflag`; the flag statistics) | `solvers/flag_task.py` | every flagging step except `tfcrop` |
+| `flagdata` (`manual`, `list`, `quack`, `unflag`; the flag statistics) | `solvers/flag_task.py` | every selection-based flagging step |
+| `flagdata(mode='tfcrop')` | `solvers/tfcrop_task.py` | the `flag_tfcrop` autoflagging (CASA's flags, cell for cell) |
 | `flagmanager` | `solvers/flagversions.py` | flag versions (same files as CASA's) |
 | `statwt` (default binning) | `solvers/statwt_task.py` | `reweight` |
 | `accor`, `smoothcal` (of the accor table) | `solvers/accor_task.py` | the correlator amplitude correction (VLBA, LBA) |
@@ -99,7 +100,7 @@ pip install "vlbipy[casa,daskms]"
 | `msmetadata`, the `ms` tool readers | `solvers/ms_metadata.py`, `solvers/plot_read.py` | metadata, the diagnostic and final plots |
 | `casatools.table`, python-casacore | `vlbipy/casacore_format/` | every table read and write |
 
-Still CASA: `tfcrop`, `rflag` and `clip` flagging (run on every sub-MS in parallel),
+Still CASA: `rflag` and `clip` flagging (run on every sub-MS in parallel),
 `listobs`, `importuvfits` and `concat`. A call the native code does not reproduce exactly (an unusual
 selection, a cal library, `bandtype='BPOLY'`...) is handed to the CASA task
 with a warning.
