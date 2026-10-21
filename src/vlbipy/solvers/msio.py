@@ -14,11 +14,12 @@ make that fast:
 * visibility columns are read **sliced** (:func:`read_run`): a fringe fit needs
   the parallel hands of the central channels, a third of the bytes.
 
-Table engine: ``native`` by default — :mod:`vlbipy.casacore_format` reads ``table.dat`` and the storage managers
-itself and memory-maps the tiled columns, with no casacore library in the process. A table it cannot handle
-(an unusual storage manager) is opened with the compiled engine instead: python-casacore when it works on this
-machine, ``casatools.table`` otherwise (python-casacore segfaults on import on some macOS builds, so its health is
-probed once in a subprocess). ``$VLBIPY_TABLE_ENGINE`` (``native``, ``casacore``, ``casatools``) forces one.
+Table engine: the compiled one by default — python-casacore when it works on this machine, ``casatools.table``
+otherwise (python-casacore segfaults on import on some macOS builds, so its health is probed once in a
+subprocess). The dask-ms backend makes ``native`` the default of its process (:func:`set_default_engine`):
+:mod:`vlbipy.casacore_format` reads ``table.dat`` and the storage managers itself and memory-maps the tiled
+columns, with no casacore library in the process; a table it cannot handle (an unusual storage manager) is then
+opened with the compiled engine. ``$VLBIPY_TABLE_ENGINE`` (``native``, ``casacore``, ``casatools``) forces one.
 All arrays returned here are row-major ``(nrow, nchan, ncorr)`` in the on-disk
 dtype, whichever engine read them.
 """
@@ -33,8 +34,13 @@ from typing import Optional
 
 import numpy as np
 
-#: Environment variable forcing the table engine (``casacore`` or ``casatools``).
+#: Environment variable forcing the table engine (``native``, ``casacore`` or ``casatools``).
 ENGINE_ENV = "VLBIPY_TABLE_ENGINE"
+#: Environment variable holding the default engine of this process, set by the backend (:func:`set_default_engine`)
+#: and inherited by the worker processes it starts. Unset: the compiled engine.
+DEFAULT_ENGINE_ENV = "VLBIPY_DEFAULT_TABLE_ENGINE"
+#: The engines :func:`table_engine` can return.
+ENGINES = ("native", "casacore", "casatools")
 #: Columns whose cells are (nchan, ncorr) arrays and can therefore be read sliced.
 CUBE_COLUMNS = ("DATA", "CORRECTED_DATA", "MODEL_DATA", "FLAG", "WEIGHT_SPECTRUM", "SIGMA_SPECTRUM")
 #: casatools upcasts on read; these are the on-disk dtypes to cast back to.
@@ -43,13 +49,35 @@ _CASATOOLS_DTYPES = {"DATA": np.complex64, "CORRECTED_DATA": np.complex64, "MODE
                      "SIGMA": np.float32, "FLAG": np.bool_, "FLAG_ROW": np.bool_}
 
 
-@functools.cache
 def table_engine() -> str:
-    """Return the table engine to use: ``"native"`` unless ``$VLBIPY_TABLE_ENGINE`` names another."""
-    forced = os.environ.get(ENGINE_ENV, "").strip().lower()
-    if forced in ("native", "casacore", "casatools"):
-        return forced
-    return "native"
+    """Return the table engine to use: the one ``$VLBIPY_TABLE_ENGINE`` names, else the default of this process
+    (:func:`set_default_engine`: ``native`` under the dask-ms backend), else :func:`compiled_engine`."""
+    for variable in (ENGINE_ENV, DEFAULT_ENGINE_ENV):
+        chosen = os.environ.get(variable, "").strip().lower()
+        if chosen in ENGINES:
+            return chosen
+    return compiled_engine()
+
+
+def set_default_engine(engine: Optional[str]) -> None:
+    """Make ``engine`` (one of :data:`ENGINES`, or None for the compiled engine) the default table engine of this
+    process and of the worker processes started after this call. ``$VLBIPY_TABLE_ENGINE`` still overrides it."""
+    if engine is None:
+        os.environ.pop(DEFAULT_ENGINE_ENV, None)
+        return
+    if engine not in ENGINES:
+        raise ValueError(f"unknown table engine {engine!r} (expected one of {', '.join(ENGINES)})")
+    os.environ[DEFAULT_ENGINE_ENV] = engine
+
+
+def table_tool():
+    """A casatools-style table tool (``open``, Fortran-order ``getcol``, ...) on the selected engine:
+    :class:`vlbipy.casacore_format.compat.table` under the native engine, ``casatools.table`` otherwise."""
+    if table_engine() == "native":
+        from ..casacore_format.compat import table
+        return table()
+    import casatools
+    return casatools.table()
 
 
 @functools.cache

@@ -6058,9 +6058,11 @@ class CasaBackend(Backend):
         except ImportError as exc:
             raise BackendError("the CASA backend requires casatools/casatasks: "
                                "pip install vlbipy[casa]") from exc
+        from ..solvers.msio import set_default_engine
         self.tasks = casatasks
         self.tools = casatools
         self._ms_overrides: dict[str, Path] = {}
+        set_default_engine(None)            # tables through casacore/casatools (the dask-ms backend reads natively)
         super().__init__(work_dir)
         self.redirect_casa_log()
 

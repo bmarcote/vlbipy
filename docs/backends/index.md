@@ -206,7 +206,7 @@ The engine lives in `vlbipy.solvers`:
 | `VLBIPY_WORKERS=N` (environment) | Number of worker processes. Default: the number of CPU cores, capped at 16. `1` runs everything in-process. |
 | `VLBIPY_THREADS=N` (environment) | Threads a job uses for its array work. Default: its share of the cores (the cores divided by the jobs running at once). |
 | `VLBIPY_NUMBA=0` (environment) | Uses numpy for the calibration loops even when numba is installed. |
-| `VLBIPY_TABLE_ENGINE=native`, `casacore` or `casatools` (environment) | Forces the table I/O library. By default the native reader/writer (`vlbipy.casacore_format`) is used; a table it cannot handle (an unusual storage manager) is opened with python-casacore when it works on the machine, otherwise with `casatools.table`. |
+| `VLBIPY_TABLE_ENGINE=native`, `casacore` or `casatools` (environment) | Forces the table I/O library. Under the dask-ms backend the default is the native reader/writer (`vlbipy.casacore_format`), which opens a table it cannot handle (an unusual storage manager) with python-casacore when it works on the machine, otherwise with `casatools.table`. Under the `casa` backend the default stays python-casacore / `casatools.table`. |
 | `VLBIPY_NATIVE_IMPORT=0` (environment) | Imports the FITS-IDI files with CASA's `importfitsidi` + `partition` instead of the native import. The native import also hands over to CASA by itself for data it does not cover (DiFX/VLBA weights, files whose tables do not match one to one, Stokes I/Q/U/V). |
 | `[import] mms` | `true` (default) imports to a Multi-MS, which lets `applycal` run in parallel over its sub-MSs. |
 | `[import] zarr_store` | `true` also writes the zarr store `<code>.zarr` (default `false`). |

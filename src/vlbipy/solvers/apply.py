@@ -213,11 +213,11 @@ def load_caltable(path) -> CalTableData:
 
     CPARAM tables give complex `param`, FPARAM tables float64.  All spws must have the same number of channels.
     """
-    from ..casacore_format.compat import table as casa_table
+    from .msio import table_tool
 
     t_start = _time.perf_counter()
     path = Path(path).absolute()
-    tb = casa_table()
+    tb = table_tool()
     tb.open(str(path))
     keywords = tb.getkeywords()
     kind = str(keywords.get("VisCal", tb.info().get("subType", "")))

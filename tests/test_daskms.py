@@ -181,3 +181,19 @@ def test_casa_tasks_get_a_deferred_calibration_written_before_reading_it(tmp_pat
     assert run("clearcal", field="3C345") == ["clearcal", "forget"]  # a selection: CASA's clearcal
     assert run("applycal") == ["write", "applycal", "external:casa"]
     assert run("tclean", vis=plain) == ["tclean"]                     # no record: nothing deferred there
+
+
+def test_native_tables_are_the_default_only_under_the_dask_ms_backend(tmp_path, monkeypatch):
+    pytest.importorskip("casatasks")
+    from vlbipy.backends.casa import CasaBackend
+    from vlbipy.backends.dask_ms import DaskMsBackend
+    from vlbipy.solvers import msio
+    monkeypatch.delenv(msio.ENGINE_ENV, raising=False)
+    monkeypatch.chdir(tmp_path)
+    assert msio.table_engine() == msio.compiled_engine()             # no backend: casacore / casatools
+    DaskMsBackend(str(tmp_path))
+    assert msio.table_engine() == "native"
+    CasaBackend(str(tmp_path))
+    assert msio.table_engine() == msio.compiled_engine()
+    monkeypatch.setenv(msio.ENGINE_ENV, "native")                     # the explicit choice wins
+    assert msio.table_engine() == "native"

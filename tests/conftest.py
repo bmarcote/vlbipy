@@ -4,6 +4,8 @@ import pathlib
 import sys
 import tempfile
 
+import pytest
+
 _SRC = pathlib.Path(__file__).resolve().parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
@@ -22,6 +24,13 @@ finally:
     os.chdir(_cwd)
 
 from vlbipy.logging_utils import configure_logging  # noqa: E402
+from vlbipy.solvers.msio import DEFAULT_ENGINE_ENV  # noqa: E402
 
 # Keep test output readable: only show warnings and above.
 configure_logging("WARNING")
+
+
+@pytest.fixture(autouse=True)
+def _default_table_engine(monkeypatch):
+    """Every test starts with no backend-chosen table engine (constructing a backend sets one for the process)."""
+    monkeypatch.delenv(DEFAULT_ENGINE_ENV, raising=False)

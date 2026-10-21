@@ -1317,9 +1317,11 @@ class DaskMsBackend(CasaBackend):
         except ImportError as exc:
             raise BackendError("the dask-ms backend requires dask-ms: "
                                "pip install vlbipy[daskms]") from exc
+        from ..solvers.msio import set_default_engine
         # CASA is imported only when a step still needs one of its tasks or tools; its log is redirected then.
         self.tasks = NativeFlagTasks(LazyModule("casatasks", on_import=lambda _: self.redirect_casa_log()))
         self.tools = NativeTools()
+        set_default_engine("native")        # every table read and written natively, here and in the workers
         self._ms_overrides: dict[str, Path] = {}
         Backend.__init__(self, work_dir)
 
