@@ -373,6 +373,57 @@ class CalibrateNamespace(Namespace):
         obs._state.mark_complete("a_priori", outputs=[t.cal_type for t in tables])
         return tables
 
+    def ionosphere(self, *, force: bool = False) -> Optional[CalTable]:
+        """Ionospheric (TEC) correction from global ionosphere maps, as AIPS TECOR/VLBATECR (``[calibration.tec]``).
+
+        Runs for every array when the band centre is below the observatory's threshold
+        (``tec_below_ghz``: EVN 5 GHz, VLBA and LBA 7 GHz) unless ``enabled`` says otherwise (``true`` forces
+        it, ``false`` turns it off). The maps are downloaded once into ``ionex_dir`` (default
+        ``<work_dir>/ionex``). The table joins the chain like the a-priori tables, so every fringe fit, bandpass
+        and the final application see it, each field corrected for its own direction. Maps that cannot be
+        fetched skip the correction with a warning under ``"auto"`` and stop the step when it was asked for.
+
+        Parameters
+        ----------
+        force : bool
+            Re-run even if the step already completed.
+
+        Returns
+        -------
+        CalTable or None
+            The table, or None when the correction does not apply (frequency, configuration, backend, no maps).
+        """
+        obs = self._obs
+        cfg = dict(obs.config.get("calibration", {}).get("tec", {}))
+        enabled = cfg.pop("enabled", "auto")
+        threshold = float(obs._observatory_handler.tec_below_ghz or 0.0)
+        freq_ghz = float(obs.metadata.freq_setup.freq_ghz)
+        wanted = enabled is True or (str(enabled).lower() == "auto" and freq_ghz < threshold)
+        if enabled is False or not wanted:
+            logger.info("tec: no ionospheric correction ({:.2f} GHz, {} threshold {:.1f} GHz, enabled={})",
+                        freq_ghz, obs._observatory_handler.name, threshold, enabled)
+            return None
+        if not self._backend.supports("calibrate", "ionosphere"):
+            logger.info("tec: the {} backend has no ionospheric correction; skipped", self._backend.kind)
+            return None
+        existing = [t for t in obs.gaintables if t.cal_type == "tec"]
+        if not obs._state.should_run("tec", force=force):
+            return existing[0] if existing else None
+        ionex_dir = cfg.pop("ionex_dir", "") or str(Path(obs.work_dir) / "ionex")
+        try:
+            table = self._backend.calibrate.ionosphere(self._code, ionex_dir=ionex_dir, **cfg)
+        except (FileNotFoundError, ConnectionError) as exc:
+            if enabled is True:
+                raise StepError("tec", f"{self._code}: ionospheric correction requested but not possible: {exc}") \
+                    from exc
+            warnings.warn(f"{self._code}: no ionospheric correction, the TEC maps are not available ({exc})")
+            obs._state.mark_complete("tec", outputs=[])
+            return None
+        obs.set_gaintables([t for t in obs.gaintables if t.cal_type != "tec"])
+        obs.add_gaintable(table, "tec")
+        obs._state.mark_complete("tec", outputs=[table.cal_type])
+        return table
+
     def _smooth_table(self, table: CalTable, cal_cfg: dict) -> CalTable:
         """De-spike one a-priori table, leaving it untouched if the backend cannot smooth."""
         if table.cal_type != "tsys" or not self._backend.supports("calibrate", "smooth"):
@@ -942,9 +993,10 @@ class CalibrateNamespace(Namespace):
         if not obs._state.should_run(step, force=force):
             return obs.gaintables
         # Everything the a-priori step made stays (Tsys, gain curve, and for DiFX data ACCOR and
-        # EOP); the types are named as well for chains recorded before tables carried their step.
+        # EOP), and so does the ionospheric correction; the types are named as well for chains recorded
+        # before tables carried their step.
         apriori = [t for t in obs.gaintables
-                   if t.step == "a_priori" or t.cal_type in ("accor", "tsys", "gc", "eop")]
+                   if t.step in ("a_priori", "tec") or t.cal_type in ("accor", "tsys", "gc", "eop", "tec")]
         dropped = [t.cal_type for t in obs.gaintables if t not in apriori]
         obs.set_gaintables(apriori)
         logger.info("{}: re-deriving {} from the a-priori tables on the flagged data",

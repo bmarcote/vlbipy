@@ -300,6 +300,33 @@ Difmap's per-antenna gain corrections).
 | `minsnr` | float | `3.0` | Minimum signal-to-noise ratio |
 | `solnorm` | bool | `true` | Keep the a-priori flux scale; level the subbands only |
 
+### `[calibration.tec]`
+
+The ionospheric correction from global TEC maps (IONEX), computed as AIPS `TECOR` does (run by `VLBATECR`, which
+also fetches the maps), for every array: the slant TEC at each antenna's ionospheric pierce point towards each
+field, every `interval` seconds, written as an ordinary Fringe Jones table (`<code>.tec`) and evaluated at every
+channel's own frequency. It joins the calibration chain right after the a-priori tables, so every fringe fit, the
+bandpass and the final application see it; each field is corrected with its own direction. Only the dask-ms backend
+computes it. The dispersive delay the fringe fit solves below `ionos_max_ghz` then only absorbs what the maps miss.
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | `"auto"`/bool | `"auto"` | `"auto"`: when the band centre is below the observatory's threshold (EVN 5 GHz, VLBA and LBA 7 GHz); `true` always (and failing to get the maps stops the step); `false` never |
+| `model` | string | `"emrg"` | IONEX product (AIPS `TECRTYPE`): `emrg` (the VLBATECR default), `jplg`, `codg`, `esag`, `igsg`, `upcg`, `casg`, and their rapid versions |
+| `fallback` | bool | `true` | Use another product when `model` is not available for the dates |
+| `interval` | float | `30.0` | Seconds between rows inside a scan (each scan also gets its first and last integration) |
+| `shell_height` | float | `0.0` | Height of the ionospheric shell [km]; 0 takes the maps' own (`HGT1`, normally 450 km) |
+| `rotation` | float | `1.0` | AIPS `APARM(2)`: interpolate in time between maps rotated with the Sun (IONEX's recommendation); 0 interpolates the maps as they are |
+| `mapping` | string | `"thin_shell"` | `"thin_shell"` (1/cos of the zenith angle at the shell) or `"petrov"` (Petrov 2023's modified mapping, AIPS `APARM(4-6)`) |
+| `ionex_files` | list[str] | `[]` | Use these IONEX files instead of downloading |
+| `ionex_dir` | string | `""` | Where the maps are downloaded and cached; empty = `<work_dir>/ionex` (kept across `--scratch`) |
+
+The maps come from CDDIS (anonymous FTP-SSL, as for the EOP file) or JPL. A run that cannot get them (no network)
+skips the correction with a warning. The sign of the correction is the one that removes the ionospheric delays
+the fringe fit measures: CASA's own TEC correction (`gencal(caltype='tecim')`) uses the opposite one, and its
+`applycal` gives an antenna the correction of its neighbour once an antenna before it has no valid TEC, so neither
+is used.
+
 ### `[calibration.tsys_smooth]`
 
 | Parameter | Type | Default | Description |

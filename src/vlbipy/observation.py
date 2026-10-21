@@ -43,7 +43,7 @@ PROJECT_FILENAME = ".project.json"
 #: everything after it, so this must match the order :meth:`VLBIObs.run` runs them
 #: in and use the same names the steps record themselves under.
 STEP_ORDER = [
-    "import_data", "a_priori", "flag_apriori", "flag_from_file", "flag_autocorr",
+    "import_data", "a_priori", "tec", "flag_apriori", "flag_from_file", "flag_autocorr",
     "plot_raw", "flag_quack", "flag_tfcrop",
     "scan_snr", "flag_weak_polarization", "initial_calibration", "fringefit", "bandpass",
     "initial_calibration_sbd2", "fringefit_mbd2", "flag_edges",

@@ -3573,6 +3573,11 @@ class CasaCalibrationOps(CalibrationOps):
         table, CASA's ``nearest`` mapping uses each field's own solution. Otherwise
         the stored ``gainfield`` supplies the phase-reference solution.
         """
+        if table.cal_type == "tec":
+            # Direction-dependent: a field is corrected with the rows of its own direction (the table has rows for
+            # every field and scan), also where several phase centres were observed at the same time.
+            own = [f.strip() for f in str(apply_field).split(",") if f.strip()]
+            return own[0] if len(own) == 1 else ""
         if not table.gainfield or not apply_field:
             return table.gainfield
         requested = {f.strip() for f in apply_field.split(",") if f.strip()}

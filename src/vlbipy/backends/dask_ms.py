@@ -42,7 +42,7 @@ import numpy as np
 
 from ..errors import BackendError
 from ..logging_utils import get_logger, warnings
-from ..models import Antenna, FreqSetup, ObsMetadata, Scan, Stokes
+from ..models import Antenna, CalTable, FreqSetup, ObsMetadata, Scan, Stokes
 from ..solvers.msio import compiled_engine
 from .base import Backend
 from .casa import CasaBackend, CasaCalibrationOps, CasaDataOps, CasaExportOps, CasaFlagOps
@@ -972,6 +972,40 @@ class DaskMsCalibrationOps(CasaCalibrationOps):
 
     #: ``apply(defer=True)`` is understood (see :meth:`apply`).
     defers_apply = True
+
+    def ionosphere(self, project_code: str, *, ionex_dir: str, **kwargs) -> CalTable:
+        """The ionospheric correction as a Fringe Jones table (:func:`vlbipy.solvers.tec_task.write_tec_table`:
+        the dispersive delay of AIPS TECOR from global ionosphere maps, per antenna, field and time).
+
+        Parameters
+        ----------
+        project_code : str
+            Project code (the MS must exist).
+        ionex_dir : str
+            Where the IONEX maps are cached or downloaded.
+        **kwargs
+            ``[calibration.tec]``: ``model``, ``fallback``, ``interval``, ``shell_height`` (0: the maps' own),
+            ``rotation``, ``mapping`` (``"thin_shell"`` or ``"petrov"``), ``ionex_files``.
+
+        Returns
+        -------
+        CalTable
+            The table (``cal_type="tec"``, linear interpolation, weights untouched), applied to every field with
+            that field's own rows (see :meth:`CasaCalibrationOps._resolve_table_gainfield`).
+        """
+        from ..solvers.tec_task import PETROV_MAPPING, write_tec_table
+        options = {k: v for k, v in kwargs.items() if k in ("model", "fallback", "interval", "rotation")}
+        mapping = str(kwargs.get("mapping", "thin_shell")).strip().lower()
+        if mapping == "petrov":
+            options.update(PETROV_MAPPING)
+        elif mapping != "thin_shell":
+            raise BackendError(f"[calibration.tec] mapping must be 'thin_shell' or 'petrov', not {mapping!r}")
+        options["shell_height"] = float(kwargs["shell_height"]) if kwargs.get("shell_height") else None
+        options["ionex_files"] = list(kwargs.get("ionex_files") or []) or None
+        caltable = self.backend.caldir() / f"{project_code}.tec"
+        report = write_tec_table(self.backend.ms_path(project_code), caltable, ionex_dir=ionex_dir, **options)
+        return CalTable(cal_type="tec", path=str(report["caltable"]), field=",".join(report["fields"]),
+                        gainfield="", interp="linear", calwt=False, step="tec")
 
     def ensure_corrected(self, project_code: str) -> list[int]:
         """Write CORRECTED_DATA of every field whose calibration was deferred; returns those fields.

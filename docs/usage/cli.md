@@ -140,6 +140,10 @@ on the terminal as well.
 
 ## The ionosphere
 
+Below the array's threshold (EVN 5 GHz, VLBA and LBA 7 GHz) the run first removes the ionosphere predicted by
+global TEC maps, as AIPS `TECOR`/`VLBATECR` do (`[calibration.tec]`, dask-ms backend): the maps are downloaded
+into `<work_dir>/ionex`, and every antenna, field and channel is corrected for its own line of sight.
+
 Below 6 GHz the fringe fit also solves for the dispersive (ionospheric) delay,
 because at those frequencies the residual delay is genuinely frequency-dependent
 and fitting a single non-dispersive delay leaves phase behind. Above 6 GHz it is

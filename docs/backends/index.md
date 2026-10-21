@@ -98,6 +98,7 @@ pip install "vlbipy[casa,daskms]"
 | `mstransform`/`split` | `solvers/split_task.py` | the per-source splits |
 | `exportuvfits` | `solvers/uvfits_task.py` | the UVFITS files for difmap |
 | `concat` (+ the epoch scaling) | `solvers/concat_task.py` | combining the epochs of a campaign (`merge`) |
+| AIPS `TECOR` (CASA `tec_maps` + `gencal('tecim')`) | `ionex.py`, `solvers/tec_task.py` | the ionospheric correction from global TEC maps (`[calibration.tec]`), written as a Fringe Jones table |
 | `msmetadata`, the `ms` tool readers | `solvers/ms_metadata.py`, `solvers/plot_read.py` | metadata, the diagnostic and final plots |
 | `casatools.table`, python-casacore | `vlbipy/casacore_format/` | every table read and write |
 

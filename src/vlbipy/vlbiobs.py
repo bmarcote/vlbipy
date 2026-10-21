@@ -426,6 +426,7 @@ class VLBIObs:
         self.notebook()                                                # first notebook: what is there so far
         self.flag.apriori(force=force)                                 # step 4
         self.calibrate.a_priori(force=force)                           # steps 5-6 (EOP, Tsys, GC)
+        self.calibrate.ionosphere(force=force)                         # TEC maps, below tec_below_ghz
         self.plot.diagnostics(column="data", label="raw", force=force)  # step 7
         self.flag.quack(force=force)                                   # step 7 (slewing)
         self.flag.initial(force=force)                                 # step 8

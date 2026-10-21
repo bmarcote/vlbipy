@@ -732,8 +732,18 @@ def antenna_gains(table, antenna_ids, times, spw, chan_freq, *, field_id=None, i
     return (np.broadcast_to(gains.reshape(dense), shape).copy(), np.broadcast_to(flags.reshape(dense), shape).copy())
 
 
+#: Table kinds that are not gains (delays, TEC, leakages, antenna positions, baseline terms): applying their
+#: parameters as a G-like gain would be wrong, so they are refused instead. The TEC correction of this package
+#: is a Fringe Jones table (vlbipy.solvers.tec_task), never CASA's "F Jones".
+NON_GAIN_KINDS = ("F Jones", "K Jones", "KAntPos Jones", "KMBD Jones", "D Jones", "Df Jones", "X Jones",
+                  "Xf Jones", "M Mueller", "A Mueller")
+
+
 def _check_kind(table):
-    """Warn about a table kind that is applied as a plain gain without being one of those known to be."""
+    """Refuse a table kind that is known not to be a gain; warn about one that is applied as a plain gain
+    without being one of those known to be."""
+    if table.kind in NON_GAIN_KINDS:
+        raise NotImplementedError(f"{table.path}: {table.kind!r} tables are not applied natively")
     if table.kind not in ("G Jones", "T Jones", "B Jones", "B TSYS", "Fringe Jones", *GAIN_CURVE_KINDS):
         log.warning("table kind %r of %s not explicitly supported, applying as a G-like gain", table.kind,
                     table.path)

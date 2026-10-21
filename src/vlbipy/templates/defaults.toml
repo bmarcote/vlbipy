@@ -190,6 +190,18 @@ solint = "30s"               # accor solution interval
 smoothtype = "median"        # smoothcal filter
 smoothtime = 1800.0          # smoothcal filter width in seconds (0 = apply the table unsmoothed)
 
+[calibration.tec]
+# Ionospheric correction from global TEC maps (IONEX), as AIPS TECOR/VLBATECR, for every array.
+enabled = "auto"             # "auto": below the observatory's tec_below_ghz (EVN 5, VLBA/LBA 7); true; false
+model = "emrg"               # IONEX product (AIPS TECRTYPE): emrg, jplg, codg, esag, igsg, upcg, casg, ...
+fallback = true              # try the other products when this one is not available
+interval = 30.0              # seconds between table rows inside a scan (plus each scan's first/last time)
+shell_height = 0.0           # km; 0 = the height in the maps (HGT1, usually 450 km)
+rotation = 1.0               # AIPS APARM(2): interpolate in time between maps rotated with the Sun (0 = not)
+mapping = "thin_shell"       # "thin_shell" or "petrov" (Petrov 2023 modified mapping, AIPS APARM(4-6))
+ionex_files = []             # use these IONEX files instead of downloading
+ionex_dir = ""               # where the maps are cached; empty = <work_dir>/ionex
+
 [calibration.tsys_smooth]
 window = 5                   # running-median window, in solutions, used to de-spike Tsys
 
