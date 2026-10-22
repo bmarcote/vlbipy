@@ -20,12 +20,30 @@ targets = []
 check_sources = []
 polarization_calibrators = []
 
-# Calibrator -> target phase-referencing map.
-# Key = target name, value = calibrator name or list of calibrator names.
+# Phase referencing: which sources the phases are solved on and how they reach the others (vlbipy.phaseref).
+# The reference sources are the phase calibrators, or the targets with `inverse = true` (inverse phase
+# referencing: solve on a bright target, transfer to the calibrators; "target" still names the source of
+# interest). With several reference sources:
+#   "sequential"  solve on the brightest and apply it everywhere, then solve each next one on data already
+#                 corrected by it: its second-order solutions go to the later references and the targets;
+#   "interpolate" solve each on its own; a target takes their phases, delays and rates combined along the
+#                 line joining the two nearest on the sky (1-D, by its projection onto that line);
+#   "time"        a target takes the solutions of whichever reference was observed closest in time;
+#   "auto"        "sequential" when the brightest is `brightness_ratio` times brighter (fringe SNR) than the
+#                 next one, "interpolate" otherwise.
+# Changing the strategy needs a re-run from the fringe fit (--from-step fringefit).
+# Any other key is a calibrator -> target map entry: key = target name, value = calibrator name or list.
 # Example:
 #   "3C286"     = "J1048+7143"
 #   "R20181030" = ["J1027+7428", "J1048+7143"]
 [phase_referencing]
+inverse = false              # --inverse-phaseref
+strategy = "auto"            # --phaseref-strategy: auto | sequential | interpolate | time
+brightness_ratio = 3.0
+order = []                   # sequential solve order; default brightest first
+max_extrapolation = 1.0      # interpolate: furthest beyond either reference, in units of their separation
+max_gap = 600.0              # interpolate (and auto): both references observed within this many seconds,
+                             # before and after, or a receiver time takes the time interpolation
 
 [import]
 scan_gap = 15                # seconds; gap defining a new scan boundary
@@ -63,6 +81,8 @@ outlier_sigma = 5.0          # robust-sigma cut for per-baseline outlier flaggin
 outlier_gross_departure = 0.25  # a baseline with too many outliers to trust the sigma cut still loses the
                              # time bins further than this fraction from its local level ...
 outlier_gross_max_fraction = 0.35  # ... unless they are more than this share of the baseline
+weak_polarization_ratio = 5.0  # flag a receptor this many times weaker (fringe SNR on the calibrators) than
+                             # the antenna's other one, or never detected while it is; 0 = off
 bandpass_min_gain = 0.5      # channels whose bandpass solution is flagged or below this (subband median = 1)
                              # are flagged per antenna and subband after the bandpass
 flag_off_source = true       # after the first apply: flag antennas while they are still slewing or have dropped

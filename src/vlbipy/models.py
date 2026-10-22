@@ -496,6 +496,50 @@ class ScanSNRSurvey:
             ranked.append((source, _median(best, default=0.0), detected))
         return sorted(ranked, key=lambda entry: (entry[1], entry[2]), reverse=True)
 
+    def weak_hands(self, ratio: float = 5.0, *, detection: float = 7.0,
+                   min_scans: int = 3) -> dict[str, tuple[str, float]]:
+        """Antennas whose one parallel hand is much weaker than the other.
+
+        Both hands of an antenna see the same noise, so the ratio of their
+        fringe SNR in a scan is the ratio of their amplitudes. Over the scans
+        where the stronger hand is detected (SNR >= ``detection``), the median
+        of that ratio decides: a hand ``ratio`` times weaker or more is weak.
+        A scan where the weaker hand has no solution counts as an infinite
+        ratio, so a dead hand is caught whatever the SNR of the good one.
+
+        Parameters
+        ----------
+        ratio : float
+            Amplitude ratio from which the weaker hand is weak.
+        detection : float
+            SNR from which the stronger hand counts as detected in a scan.
+        min_scans : int
+            Fewest scans with the stronger hand detected for a decision.
+
+        Returns
+        -------
+        dict
+            ``{antenna: (weak hand, median ratio)}``, e.g. ``{"CD": ("LL", 11.0)}``.
+        """
+        hands = [hand for hand in ("RR", "LL") if hand in self.snr]
+        if len(hands) < 2:
+            return {}
+        weak: dict[str, tuple[str, float]] = {}
+        for column, name in enumerate(self.antennas):
+            for strong, other in ((hands[0], hands[1]), (hands[1], hands[0])):
+                ratios = []
+                for row in range(len(self.scan_numbers)):
+                    good, bad = self.snr[strong][row][column], self.snr[other][row][column]
+                    if not (good == good and good >= detection):
+                        continue
+                    ratios.append(good / bad if bad == bad and bad > 0 else math.inf)
+                if len(ratios) >= min_scans:
+                    middle = _median(ratios)
+                    if middle >= ratio:
+                        weak[name] = (other, middle)
+                        break
+        return weak
+
     def source_of_scan(self) -> dict[int, str]:
         """Return ``{scan_number: source}`` for the surveyed scans."""
         return {int(scan): source for scan, source in zip(self.scan_numbers, self.scan_sources)}

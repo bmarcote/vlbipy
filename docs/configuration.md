@@ -28,6 +28,10 @@ targets = ["J1234+5678"]
 check_sources = []
 polarization_calibrators = []
 
+[phase_referencing]
+inverse = false              # Solve on the target(s), transfer to the phase calibrators
+strategy = "auto"            # auto | sequential | interpolate | time
+
 [import]
 scan_gap = 15                # Seconds gap threshold for defining new scans in importfitsidi
 
@@ -124,6 +128,47 @@ Source names must exactly match those in the data file. Both the new-style keys 
 | `check_sources` | list[str] | `[]` | Check source names |
 | `polarization_calibrators` | list[str] | `[]` | Polarization calibrator source names |
 
+### `[phase_referencing]`
+
+Which sources the phases are solved on (the *reference sources*) and how their solutions reach the other
+fields (the *receivers*: targets, check sources, any other field; never the fringe finders). The reference
+sources are the phase calibrators, or the targets with `inverse = true`. This applies to the fringe fit and to
+the phase calibrators' self-calibration (and the campaign's joint models); the decision is logged and kept in
+`<work_dir>/.phaseref.json`, so a resumed run follows it. Changing the strategy or `inverse` needs a re-run from
+the fringe fit (`--from-step fringefit`).
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `inverse` | bool | `false` | Inverse phase referencing: the target(s) are fringe-fitted and self-calibrated, and their solutions go to the phase calibrators, which are only imaged. Only the calibration roles swap: "target" still names the source of interest in every product and report. |
+| `strategy` | string | `"auto"` | How several reference sources share the transfer (below). |
+| `brightness_ratio` | float | `3.0` | `auto` picks `sequential` when the brightest reference has at least this many times the fringe SNR of the next one (from the scan SNR survey), `interpolate` otherwise. |
+| `order` | list[str] | `[]` | Solve order for `sequential`; references not listed follow, brightest first. |
+| `max_extrapolation` | float | `1.0` | `interpolate`: how far beyond either reference a receiver may be taken, in units of their separation. |
+| `max_gap` | float | `600` | `interpolate`: seconds within which both references must have been observed, before and after, for a receiver time to be interpolated; otherwise it takes the time interpolation. `auto` picks `time` instead of `interpolate` when the references bracket the receiver scans less closely than this (median over the scans): a schedule that pairs each target scan with one calibrator. |
+
+Strategies, with several reference sources:
+
+- `sequential`: the brightest is fringe-fitted (with the fringe finders) and its solutions go to every field.
+  Each next one is then solved on data already corrected by it, into `<code>.mbd_<source>`; that second-order
+  table goes to itself, the later references and the receivers, never back to the brighter ones. The
+  self-calibration follows the same order.
+- `interpolate`: every reference is solved on its own (fringe fit and self-calibration). Each receiver takes
+  the solutions of the two references nearest to it on the sky, combined along the line joining them: with
+  `x` the projection of the receiver onto that line (0 at one, 1 at the other), phase, delay, rate and
+  dispersive delay are `(1 - x) A + x B`, extrapolated for `x` outside [0, 1]; the phase difference is
+  unwrapped within each receiver scan and taken on its shortest branch between scans. Amplitudes (self-cal
+  `selfamp`/`joint` tables) use `x` clipped to [0, 1]. The receivers get these as derived tables in
+  `<work_dir>/caltables/phaseref/`, rebuilt whenever a table they come from changes.
+- `time`: every receiver takes the solutions of whichever reference was observed closest in time, as CASA's
+  linear time interpolation across all of them does (the behaviour before these strategies).
+- `auto`: `sequential` by `brightness_ratio`; otherwise `interpolate` if both references bracket the receiver
+  scans within `max_gap`, `time` if they do not. Carrying a reference's phases over a long gap costs more than
+  the geometry gains: on V589A (each target scan between two scans of one calibrator, the other one 13-21 min
+  away) `interpolate` lowered the target's S/N from 15.8 to 12.5.
+
+Any other key of the section is an entry of the target -> calibrator map (key = target name, value = a
+calibrator name or list).
+
 ### `[import]`
 
 | Parameter | Type | Default | Description |
@@ -144,6 +189,7 @@ Source names must exactly match those in the data file. Both the new-style keys 
 | `outlier_sigma` | float | `5.0` | Robust-sigma cut for per-baseline outlier flagging |
 | `outlier_gross_departure` | float | `0.25` | A baseline with more outliers than the sigma cut can be trusted on (over 10%) still loses the time bins further than this fraction from its local level |
 | `outlier_gross_max_fraction` | float | `0.35` | ... unless those bins are more than this share of the baseline, which is then left untouched and reported |
+| `weak_polarization_ratio` | float | `5.0` | Before the instrumental calibration (step `flag_weak_polarization`), a receptor whose fringe SNR on the calibrators is this many times below the antenna's other one (median over the scans where the other is detected at `[calibration] detection_snr`), or that is never detected while the other is, is flagged: its parallel hand and both cross hands on every baseline of the antenna. Otherwise a Stokes I calibration averages its near-zero signal with the good hand. `0` turns it off |
 | `bandpass_min_gain` | float | `0.5` | After the bandpass, channels whose solution is flagged or whose amplitude (subband median = 1) is below this are flagged per antenna and subband |
 | `flag_off_source` | bool | `true` | After the first apply, flag antennas while they are not on source: measured per integration on the fringe finders and phase calibrators (one factor per antenna and time sample, so a late antenna is told from a late partner) and transferred to the fainter fields as the time each antenna typically arrives late |
 | `off_source_level` | float | `0.8` | An antenna counts as off source when all its baselines sit below this fraction of their own level |
@@ -336,6 +382,8 @@ CLI arguments override the corresponding TOML parameters:
 | `--check-source` | `[sources] check_sources` |
 | `--pwd` | `[global] pwd` |
 | `--no-ionos` | `[calibration] ionos = false` |
+| `--inverse-phaseref` | `[phase_referencing] inverse = true` |
+| `--phaseref-strategy` | `[phase_referencing] strategy` |
 | `--obsdate` | `[import] obsdate` (every subcommand) |
 | `--username` | `[import] username` (every subcommand) |
 | `--password` | `[import] password` (every subcommand; never saved to `.project.json`) |

@@ -3258,13 +3258,32 @@ class CasaCalibrationOps(CalibrationOps):
 
     def _normalise_per_antenna(self, table_path: Path, *, max_factor: float = 2.0,
                                fill_unsolved: bool = False) -> tuple[list[str], list[str]]:
-        """Scale a gain table so each antenna/polarization has median amplitude 1 across its subbands.
+        """Level each antenna/polarization across its subbands and merge the calibrators into one solution.
 
-        Solutions more than a factor ``max_factor`` above or below that median are
-        flagged. Solutions the solver flagged are left flagged, or with
-        ``fill_unsolved`` set to gain 1 and unflagged. Returns the labels
-        (``"<antenna> spw <n> pol <index>"``) of the newly flagged and of the
-        filled solutions.
+        gaincal solves every calibrator field on its own (``combine`` has no
+        ``field``) against a 1 Jy point model, so the solutions of each field
+        carry that source's flux density and structure on top of the subband
+        steps. Each (antenna, polarization, field) set is therefore scaled to
+        median amplitude 1 across its subbands on its own; only then are the
+        fields comparable. Their SNR-weighted geometric mean is written to every
+        row of that antenna/subband/polarization, so the table holds a single
+        time-independent level per antenna, subband and polarization and every
+        time and field gets the same correction, whatever the interpolation.
+
+        Normalising all the fields of an antenna together, as was done before,
+        left each field's solutions offset by its flux density; applied with
+        ``interp='nearest'`` the correction then switched from one offset to the
+        other halfway through the observation, a step of up to x2 per baseline
+        in every antenna (V589, J1346-6024 against J1355-6326) that no constant
+        amplitude self-calibration could undo.
+
+        A solution more than a factor ``max_factor`` above or below its field's
+        level is not merged; when no field has a usable solution for that
+        antenna/subband/polarization it is flagged. Solutions the solver could
+        not find in any field are left flagged, or with ``fill_unsolved`` set to
+        gain 1 and unflagged. Returns the labels
+        (``"<antenna> spw <n> pol <index>"``) of the flagged and of the filled
+        solutions.
         """
         handle = self.backend.tools.table()
         if not handle.open(str(table_path), nomodify=False):
@@ -3274,6 +3293,8 @@ class CasaCalibrationOps(CalibrationOps):
             flags = np.asarray(handle.getcol("FLAG")).astype(bool)
             antennas = np.asarray(handle.getcol("ANTENNA1"))
             spws = np.asarray(handle.getcol("SPECTRAL_WINDOW_ID"))
+            fields = np.asarray(handle.getcol("FIELD_ID"))
+            snr = np.asarray(handle.getcol("SNR")).astype(float)
             names = self._table_antenna_names(table_path)
             dropped: set[str] = set()
             filled: set[str] = set()
@@ -3282,19 +3303,31 @@ class CasaCalibrationOps(CalibrationOps):
                 name = names[int(antenna)] if int(antenna) < len(names) else f"#{int(antenna)}"
                 for pol in range(gains.shape[0]):
                     amplitude = np.abs(gains[pol, 0, rows])
-                    good = ~flags[pol, 0, rows] & np.isfinite(amplitude) & (amplitude > 0)
-                    if fill_unsolved and not good.all():
-                        gains[pol, 0, rows[~good]] = 1.0
-                        flags[pol, 0, rows[~good]] = False
-                        filled.update(f"{name} spw {int(s)} pol {pol}" for s in spws[rows[~good]])
-                    if not good.any():
-                        continue
-                    level = float(np.median(amplitude[good]))
-                    gains[pol, 0, rows[good]] = gains[pol, 0, rows[good]] / level
-                    ratio = amplitude / level
-                    off = good & ((ratio > max_factor) | (ratio < 1.0 / max_factor))
-                    flags[pol, 0, rows[off]] = True
-                    dropped.update(f"{name} spw {int(s)} pol {pol}" for s in spws[rows[off]])
+                    solved = ~flags[pol, 0, rows] & np.isfinite(amplitude) & (amplitude > 0)
+                    usable = solved.copy()
+                    relative = np.full(rows.size, np.nan)
+                    for field in np.unique(fields[rows]):
+                        in_field = solved & (fields[rows] == field)
+                        if not in_field.any():
+                            continue
+                        relative[in_field] = amplitude[in_field] / float(np.median(amplitude[in_field]))
+                        usable[in_field] = (relative[in_field] <= max_factor) & (relative[in_field] >= 1.0 / max_factor)
+                    for spw in np.unique(spws[rows]):
+                        same = spws[rows] == spw
+                        label = f"{name} spw {int(spw)} pol {pol}"
+                        merge = same & usable
+                        if merge.any():
+                            weight = np.where(snr[pol, 0, rows[merge]] > 0, snr[pol, 0, rows[merge]], 1.0)
+                            level = float(np.exp(np.sum(weight * np.log(relative[merge])) / np.sum(weight)))
+                            gains[pol, 0, rows[same]] = level
+                            flags[pol, 0, rows[same]] = False
+                        elif (same & solved).any():
+                            flags[pol, 0, rows[same]] = True
+                            dropped.add(label)
+                        elif fill_unsolved:
+                            gains[pol, 0, rows[same]] = 1.0
+                            flags[pol, 0, rows[same]] = False
+                            filled.add(label)
             handle.putcol("CPARAM", gains)
             handle.putcol("FLAG", flags)
         finally:
@@ -3322,7 +3355,11 @@ class CasaCalibrationOps(CalibrationOps):
             handle.close()
 
     def _subband_gain_spread(self, table_path: Path) -> float:
-        """Return the median across antennas of the relative spread of gain across subbands."""
+        """Return the median across antennas of the relative spread of gain across subbands.
+
+        Measured per calibrator field: the fields' levels differ by their flux densities, which is not a
+        subband step.
+        """
         handle = self.backend.tools.table()
         if not handle.open(str(table_path)):
             return 0.0
@@ -3330,12 +3367,13 @@ class CasaCalibrationOps(CalibrationOps):
             gains = np.abs(np.asarray(handle.getcol("CPARAM")))
             flags = np.asarray(handle.getcol("FLAG")).astype(bool)
             antennas = np.asarray(handle.getcol("ANTENNA1"))
+            fields = np.asarray(handle.getcol("FIELD_ID"))
         finally:
             handle.close()
         values = np.where(flags, np.nan, gains)
         spreads = []
-        for antenna in np.unique(antennas):
-            per_antenna = values[..., antennas == antenna]
+        for antenna, field in sorted(set(zip(antennas.tolist(), fields.tolist()))):
+            per_antenna = values[..., (antennas == antenna) & (fields == field)]
             finite = per_antenna[np.isfinite(per_antenna)]
             if finite.size > 1 and np.median(finite) > 0:
                 spreads.append(float(np.std(finite) / np.median(finite)))

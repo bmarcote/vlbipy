@@ -29,6 +29,7 @@ from rich_argparse import RawDescriptionRichHelpFormatter, RichHelpFormatter
 from ._version import __version__
 from .logging_utils import configure_logging, get_logger
 from .models import CalTable
+from .phaseref import STRATEGIES
 from .registry import get_backend
 from .vlbiobs import VLBIObs
 
@@ -95,6 +96,14 @@ def _common_parser(*, project_required: bool = True) -> argparse.ArgumentParser:
     p.add_argument("--callib", action="store_true", default=None,
                    help="Use CASA cal-library files instead of explicit parallel "
                         "gaintable/gainfield/interp/spwmap/calwt parameters.")
+    p.add_argument("--inverse-phaseref", dest="inverse_phaseref", action="store_true", default=None,
+                   help="Inverse phase referencing: solve the phases on the target(s) and transfer them to the "
+                        "phase calibrators ([phase_referencing].inverse). The targets keep their name.")
+    p.add_argument("--phaseref-strategy", dest="phaseref_strategy", choices=list(STRATEGIES),
+                   help="How several phase-reference sources share the transfer ([phase_referencing].strategy): "
+                        "'sequential' (brightest first, then second-order corrections), 'interpolate' (1-D "
+                        "along the line joining the two nearest), 'time' (nearest in time) or 'auto' (sequential "
+                        "when the brightest is [phase_referencing].brightness_ratio times brighter)")
     p.add_argument("--scratch", action="store_true",
                    help="Start over: forget all recorded progress and reset the data "
                         "(clearcal + unflag). Without it the run resumes where it stopped.")
@@ -260,6 +269,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_apply.add_argument("--interp", nargs="+", help="Per-table interpolation mode(s); one broadcasts")
     p_apply.add_argument("--spwmap", nargs="+", help="Per-table comma-separated SPW mappings; one broadcasts")
     p_apply.add_argument("--calwt", nargs="+", help="Per-table true/false weight calibration; one broadcasts")
+    p_apply.add_argument("--phaseref", choices=["time", "interpolate"], default="time",
+                         help="A table whose --gainfield names two or more fields: 'time' (default) takes the "
+                              "solutions nearest in time, as CASA does; 'interpolate' gives every other field the "
+                              "phases, delays and rates of the two of them nearest on the sky combined along the "
+                              "line joining them (1-D, by the field's projection onto it)")
+    p_apply.add_argument("--max-extrapolation", type=float, default=1.0,
+                         help="With --phaseref interpolate: furthest a field may lie beyond either of the two, "
+                              "in units of their separation (default 1)")
+    p_apply.add_argument("--max-gap", type=float, default=600.0,
+                         help="With --phaseref interpolate: a time either of the two was not observed within this "
+                              "many seconds of (before and after) takes the time interpolation instead (default "
+                              "600)")
     p_apply.add_argument("-v", "--verbose", action="store_true", help="Verbose (DEBUG) logging")
 
     sub.add_parser(
@@ -374,7 +395,8 @@ def _build_obs(args: argparse.Namespace) -> VLBIObs:
     return VLBIObs(args.project, network=args.network, backend=args.backend, target=args.target,
                    phasecal=args.phasecal, fringe_finder=args.fringe_finder,
                    check_source=getattr(args, "check_source", None), refant=refant,
-                   config=args.config, **overrides)
+                   inverse_phaseref=getattr(args, "inverse_phaseref", None),
+                   phaseref_strategy=getattr(args, "phaseref_strategy", None), config=args.config, **overrides)
 
 
 def format_steps(statuses: Optional[dict] = None) -> str:
@@ -519,6 +541,9 @@ def _cmd_applycal(obs: Optional[VLBIObs], args: argparse.Namespace) -> int:
     casa_selection = {name: getattr(args, name) for name in ("intent", "timerange", "antenna", "observation")
                       if getattr(args, name)}
     if args.callib or casa_selection:
+        if args.phaseref != "time":
+            raise SystemExit("applycal: --phaseref interpolate is applied natively; it cannot go with --callib or "
+                             "the CASA-only --intent/--timerange/--antenna/--observation selections")
         has_corrected = (Path(ms) / "table.dat").exists() and _has_corrected(ms)
         if has_corrected and not args.from_data:
             raise SystemExit("applycal: --callib and the --intent/--timerange/--antenna/--observation selections "
@@ -556,7 +581,8 @@ def _cmd_applycal(obs: Optional[VLBIObs], args: argparse.Namespace) -> int:
                  scan=args.scan, gainfield=_broadcast(args.gainfield, count, ""),
                  interp=_broadcast(args.interp, count, "linear"), spwmap=_broadcast(args.spwmap, count, ""),
                  calwt=_broadcast(args.calwt, count, "true"), parang=args.parang,
-                 applymode=args.applymode or "calflagstrict", on_corrected=False if args.from_data else None)
+                 applymode=args.applymode or "calflagstrict", on_corrected=False if args.from_data else None,
+                 phaseref=args.phaseref, max_extrapolation=args.max_extrapolation, max_gap=args.max_gap)
     except (ValueError, NotImplementedError) as exc:
         raise SystemExit(f"applycal: {exc}") from exc
     return 0

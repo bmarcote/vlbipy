@@ -102,6 +102,11 @@ class VLBIObs:
         Preferred reference antenna(s).
     mode : str
         Observing mode (``"continuum"`` by default).
+    inverse_phaseref : bool, optional
+        Inverse phase referencing: solve the phases on the target(s) and transfer them to the phase
+        calibrators (``[phase_referencing].inverse``; see :mod:`vlbipy.phaseref`).
+    phaseref_strategy : str, optional
+        ``"auto"``, ``"sequential"``, ``"interpolate"`` or ``"time"`` (``[phase_referencing].strategy``).
     config : str or pathlib.Path or dict, optional
         User TOML config path or dict.
     work_dir : str or pathlib.Path, optional
@@ -112,13 +117,15 @@ class VLBIObs:
 
     def __init__(self, project: ProjectLike, *, network: Optional[str] = None, backend: Optional[str] = None,
                  target=None, phasecal=None, fringe_finder=None, check_source=None,
-                 refant=None, mode: str = "continuum", config=None, work_dir=None, **overrides) -> None:
+                 refant=None, mode: str = "continuum", inverse_phaseref: Optional[bool] = None,
+                 phaseref_strategy: Optional[str] = None, config=None, work_dir=None, **overrides) -> None:
         codes: list[str] = [project] if isinstance(project, str) else list(project)
         if not codes:
             raise ValueError("At least one project code is required")
 
         kw_over = kwargs_to_overrides(
             network=network, backend=backend, mode=mode,
+            inverse_phaseref=inverse_phaseref, phaseref_strategy=phaseref_strategy,
             refant=refant if refant else None,
             target=_string_list(target) or None,
             phasecal=_string_list(phasecal) or None,
@@ -427,6 +434,8 @@ class VLBIObs:
         # Every application before the last one is deferred where the backend can (dask-ms): the
         # steps in between read the corrected data through readers that calibrate DATA as they
         # read it, and CORRECTED_DATA is written once, with the final chain (write_corrected).
+        # A receptor much weaker than its pair goes first, so no solve averages it in.
+        self.flag.weak_polarizations(force=force)
         self.calibrate.instrumental(force=force)
         self.flag.edges(force=force)
         self.calibrate.apply(force=True, defer=True)

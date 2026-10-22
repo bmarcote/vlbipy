@@ -257,11 +257,12 @@ def combine_epochs(vlbi, *, force: bool = False) -> dict:
     # A previous combination left its tables in the chains: the joint model must be built from the
     # per-epoch calibration alone, so they come out first (and the splits are redone without them).
     stale: set[str] = set()
+    # The phase-reference sources in each epoch's solve order (the targets with inverse phase referencing).
     calibrators: list[str] = []
     for obs in observations:
-        for source in obs.sources.phase_calibrators:
-            if source.name not in calibrators:
-                calibrators.append(source.name)
+        for source in obs.phaseref_plan().references:
+            if source not in calibrators:
+                calibrators.append(source)
     for obs in observations:
         if obs.drop_gaintables({_joint_step(source) for source in calibrators}):
             stale.add(obs.project_code)
