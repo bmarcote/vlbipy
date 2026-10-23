@@ -39,7 +39,6 @@ columns instead of being rebuilt from SIGMA.
 """
 from __future__ import annotations
 
-import tempfile
 import time as _time
 from pathlib import Path
 from typing import Optional
@@ -638,49 +637,9 @@ def _table_fields(table, gainfield: str, ms_field_names: list[str]):
     return ids
 
 
-def _interpolated_entries(ms: Path, entries: list[dict], field_ids: list[int], setup: dict, layout: dict,
-                          max_extrapolation: float, workdir: Path, max_gap: Optional[float] = None) -> dict:
-    """``{field: entries}`` where a table whose gainfield lists two or more fields reaches the other fields
-    interpolated between the two of them nearest on the sky (:func:`vlbipy.phaseref.interpolated_table`)."""
-    from types import SimpleNamespace
-    from .. import phaseref
-    from .apply import adapt_table, load_caltable
-    names = setup["field_names"]
-    coords = {name: tuple(np.degrees(setup["field_dirs"][index])) for index, name in enumerate(names)}
-    spans: dict = {}
-    for f, s, lo, hi in zip(layout["field"], layout["scan"], layout["t_min"], layout["t_max"]):
-        old = spans.get((int(f), int(s)), (lo, hi))
-        spans[(int(f), int(s))] = (min(old[0], lo), max(old[1], hi))
-    scans = [SimpleNamespace(source=names[f], time_start=lo, time_end=hi) for (f, _), (lo, hi) in spans.items()]
-    out = {}
-    for f in field_ids:
-        chosen = []
-        for index, entry in enumerate(entries):
-            ids = entry["gainfield"]
-            table = entry["table"]
-            if not isinstance(ids, list) or len(ids) < 2 or names[f] in {str(table.field_names[i]) for i in ids}:
-                chosen.append(entry)
-                continue
-            references = [str(table.field_names[i]) for i in ids]
-            missing = [name for name in references if name not in coords]
-            if missing:
-                raise ValueError(f"--phaseref interpolate: {', '.join(missing)} not a field of {ms.name}")
-            a, b, x, offset = phaseref.interpolation_pair(references, coords, names[f], max_extrapolation)
-            logger.info("applycal: {} at x = {:.3f} between {} and {} ({:.2f} deg off their line)", names[f], x, a,
-                        b, offset)
-            derived = workdir / f"{index}.{Path(table.path).name}.{names[f]}"
-            phaseref.interpolated_table((table.path, a), (table.path, b), x, names[f],
-                                        phaseref.receiver_times(scans, names[f]), derived, max_gap=max_gap)
-            new = adapt_table(load_caltable(derived), setup["antenna_names"])
-            chosen.append(dict(entry, table=new, gainfield=[[str(n) for n in new.field_names].index(names[f])]))
-        out[f] = chosen
-    return out
-
-
 def applycal(ms, caltables: list[str], *, field: str = "", spw: str = "", scan: str = "", gainfield=None,
              interp=None, spwmap=None, calwt=None, parang: Optional[bool] = None, applymode: str = "calflagstrict",
-             on_corrected: Optional[bool] = None, workers: Optional[int] = None, phaseref: str = "time",
-             max_extrapolation: float = 1.0, max_gap: Optional[float] = 600.0) -> dict:
+             on_corrected: Optional[bool] = None, workers: Optional[int] = None) -> dict:
     """Apply calibration tables to any measurement set (``vlbipy applycal``).
 
     On a set that has CORRECTED_DATA the tables are applied on top of it: their corrections multiply what
@@ -700,13 +659,6 @@ def applycal(ms, caltables: list[str], *, field: str = "", spw: str = "", scan: 
         The feed rotation. Off by default, as in ``casatasks.applycal``: the tables one applies this way (a
         self-calibration, a table from another set) go on data that are calibrated already, the feed rotation
         included (CORRECTED_DATA, or the DATA of a split).
-    phaseref : {"time", "interpolate"}
-        For a table whose ``gainfield`` lists two or more fields: ``"time"`` takes the solutions nearest in
-        time, whichever field they belong to (as CASA does); ``"interpolate"`` gives every other field the
-        solutions of the two of them nearest on the sky combined along the line joining them
-        (:mod:`vlbipy.phaseref`), at most ``max_extrapolation`` times their separation beyond either. A time
-        either of them was not observed within ``max_gap`` seconds of (before and after) takes the time
-        interpolation instead (None: never).
 
     Returns
     -------
@@ -770,15 +722,7 @@ def applycal(ms, caltables: list[str], *, field: str = "", spw: str = "", scan: 
     logger.info("applycal: {} {} {} ({}), parang {}", ", ".join(Path(t).name for t in caltables),
                 "on top of" if on_corrected else "applied to", source if on_corrected else "DATA -> CORRECTED_DATA",
                 ms.name, "on" if parang else "off (--parang to de-rotate the feeds of uncalibrated data)")
-    if phaseref not in ("time", "interpolate"):
-        raise ValueError(f"phaseref must be 'time' or 'interpolate', got {phaseref!r}")
-    with tempfile.TemporaryDirectory(prefix=".phaseref.", dir=ms.parent) as workdir:
-        if phaseref == "interpolate":
-            entries_by_field = _interpolated_entries(ms, entries, field_ids, setup, layout, max_extrapolation,
-                                                     Path(workdir), max_gap=max_gap)
-        else:
-            entries_by_field = {f: entries for f in field_ids}
-        total = apply_to_ms(ms, entries_by_field, parang=parang, applymode=applymode,
-                            workers=workers, source=source, ddids=ddids, scans=scans)
+    total = apply_to_ms(ms, {f: entries for f in field_ids}, parang=parang, applymode=applymode,
+                        workers=workers, source=source, ddids=ddids, scans=scans)
     total.update(source=source, parang=parang, fields=[setup["field_names"][f] for f in field_ids])
     return total

@@ -273,6 +273,13 @@ def process_values(infp, keys, pols, idi, data):
     timeoff = 0
     if 'TIMEOFF' in keys:
         timeoff = float(keys['TIMEOFF'])
+    # FT multiplies every Tsys value of the group, as in AIPS ANTAB. Stations that
+    # give a nominal SEFD (DPFU = 1, a constant "Tsys") use it to put the values on
+    # scale (EB104D: T6 FT = 484, KM FT = 0.5476); left out, T6 came out ~20x low.
+    ft = float(keys.get('FT', 1.0))
+    if ft != 1.0:
+        print('Tsys of antenna %s scaled by FT = %g' % (antenna_name, ft))
+        pass
     for line in infp:
         if line.startswith('!'):
             continue
@@ -296,6 +303,8 @@ def process_values(infp, keys, pols, idi, data):
                         value = float(values[spwmap[(pol, spw)]])
                         if value == 999.9:
                             value = float(-999.9)
+                        elif value > 0:
+                            value *= ft
                             pass
                     except:
                         value = float(-999.9)

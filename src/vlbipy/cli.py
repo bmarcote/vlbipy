@@ -29,7 +29,6 @@ from rich_argparse import RawDescriptionRichHelpFormatter, RichHelpFormatter
 from ._version import __version__
 from .logging_utils import configure_logging, get_logger
 from .models import CalTable
-from .phaseref import STRATEGIES
 from .registry import get_backend
 from .vlbiobs import VLBIObs
 
@@ -96,14 +95,6 @@ def _common_parser(*, project_required: bool = True) -> argparse.ArgumentParser:
     p.add_argument("--callib", action="store_true", default=None,
                    help="Use CASA cal-library files instead of explicit parallel "
                         "gaintable/gainfield/interp/spwmap/calwt parameters.")
-    p.add_argument("--inverse-phaseref", dest="inverse_phaseref", action="store_true", default=None,
-                   help="Inverse phase referencing: solve the phases on the target(s) and transfer them to the "
-                        "phase calibrators ([phase_referencing].inverse). The targets keep their name.")
-    p.add_argument("--phaseref-strategy", dest="phaseref_strategy", choices=list(STRATEGIES),
-                   help="How several phase-reference sources share the transfer ([phase_referencing].strategy): "
-                        "'sequential' (brightest first, then second-order corrections), 'interpolate' (1-D "
-                        "along the line joining the two nearest), 'time' (nearest in time) or 'auto' (sequential "
-                        "when the brightest is [phase_referencing].brightness_ratio times brighter)")
     p.add_argument("--scratch", action="store_true",
                    help="Start over: forget all recorded progress and reset the data "
                         "(clearcal + unflag). Without it the run resumes where it stopped.")
@@ -161,7 +152,7 @@ def _options_epilog(sub: argparse._SubParsersAction, common: argparse.ArgumentPa
                               if action.option_strings)
     lines.append(f"  {common_detail}")
     lines.append("")
-    lines.append("For more information, visit: https://bmarcote.github.io/vlbipy")
+    lines.append("For more information, visit: https://vlbipy.readthedocs.io/")
     return "\n".join(lines)
 
 
@@ -269,18 +260,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_apply.add_argument("--interp", nargs="+", help="Per-table interpolation mode(s); one broadcasts")
     p_apply.add_argument("--spwmap", nargs="+", help="Per-table comma-separated SPW mappings; one broadcasts")
     p_apply.add_argument("--calwt", nargs="+", help="Per-table true/false weight calibration; one broadcasts")
-    p_apply.add_argument("--phaseref", choices=["time", "interpolate"], default="time",
-                         help="A table whose --gainfield names two or more fields: 'time' (default) takes the "
-                              "solutions nearest in time, as CASA does; 'interpolate' gives every other field the "
-                              "phases, delays and rates of the two of them nearest on the sky combined along the "
-                              "line joining them (1-D, by the field's projection onto it)")
-    p_apply.add_argument("--max-extrapolation", type=float, default=1.0,
-                         help="With --phaseref interpolate: furthest a field may lie beyond either of the two, "
-                              "in units of their separation (default 1)")
-    p_apply.add_argument("--max-gap", type=float, default=600.0,
-                         help="With --phaseref interpolate: a time either of the two was not observed within this "
-                              "many seconds of (before and after) takes the time interpolation instead (default "
-                              "600)")
     p_apply.add_argument("-v", "--verbose", action="store_true", help="Verbose (DEBUG) logging")
 
     sub.add_parser(
@@ -395,8 +374,7 @@ def _build_obs(args: argparse.Namespace) -> VLBIObs:
     return VLBIObs(args.project, network=args.network, backend=args.backend, target=args.target,
                    phasecal=args.phasecal, fringe_finder=args.fringe_finder,
                    check_source=getattr(args, "check_source", None), refant=refant,
-                   inverse_phaseref=getattr(args, "inverse_phaseref", None),
-                   phaseref_strategy=getattr(args, "phaseref_strategy", None), config=args.config, **overrides)
+                   config=args.config, **overrides)
 
 
 def format_steps(statuses: Optional[dict] = None) -> str:
@@ -441,7 +419,7 @@ def _cmd_pipeline(obs: VLBIObs, args: argparse.Namespace) -> int:
         obs.import_data(force=False)
         for observation in obs.observations:
             observation.flag.statistics()
-            serve_dashboard(observation)     # one dashboard per epoch
+        serve_dashboard(obs)
         return 0
     if args.summary_only:
         obs.import_data(force=args.force)
@@ -541,9 +519,6 @@ def _cmd_applycal(obs: Optional[VLBIObs], args: argparse.Namespace) -> int:
     casa_selection = {name: getattr(args, name) for name in ("intent", "timerange", "antenna", "observation")
                       if getattr(args, name)}
     if args.callib or casa_selection:
-        if args.phaseref != "time":
-            raise SystemExit("applycal: --phaseref interpolate is applied natively; it cannot go with --callib or "
-                             "the CASA-only --intent/--timerange/--antenna/--observation selections")
         has_corrected = (Path(ms) / "table.dat").exists() and _has_corrected(ms)
         if has_corrected and not args.from_data:
             raise SystemExit("applycal: --callib and the --intent/--timerange/--antenna/--observation selections "
@@ -581,8 +556,7 @@ def _cmd_applycal(obs: Optional[VLBIObs], args: argparse.Namespace) -> int:
                  scan=args.scan, gainfield=_broadcast(args.gainfield, count, ""),
                  interp=_broadcast(args.interp, count, "linear"), spwmap=_broadcast(args.spwmap, count, ""),
                  calwt=_broadcast(args.calwt, count, "true"), parang=args.parang,
-                 applymode=args.applymode or "calflagstrict", on_corrected=False if args.from_data else None,
-                 phaseref=args.phaseref, max_extrapolation=args.max_extrapolation, max_gap=args.max_gap)
+                 applymode=args.applymode or "calflagstrict", on_corrected=False if args.from_data else None)
     except (ValueError, NotImplementedError) as exc:
         raise SystemExit(f"applycal: {exc}") from exc
     return 0
@@ -685,10 +659,9 @@ def _cmd_export(obs: VLBIObs, args: argparse.Namespace) -> int:
 
 
 def _cmd_combine(obs: VLBIObs, args: argparse.Namespace) -> int:
-    """Multi-epoch stage on already-calibrated epochs; the epochs' pages are rebuilt with its calibration."""
+    """Multi-epoch stage on already-calibrated epochs."""
     obs.import_data(force=False)
     obs.combine(force=args.force)
-    obs.report()
     return 0
 
 
@@ -708,7 +681,7 @@ def _cmd_notebook(obs: VLBIObs, args: argparse.Namespace) -> int:
 
 
 def _cmd_report(obs: VLBIObs, args: argparse.Namespace) -> int:
-    """Build the static HTML dashboard of every epoch from the products already on disk."""
+    """Build the static HTML dashboard from the products already on disk."""
     from .dashboard import build_dashboard, serve_dashboard
     try:
         obs.import_data(force=False)
@@ -719,8 +692,8 @@ def _cmd_report(obs: VLBIObs, args: argparse.Namespace) -> int:
             observation.flag.statistics()
         except Exception:  # noqa: BLE001 - without the MS there are no flags to count
             logger.debug("report: flag statistics unavailable for {}", observation.project_code)
-        index = serve_dashboard(observation) if args.open else build_dashboard(observation)
-        print(index)
+    index = serve_dashboard(obs) if args.open else build_dashboard(obs)
+    print(index)
     return 0
 
 
@@ -765,7 +738,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _HANDLERS[args.command](obs, args)
     except Exception as exc:  # noqa: BLE001 - top-level CLI guard
         logger.error("{} failed: {}", args.command, exc)
-        logger.opt(exception=exc).debug("{} failed with this traceback:", args.command)   # to the run logs
         return 1
 
 

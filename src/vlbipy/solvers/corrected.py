@@ -167,9 +167,14 @@ def record_deferred(ms, entries_by_field: dict, *, parang: bool, write_flags: bo
             version = hashlib.blake2b(json.dumps([item["path"], signature]).encode(), digest_size=8).hexdigest()
             frozen = frozen_root / version / Path(item["path"]).name
             if not frozen.is_dir():
-                # With table.lock: a table CASA left open after writing (the SPECTRAL_WINDOW importfitsidi
-                # and partition give a Multi-MS) records its rows there only, so a copy without it is empty.
-                shutil.copytree(item["path"], frozen)
+                # With the lock files: a casacore lock file carries the table's synchronisation record, which
+                # for some tables (the SPECTRAL_WINDOW of a CASA import) is the only place that holds the
+                # current number of rows. Copied aside and renamed once complete, so that a copy cut short
+                # is never taken for the table.
+                partial = frozen.with_name(frozen.name + ".partial")
+                shutil.rmtree(partial, ignore_errors=True)
+                shutil.copytree(item["path"], partial)
+                partial.rename(frozen)
             plain.append(dict(item, frozen=str(frozen.relative_to(Path(ms)))))
         record["fields"][int(field_id)] = {"digest": chain_digest(entries, parang=parang, write_flags=write_flags),
                                            "entries": plain, "parang": bool(parang),

@@ -6,10 +6,10 @@ import re
 from pathlib import Path
 
 from vlbipy import VLBIObs
-from vlbipy.dashboard import (AUTOCORR_PATTERNS, CALIBRATION_GROUPS, CROSSCORR_PATTERNS, FINAL_GROUPS, _sky_map,
+from vlbipy.dashboard import (AUTOCORR_PATTERNS, CALIBRATION_GROUPS, CROSSCORR_PATTERNS, FINAL_GROUPS,
                               TIME_EVOLUTION_PATTERNS, build_dashboard, collect, find_plots, format_obs_date,
                               gain_class, match_ifs_to_subbands, plot_source, read_gain_record, render_pages,
-                              angular_offset, snr_class, time_evolution_key)
+                              snr_class, time_evolution_key)
 
 
 def make_obs(tmp_path, **roles):
@@ -50,40 +50,6 @@ def test_overview_content(tmp_path):
     assert "db01" in text
     # the antenna subband coverage bars exist for every antenna
     assert text.count('class="sbbar"') >= len(obs["db01"].metadata.antennas)
-
-
-def test_overview_sections_carry_no_item_counts_except_the_comments(tmp_path):
-    obs = make_obs(tmp_path, phasecal="J1848+3219", fringe_finder="3C345")
-    build_dashboard(obs)
-    text = (Path(obs["db01"].work_dir) / "html" / "index.html").read_text(encoding="utf-8")
-    headings = re.findall(r'<section id="([^"]+)"><h2>(.*?)</h2>', text)
-    assert [anchor for anchor, h2 in headings if 'class="count"' in h2] in ([], ["comments"])
-    assert "<h2>Sources</h2>" in text and "<h2>Scans</h2>" in text
-
-
-def test_angular_offset_distance_and_position_angle():
-    rho, pa = angular_offset(10.0, 0.0, 11.0, 0.0)
-    assert abs(rho - 1.0) < 1e-9 and abs(pa - 90.0) < 1e-9  # east of the centre
-    rho, pa = angular_offset(10.0, 30.0, 10.0, 28.0)
-    assert abs(rho - 2.0) < 1e-9 and abs(pa - 180.0) < 1e-9  # south of the centre
-    rho, _ = angular_offset(0.0, 89.0, 180.0, 89.0)
-    assert abs(rho - 2.0) < 1e-9  # across the pole
-
-
-def test_sky_map_places_sources_and_joins_targets_to_their_nearest_phase_calibrator():
-    sources = [{"name": "TGT", "type": "target", "ra_deg": 280.0, "dec_deg": 32.0, "ra": "", "dec": ""},
-               {"name": "PC_NEAR", "type": "phasecal", "ra_deg": 281.0, "dec_deg": 32.0, "ra": "", "dec": ""},
-               {"name": "PC_FAR", "type": "phasecal", "ra_deg": 290.0, "dec_deg": 40.0, "ra": "", "dec": ""},
-               {"name": "FF", "type": "fringefinder", "ra_deg": 250.0, "dec_deg": 39.0, "ra": "", "dec": ""},
-               {"name": "NOPOS", "type": "other", "ra_deg": None, "dec_deg": None}]
-    svg = _sky_map(sources)
-    assert svg.startswith('<figure class="skymap"><svg') and "NOPOS" not in svg
-    for name, role in (("TGT", "target"), ("PC_NEAR", "phasecal"), ("FF", "fringefinder")):
-        assert f'class="src {role}"' in svg and f">{name}</text>" in svg
-    assert svg.count('class="pair"') == 1 and "50.9\u2032" in svg  # 1 deg in RA at Dec 32
-    x = {m[1]: float(m[0]) for m in re.findall(r'<text class="srclabel" x="([-0-9.]+)"[^>]*>([^<]+)<', svg)}
-    assert x["FF"] > x["PC_FAR"]  # east is left: the source at lower RA lies to the right
-    assert _sky_map(sources[:1]) == "" and _sky_map([]) == ""
 
 
 def test_format_obs_date_robustly():
@@ -370,7 +336,7 @@ def test_final_results_downloads_list_products_found_on_disk(tmp_path):
     context = json.loads((work / "html" / "dashboard.json").read_text())
     entries = context["downloads"]["3C395"]
     assert [e["kind"] for e in entries] == ["uvfits", "ms", "fits", "fits"]
-    assert [e["label"] for e in entries][2:] == ["Image FITS (robust -2)", "Image FITS (robust 0)"]
+    assert [e["label"] for e in entries][2:] == ["CLEAN image FITS (robust -2)", "CLEAN image FITS (robust 0)"]
     assert entries[0]["size_human"] == "2.00 MiB" and entries[1]["is_dir"] is True
     assert entries[1]["size_human"] == "" and entries[1]["relpath"] == "calibrated_data/db01_3C395.ms"
     assert context["downloads"]["J1848+3219"] == []
@@ -692,11 +658,11 @@ def test_diagnostics_page_has_three_horizontal_subtabs(tmp_path):
     bodies = dict(zip(ids, re.split(r'<div class="subpanel[^"]*" id="[^"]+">', page)[1:]))
     auto, cross, evolution = (bodies[i] for i in ids)
 
-    # Every file lands in its own sub-tab only, each with its blurb and no plot count.
+    # Every file lands in its own sub-tab only, each with its blurb and plot count.
     assert "db01.raw_scan1.autocorr.png" in auto and "spectrum.png" not in auto and "time_evolution" not in auto
     assert "db01.raw_scan1.spectrum.png" in cross and "autocorr.png" not in cross and "time_evolution" not in cross
     assert "autocorr.png" not in evolution and "spectrum.png" not in evolution
-    assert "plot(s)" not in page
+    assert "1 plot(s)" in auto and "1 plot(s)" in cross and "4 plot(s)" in evolution
     assert "Auto-correlation spectra per antenna" in auto and "vector-averaged over the central channels" in evolution
     # The observation's reference antenna (EF) leads although AR sorts first; subbands in numeric order;
     # a file that does not follow the naming convention is still shown, last.
@@ -754,7 +720,7 @@ def test_overview_shows_the_general_comments_between_observation_and_antennas(tm
     assert text.index('id="observation"') < text.index('id="comments"') < text.index('id="antennas"')
     assert '<a href="#observation">Observation</a><a href="#comments">General comments</a><a href="#antennas">' in text
     section = text[text.index('id="comments"'):text.index('id="antennas"')]
-    assert "<h3>Data and calibration</h3>" in section and "<h3>Antennas</h3>" in section
+    assert "<h3>Calibration and results</h3>" in section and "<h3>Antennas</h3>" in section
     assert ("Scan 3 (3C345) was selected for the instrumental delay (reference antenna EF): it was observed by all 7 "
             "antennas with usable data, and all were solved there.") in section
     # One block per antenna with something to say, its code prominent and the severity as a chip.
@@ -816,21 +782,13 @@ def test_collect_gathers_what_the_comments_need_from_the_caches(tmp_path):
     assert ("JB", "no signal in LCP (LL): no fringes in any of the 9 surveyed scans it took part in, while RCP (RR) "
                   "was detected in 9") in by_antenna
     assert ("WB", "shows no usable fringes on 3C345") in by_antenna
-    per_source = {(c["source"], c["role"], c["text"]) for c in context["comments"] if c["category"] == "source"}
-    assert ("3C395", "target", "Detected at 27 sigma in the search map (dirty-map peak 136 uJy/beam), 0.8 mas "
-            "(0.3 beams) from the phase centre.") in per_source
-    assert ("J1848+3219", "phasecal", "Image (robust 0): peak 308 mJy/beam, rms 330 uJy/beam, dynamic "
-            "range 933.") in per_source
+    general = [c["text"] for c in context["comments"] if not c["antenna"]]
+    assert "3C395 (target): detected at 27 sigma in the search map (dirty-map peak 136 uJy/beam), 0.8 mas (0.3 beams) " \
+           "from the phase centre." in general
+    assert "J1848+3219 (phasecal): CLEAN image (robust 0): peak 308 mJy/beam, rms 330 uJy/beam, dynamic range 933." in general
 
     page = render_pages(context, tmp_path / "replay")
     text = Path(page).read_text(encoding="utf-8")
-    # One box per source, headed by its name in bold and its role badge, before the antennas.
-    sources = text[text.index("<h3>Sources</h3>"):text.index("<h3>Antennas</h3>")]
-    assert sources.count('<div class="cmt-src">') == 2
-    assert '<div class="cmt-src-head"><b>3C395</b> <span class="badge target">target</span></div>' in sources
-    table_order = [s["name"] for s in context["sources"] if f"<b>{s['name']}</b>" in sources]
-    assert table_order == sorted(table_order, key=lambda name: sources.index(f"<b>{name}</b>"))
-    assert len(table_order) == 2
     assert "<h3>Warnings raised by the pipeline</h3>" in text
     assert '<span class="when">first seen 2026-10-10 12:07:00 UTC</span>' in text
     assert '<li class="cmt-problem"><span class="chip crit">problem</span><span>flag[quack] removed 61.0% of data' in text

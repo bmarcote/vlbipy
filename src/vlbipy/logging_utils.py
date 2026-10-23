@@ -4,12 +4,6 @@ Provides a configured colored logger (orange/yellow warnings, red-bold errors)
 and a :class:`WarningCollector` that aggregates warnings and anomalies during a
 run so a summary can be printed at the end and embedded in reports.
 
-At the default console level (``INFO``) the terminal shows only the main line of
-each step (:func:`headline`, in bold), anomalies and errors; every other message,
-warnings included, goes to the run log (:func:`add_file_log`) and the warnings to
-the end-of-run summary. ``DEBUG`` (``vlbipy -v``) shows everything; any other level
-is a plain threshold.
-
 loguru is used per project convention for this (complex) program. Configuration
 is centralised here so the logging backend stays swappable.
 """
@@ -23,9 +17,7 @@ _CONFIGURED = False
 _CONSOLE_LEVEL = "INFO"
 #: The :func:`logging_setup` this (worker) process was last attached to, so re-attaching is free.
 _ATTACHED: dict = {}
-#: Console format of ordinary records and of step headlines (:func:`headline`).
-_FORMAT = "<level>{message}</level>\n{exception}"
-_HEADLINE_FORMAT = "<bold>{message}</bold>\n{exception}"
+_FORMAT = "<level>{message}</level>"
 #: File sink format: timestamped and level-tagged, so a run can be audited afterwards.
 _FILE_FORMAT = "{time:YYYY-MM-DD HH:mm:ss} | {level: <7} | {message}"
 #: Log files already attached, keyed by directory, so re-entry does not duplicate sinks.
@@ -45,42 +37,11 @@ def configure_logging(level: str = "INFO") -> None:
     """
     global _CONFIGURED, _CONSOLE_LEVEL
     _logger.remove()
-    _logger.level("INFO", color="<normal>")
     _logger.level("WARNING", color="<yellow>")
     _logger.level("ERROR", color="<red><bold>")
-    _logger.add(sys.stderr, level=level, format=_console_format, colorize=True,
-                filter=_steps_only if str(level).upper() == "INFO" else None)
+    _logger.add(sys.stderr, level=level, format=_FORMAT, colorize=True)
     _CONFIGURED = True
     _CONSOLE_LEVEL = level
-
-
-def _console_format(record) -> str:
-    """Bold for a step headline, the level's colour otherwise."""
-    return _HEADLINE_FORMAT if record["extra"].get("headline") else _FORMAT
-
-
-def _steps_only(record) -> bool:
-    """The console filter of the default level: headlines, anomalies and errors (the rest is in the run log)."""
-    extra = record["extra"]
-    return bool(extra.get("headline") or extra.get("anomaly")) or record["level"].no >= _logger.level("ERROR").no
-
-
-def headline(message: str, *args) -> None:
-    """Log the main line of a step: shown in bold on the console at the default level (and in the run log).
-
-    Parameters
-    ----------
-    message : str
-        loguru format string.
-    *args
-        Its arguments.
-    """
-    get_logger().opt(depth=1).bind(headline=True).info(message, *args)
-
-
-def run_logs() -> list[Path]:
-    """The run log files this process writes (see :func:`add_file_log`)."""
-    return sorted(sink["path"] for sink in _FILE_SINKS.values())
 
 
 def add_file_log(log_dir, project_code: str = "", level: str = "DEBUG"):
@@ -121,7 +82,7 @@ def add_file_log(log_dir, project_code: str = "", level: str = "DEBUG"):
     sink_id = _logger.add(str(path), level=level, format=_FILE_FORMAT, colorize=False,
                           enqueue=False, backtrace=True, diagnose=False)
     _FILE_SINKS[str(directory.resolve())] = {"path": path, "id": sink_id}
-    _logger.bind(headline=True).info("logging this run to {}", path)
+    _logger.info("logging this run to {}", path)
     return path
 
 
@@ -185,8 +146,8 @@ class WarningCollector:
         self._items.append(message)
 
     def anomaly(self, message: str) -> None:
-        """Log a prominent anomaly (shown on the console at every level) and record it for the summary."""
-        get_logger().bind(anomaly=True).warning("ANOMALY: {}", message)
+        """Log a prominent anomaly and record it for the summary."""
+        get_logger().warning("ANOMALY: {}", message)
         self._items.append("ANOMALY: " + message)
 
     def summary(self) -> list[str]:

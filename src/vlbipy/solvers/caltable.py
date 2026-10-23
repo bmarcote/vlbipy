@@ -9,15 +9,15 @@ The layout mirrors what CASA 6.7 ``fringefit`` writes (see /tmp/vlbipy_spec/frin
   channel per spw (the solution reference frequency).  Subtables are registered as table keywords with the
   casacore "Table: <absolute path>" string form.
 
-Tables are written and read with :mod:`vlbipy.casacore_format` (no casacore library): the column descriptions below
-are casacore's dict form (shapes in Fortran order, as casatools takes them), converted by :func:`_columns`. All
-columns go into one StandardStMan named MSMTAB, like CASA's; subtables are linked by relative ``././NAME``
-keywords and reported as ``Table: <absolute path>`` like casatools does.
+Only the casatools ``table`` tool is used, imported lazily so this module imports without casatools.
+casatools quirks handled here: ``putcol``/``getcol`` use Fortran (column-major) order, so a (nrow, 1, 8) array is
+written as its transpose (8, 1, nrow) and read back with ``.T``; float columns are returned as float64 by getcol.
 """
 
 from __future__ import annotations
 
 import logging
+import shutil
 import time
 from pathlib import Path
 
@@ -114,64 +114,41 @@ def _dminfo(columns):
                    "TYPE": "StandardStMan"}}
 
 
-def _columns(desc: dict) -> list:
-    """casacore dict column descriptions -> :class:`vlbipy.casacore_format.tabledat.ColumnDesc` list (same order)."""
-    from ..casacore_format.tabledat import ColumnDesc
-    from ..casacore_format.writer import VALUE_TYPES
-    columns = []
-    for name, item in desc.items():
-        is_array = "ndim" in item
-        shape = item.get("shape")
-        columns.append(ColumnDesc(name=name, dtype=VALUE_TYPES[item["valueType"]], is_array=is_array,
-                                  comment=item.get("comment", ""), option=int(item.get("option", 0)),
-                                  ndim=int(item.get("ndim", 0)),
-                                  shape=tuple(int(n) for n in shape) if shape is not None else None,
-                                  maxlen=int(item.get("maxlen", 0)), keywords=_keywords(item.get("keywords", {}))))
-    return columns
-
-
-def _keywords(keywords: dict) -> dict:
-    """Keyword values in the types the native writer stores (numpy string arrays -> lists of str)."""
-    out = {}
-    for key, value in keywords.items():
-        if isinstance(value, dict):
-            out[key] = _keywords(value)
-        elif isinstance(value, np.ndarray) and value.dtype.kind in "US":
-            out[key] = [str(v) for v in value]
-        else:
-            out[key] = value
-    return out
-
-
-def _create(path, desc: dict, nrow: int, values: dict, *, keywords=None, info=("", "")) -> Path:
-    """Create a table of ``desc`` columns (one StandardStMan, MSMTAB, like CASA) holding ``values``."""
-    from ..casacore_format.writer import create_table
-    return create_table(path, _columns(desc), nrow, values, keywords=keywords, info=info, manager_name="MSMTAB")
-
-
 def _copy_subtable(ms_path, name, dest_dir):
     """Deep-copy MS subtable `name` into `dest_dir`/`name` and return its absolute path.
 
-    Copied value by value (:func:`vlbipy.casacore_format.writer.copy_table`): a plain file copy of the subtable of
-    a Multi-MS (a link into its first part) leaves the rows recorded only in the source's ``table.lock``; reading
-    it through the table layer gives the rows casacore sees.
+    The rows are copied value by value: a file copy would carry over a ``table.dat`` that CASA's import can
+    leave out of date (the current number of rows then lives only in the table's lock file).
     """
-    from ..casacore_format.writer import copy_table
-    return copy_table(Path(ms_path) / name, Path(dest_dir) / name).absolute()
+    import casatools
+
+    src = Path(ms_path) / name
+    dest = Path(dest_dir) / name
+    tb = casatools.table()
+    tb.open(str(src))
+    copied = tb.copy(str(dest), deep=True, valuecopy=True)
+    copied.close()
+    tb.close()
+    return dest
 
 
 def _read_ms_spw_scalars(ms_path):
     """Read the per-spw scalar columns copied verbatim from the MS SPECTRAL_WINDOW table. Returns (nspw, dict)."""
-    from ..casacore_format.table import Table
-    with Table(Path(ms_path) / "SPECTRAL_WINDOW") as table:
-        nspw = table.nrows()
-        present = set(table.colnames())
-        values = {col: table.getcol(col) for col in SPW_COPIED_SCALARS if col in present}
+    import casatools
+
+    tb = casatools.table()
+    tb.open(str(Path(ms_path) / "SPECTRAL_WINDOW"))
+    nspw = tb.nrows()
+    present = set(tb.colnames())
+    values = {col: tb.getcol(col) for col in SPW_COPIED_SCALARS if col in present}
+    tb.close()
     return nspw, values
 
 
 def _write_spectral_window(dest_dir, ms_path, spw_chan_freq, spw_chan_width):
     """Create the single-channel SPECTRAL_WINDOW subtable from the MS one; returns its absolute path."""
+    import casatools
+
     chan_freq = np.asarray(spw_chan_freq, dtype=np.float64).reshape(-1)
     chan_width = np.asarray(spw_chan_width, dtype=np.float64).reshape(-1)
     nspw, scalars = _read_ms_spw_scalars(ms_path)
@@ -179,28 +156,37 @@ def _write_spectral_window(dest_dir, ms_path, spw_chan_freq, spw_chan_width):
         raise ValueError(f"spw_chan_freq/spw_chan_width must have {nspw} entries (MS spws), got "
                          f"{chan_freq.shape[0]}/{chan_width.shape[0]}")
     dest = Path(dest_dir) / "SPECTRAL_WINDOW"
+    desc = spectral_window_table_desc()
+    tb = casatools.table()
+    tb.create(str(dest), desc, dminfo=_dminfo(list(desc)))
+    tb.addrows(nspw)
     defaults = {"REF_FREQUENCY": chan_freq, "MEAS_FREQ_REF": np.full(nspw, 5, dtype=np.int32),
                 "FLAG_ROW": np.zeros(nspw, dtype=bool), "FREQ_GROUP": np.zeros(nspw, dtype=np.int32),
-                "FREQ_GROUP_NAME": [""] * nspw, "IF_CONV_CHAIN": np.zeros(nspw, dtype=np.int32),
-                "NAME": [""] * nspw, "NET_SIDEBAND": np.ones(nspw, dtype=np.int32),
+                "FREQ_GROUP_NAME": np.array([""] * nspw), "IF_CONV_CHAIN": np.zeros(nspw, dtype=np.int32),
+                "NAME": np.array([""] * nspw), "NET_SIDEBAND": np.ones(nspw, dtype=np.int32),
                 "TOTAL_BANDWIDTH": np.abs(chan_width)}
-    values = {col: scalars.get(col, defaults[col]) for col in SPW_COPIED_SCALARS}
-    values.update({"NUM_CHAN": np.ones(nspw, dtype=np.int32), "CHAN_FREQ": chan_freq.reshape(nspw, 1),
-                   "CHAN_WIDTH": chan_width.reshape(nspw, 1), "EFFECTIVE_BW": np.abs(chan_width).reshape(nspw, 1),
-                   "RESOLUTION": np.abs(chan_width).reshape(nspw, 1)})
-    return _create(dest, spectral_window_table_desc(), nspw, values).absolute()
+    for col in SPW_COPIED_SCALARS:
+        tb.putcol(col, scalars.get(col, defaults[col]))
+    tb.putcol("NUM_CHAN", np.ones(nspw, dtype=np.int32))
+    # Fortran order: a (nspw, 1) per-row array column is passed as shape (1, nspw).
+    tb.putcol("CHAN_FREQ", chan_freq.reshape(1, nspw))
+    tb.putcol("CHAN_WIDTH", chan_width.reshape(1, nspw))
+    tb.putcol("EFFECTIVE_BW", np.abs(chan_width).reshape(1, nspw))
+    tb.putcol("RESOLUTION", np.abs(chan_width).reshape(1, nspw))
+    tb.close()
+    return dest
 
 
-def _write_history_table(dest_dir, rows: int = 0, values=None):
-    """Create the HISTORY subtable in `dest_dir` (empty unless rows/values are given); returns its absolute path."""
+def _write_history_table(dest_dir):
+    """Create an empty HISTORY subtable in `dest_dir`; returns its absolute path."""
+    import casatools
+
     dest = Path(dest_dir) / "HISTORY"
-    return _create(dest, history_table_desc(), rows, values or {}).absolute()
-
-
-def _link_subtables(path, names) -> dict:
-    """Table keywords linking subtables ``names`` of the table at ``path`` (relative, as CASA writes them)."""
-    from ..casacore_format.aipsio import TableRef
-    return {name: TableRef(f"././{name}") for name in names}
+    desc = history_table_desc()
+    tb = casatools.table()
+    tb.create(str(dest), desc, dminfo=_dminfo(list(desc)))
+    tb.close()
+    return dest
 
 
 def _as_param_array(name, values, nrow, dtype):
@@ -231,6 +217,8 @@ def write_fringe_table(path, ms_path, *, times, field_ids, spw_ids, antenna_ids,
     ANTENNA/FIELD/OBSERVATION are copied from `ms_path`.  WEIGHT is left undefined, as CASA does.
     Returns the absolute path of the written table.
     """
+    import casatools
+
     path = Path(path).absolute()
     ms_path = Path(ms_path)
     nrow = int(np.asarray(times).reshape(-1).shape[0])
@@ -249,18 +237,33 @@ def write_fringe_table(path, ms_path, *, times, field_ids, spw_ids, antenna_ids,
               "SNR": _as_param_array("snr", snr, nrow, np.float32),
               "FLAG": _as_param_array("flag", flag, nrow, bool)}
 
+    if path.exists():
+        shutil.rmtree(path)
     logger.info("Writing fringe caltable %s (%d rows, MS %s)", path, nrow, ms_path)
-    values = dict(columns)
-    values.update({name: array.reshape(nrow, 1, NPARAM) for name, array in params.items()})     # (1, 8) cells
-    subtables = ("OBSERVATION", "ANTENNA", "FIELD", "SPECTRAL_WINDOW", "HISTORY")
-    keywords = {"ParType": "Float", "MSName": ms_path.name, "VisCal": "Fringe Jones", "PolBasis": "unknown",
-                "CASA_Version": str(casa_version)}
-    keywords.update(_link_subtables(path, subtables))
-    _create(path, main_table_desc(), nrow, values, keywords=keywords, info=("Calibration", "Fringe Jones"))
-    for name in ("OBSERVATION", "ANTENNA", "FIELD"):
-        _copy_subtable(ms_path, name, path)
-    _write_spectral_window(path, ms_path, spw_chan_freq, spw_chan_width)
-    _write_history_table(path)
+    desc = main_table_desc()
+    tb = casatools.table()
+    tb.create(str(path), desc, dminfo=_dminfo(MAIN_COLUMNS))
+    tb.addrows(nrow)
+    for name, values in columns.items():
+        tb.putcol(name, values)
+    # casatools expects Fortran order: cell shape (1, 8) over nrow rows is passed as (8, 1, nrow).
+    for name, values in params.items():
+        tb.putcol(name, values.reshape(nrow, 1, NPARAM).T)
+    tb.putinfo({"type": "Calibration", "subType": "Fringe Jones", "readme": ""})
+    tb.putkeyword("ParType", "Float")
+    tb.putkeyword("MSName", ms_path.name)
+    tb.putkeyword("VisCal", "Fringe Jones")
+    tb.putkeyword("PolBasis", "unknown")
+    tb.putkeyword("CASA_Version", str(casa_version))
+    tb.close()
+
+    subtables = {name: _copy_subtable(ms_path, name, path) for name in ("OBSERVATION", "ANTENNA", "FIELD")}
+    subtables["SPECTRAL_WINDOW"] = _write_spectral_window(path, ms_path, spw_chan_freq, spw_chan_width)
+    subtables["HISTORY"] = _write_history_table(path)
+    tb.open(str(path), nomodify=False)
+    for name, sub_path in subtables.items():
+        tb.putkeyword(name, f"Table: {sub_path}")
+    tb.close()
     return path
 
 
@@ -278,21 +281,22 @@ def write_jones_table(path, ms_path, *, viscal, times, field_ids, spw_ids, anten
     ``refant_ids`` fills ANTENNA2 with the reference antenna of each row, as CASA
     does (-1 when omitted).
     """
+    import casatools
+
     path, ms_path = Path(path).absolute(), Path(ms_path).absolute()
     if (cparam is None) == (fparam is None):
         raise ValueError("give exactly one of cparam and fparam")
     real = fparam is not None
-    param_values = np.asarray(fparam, dtype=np.float32) if real else np.asarray(cparam, dtype=np.complex64)
+    values = np.asarray(fparam, dtype=np.float32) if real else np.asarray(cparam, dtype=np.complex64)
     param_column = "FPARAM" if real else "CPARAM"
     nrow = int(np.asarray(times).size)
-    if param_values.ndim != 3 or param_values.shape[0] != nrow:
-        raise ValueError(f"{param_column.lower()} must have shape (nrow, nchan, npol), got {param_values.shape}")
-    nchan, npol = param_values.shape[1:]
+    if values.ndim != 3 or values.shape[0] != nrow:
+        raise ValueError(f"{param_column.lower()} must have shape (nrow, nchan, npol), got {values.shape}")
+    nchan, npol = values.shape[1:]
     flags = np.asarray(flag, dtype=bool)
     snrs = np.asarray(snr, dtype=np.float32)
-    errors = (np.zeros(param_values.shape, dtype=np.float32) if paramerr is None
-              else np.asarray(paramerr, dtype=np.float32))
-    if flags.shape != param_values.shape or snrs.shape != param_values.shape or errors.shape != param_values.shape:
+    errors = np.zeros(values.shape, dtype=np.float32) if paramerr is None else np.asarray(paramerr, dtype=np.float32)
+    if flags.shape != values.shape or snrs.shape != values.shape or errors.shape != values.shape:
         raise ValueError("flag, snr and paramerr must match cparam shape")
     if (spw_chan_freq is None) != (spw_chan_width is None):
         raise ValueError("spw_chan_freq and spw_chan_width must be given together")
@@ -318,20 +322,33 @@ def write_jones_table(path, ms_path, *, viscal, times, field_ids, spw_ids, anten
             "FLAG": _array_column("boolean", ndim=2, shape=[npol, nchan]),
             "SNR": _array_column("float", ndim=2, shape=[npol, nchan]),
             "WEIGHT": _array_column("float", ndim=2, shape=[npol, nchan])}
-    values = dict(vectors)
-    values.update({param_column: np.ascontiguousarray(param_values), "PARAMERR": errors, "FLAG": flags, "SNR": snrs,
-                   "WEIGHT": np.where(flags, 0.0, 1.0).astype(np.float32)})
-    keywords = {"ParType": "Float" if real else "Complex", "MSName": ms_path.name, "VisCal": viscal,
-                "PolBasis": "unknown", "CASA_Version": "vlbipy"}
-    keywords.update(_link_subtables(path, ("OBSERVATION", "ANTENNA", "FIELD", "SPECTRAL_WINDOW", "HISTORY")))
-    _create(path, desc, nrow, values, keywords=keywords, info=("Calibration", viscal))
-    for name in ("OBSERVATION", "ANTENNA", "FIELD"):
-        _copy_subtable(ms_path, name, path)
+    columns = list(desc)
+    if path.exists():
+        shutil.rmtree(path)
+    tb = casatools.table()
+    tb.create(str(path), desc, dminfo=_dminfo(columns))
+    tb.addrows(nrow)
+    for name, column in vectors.items():
+        tb.putcol(name, column)
+    for name, column in ((param_column, values), ("PARAMERR", errors), ("FLAG", flags), ("SNR", snrs),
+                         ("WEIGHT", np.where(flags, 0.0, 1.0).astype(np.float32))):
+        tb.putcol(name, np.asfortranarray(column.transpose(2, 1, 0)))
+    tb.putinfo({"type": "Calibration", "subType": viscal, "readme": ""})
+    for key, value in {"ParType": "Float" if real else "Complex", "MSName": ms_path.name, "VisCal": viscal,
+                       "PolBasis": "unknown", "CASA_Version": "vlbipy"}.items():
+        tb.putkeyword(key, value)
+    tb.close()
+
+    subtables = {name: _copy_subtable(ms_path, name, path) for name in ("OBSERVATION", "ANTENNA", "FIELD")}
     if spw_chan_freq is None:
-        _copy_subtable(ms_path, "SPECTRAL_WINDOW", path)
+        subtables["SPECTRAL_WINDOW"] = _copy_subtable(ms_path, "SPECTRAL_WINDOW", path)
     else:
-        _write_spectral_window(path, ms_path, spw_chan_freq, spw_chan_width)
-    _write_history_table(path)
+        subtables["SPECTRAL_WINDOW"] = _write_spectral_window(path, ms_path, spw_chan_freq, spw_chan_width)
+    subtables["HISTORY"] = _write_history_table(path)
+    tb.open(str(path), nomodify=False)
+    for name, sub_path in subtables.items():
+        tb.putkeyword(name, f"Table: {sub_path}")
+    tb.close()
     return path
 
 
@@ -340,59 +357,60 @@ def read_fringe_table(path) -> dict:
 
     Returns a dict with every main column as a numpy array (FPARAM/PARAMERR/SNR float32 and FLAG bool back in
     C-order (nrow, 8); WEIGHT only if defined), plus "antenna_names" (ANTENNA subtable NAME), "spw_chan_freq"
-    (nspw,) and "spw_chan_width" (nspw,) from the SPECTRAL_WINDOW subtable, "keywords" (table keywords, subtables
-    as ``"Table: <absolute path>"``) and "info" (``type``, ``subType``, ``readme``).
+    (nspw,) and "spw_chan_width" (nspw,) from the SPECTRAL_WINDOW subtable, "keywords" (table keywords) and
+    "info" (table info dict).
     """
-    from ..casacore_format.table import Table
+    import casatools
 
     path = Path(path).absolute()
-    with Table(path) as table:
-        nrow = table.nrows()
-        out = {"nrow": nrow, "keywords": table.getkeywords(), "info": table.info()}
-        for name in ("TIME", "INTERVAL"):
-            out[name] = np.asarray(table.getcol(name), dtype=np.float64)
-        for name in ("FIELD_ID", "SPECTRAL_WINDOW_ID", "ANTENNA1", "ANTENNA2", "SCAN_NUMBER", "OBSERVATION_ID"):
-            out[name] = np.asarray(table.getcol(name), dtype=np.int32)
-        for name, dtype in (("FPARAM", np.float32), ("PARAMERR", np.float32), ("SNR", np.float32), ("FLAG", bool)):
-            if nrow == 0:
-                out[name] = np.zeros((0, NPARAM), dtype=dtype)
-                continue
-            out[name] = np.ascontiguousarray(np.asarray(table.getcol(name)).reshape(nrow, -1), dtype=dtype)
-        if nrow > 0 and "WEIGHT" in table.colnames():
-            weight = table.getcol("WEIGHT")
-            if isinstance(weight, np.ndarray):
-                out["WEIGHT"] = np.ascontiguousarray(weight.reshape(nrow, -1), dtype=np.float32)
-    with Table(path / "ANTENNA") as table:
-        out["antenna_names"] = np.asarray(table.getcol("NAME"), dtype=str)
-    with Table(path / "SPECTRAL_WINDOW") as table:
-        nspw = table.nrows()
-        out["spw_chan_freq"] = np.array([np.asarray(table.getcell("CHAN_FREQ", i)).reshape(-1)[0] for i in range(nspw)])
-        out["spw_chan_width"] = np.array([np.asarray(table.getcell("CHAN_WIDTH", i)).reshape(-1)[0]
-                                          for i in range(nspw)])
+    tb = casatools.table()
+    tb.open(str(path))
+    nrow = tb.nrows()
+    out = {"nrow": nrow, "keywords": tb.getkeywords(), "info": tb.info()}
+    for name in ("TIME", "INTERVAL"):
+        out[name] = np.asarray(tb.getcol(name), dtype=np.float64)
+    for name in ("FIELD_ID", "SPECTRAL_WINDOW_ID", "ANTENNA1", "ANTENNA2", "SCAN_NUMBER", "OBSERVATION_ID"):
+        out[name] = np.asarray(tb.getcol(name), dtype=np.int32)
+    for name, dtype in (("FPARAM", np.float32), ("PARAMERR", np.float32), ("SNR", np.float32), ("FLAG", bool)):
+        if nrow == 0:
+            out[name] = np.zeros((0, NPARAM), dtype=dtype)
+            continue
+        out[name] = np.ascontiguousarray(np.asarray(tb.getcol(name)).T.reshape(nrow, -1), dtype=dtype)
+    if nrow > 0 and tb.iscelldefined("WEIGHT", 0):
+        out["WEIGHT"] = np.ascontiguousarray(np.asarray(tb.getcol("WEIGHT")).T.reshape(nrow, -1), dtype=np.float32)
+    tb.close()
+
+    tb.open(str(path / "ANTENNA"))
+    out["antenna_names"] = np.asarray(tb.getcol("NAME"), dtype=str)
+    tb.close()
+    tb.open(str(path / "SPECTRAL_WINDOW"))
+    nspw = tb.nrows()
+    out["spw_chan_freq"] = np.array([np.asarray(tb.getcell("CHAN_FREQ", i)).reshape(-1)[0] for i in range(nspw)])
+    out["spw_chan_width"] = np.array([np.asarray(tb.getcell("CHAN_WIDTH", i)).reshape(-1)[0] for i in range(nspw)])
+    tb.close()
     return out
 
 
 def write_history(path, message, origin="vlbipy", application="vlbipy", priority="INFO"):
     """Append one row to the HISTORY subtable of the caltable at `path` with TIME = now (MJD seconds, UTC).
 
-    APP_PARAMS and CLI_COMMAND (variable-length string arrays) are written as empty string arrays. The subtable is
-    small, so it is rewritten with the new row added.
+    APP_PARAMS and CLI_COMMAND (variable-length string arrays) are written as empty string arrays.
     """
-    from ..casacore_format.table import Table
+    import casatools
 
     hist = Path(path).absolute() / "HISTORY"
-    desc = history_table_desc()
-    with Table(hist) as table:
-        nrow = table.nrows()
-        values = {name: list(table.getcol(name)) if nrow else [] for name in desc}
-    row = {"APPLICATION": str(application), "MESSAGE": str(message), "ORIGIN": str(origin),
-           "PRIORITY": str(priority), "TIME": MJD_UNIX_EPOCH_SECONDS + time.time(), "OBSERVATION_ID": 0,
-           "OBJECT_ID": 0, "APP_PARAMS": np.array([], dtype=object), "CLI_COMMAND": np.array([], dtype=object)}
-    for name in desc:
-        values[name].append(row[name])
-    for name in ("TIME",):
-        values[name] = np.asarray(values[name], dtype=np.float64)
-    for name in ("OBSERVATION_ID", "OBJECT_ID"):
-        values[name] = np.asarray(values[name], dtype=np.int32)
-    _write_history_table(Path(path).absolute(), nrow + 1, values)
+    tb = casatools.table()
+    tb.open(str(hist), nomodify=False)
+    row = tb.nrows()
+    tb.addrows(1)
+    tb.putcell("APPLICATION", row, str(application))
+    tb.putcell("MESSAGE", row, str(message))
+    tb.putcell("ORIGIN", row, str(origin))
+    tb.putcell("PRIORITY", row, str(priority))
+    tb.putcell("TIME", row, MJD_UNIX_EPOCH_SECONDS + time.time())
+    tb.putcell("OBSERVATION_ID", row, 0)
+    tb.putcell("OBJECT_ID", row, 0)
+    tb.putcell("APP_PARAMS", row, np.array([], dtype=str))
+    tb.putcell("CLI_COMMAND", row, np.array([], dtype=str))
+    tb.close()
     logger.info("Appended HISTORY row to %s: %s", hist, message)

@@ -762,58 +762,70 @@ class CasaDataOps(DataOps):
         participating antennas, subbands, integration time), the frequency setup
         and the sources that actually have data. Array geometry (baseline lengths,
         resolution) is derived from this by :class:`~vlbipy.models.ObsMetadata`.
-        The msmd quantities come from :meth:`_ms_summary` (the dask-ms backend reads them natively).
         """
         ms = self.backend.ms_path(project_code)
-        summary = self._ms_summary(ms)
-        antenna_names = summary["antenna_names"]
-        telescope = summary["telescopes"][0] if summary["telescopes"] else ""
-        # Accept aliases (e.g. VLBA and LBA observations recorded under other telescope names).
-        expected = {observatory.upper()} | _TELESCOPE_ALIASES.get(observatory.upper(), set())
-        if telescope and observatory and telescope.upper() not in expected:
-            logger.warning("observatory mismatch: config says {} but the MS says {}",
-                           observatory, telescope)
+        msmd = self.backend.tools.msmetadata()
+        if not msmd.open(str(ms)):
+            raise BackendError(f"could not open MS {ms}")
+        try:
+            antenna_names = list(msmd.antennanames())
+            telescope = msmd.observatorynames()[0] if msmd.observatorynames() else ""
+            # DiFX labels every array it correlates "VLBA", so an LBA dataset saying so is expected.
+            expected = {observatory.upper()} | _TELESCOPE_ALIASES.get(observatory.upper(), set())
+            if telescope and observatory and telescope.upper() not in expected:
+                logger.warning("observatory mismatch: config says {} but the MS says {}",
+                               observatory, telescope)
 
-        field_names = summary["field_names"]
-        source_coords: dict[str, tuple[float, float]] = {}
-        for i, name in enumerate(field_names):
-            ra_deg = float(summary["phase_dirs"][i][0]) * 180.0 / math.pi
-            dec_deg = float(summary["phase_dirs"][i][1]) * 180.0 / math.pi
-            source_coords[name] = (ra_deg % 360.0, dec_deg)
+            field_names = list(msmd.fieldnames())
+            source_coords: dict[str, tuple[float, float]] = {}
+            for i, name in enumerate(field_names):
+                center = msmd.phasecenter(i)
+                to_deg = (180.0 / math.pi) if center["m0"].get("unit", "rad") == "rad" else 1.0
+                ra_deg = float(center["m0"]["value"]) * to_deg
+                dec_deg = float(center["m1"]["value"]) * to_deg
+                source_coords[name] = (ra_deg % 360.0, dec_deg)
 
-        t_start, t_end = summary["time_range"]
-        obs_date = (dt.datetime(1858, 11, 17) + dt.timedelta(seconds=t_start)).date()
+            timerange = msmd.timerangeforobs(0)
+            t_start = float(timerange["begin"]["m0"]["value"]) * 86400.0
+            t_end = float(timerange["end"]["m0"]["value"]) * 86400.0
+            obs_date = (dt.datetime(1858, 11, 17) + dt.timedelta(seconds=t_start)).date()
 
-        chan_freq = summary["chan_freq"]
-        n_spw = len(chan_freq)
-        mean_freq = (float(np.mean(chan_freq[0])) + float(np.mean(chan_freq[n_spw - 1]))) / 2.0
-        freq = FreqSetup(ref_freq=float(mean_freq), total_bandwidth=float(np.sum(summary["bandwidths"])),
-                         n_subbands=n_spw, n_channels=int(len(chan_freq[0])),
-                         channel_width=float(abs(summary["chan_width"][0][0])),
-                         polarizations=[Stokes(int(c)) for c in summary["corr_types"] if 0 <= int(c) <= 12],
-                         channel_freqs=[[float(f) for f in chan_freq[s]] for s in range(n_spw)])
+            n_spw = int(msmd.nspw())
+            mean_freq = (msmd.meanfreq(0) + msmd.meanfreq(n_spw - 1)) / 2.0
+            bandwidths = msmd.bandwidths()
+            freq = FreqSetup(ref_freq=float(mean_freq),
+                             total_bandwidth=float(sum(bandwidths)) if hasattr(bandwidths, "__len__")
+                             else float(bandwidths) * n_spw,
+                             n_subbands=n_spw, n_channels=int(msmd.nchan(0)),
+                             channel_width=float(abs(msmd.chanwidths(0)[0])),
+                             polarizations=[Stokes(int(c)) for c in msmd.corrtypesforpol(0)
+                                            if 0 <= int(c) <= 12],
+                             channel_freqs=[[float(f) for f in msmd.chanfreqs(s)]
+                                            for s in range(n_spw)])
 
-        scans: list[Scan] = []
-        observed: set[str] = set()
-        observed_fields: set[int] = set()
-        scan_counts: dict[str, int] = {}
-        for scan_number in sorted(summary["scans"]):
-            entry = summary["scans"][scan_number]
-            scan_fields = entry["fields"]
-            observed_fields.update(int(f) for f in scan_fields)
-            source = field_names[int(scan_fields[0])] if len(scan_fields) else ""
-            times = np.asarray(entry["times"])
-            ants = [antenna_names[a] for a in entry["antennas"]]
-            observed.update(ants)
-            for ant in ants:
-                scan_counts[ant] = scan_counts.get(ant, 0) + 1
-            scans.append(Scan(scan_number=int(scan_number), source=source,
-                              time_start=float(times.min()) if len(times) else 0.0,
-                              time_end=float(times.max()) if len(times) else 0.0,
-                              antennas=ants, integration_time=float(entry["exposure"]),
-                              subbands=tuple(int(s) for s in entry["spws"])))
+            scans: list[Scan] = []
+            observed: set[str] = set()
+            observed_fields: set[int] = set()
+            scan_counts: dict[str, int] = {}
+            for scan_number in msmd.scannumbers():
+                scan_fields = msmd.fieldsforscan(scan_number)
+                observed_fields.update(int(f) for f in scan_fields)
+                source = field_names[int(scan_fields[0])] if len(scan_fields) else ""
+                times = msmd.timesforscan(scan_number)
+                ants = [antenna_names[a] for a in msmd.antennasforscan(scan_number)]
+                observed.update(ants)
+                for ant in ants:
+                    scan_counts[ant] = scan_counts.get(ant, 0) + 1
+                scans.append(Scan(scan_number=int(scan_number), source=source,
+                                  time_start=float(times.min()) if len(times) else 0.0,
+                                  time_end=float(times.max()) if len(times) else 0.0,
+                                  antennas=ants,
+                                  integration_time=self._exposure_time(msmd, scan_number),
+                                  subbands=tuple(int(s) for s in msmd.spwsforscan(scan_number))))
+        finally:
+            msmd.close()
 
-        # Keep only the fields that actually have data (FIELD lists every scheduled source).
+        # The FIELD table lists every scheduled source; keep only those with actual data.
         source_ids = {field_names[i]: i for i in sorted(observed_fields) if i < len(field_names)}
         source_names = list(source_ids)
         source_coords = {name: source_coords[name] for name in source_names if name in source_coords}
@@ -834,40 +846,6 @@ class CasaDataOps(DataOps):
                     meta.max_baseline / 1e3, meta.resolution_mas,
                     meta.min_baseline / 1e3, meta.largest_angular_scale_mas)
         return meta
-
-    def _ms_summary(self, ms: Path) -> dict:
-        """The msmd quantities :meth:`get_metadata` needs (see :func:`vlbipy.solvers.ms_metadata.ms_summary`)."""
-        msmd = self.backend.tools.msmetadata()
-        if not msmd.open(str(ms)):
-            raise BackendError(f"could not open MS {ms}")
-        try:
-            field_names = list(msmd.fieldnames())
-            phase_dirs = []
-            for i in range(len(field_names)):
-                center = msmd.phasecenter(i)
-                to_rad = 1.0 if center["m0"].get("unit", "rad") == "rad" else math.pi / 180.0
-                phase_dirs.append((float(center["m0"]["value"]) * to_rad, float(center["m1"]["value"]) * to_rad))
-            timerange = msmd.timerangeforobs(0)
-            n_spw = int(msmd.nspw())
-            bandwidths = msmd.bandwidths()
-            scans = {}
-            for scan_number in msmd.scannumbers():
-                scans[int(scan_number)] = {"fields": np.asarray(msmd.fieldsforscan(scan_number), dtype=int),
-                                           "times": np.asarray(msmd.timesforscan(scan_number), dtype=float),
-                                           "antennas": np.asarray(msmd.antennasforscan(scan_number), dtype=int),
-                                           "spws": np.asarray(msmd.spwsforscan(scan_number), dtype=int),
-                                           "exposure": self._exposure_time(msmd, scan_number)}
-            return {"antenna_names": list(msmd.antennanames()), "telescopes": list(msmd.observatorynames()),
-                    "field_names": field_names, "phase_dirs": np.asarray(phase_dirs).reshape(-1, 2),
-                    "time_range": (float(timerange["begin"]["m0"]["value"]) * 86400.0,
-                                   float(timerange["end"]["m0"]["value"]) * 86400.0),
-                    "chan_freq": [np.asarray(msmd.chanfreqs(s), dtype=float) for s in range(n_spw)],
-                    "chan_width": [np.asarray(msmd.chanwidths(s), dtype=float) for s in range(n_spw)],
-                    "bandwidths": (np.asarray(bandwidths, dtype=float) if hasattr(bandwidths, "__len__")
-                                   else np.full(n_spw, float(bandwidths))),
-                    "corr_types": [int(c) for c in msmd.corrtypesforpol(0)], "scans": scans}
-        finally:
-            msmd.close()
 
     def _exposure_time(self, msmd, scan_number: int) -> float:
         """Return the correlator integration time of a scan in seconds (0.0 if unavailable)."""
@@ -3264,9 +3242,6 @@ class CasaCalibrationOps(CalibrationOps):
             shutil.rmtree(table_path)
         new_path.rename(table_path)
         spread = self._subband_gain_spread(table_path)
-        # The normalisation removes each hand's level: compare the two hands first.
-        (self.backend.caldir() / f"{project_code}.scalar_bp.hands.json").write_text(
-            json.dumps(self._hand_levels(table_path), indent=1))
         dropped, filled = self._normalise_per_antenna(table_path, max_factor=max_factor,
                                                       fill_unsolved=fill_unsolved)
         if filled:
@@ -3283,32 +3258,13 @@ class CasaCalibrationOps(CalibrationOps):
 
     def _normalise_per_antenna(self, table_path: Path, *, max_factor: float = 2.0,
                                fill_unsolved: bool = False) -> tuple[list[str], list[str]]:
-        """Level each antenna/polarization across its subbands and merge the calibrators into one solution.
+        """Scale a gain table so each antenna/polarization has median amplitude 1 across its subbands.
 
-        gaincal solves every calibrator field on its own (``combine`` has no
-        ``field``) against a 1 Jy point model, so the solutions of each field
-        carry that source's flux density and structure on top of the subband
-        steps. Each (antenna, polarization, field) set is therefore scaled to
-        median amplitude 1 across its subbands on its own; only then are the
-        fields comparable. Their SNR-weighted geometric mean is written to every
-        row of that antenna/subband/polarization, so the table holds a single
-        time-independent level per antenna, subband and polarization and every
-        time and field gets the same correction, whatever the interpolation.
-
-        Normalising all the fields of an antenna together, as was done before,
-        left each field's solutions offset by its flux density; applied with
-        ``interp='nearest'`` the correction then switched from one offset to the
-        other halfway through the observation, a step of up to x2 per baseline
-        in every antenna (V589, J1346-6024 against J1355-6326) that no constant
-        amplitude self-calibration could undo.
-
-        A solution more than a factor ``max_factor`` above or below its field's
-        level is not merged; when no field has a usable solution for that
-        antenna/subband/polarization it is flagged. Solutions the solver could
-        not find in any field are left flagged, or with ``fill_unsolved`` set to
-        gain 1 and unflagged. Returns the labels
-        (``"<antenna> spw <n> pol <index>"``) of the flagged and of the filled
-        solutions.
+        Solutions more than a factor ``max_factor`` above or below that median are
+        flagged. Solutions the solver flagged are left flagged, or with
+        ``fill_unsolved`` set to gain 1 and unflagged. Returns the labels
+        (``"<antenna> spw <n> pol <index>"``) of the newly flagged and of the
+        filled solutions.
         """
         handle = self.backend.tools.table()
         if not handle.open(str(table_path), nomodify=False):
@@ -3318,8 +3274,6 @@ class CasaCalibrationOps(CalibrationOps):
             flags = np.asarray(handle.getcol("FLAG")).astype(bool)
             antennas = np.asarray(handle.getcol("ANTENNA1"))
             spws = np.asarray(handle.getcol("SPECTRAL_WINDOW_ID"))
-            fields = np.asarray(handle.getcol("FIELD_ID"))
-            snr = np.asarray(handle.getcol("SNR")).astype(float)
             names = self._table_antenna_names(table_path)
             dropped: set[str] = set()
             filled: set[str] = set()
@@ -3328,31 +3282,19 @@ class CasaCalibrationOps(CalibrationOps):
                 name = names[int(antenna)] if int(antenna) < len(names) else f"#{int(antenna)}"
                 for pol in range(gains.shape[0]):
                     amplitude = np.abs(gains[pol, 0, rows])
-                    solved = ~flags[pol, 0, rows] & np.isfinite(amplitude) & (amplitude > 0)
-                    usable = solved.copy()
-                    relative = np.full(rows.size, np.nan)
-                    for field in np.unique(fields[rows]):
-                        in_field = solved & (fields[rows] == field)
-                        if not in_field.any():
-                            continue
-                        relative[in_field] = amplitude[in_field] / float(np.median(amplitude[in_field]))
-                        usable[in_field] = (relative[in_field] <= max_factor) & (relative[in_field] >= 1.0 / max_factor)
-                    for spw in np.unique(spws[rows]):
-                        same = spws[rows] == spw
-                        label = f"{name} spw {int(spw)} pol {pol}"
-                        merge = same & usable
-                        if merge.any():
-                            weight = np.where(snr[pol, 0, rows[merge]] > 0, snr[pol, 0, rows[merge]], 1.0)
-                            level = float(np.exp(np.sum(weight * np.log(relative[merge])) / np.sum(weight)))
-                            gains[pol, 0, rows[same]] = level
-                            flags[pol, 0, rows[same]] = False
-                        elif (same & solved).any():
-                            flags[pol, 0, rows[same]] = True
-                            dropped.add(label)
-                        elif fill_unsolved:
-                            gains[pol, 0, rows[same]] = 1.0
-                            flags[pol, 0, rows[same]] = False
-                            filled.add(label)
+                    good = ~flags[pol, 0, rows] & np.isfinite(amplitude) & (amplitude > 0)
+                    if fill_unsolved and not good.all():
+                        gains[pol, 0, rows[~good]] = 1.0
+                        flags[pol, 0, rows[~good]] = False
+                        filled.update(f"{name} spw {int(s)} pol {pol}" for s in spws[rows[~good]])
+                    if not good.any():
+                        continue
+                    level = float(np.median(amplitude[good]))
+                    gains[pol, 0, rows[good]] = gains[pol, 0, rows[good]] / level
+                    ratio = amplitude / level
+                    off = good & ((ratio > max_factor) | (ratio < 1.0 / max_factor))
+                    flags[pol, 0, rows[off]] = True
+                    dropped.update(f"{name} spw {int(s)} pol {pol}" for s in spws[rows[off]])
             handle.putcol("CPARAM", gains)
             handle.putcol("FLAG", flags)
         finally:
@@ -3379,48 +3321,8 @@ class CasaCalibrationOps(CalibrationOps):
         finally:
             handle.close()
 
-    def _hand_levels(self, table_path: Path) -> dict:
-        """How the two hands of every antenna compare in the scalar-bandpass solutions, before normalising.
-
-        Each solution is the amplitude of one hand of one antenna in one subband against the 1 Jy model of
-        one calibrator, so the ratio of the two hands' solutions of the same subband and calibrator is the
-        ratio of their amplitudes, whatever the calibrator's flux density or structure.
-
-        Returns
-        -------
-        dict
-            ``{antenna: {"ratio": median |g_RR| / |g_LL| over the (field, subband) solutions both hands have
-            (None without any), "pairs": their number, "solved": {"RR": n, "LL": n}}}``.
-        """
-        handle = self.backend.tools.table()
-        if not handle.open(str(table_path)):
-            return {}
-        try:
-            gains = np.abs(np.asarray(handle.getcol("CPARAM")))[:, 0]   # (npol, nrow)
-            flags = np.asarray(handle.getcol("FLAG")).astype(bool)[:, 0]
-            antennas = np.asarray(handle.getcol("ANTENNA1"))
-        finally:
-            handle.close()
-        names = self._table_antenna_names(table_path)
-        if gains.shape[0] < 2:
-            return {}
-        solved = ~flags & np.isfinite(gains) & (gains > 0)
-        levels = {}
-        for antenna in np.unique(antennas):
-            rows = antennas == antenna
-            both = rows & solved[0] & solved[1]
-            ratios = gains[0, both] / gains[1, both]
-            name = names[int(antenna)] if int(antenna) < len(names) else f"#{int(antenna)}"
-            levels[name] = {"ratio": float(np.median(ratios)) if ratios.size else None, "pairs": int(both.sum()),
-                            "solved": {"RR": int((rows & solved[0]).sum()), "LL": int((rows & solved[1]).sum())}}
-        return levels
-
     def _subband_gain_spread(self, table_path: Path) -> float:
-        """Return the median across antennas of the relative spread of gain across subbands.
-
-        Measured per calibrator field: the fields' levels differ by their flux densities, which is not a
-        subband step.
-        """
+        """Return the median across antennas of the relative spread of gain across subbands."""
         handle = self.backend.tools.table()
         if not handle.open(str(table_path)):
             return 0.0
@@ -3428,13 +3330,12 @@ class CasaCalibrationOps(CalibrationOps):
             gains = np.abs(np.asarray(handle.getcol("CPARAM")))
             flags = np.asarray(handle.getcol("FLAG")).astype(bool)
             antennas = np.asarray(handle.getcol("ANTENNA1"))
-            fields = np.asarray(handle.getcol("FIELD_ID"))
         finally:
             handle.close()
         values = np.where(flags, np.nan, gains)
         spreads = []
-        for antenna, field in sorted(set(zip(antennas.tolist(), fields.tolist()))):
-            per_antenna = values[..., (antennas == antenna) & (fields == field)]
+        for antenna in np.unique(antennas):
+            per_antenna = values[..., antennas == antenna]
             finite = per_antenna[np.isfinite(per_antenna)]
             if finite.size > 1 and np.median(finite) > 0:
                 spreads.append(float(np.std(finite) / np.median(finite)))
@@ -3573,11 +3474,6 @@ class CasaCalibrationOps(CalibrationOps):
         table, CASA's ``nearest`` mapping uses each field's own solution. Otherwise
         the stored ``gainfield`` supplies the phase-reference solution.
         """
-        if table.cal_type == "tec":
-            # Direction-dependent: a field is corrected with the rows of its own direction (the table has rows for
-            # every field and scan), also where several phase centres were observed at the same time.
-            own = [f.strip() for f in str(apply_field).split(",") if f.strip()]
-            return own[0] if len(own) == 1 else ""
         if not table.gainfield or not apply_field:
             return table.gainfield
         requested = {f.strip() for f in apply_field.split(",") if f.strip()}
@@ -4345,11 +4241,8 @@ class CasaFlagOps(FlagOps):
         from ..statistics import mad_sigma, running_median
 
         empty = (np.zeros(0, dtype=int), np.full(amplitude.shape[0], np.nan))
-        # Time bins with no usable sample stay NaN (nanmedian would warn about every one of them).
-        rows = np.asarray(finite).any(axis=1)
-        profile = np.full(amplitude.shape[0], np.nan)
         with np.errstate(invalid="ignore", divide="ignore"):
-            profile[rows] = np.nanmedian(np.where(finite, amplitude, np.nan)[rows], axis=1)
+            profile = np.nanmedian(np.where(finite, amplitude, np.nan), axis=1)
             level = running_median(profile, window=smooth_bins)
             level = np.where(np.isfinite(level) & (level > 0.0), level, np.nan)
             if not np.isfinite(level).any():
@@ -4371,7 +4264,6 @@ class CasaFlagOps(FlagOps):
         channel amplitude; the median over the bins. Noise averages down across the
         channels while a calibrated source does not.
         """
-        values = values[np.isfinite(values).any(axis=1)]       # an all-NaN bin has no ratio (and nanmean warns)
         with np.errstate(invalid="ignore", divide="ignore"):
             ratio = np.abs(np.nanmean(values, axis=1)) / np.nanmean(np.abs(values), axis=1)
         ratio = ratio[np.isfinite(ratio)]
@@ -5137,11 +5029,14 @@ class CasaFlagOps(FlagOps):
         """Return ``(left, right)`` channels to trim, from three independent indicators.
 
         Amplitude roll-off, rising phase scatter and channels the solver could not solve
-        each vote on where the usable band starts and ends. The verdict is their *median*
-        per side, not the widest of them: one indicator running away — phase scatter is
-        noisy on a weak antenna — would otherwise throw away good bandwidth on the word of
-        a single measurement, and every flagged channel costs sensitivity in the final
-        image. Two indicators must agree before a channel is given up.
+        each say where the usable band starts and ends. The amplitude roll-off is enough on
+        its own: it is a median over every solution of the antenna, and a strong station
+        shows a clean roll-off with flat phases and every channel solved, so a vote of the
+        three would let the other two overrule it (EB104D: TR and EF were left untrimmed with
+        their outer channels 15-30% down, and those channels came out of the calibration
+        low). Phase scatter and unsolved channels only trim further where *both* agree:
+        either one alone runs away on a weak antenna (phase scatter is noisy there), and
+        every flagged channel costs sensitivity in the final image.
 
         Parameters
         ----------
@@ -5167,10 +5062,9 @@ class CasaFlagOps(FlagOps):
                                       max_edge_fraction=max_trim / max(n_channels, 1))
         solved = np.where(np.asarray(flagged_fraction) < 0.5)[0]
         solved_range = (int(solved[0]), int(solved[-1])) if solved.size else (0, n_channels - 1)
-        lefts = sorted((amp_range[0], phase_range[0], solved_range[0]))
-        rights = sorted((n_channels - 1 - amp_range[1], n_channels - 1 - phase_range[1],
-                         n_channels - 1 - solved_range[1]))
-        return (int(min(max(lefts[1], 0), max_trim)), int(min(max(rights[1], 0), max_trim)))
+        left = max(amp_range[0], min(phase_range[0], solved_range[0]))
+        right = n_channels - 1 - min(amp_range[1], max(phase_range[1], solved_range[1]))
+        return (int(min(max(left, 0), max_trim)), int(min(max(right, 0), max_trim)))
 
     def _edge_spw_selection(self, project_code: str, *, edge_fraction: float = 0.1,
                             n_channels: int = 0, edge_channels: int = 0,
@@ -5576,16 +5470,13 @@ class CasaExportOps(ExportOps):
         logger.info("exportuvfits: {} -> {} (combinespw={}, padwithflags={})",
                     source_ms.name, target.name, combinespw, padwithflags)
         try:
-            self._run_exportuvfits({"vis": str(source_ms), "fitsfile": str(target), "datacolumn": "data",
-                                    "multisource": multisource, "combinespw": combinespw,
-                                    "padwithflags": padwithflags, "overwrite": overwrite})
+            self.backend.tasks.exportuvfits(vis=str(source_ms), fitsfile=str(target),
+                                            datacolumn="data", multisource=multisource,
+                                            combinespw=combinespw, padwithflags=padwithflags,
+                                            overwrite=overwrite)
         except RuntimeError as exc:
             raise BackendError(f"{project_code}: exportuvfits of {source!r} failed: {exc}") from exc
         return str(target)
-
-    def _run_exportuvfits(self, params: dict) -> None:
-        """Run ``exportuvfits`` with ``params`` (engine hook: the dask-ms backend writes the file natively)."""
-        self.backend.tasks.exportuvfits(**params)
 
 
 def robust_tag(robust: float) -> str:
@@ -6063,11 +5954,9 @@ class CasaBackend(Backend):
         except ImportError as exc:
             raise BackendError("the CASA backend requires casatools/casatasks: "
                                "pip install vlbipy[casa]") from exc
-        from ..solvers.msio import set_default_engine
         self.tasks = casatasks
         self.tools = casatools
         self._ms_overrides: dict[str, Path] = {}
-        set_default_engine(None)            # tables through casacore/casatools (the dask-ms backend reads natively)
         super().__init__(work_dir)
         self.redirect_casa_log()
 
@@ -6112,10 +6001,8 @@ class CasaBackend(Backend):
         # The old file is closed now that the logger moved: fold it in, then sweep.
         # The project directory is swept too — a log loose beside the data is as
         # much clutter as one in the shell's cwd.
-        # A previous log already inside another epoch's ``logs`` directory (a campaign
-        # redirects once per epoch in the same process) belongs to that epoch: leave it.
         search_dirs = {Path.cwd(), self.work_dir}
-        if previous and Path(previous).parent.name != log_dir.name:
+        if previous:
             search_dirs.add(Path(previous).parent)
         collect_casa_logs(log_dir, search_dirs=search_dirs)
         logger.info("CASA log -> {}", target)

@@ -7,6 +7,8 @@ solvers, the fringe fitter and the calibration application.
 from __future__ import annotations
 
 import os
+import shutil
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -546,15 +548,9 @@ def _split_reference(ms, column, chanbin, timebin):
     return out
 
 
-@pytest.mark.parametrize("reduce_rows", [None, 7], ids=["whole-job", "7-row-blocks"])
-def test_split_field_averages_like_mstransform(sim, tmp_path, monkeypatch, reduce_rows):
-    from vlbipy.solvers import split_task
+def test_split_field_averages_like_mstransform(sim, tmp_path):
     from vlbipy.solvers.split_task import split_field
     pytest.importorskip("casacore.tables")
-    if reduce_rows:
-        # Blocks far smaller than a time bin's rows: every bin is summed across several blocks. The jobs run
-        # in this process (workers=1) so that the patched block size applies.
-        monkeypatch.setattr(split_task, "REDUCE_ROWS", reduce_rows)
     tb = casatools.table()
     tb.open(str(sim["ms"]), nomodify=False)
     nrow = tb.nrows()
@@ -574,7 +570,7 @@ def test_split_field_averages_like_mstransform(sim, tmp_path, monkeypatch, reduc
     tb.putcol("TIME_CENTROID", sim["time"] + 0.1)
     tb.close()
     target = tmp_path / "split.ms"
-    report = split_field(sim["ms"], target, "CAL", chanbin=4, timebin=3 * DT, workers=1 if reduce_rows else 2)
+    report = split_field(sim["ms"], target, "CAL", chanbin=4, timebin=3 * DT, workers=2)
     expected = _split_reference(sim["ms"], "CORRECTED_DATA", 4, 3 * DT)
     assert report["rows_out"] == len(expected)
     got = _columns(target, "SCAN_NUMBER", "DATA_DESC_ID", "ANTENNA1", "ANTENNA2", "TIME", "INTERVAL", "EXPOSURE",
@@ -899,13 +895,47 @@ def test_pool_jobs_share_the_cores(monkeypatch):
         workers.close_pool()
 
 
-def test_clearcal_sets_corrected_to_data_and_drops_the_deferred_record(sim):
+def _rows_only_in_the_lock_file(path):
+    """Leave the table ``path`` as CASA's import leaves the SPECTRAL_WINDOW of a set: ``table.dat`` records no
+    row, and only the lock file holds the current number of rows."""
+    ct = pytest.importorskip("casacore.tables")
+    empty = path.with_name(path.name + ".empty")
+    table = ct.table(str(path), ack=False)
+    nrow = table.nrows()
+    table.copy(str(empty), deep=True, valuecopy=True, copynorows=True).close()
+    table.close()
+    (path / "table.dat").write_bytes((empty / "table.dat").read_bytes())
+    table = ct.table(str(path), ack=False)
+    assert table.nrows() == nrow > 0
+    table.close()
+    shutil.rmtree(empty)
+    return nrow
+
+
+def test_frozen_tables_keep_the_rows_only_their_lock_files_hold(sim, tmp_path):
     from vlbipy.solvers import corrected
-    from vlbipy.solvers.clearcal_task import clearcal_ms
-    (sim["ms"] / corrected.RECORD_DIR).mkdir()
-    report = clearcal_ms(sim["ms"], addmodel=True, workers=1)
-    assert report["rows"] == len(sim["time"]) and report["model"]
-    corrected_data, model = _columns(sim["ms"], "CORRECTED_DATA", "MODEL_DATA")
-    assert np.array_equal(corrected_data, sim["data"])
-    assert np.all(model == 1.0)
-    assert not (sim["ms"] / corrected.RECORD_DIR).exists()
+    from vlbipy.solvers.apply import load_caltable
+    from vlbipy.solvers.apply_task import defer_to_ms
+    table = run_fringefit(str(sim["ms"]), str(tmp_path / "sim.K"), field="CAL", solint="20s", refant="A0",
+                          minsnr=3.0, workers=1)
+    nspw = _rows_only_in_the_lock_file(Path(table) / "SPECTRAL_WINDOW")
+    ms = tmp_path / "deferred.ms"
+    shutil.copytree(sim["ms"], ms)
+    defer_to_ms(ms, {0: [{"path": str(table), "interp": "linear"}]}, parang=False, workers=1)
+    frozen = corrected.frozen_entries(ms, corrected.load_record(ms)["fields"][0])
+    assert load_caltable(frozen[0]["path"]).spw_chan_freq.shape[0] == nspw
+    assert not list((ms / corrected.RECORD_DIR).rglob("*.partial"))
+
+
+def test_caltable_subtables_copied_from_a_set_record_their_rows(sim, tmp_path):
+    """A caltable copies the SPECTRAL_WINDOW of the set it is solved on: written value by value, its table.dat
+    holds the rows even when the set's own one does not."""
+    pytest.importorskip("casacore.tables")
+    from vlbipy.solvers.caltable import _copy_subtable
+    nspw = _rows_only_in_the_lock_file(sim["ms"] / "SPECTRAL_WINDOW")
+    copied = _copy_subtable(sim["ms"], "SPECTRAL_WINDOW", tmp_path)
+    (copied / "table.lock").unlink(missing_ok=True)
+    import casacore.tables as ct
+    table = ct.table(str(copied), ack=False)
+    assert table.nrows() == nspw
+    table.close()

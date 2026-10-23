@@ -21,7 +21,6 @@ from .models import CalTable, ObsMetadata
 from .namespaces import (CalibrateNamespace, CleanNamespace, ExportNamespace, FlagNamespace,
                          ImportDataNamespace, PlotNamespace, SelfcalNamespace)
 from .observatories import get_observatory_handler
-from .phaseref import PhaseRefPlan, PhaseRefSettings, median_sampling, resolve_plan
 from .sources import SourceSet
 from .state import StepState
 
@@ -34,8 +33,6 @@ CAL_SELECTION_FILENAME = ".cal_selection.json"
 SOURCE_ROLES_FILENAME = ".source_roles.json"
 #: Cached observation metadata, so reporting works without reopening the data.
 METADATA_FILENAME = ".metadata.json"
-#: The phase-referencing decision (strategy, solve order), so every later step follows the fringe fit's.
-PHASEREF_FILENAME = ".phaseref.json"
 #: File listing the project codes of a run (written by ``VLBIObs``, which owns the name as ``PROJECT_FILENAME``).
 PROJECT_FILENAME = ".project.json"
 
@@ -43,18 +40,14 @@ PROJECT_FILENAME = ".project.json"
 #: everything after it, so this must match the order :meth:`VLBIObs.run` runs them
 #: in and use the same names the steps record themselves under.
 STEP_ORDER = [
-    "import_data", "a_priori", "tec", "flag_apriori", "flag_from_file", "flag_autocorr",
+    "import_data", "a_priori", "flag_apriori", "flag_from_file", "flag_autocorr",
     "plot_raw", "flag_quack", "flag_tfcrop",
-    "scan_snr", "flag_weak_polarization", "initial_calibration", "fringefit", "bandpass",
+    "scan_snr", "initial_calibration", "fringefit", "bandpass",
     "initial_calibration_sbd2", "fringefit_mbd2", "flag_edges",
     "apply", "flag_aoflagger", "flag_outliers",
-    "second_pass", "scalar_bandpass", "reweight", "flag_outliers_reweighted", "third_pass", "split",
+    "second_pass", "scalar_bandpass", "reweight", "flag_outliers_reweighted", "third_pass",
+    "flag_edges_final", "split",
 ]
-#: The stages after the split, recorded once per source (``<prefix><source>``) or once per run. They are
-#: not resumed from, but they work on the calibration of every step above: resuming from any of those
-#: redoes them too (and drops the tables they added to the chain).
-LATE_STEP_PREFIXES = ("selfcal_", "joint_", "clean_")
-LATE_STEPS = ("final_plots",)
 
 
 class Observation:
@@ -286,81 +279,6 @@ class Observation:
             self.gaintables[:] = [t for t in self.gaintables if t.step not in steps]
             self._save_gaintables()
         return dropped
-
-    # -- phase referencing --
-    @property
-    def phaseref_settings(self) -> PhaseRefSettings:
-        """The ``[phase_referencing]`` settings (:class:`vlbipy.phaseref.PhaseRefSettings`)."""
-        return PhaseRefSettings.from_config(self.config.get("phase_referencing"))
-
-    def phaseref_plan(self, *, refresh: bool = False) -> PhaseRefPlan:
-        """Which sources the phases are solved on, in which order, and how they reach the others.
-
-        Decided once (:func:`vlbipy.phaseref.resolve_plan`, with the fringe SNR of the reference sources as
-        their brightness when the decision needs it) and kept in :data:`PHASEREF_FILENAME`: the
-        self-calibration and every application of a resumed run follow the decision the fringe fit took, as
-        long as the settings and the sources are the same. ``refresh`` decides again.
-        """
-        settings = self.phaseref_settings
-        meta = self.metadata
-        observed = list(meta.source_names) if meta is not None and meta.source_names else list(self.sources.names)
-        finders = {s.name for s in self.sources.fringe_finders}
-        role = self.sources.targets if settings.inverse else self.sources.phase_calibrators
-        references = [s.name for s in role if s.name in observed and s.name not in finders]
-        receivers = [name for name in observed if name not in finders and name not in references]
-        key = {"settings": settings.to_dict(), "references": sorted(references), "receivers": receivers}
-        path = Path(self.work_dir) / PHASEREF_FILENAME if self._backend.requires_data_files else None
-        cached = getattr(self, "_phaseref", None)
-        if not refresh:
-            if cached is not None and cached[0] == key:
-                return cached[1]
-            if path is not None and path.is_file():
-                stored = json.loads(path.read_text())
-                if stored.get("key") == key:
-                    plan = PhaseRefPlan.from_dict(stored["plan"])
-                    self._phaseref = (key, plan)
-                    return plan
-        needs_brightness = len(references) > 1 and (
-            settings.strategy == "auto" or (settings.strategy == "sequential"
-                                            and not set(references) <= set(settings.order)))
-        sampling = None
-        if len(references) > 1 and settings.strategy == "auto" and meta is not None:
-            sampling = median_sampling(meta.scans, references, receivers, dict(meta.source_coords or {}))
-        plan = resolve_plan(settings, references, receivers,
-                            self._reference_brightness(references) if needs_brightness else {}, sampling=sampling)
-        logger.info("phase referencing: {}{} -> {} ({}){}", "inverse; " if plan.inverse else "",
-                    ", ".join(plan.references) or "no reference source", plan.strategy, plan.reason,
-                    f"; transferred to {', '.join(plan.receivers)}" if plan.receivers else "")
-        self._phaseref = (key, plan)
-        if path is not None:
-            path.write_text(json.dumps({"key": key, "plan": plan.to_dict()}, indent=1))
-        return plan
-
-<<<<<<< HEAD
-=======
-    def clear_phaseref(self) -> None:
-        """Forget the phase-referencing decision; the next :meth:`phaseref_plan` takes it again."""
-        self._phaseref = None
-        if self._backend.requires_data_files:
-            (Path(self.work_dir) / PHASEREF_FILENAME).unlink(missing_ok=True)
-
->>>>>>> 5d3198be0e79117f058939871de32e9e7c0bf006
-    def _reference_brightness(self, references: list[str]) -> dict[str, float]:
-        """Array fringe SNR of each reference source (empty when the survey cannot be had)."""
-        survey = self.metadata.snr_survey if self.metadata is not None else None
-        ranked = {name: snr for name, snr, _ in survey.rank_sources()} if survey is not None else {}
-        # The calibrator survey first (a resumed run reads it back from disk), the references alone if it
-        # does not cover them.
-        for selection in ("", ",".join(references)):
-            if set(references) <= set(ranked):
-                break
-            try:
-                survey = self.calibrate.scan_snr(field=selection)
-                ranked.update({name: snr for name, snr, _ in survey.rank_sources()})
-            except Exception as exc:  # noqa: BLE001 - the plan falls back to its brightness-free choice
-                logger.warning("phase referencing: no fringe SNR survey of {} ({}); brightness unknown",
-                               selection or "the calibrators", exc)
-        return {name: ranked[name] for name in references if name in ranked}
 
     # -- read-only accessors --
     @property
@@ -606,7 +524,6 @@ class Observation:
             self.clear_cal_selection()
             self.clear_source_roles()
             self.clear_run_warnings()
-            self.clear_phaseref()
             self._scratch = True
             return
         if from_step:
@@ -615,20 +532,13 @@ class Observation:
                                 f"{', '.join(STEP_ORDER)}")
             logger.info("[{}] resuming from {}", self.project_code, from_step)
             self._state.invalidate_downstream(from_step, STEP_ORDER)
-            late = [name for name in self._state.completed()
-                    if name in LATE_STEPS or name.startswith(LATE_STEP_PREFIXES)]
-            for name in late:
-                self._state.invalidate_downstream(name, [name])
             # The tables those steps produced are about to be re-derived: keeping them
             # in the chain would apply the stale solution alongside its replacement.
             # Redoing the survey or the first instrumental solve means deciding again which
             # antennas and scans it uses; a cached choice would make the new survey pointless.
             if STEP_ORDER.index(from_step) <= STEP_ORDER.index("initial_calibration"):
                 self.clear_cal_selection()
-            # The phase-referencing decision is the fringe fit's: redoing it decides again.
-            if STEP_ORDER.index(from_step) <= STEP_ORDER.index("fringefit"):
-                self.clear_phaseref()
-            stale = self.drop_gaintables(STEP_ORDER[STEP_ORDER.index(from_step):] + late)
+            stale = self.drop_gaintables(STEP_ORDER[STEP_ORDER.index(from_step):])
             if stale:
                 logger.info("[{}] dropped from the calibration chain: {}",
                             self.project_code, ", ".join(stale))

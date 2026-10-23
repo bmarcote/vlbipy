@@ -30,12 +30,6 @@ Inside a job, array work that is cut into independent blocks runs in threads
 with the cores even though the table I/O does not. Every job gets its share of
 the cores (all of them when fewer jobs than cores run), so a few long jobs, as
 one per Multi-MS part, still use the whole machine.
-
-A job that itself calls :func:`run_jobs` or :func:`submit_jobs` (a plot drawn in
-a worker that reads the measurement set) runs those jobs in its own process: the
-caller already spreads its work over the pool, and a pool started in every
-worker multiplied the processes (16 x 16 on a 20-core machine) and their memory
-beyond what the caller planned for.
 """
 from __future__ import annotations
 
@@ -47,9 +41,7 @@ import queue
 import subprocess
 import sys
 import threading
-import time
 import traceback
-from pathlib import Path
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from multiprocessing.connection import Client, Listener
@@ -57,31 +49,16 @@ from typing import Optional
 
 import numpy as np
 
-from ..logging_utils import get_logger
-from ..resources import available_memory, describe, parse_size, usable_cpus
-
-logger = get_logger()
-
 #: Environment variable overriding the number of worker processes.
 WORKERS_ENV = "VLBIPY_WORKERS"
 #: Upper bound on the default pool size (the Multi-MS parts and scans rarely feed more).
 MAX_DEFAULT_WORKERS = 16
-#: Memory planned per worker process when sizing the pool. Measured on LBA data (32 channels, 4
-#: correlations): 0.13 GB idle, 0.45 GB for a split job, up to 0.9 GB with the calibration tables it keeps.
-WORKER_MEMORY = 1 << 30
-#: Environment variable overriding :data:`WORKER_MEMORY` (e.g. ``2G`` for data with many more channels).
-WORKER_MEMORY_ENV = "VLBIPY_WORKER_MEMORY"
-#: Share of the available memory the pool is sized to fill; the rest is for the main process (CASA, the
-#: concatenated results of a task, plots) and whatever else runs on the machine.
-POOL_MEMORY_FRACTION = 0.75
 #: Seconds to wait for the worker processes to start and connect back.
 START_TIMEOUT = 120.0
 #: Shared objects (calibration tables) a worker keeps; the least recently used one is dropped beyond that.
 WORKER_CACHE_SIZE = 32
 #: Environment variable overriding the number of threads a job uses for its array work (:func:`thread_map`).
 THREADS_ENV = "VLBIPY_THREADS"
-#: Environment variable the pool sets in every worker process (it carries the key of the connection back).
-AUTHKEY_ENV = "VLBIPY_WORKER_AUTHKEY"
 
 _POOL: Optional["WorkerPool"] = None
 _POOL_LOCK = threading.Lock()
@@ -90,44 +67,14 @@ _JOB_THREADS: Optional[int] = None
 _EXECUTOR: Optional[tuple] = None                # (executor, number of threads)
 _EXECUTOR_LOCK = threading.Lock()
 _IN_THREAD = threading.local()
-_CPUS: Optional[int] = None
-
-
-def _cpus() -> int:
-    """CPUs this process may use (:func:`vlbipy.resources.usable_cpus`, read once per process)."""
-    global _CPUS
-    if _CPUS is None:
-        _CPUS = usable_cpus()
-    return _CPUS
-
-
-def worker_memory() -> int:
-    """Bytes planned per worker process: ``$VLBIPY_WORKER_MEMORY`` or :data:`WORKER_MEMORY`."""
-    configured = os.environ.get(WORKER_MEMORY_ENV, "").strip()
-    return max(1, parse_size(configured)) if configured else WORKER_MEMORY
 
 
 def default_workers() -> int:
-    """Number of worker processes to use: ``$VLBIPY_WORKERS``, else as many as the machine can run.
-
-    That is the CPUs this process may use (its affinity and any cgroup CPU quota), at most 16, and no more
-    than fit in :data:`POOL_MEMORY_FRACTION` of the available memory (the system's, or what a container,
-    batch job or ``systemd-run -p MemoryMax=`` unit leaves) at :func:`worker_memory` each.
-    """
+    """Number of worker processes to use: ``$VLBIPY_WORKERS`` or the CPU count capped at 16."""
     configured = os.environ.get(WORKERS_ENV, "").strip()
     if configured:
         return max(1, int(configured))
-    by_cpu = min(_cpus(), MAX_DEFAULT_WORKERS)
-    free = available_memory()
-    if free is None:
-        return max(1, by_cpu)
-    return max(1, min(by_cpu, int(free * POOL_MEMORY_FRACTION // worker_memory())))
-
-
-def in_worker() -> bool:
-    """True in a worker process of a :class:`WorkerPool`, where :func:`run_jobs` and :func:`submit_jobs` run
-    their jobs in the process instead of starting a pool of their own."""
-    return bool(os.environ.get(AUTHKEY_ENV))
+    return max(1, min(os.cpu_count() or 1, MAX_DEFAULT_WORKERS))
 
 
 def job_threads() -> int:
@@ -141,7 +88,7 @@ def job_threads() -> int:
         return max(1, int(configured))
     if _JOB_THREADS is not None:
         return _JOB_THREADS
-    return _cpus()
+    return max(1, os.cpu_count() or 1)
 
 
 def in_thread_map() -> bool:
@@ -172,7 +119,7 @@ def thread_map(function, items) -> list:
     global _EXECUTOR
     with _EXECUTOR_LOCK:
         if _EXECUTOR is None or _EXECUTOR[1] < threads:
-            size = max(threads, _cpus())
+            size = max(threads, os.cpu_count() or 1)
             _EXECUTOR = (ThreadPoolExecutor(max_workers=size, thread_name_prefix="vlbipy-array"), size)
         executor = _EXECUTOR[0]
     shares = [future.result() for future in [executor.submit(share, first) for first in range(threads)]]
@@ -267,20 +214,13 @@ class WorkerPool:
     def __init__(self, size: int) -> None:
         """Start ``size`` workers and wait until every one has connected back."""
         self.size = int(size)
-        logger.debug("worker pool: starting {} process(es) ({}; {:.1f} GB planned per worker)", self.size,
-                     describe(), worker_memory() / 2**30)
         authkey = os.urandom(32)
-        # Every worker connects at once: with the default backlog of 1 a Unix socket refuses the others outright.
-        listener = Listener(authkey=authkey, backlog=max(16, self.size))
+        listener = Listener(authkey=authkey)
         environment = dict(os.environ)
         # One job per core: numerical libraries inside a worker must not start their own thread teams.
         for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VLBIPY_FFT_WORKERS"):
             environment[name] = "1"
-        environment[AUTHKEY_ENV] = authkey.hex()
-        # The workers must import the vlbipy this process runs (a source tree, a test run), not another copy.
-        package_root = str(Path(__file__).resolve().parents[2])
-        environment["PYTHONPATH"] = os.pathsep.join([package_root] + [p for p in
-                                                     environment.get("PYTHONPATH", "").split(os.pathsep) if p])
+        environment["VLBIPY_WORKER_AUTHKEY"] = authkey.hex()
         command = [sys.executable, "-m", "vlbipy.solvers.workers", str(listener.address)]
         self._processes = [subprocess.Popen(command, env=environment, stdin=subprocess.DEVNULL)
                            for _ in range(self.size)]
@@ -306,25 +246,14 @@ class WorkerPool:
         self._held: list[OrderedDict] = [OrderedDict() for _ in range(self.size)]
         self._digests: dict = {}
         self._threads = ThreadPoolExecutor(max_workers=self.size)
+        self._job_threads = 1
         self.closed = False
 
-    @property
-    def busy(self) -> bool:
-        """True while any worker is running a job (the pool must not be closed under it)."""
-        return self._idle.qsize() < self.size
-
-    def threads_for(self, together: int) -> int:
-        """Threads each of ``together`` jobs running at once may use for its array work (its share of the cores)."""
-        return max(1, _cpus() // max(1, min(int(together), self.size)))
-
-    def _run(self, job: tuple, digests: Optional[dict] = None, threads: int = 1) -> object:
+    def _run(self, job: tuple, digests: Optional[dict] = None) -> object:
         """Send one job to an idle worker and return its result (raises :class:`WorkerError` on failure).
 
         ``digests`` caches shared-object digests by object id; it defaults to the one of the running map call.
-        ``threads`` is the job's share of the cores (:func:`job_threads` in the worker).
         """
-        if self.closed:
-            raise WorkerError(f"the worker pool is closed; {job[0]} was not run")
         index = self._idle.get()
         try:
             connection = self._connections[index]
@@ -337,7 +266,7 @@ class WorkerPool:
                 held.move_to_end(digest)
             while len(held) > WORKER_CACHE_SIZE:
                 held.popitem(last=False)
-            connection.send((function_path, kwargs, outgoing, threads))
+            connection.send((function_path, kwargs, outgoing, self._job_threads))
             ok, payload = connection.recv()
         except (EOFError, OSError) as exc:
             # The worker died (out of memory, a crash in a C library): the pool cannot be trusted any more.
@@ -349,31 +278,21 @@ class WorkerPool:
             raise WorkerError(f"worker job {job[0]} failed:\n{payload}")
         return payload
 
-    def run(self, function_path: str, kwargs: dict, threads: Optional[int] = None) -> object:
-        """Run ``function(**kwargs)`` in an idle worker (waiting for one) and return its result.
+    def run(self, function_path: str, kwargs: dict) -> object:
+        """Run ``function(**kwargs)`` in an idle worker (waiting for one) and return its result."""
+        return self._run((function_path, kwargs), digests={})
 
-        ``threads`` is the job's share of the cores; by default that of a job running beside a full pool.
-        """
-        return self._run((function_path, kwargs), digests={},
-                         threads=self.threads_for(self.size) if threads is None else int(threads))
-
-    def map(self, function_path: str, jobs: list[dict], workers: Optional[int] = None) -> list:
-        """Run ``function(**kwargs)`` for every kwargs dict of ``jobs``, at most ``workers`` (default: the pool
-        size) at a time; results come back in job order."""
+    def map(self, function_path: str, jobs: list[dict]) -> list:
+        """Run ``function(**kwargs)`` for every kwargs dict of ``jobs``; results come back in job order."""
         if self.closed:
             raise RuntimeError("the worker pool is closed")
-        together = max(1, min(int(workers or self.size), self.size, len(jobs)))
+        self._digests = {}     # object ids are only stable while the caller holds the jobs
         # The cores are shared among the jobs that run at the same time (see :func:`thread_map`).
-        threads = self.threads_for(together)
-        # Object ids are only stable while the caller holds the jobs; a map of its own keeps two maps running
-        # at once (two threads of the main process) from sharing it.
-        digests: dict = {}
-        if together >= self.size:
-            return list(self._threads.map(lambda job: self._run(job, digests, threads),
-                                          [(function_path, kwargs) for kwargs in jobs]))
-        with ThreadPoolExecutor(max_workers=together) as executor:
-            return list(executor.map(lambda job: self._run(job, digests, threads),
-                                     [(function_path, kwargs) for kwargs in jobs]))
+        self._job_threads = max(1, (os.cpu_count() or 1) // max(1, min(len(jobs), self.size)))
+        try:
+            return list(self._threads.map(self._run, [(function_path, kwargs) for kwargs in jobs]))
+        finally:
+            self._digests = {}
 
     def close(self) -> None:
         """Stop the workers (closing a connection ends that worker's loop)."""
@@ -392,17 +311,11 @@ class WorkerPool:
 
 
 def get_pool(workers: Optional[int] = None) -> WorkerPool:
-    """Return the shared pool, starting it (or restarting it with another size) when needed.
-
-    A pool running jobs is never restarted for another size (that would cut off the jobs of another thread,
-    as the plot workers of :mod:`vlbipy.plot_jobs`): the caller gets the running one, and :meth:`WorkerPool.map`
-    then runs at most the ``workers`` it asked for at a time.
-    """
+    """Return the shared pool, starting it (or restarting it with another size) when needed."""
     global _POOL
     size = int(workers) if workers else default_workers()
     with _POOL_LOCK:
-        if (_POOL is None or _POOL.closed
-                or (workers and _POOL.size != size and not _POOL.busy)):
+        if _POOL is None or _POOL.closed or (workers and _POOL.size != size):
             if _POOL is not None:
                 _POOL.close()
             _POOL = WorkerPool(size)
@@ -422,15 +335,14 @@ atexit.register(close_pool)
 
 
 def run_jobs(function_path: str, jobs: list[dict], workers: Optional[int] = None) -> list:
-    """Run ``jobs`` and return their results in order: in this process for one job, ``workers=1`` or inside a
-    worker process (:func:`in_worker`), else in the pool."""
+    """Run ``jobs`` and return their results in order: in this process for one job or ``workers=1``, else in the pool."""
     if not jobs:
         return []
     size = int(workers) if workers else default_workers()
-    if size <= 1 or len(jobs) == 1 or in_worker():
+    if size <= 1 or len(jobs) == 1:
         function = resolve(function_path)
         return [function(**kwargs) for kwargs in jobs]
-    return get_pool(workers).map(function_path, jobs, workers=size)
+    return get_pool(workers).map(function_path, jobs)
 
 
 def submit_jobs(function_path: str, jobs: list[dict], workers: int) -> list[Future]:
@@ -438,30 +350,15 @@ def submit_jobs(function_path: str, jobs: list[dict], workers: int) -> list[Futu
 
     Returns at once, so the caller can do other work meanwhile. Each future gives the job's result or raises
     :class:`WorkerError` (the job raised, or its worker died); a failed job does not stop the others. Raises
-    ``RuntimeError`` when the pool cannot be started. Inside a worker process (:func:`in_worker`) the jobs run
-    here, one after the other, before this returns.
+    ``RuntimeError`` when the pool cannot be started.
     """
     if not jobs:
         return []
-    if in_worker():
-        return [_run_here(function_path, kwargs) for kwargs in jobs]
     pool = get_pool()
-    together = max(1, min(int(workers), pool.size))
-    threads = pool.threads_for(together)
-    executor = ThreadPoolExecutor(max_workers=together)
-    futures = [executor.submit(pool.run, function_path, kwargs, threads) for kwargs in jobs]
+    executor = ThreadPoolExecutor(max_workers=max(1, min(int(workers), pool.size)))
+    futures = [executor.submit(pool.run, function_path, kwargs) for kwargs in jobs]
     executor.shutdown(wait=False)       # the submitted jobs still run; the threads end with the last one
     return futures
-
-
-def _run_here(function_path: str, kwargs: dict) -> Future:
-    """A finished future of ``function(**kwargs)`` run in this process (a failure becomes a :class:`WorkerError`)."""
-    future: Future = Future()
-    try:
-        future.set_result(resolve(function_path)(**kwargs))
-    except Exception:  # noqa: BLE001 - reported through the future, as a worker job would be
-        future.set_exception(WorkerError(f"job {function_path} failed:\n{traceback.format_exc()}"))
-    return future
 
 
 def kwargs_digests(value, depth: int = 0) -> list[str]:
@@ -477,22 +374,11 @@ def kwargs_digests(value, depth: int = 0) -> list[str]:
     return []
 
 
-def _connect(address: str, authkey: bytes, attempts: int = 50):
-    """Connect to the pool's listener, retrying while its accept queue is full (refused) for up to ~5 s."""
-    for attempt in range(attempts):
-        try:
-            return Client(address, authkey=authkey)
-        except (ConnectionRefusedError, FileNotFoundError):
-            if attempt == attempts - 1:
-                raise
-            time.sleep(0.1)
-
-
 def _serve(address: str) -> None:
     """Worker main loop: receive ``(function path, kwargs, shared objects, threads)``, reply ``(True, result)``
     or ``(False, traceback)``; shared objects are kept for later jobs (see :func:`_share`)."""
     global _JOB_THREADS
-    connection = _connect(address, bytes.fromhex(os.environ[AUTHKEY_ENV]))
+    connection = Client(address, authkey=bytes.fromhex(os.environ["VLBIPY_WORKER_AUTHKEY"]))
     cache: OrderedDict = OrderedDict()
     while True:
         try:

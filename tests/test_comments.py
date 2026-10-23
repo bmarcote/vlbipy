@@ -288,10 +288,28 @@ def test_a_source_where_half_the_antennas_look_off_is_reported_as_poorly_constra
                   naive={"EF": 0.75, "JB": 0.90, "WB": 0.88, "MC": 0.98, "IR": 1.13, "DE": 1.0})
     comments = cm.gain_comments(context([antenna(a) for a in ("EF", "JB", "WB", "MC", "IR", "DE")],
                                         gain_corrections=[entry]))
-    assert [c["category"] for c in comments] == ["source"] and comments[0]["severity"] == "warning"
-    assert comments[0]["source"] == "3C345"
+    assert [c["category"] for c in comments] == ["calibration"] and comments[0]["severity"] == "warning"
     assert "3 of its 6 antennas by more than 10% (EF x0.75, WB x0.88, IR x1.13)" in comments[0]["text"]
-    assert comments[0]["text"].startswith("The amplitude self-calibration is poorly constrained")
+    assert comments[0]["text"].startswith("The amplitude self-calibration of 3C345 is poorly constrained")
+
+
+def test_one_station_with_a_wrong_scale_is_blamed_instead_of_the_source():
+    """EB104D: T6 ~20x low drags the model down; the others all look "x0.5", T6 is the one that is off."""
+    names = ("WB", "EF", "O6", "T6", "UR", "TR", "YS")
+    pc = gains("J1031", {"WB": 0.99, "EF": 0.99, "O6": 0.98, "T6": 1.29, "UR": 0.99, "TR": 0.99, "YS": 0.99},
+               naive={"WB": 0.54, "EF": 0.54, "O6": 0.48, "T6": 4.70, "UR": 0.50, "TR": 0.45, "YS": 0.40})
+    ff = gains("J1048", {"WB": 0.99, "EF": 1.0, "O6": 1.0, "T6": 1.03, "UR": 1.0, "TR": 0.99, "YS": 0.99},
+               naive={"WB": 0.65, "EF": 0.91, "O6": 0.75, "T6": 2.83, "UR": 0.76, "TR": 0.68, "YS": 0.60})
+    comments = cm.gain_comments(context([antenna(a) for a in names], gain_corrections=[pc, ff]))
+    problems = [c for c in comments if c["severity"] == "problem"]
+    assert [c["antenna"] for c in problems] == ["T6"]
+    assert problems[0]["text"].startswith("amplitude scale looks wrong against the rest of the array: relative to "
+                                          "the array median, an unconstrained gscale asks for x9.40 on J1031, x3.77 "
+                                          "on J1048, but at most x1.29 was applied")
+    assert "(ANTAB Tsys, DPFU, FT)" in problems[0]["text"]
+    source_level = [c for c in comments if c["category"] == "calibration"]
+    assert source_level and all("most likely the model following T6" in c["text"] for c in source_level)
+    assert not any(c["antenna"] == "T6" and "could not be fixed" in c["text"] for c in comments)
 
 
 def test_report_findings_about_the_source_are_passed_on_condensed_and_unapplied_gains_are_flagged():
@@ -302,10 +320,9 @@ def test_report_findings_about_the_source_are_passed_on_condensed_and_unapplied_
     entry = gains("CAL", {"EF": 1.0, "JB": 1.0}, findings=findings, applied=False)
     comments = cm.gain_comments(context([antenna("EF"), antenna("JB")], gain_corrections=[entry]))
     assert texts(comments) == [
-        "The amplitude corrections were computed but not applied to the data.",
-        "Amplitude self-calibration: net flux-scale change: -1.48% to +0.20% over the 4 IFs; 3 of 36 runs "
+        "The amplitude corrections of CAL were computed but not applied to the data.",
+        "Amplitude self-calibration of CAL: net flux-scale change: -1.48% to +0.20% over the 4 IFs; 3 of 36 runs "
         "failed and were left out."]
-    assert [(c["category"], c["source"]) for c in comments] == [("source", "CAL"), ("source", "CAL")]
 
 
 # -- results ------------------------------------------------------------------------------------
@@ -321,7 +338,7 @@ def test_flagged_fraction_is_given_with_and_without_the_dead_antennas():
     assert cm.flagging_comments(context([], flagging={"fraction": None})) == []
 
 
-def test_source_results_combine_the_search_and_the_image():
+def test_source_results_combine_the_search_and_the_clean_image():
     results = [
         {"source": "TGT", "role": "target", "images": [],
          "search": {"detected": True, "recentred": True, "snr": 26.6, "peak": 1.36e-4, "fov_mas": 1000.0,
@@ -336,15 +353,14 @@ def test_source_results_combine_the_search_and_the_image():
          "search": {"detected": False, "recentred": False, "snr": 4.2, "peak": 1e-4, "fov_mas": 1000.0}}]
     comments = cm.source_comments(context([], source_results=results))
     assert texts(comments) == [
-        "Detected at 27 sigma in the search map (dirty-map peak 136 uJy/beam), 120.0 mas (41.0 beams) "
+        "TGT (target): detected at 27 sigma in the search map (dirty-map peak 136 uJy/beam), 120.0 mas (41.0 beams) "
         "from the phase centre and re-centred on the peak.",
-        "Detected at 425 sigma in the search map, at the phase centre; image (robust 0): peak "
+        "PC (phasecal): detected at 425 sigma in the search map, at the phase centre; CLEAN image (robust 0): peak "
         "136 mJy/beam, rms 62.3 uJy/beam, dynamic range 2175.",
-        "Image (robust 0): peak 3.24 mJy/beam, rms 147 uJy/beam, dynamic range 22 - low for "
+        "FF (fringefinder): CLEAN image (robust 0): peak 3.24 mJy/beam, rms 147 uJy/beam, dynamic range 22 - low for "
         "a calibrator, check its calibration and model.",
-        "Not detected in the 1000 mas search map (brightest peak at 4.2 sigma)."]
+        "CHK (checksource): not detected in the 1000 mas search map (brightest peak at 4.2 sigma)."]
     assert [c["severity"] for c in comments] == ["note", "note", "warning", "warning"]
-    assert [(c["category"], c["source"]) for c in comments] == [("source", name) for name in ("TGT", "PC", "FF", "CHK")]
 
 
 def test_poor_tables_and_failed_steps_are_reported():
@@ -404,24 +420,16 @@ def full_context() -> dict:
         calibration_selection=[{"scan": 1, "source": "CAL", "refant": "EF", "antennas": ARRAY}],
         flagging={"fraction": 0.3, "excluding_dead": {"fraction": None, "excluded_antennas": []}},
         steps={"bandpass": {"status": "failed", "error": "no solutions"}},
-        sources=[{"name": "CAL", "type": "phasecal"}, {"name": "TGT", "type": "target"}],
-        source_results=[{"source": "TGT", "role": "target", "images": [],
-                         "search": {"detected": False, "recentred": False, "snr": 4.2, "fov_mas": 1000.0}},
-                        {"source": "CAL", "role": "phasecal", "search": None,
-                         "images": [{"robust": 0.0, "peak": 0.136, "rms": 6.23e-5, "dynamic_range": 2175.0}]}],
         run_warnings=[run_warning("antenna WB shows no usable fringes on CAL"), run_warning("uv plot failed")])
 
 
 def test_build_comments_groups_and_orders_everything():
     comments = cm.build_comments(full_context())
-    assert [c["category"] for c in comments] == ["calibration", "result", "source", "source", "antenna", "antenna",
-                                                 "antenna", "antenna", "pipeline", "pipeline"]
-    # Sources in the order of the source table (not of the results), each with its role.
-    assert [(c["source"], c["role"]) for c in comments if c["category"] == "source"] == [("CAL", "phasecal"),
-                                                                                          ("TGT", "target")]
+    assert [c["category"] for c in comments] == ["calibration", "result", "antenna", "antenna", "antenna", "antenna",
+                                                 "pipeline", "pipeline"]
     stations = [c["antenna"] for c in comments if c["category"] == "antenna"]
     assert stations == ["JB", "WB", "TR", ""]                         # context order, then the closing line
-    assert comments[7]["text"] == "Nothing to report for: EF, MC, T6."
+    assert comments[5]["text"] == "Nothing to report for: EF, MC, T6."
     assert [c["severity"] for c in comments if c["category"] == "pipeline"] == ["problem", "warning"]
     assert all(set(c) >= {"severity", "category", "antenna", "text"} for c in comments)
     json.dumps(comments)                                              # the list goes into dashboard.json
@@ -437,12 +445,7 @@ def test_comments_text_is_a_fixed_width_block_grouped_like_the_page():
     block = cm.comments_text(cm.build_comments(full_context()), "t01")
     lines = block.splitlines()
     assert lines[0] == "General Comments for t01" and lines[1] == "=" * 100
-    assert (lines.index("Data and calibration") < lines.index("Sources") < lines.index("Antennas")
-            < lines.index("Warnings raised by the pipeline"))
-    # Each source is a header line with its role, its comments indented below it without the name.
-    at = lines.index("  CAL (phasecal)")
-    assert lines[at + 1].startswith("    note     Image (robust 0): peak 136 mJy/beam")
-    assert lines[lines.index("  TGT (target)") + 1].startswith("    WARNING  Not detected in the 1000 mas search map")
+    assert lines.index("Calibration and results") < lines.index("Antennas") < lines.index("Warnings raised by the pipeline")
     assert "  JB  WARNING  no data from 10:06 UTC to the end of the observation (scans 6-10)" in lines
     assert "  WB  WARNING  shows no usable fringes on CAL [first seen 2026-10-10 12:07:00 UTC]" in lines
     assert "  Nothing to report for: EF, MC, T6." in lines

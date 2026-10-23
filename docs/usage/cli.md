@@ -87,36 +87,6 @@ vlbipy applycal sbd.K bpass.B target.ms --interp linear nearest,linear --gainfie
   `--observation` selections and `--callib` go through CASA's `applycal`,
   which always starts from DATA (`--from-data` is then required on a set
   with CORRECTED_DATA).
-- A table whose `--gainfield` names two or more fields gives every other
-  field the solutions nearest in time (`--phaseref time`, the default, as
-  CASA does). `--phaseref interpolate` gives it instead the phases, delays
-  and rates of the two of them nearest on the sky, combined along the line
-  joining them by the field's projection onto it (see
-  [`[phase_referencing]`](../configuration.md#phase_referencing));
-  `--max-extrapolation` limits how far beyond either one (in units of their
-  separation, default 1), and a time either one was not observed within
-  `--max-gap` seconds of (default 600) takes the time interpolation instead.
-
-## Phase referencing
-
-The pipeline solves the phases on the phase calibrators and transfers them to
-the targets. With several phase calibrators, `--phaseref-strategy` chooses how:
-`sequential` (the brightest first, then each other one solved on data already
-corrected by it, as a second-order correction), `interpolate` (each solved on
-its own; a target takes them combined by its position along the line joining
-the two nearest), `time` (whichever was observed closest in time) or `auto`
-(the default: `sequential` when the brightest is `[phase_referencing]
-brightness_ratio` = 3 times brighter than the next; otherwise `interpolate` if
-both bracket the targets within `max_gap` = 10 min, `time` if not).
-`--inverse-phaseref` solves on the target instead, and transfers its solutions
-to the phase calibrators, for a target bright enough to self-calibrate:
-
-```bash
-vlbipy run -p v589a -t J1405-6118 --phasecal J1346-6024 J1355-6326 --phaseref-strategy interpolate
-vlbipy run -p v589a -t J1405-6118 --phasecal J1346-6024 J1355-6326 --inverse-phaseref
-```
-
-Changing either needs a re-run from the fringe fit (`--from-step fringefit`).
 
 ## Controlling what re-runs
 
@@ -128,21 +98,7 @@ Steps already recorded as complete are skipped:
 --scratch              # forget all progress and reset the data
 ```
 
-## What the terminal shows
-
-The terminal shows one bold line per step, the anomalies (in yellow: an antenna
-with no data, a table that failed) and errors, and at the end the number of
-warnings and where to read them. Everything else — the parameters of every task,
-the selected antennas and scans, each warning as it happens — is written to the
-run log `<work_dir>/logs/vlbipy_<code>_<time>.log`, and the warnings are also
-collected in `summary.md` and the report's *General comments*. `-v` shows all of it
-on the terminal as well.
-
 ## The ionosphere
-
-Below the array's threshold (EVN 5 GHz, VLBA and LBA 7 GHz) the run first removes the ionosphere predicted by
-global TEC maps, as AIPS `TECOR`/`VLBATECR` do (`[calibration.tec]`, dask-ms backend): the maps are downloaded
-into `<work_dir>/ionex`, and every antenna, field and channel is corrected for its own line of sight.
 
 Below 6 GHz the fringe fit also solves for the dispersive (ionospheric) delay,
 because at those frequencies the residual delay is genuinely frequency-dependent

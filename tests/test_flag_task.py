@@ -331,5 +331,5 @@ def test_flagdata_falls_back_to_casa_for_what_it_cannot_do_natively(ms, monkeypa
     tasks = NativeFlagTasks(Tasks())
     tasks.flagdata(vis=str(ms), mode="manual", antenna="EF", flagbackup=False)
     assert calls == []
-    tasks.flagdata(vis=str(ms), mode="rflag", datacolumn="data", flagbackup=False)
-    assert calls and calls[0]["mode"] == "rflag"
+    tasks.flagdata(vis=str(ms), mode="tfcrop", datacolumn="data", flagbackup=False)
+    assert calls and calls[0]["mode"] == "tfcrop"

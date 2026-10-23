@@ -9,11 +9,8 @@ comments can be rebuilt after the measurement set has been deleted.
 A comment is a plain dict:
 
 * ``severity``: ``"problem"`` (something is wrong), ``"warning"`` (look at it) or ``"note"``;
-* ``category``: ``"calibration"``, ``"result"``, ``"source"``, ``"antenna"`` or ``"pipeline"``;
+* ``category``: ``"calibration"``, ``"result"``, ``"antenna"`` or ``"pipeline"``;
 * ``antenna``: station code, ``""`` when the comment is not about one station;
-* ``source`` and ``role`` (``"source"`` comments only): the source the comment is about and its role
-  (``fringefinder``, ``phasecal``, ``target``...). The sentence does not repeat the source name: it is
-  shown once as the header of that source's group;
 * ``text``: the sentence;
 * ``when`` (warnings recorded by the pipeline only): UTC time the warning was first seen.
 
@@ -75,6 +72,8 @@ GAIN_WARN_DEVIATION: float = 0.10
 GAIN_BAD_DEVIATION: float = 0.30
 #: An applied correction within this of 1.0 "stayed at 1" although the unconstrained gscale wanted more.
 GAIN_UNFIXED_DEVIATION: float = 0.05
+#: Fewest antennas with an unconstrained gscale for their median to stand for the array's flux scale.
+MIN_ANTENNAS_FOR_SCALE: int = 4
 #: Most single subbands listed per antenna in the "single subband beyond 30%" comment.
 MAX_SUBBANDS_LISTED: int = 4
 #: From this many "off but not corrected" antennas (and at least half of those solved) the source itself
@@ -85,7 +84,7 @@ CONDENSE_FROM_IFS: int = 3
 
 #: Median solution SNR below which a calibration table is pointed out (0 means "not measured").
 POOR_TABLE_SNR: float = 10.0
-#: Dynamic range of the image below which a self-calibrated calibrator is pointed out.
+#: Dynamic range of the CLEAN image below which a self-calibrated calibrator is pointed out.
 LOW_CALIBRATOR_DYNAMIC_RANGE: float = 50.0
 #: A source found closer than this (mas) to the phase centre in the search map is said to be "at" it.
 CENTRED_OFFSET_MAS: float = 0.05
@@ -105,23 +104,12 @@ TEXT_WIDTH: int = 100
 
 # -- small helpers -----------------------------------------------------------------------------
 
-def make_comment(severity: str, category: str, text: str, antenna: str = "", when: str = "",
-                 source: str = "") -> dict:
-    """Build one comment dict (see the module docstring); ``when`` and ``source`` are only stored when given.
-
-    The ``role`` of a source comment is filled in by :func:`build_comments`, which knows every source.
-    """
+def make_comment(severity: str, category: str, text: str, antenna: str = "", when: str = "") -> dict:
+    """Build one comment dict (see the module docstring); ``when`` is only stored when given."""
     comment = {"severity": severity, "category": category, "antenna": antenna, "text": text}
     if when:
         comment["when"] = when
-    if source:
-        comment["source"] = source
     return comment
-
-
-def _sentence(text: str) -> str:
-    """``text`` with its first letter upper-cased (the rest untouched, so source and antenna names keep their case)."""
-    return text[:1].upper() + text[1:]
 
 
 def _finite(value) -> Optional[float]:
@@ -546,10 +534,19 @@ def _entry_gains(entry: dict) -> dict:
         single subbands beyond :data:`GAIN_BAD_DEVIATION` when the median is not), ``off`` (``{antenna:
         {"naive", "applied", "sigma", "p"}}``: the unconstrained gscale differs from 1 by more than
         :data:`GAIN_WARN_DEVIATION` while the applied factor stayed within :data:`GAIN_UNFIXED_DEVIATION`
-        of 1) and ``trusted`` (antennas whose unconstrained and applied factors agree within
-        :data:`GAIN_UNFIXED_DEVIATION`, i.e. whose gain this source pins down).
+        of 1), ``trusted`` (antennas whose unconstrained and applied factors agree within
+        :data:`GAIN_UNFIXED_DEVIATION`, i.e. whose gain this source pins down) and ``misscaled``
+        (``{antenna: {"relative", "applied"}}``, see below).
+
+    ``misscaled`` is judged on the unconstrained gscale *relative to the median of the array*: one
+    station with a wrong a-priori scale pulls the source model towards its own error, and against that
+    model every *other* antenna comes out off by a common factor, which says nothing about them (EB104D:
+    T6 ~20x low, every other antenna "x0.4-0.7"). An antenna is misscaled when, relative to the array, it
+    is beyond :data:`GAIN_BAD_DEVIATION` and the correction applied recovered less than half of it (in
+    log): the Bayesian self-calibration shrinks every correction to its ~10% prior, so a station-scale
+    error is never fixed there. Such an antenna is left out of ``off``.
     """
-    reading = {"solved": [], "medians": {}, "outliers": {}, "off": {}, "trusted": set()}
+    reading = {"solved": [], "medians": {}, "outliers": {}, "off": {}, "trusted": set(), "misscaled": {}}
     labels = entry.get("subband_labels") or []
     for name in entry.get("antennas") or []:
         median = _finite((entry.get("gain_median") or {}).get(name))
@@ -573,6 +570,17 @@ def _entry_gains(entry: dict) -> dict:
             reading["off"][name] = {"naive": naive, "applied": median,
                                     "sigma": _finite((entry.get("sigma") or {}).get(name)),
                                     "p": _finite((entry.get("p_correction") or {}).get(name))}
+    naive_gains = {name: _finite((entry.get("naive_gscale") or {}).get(name)) for name in reading["solved"]}
+    naive_gains = {name: value for name, value in naive_gains.items() if value is not None and value > 0}
+    if len(naive_gains) >= MIN_ANTENNAS_FOR_SCALE:
+        scale = statistics.median(naive_gains.values())
+        for name, naive in naive_gains.items():
+            relative = naive / scale
+            applied = _finite((entry.get("gain_median") or {}).get(name)) or 1.0
+            if gain_level(relative) == "bad" and applied > 0 \
+                    and abs(math.log(applied)) < 0.5 * abs(math.log(relative)):
+                reading["misscaled"][name] = {"relative": relative, "applied": applied}
+                reading["off"].pop(name, None)
     return reading
 
 
@@ -589,12 +597,24 @@ def _unfixed_text(cases: list[tuple[str, dict]]) -> str:
             f"source constrain its gain: {'; '.join(parts)}; take a careful look at its amplitudes")
 
 
+def _misscaled_text(cases: list[tuple[str, dict]]) -> str:
+    """Sentence for an antenna whose amplitude scale is off against the rest of the array on ``[(source, values)]``."""
+    wanted = ", ".join(f"x{values['relative']:.{GAIN_DECIMALS}f} on {source}" for source, values in cases)
+    applied = max((values["applied"] for _, values in cases), key=lambda gain: abs(math.log(gain)))
+    return (f"amplitude scale looks wrong against the rest of the array: relative to the array median, an "
+            f"unconstrained gscale asks for {wanted}, but at most x{applied:.{GAIN_DECIMALS}f} was applied (the "
+            "self-calibration keeps its corrections near the a-priori calibration); check the a-priori amplitude "
+            "calibration of this station (ANTAB Tsys, DPFU, FT)")
+
+
 def gain_comments(context: dict) -> list[dict]:
     """Amplitude corrections of the self-calibration that deserve a remark, one line per antenna and kind.
 
     * the median correction of an antenna beyond :data:`GAIN_WARN_DEVIATION` (warning) or
       :data:`GAIN_BAD_DEVIATION` (problem), over every self-calibrated source;
     * single subbands beyond :data:`GAIN_BAD_DEVIATION` when the median is not;
+    * antennas whose amplitude scale is off against the rest of the array and that the self-calibration
+      did not correct (``misscaled`` of :func:`_entry_gains`): a problem, on every source it shows on;
     * antennas that look off but were not corrected (``off`` of :func:`_entry_gains`). When that is true of
       at least half the antennas of a source (and of :data:`MIN_UNFIXED_FOR_SOURCE`), the source is
       reported as poorly constrained instead of every antenna; and an antenna whose gain another source
@@ -605,6 +625,7 @@ def gain_comments(context: dict) -> list[dict]:
     medians: dict[str, list[tuple[str, float, str]]] = {}
     outliers: dict[str, list[tuple[str, str, float]]] = {}
     unfixed: dict[str, list[tuple[str, dict]]] = {}
+    misscaled: dict[str, list[tuple[str, dict]]] = {}
     comments = []
     for entry, reading in readings:
         source = entry.get("source", "")
@@ -612,26 +633,32 @@ def gain_comments(context: dict) -> list[dict]:
             medians.setdefault(name, []).append((source, median, level))
         for name, values in reading["outliers"].items():
             outliers.setdefault(name, []).extend((source, label, gain) for label, gain in values)
+        for name, values in reading["misscaled"].items():
+            misscaled.setdefault(name, []).append((source, values))
         off, solved = reading["off"], reading["solved"]
         if len(off) >= MIN_UNFIXED_FOR_SOURCE and len(off) >= 0.5 * len(solved):
             wanted = ", ".join(f"{name} x{values['naive']:.{GAIN_DECIMALS}f}" for name, values in off.items())
+            blamed = list(reading["misscaled"])
+            cause = (f" The common offset is most likely the model following {' and '.join(blamed)}, whose own "
+                     f"{'scale is' if len(blamed) == 1 else 'scales are'} off against the rest of the array (see "
+                     f"{'that antenna' if len(blamed) == 1 else 'those antennas'})." if blamed else "")
             comments.append(make_comment(
-                "warning", "source", f"The amplitude self-calibration is poorly constrained: an unconstrained "
-                f"gscale would change {len(off)} of its {len(solved)} antennas by more than "
+                "warning", "calibration", f"The amplitude self-calibration of {source} is poorly constrained: an "
+                f"unconstrained gscale would change {len(off)} of its {len(solved)} antennas by more than "
                 f"{GAIN_WARN_DEVIATION:.0%} ({wanted}), but the corrections applied stayed within "
-                f"{GAIN_UNFIXED_DEVIATION:.0%} of 1. Treat the amplitude scale of this source, and its model, "
-                "with care.", source=source))
+                f"{GAIN_UNFIXED_DEVIATION:.0%} of 1.{cause} Treat the amplitude scale of this source, and its "
+                "model, with care."))
         else:
             for name, values in off.items():
                 if not any(name in other["trusted"] for _, other in readings if other is not reading):
                     unfixed.setdefault(name, []).append((source, values))
         if entry.get("applied") is False:
-            comments.append(make_comment("warning", "source", "The amplitude corrections were computed but not "
-                                         "applied to the data.", source=source))
+            comments.append(make_comment("warning", "calibration", f"The amplitude corrections of {source} were "
+                                         "computed but not applied to the data."))
         findings = _general_findings(entry)
         if findings:
-            comments.append(make_comment("note", "source", f"Amplitude self-calibration: {'; '.join(findings)}.",
-                                         source=source))
+            comments.append(make_comment("note", "calibration",
+                                         f"Amplitude self-calibration of {source}: {'; '.join(findings)}."))
     for name, values in medians.items():
         large = any(level == "bad" for _, _, level in values)
         listed = ", ".join(f"x{median:.{GAIN_DECIMALS}f} on {source}" for source, median, _ in values)
@@ -647,6 +674,8 @@ def gain_comments(context: dict) -> list[dict]:
                                      f"{GAIN_BAD_DEVIATION:.0%} although the median did not: {listed}{more}", name))
     for name, cases in unfixed.items():
         comments.append(make_comment("warning", "antenna", _unfixed_text(cases), name))
+    for name, cases in misscaled.items():
+        comments.append(make_comment("problem", "antenna", _misscaled_text(cases), name))
     return comments
 
 
@@ -670,7 +699,7 @@ def flagging_comments(context: dict) -> list[dict]:
 def _search_text(search: dict, with_peak: bool) -> str:
     """Words for the result of the source search in the wide dirty map.
 
-    ``with_peak`` adds the peak of that map: worth saying only when no image statistics are on record.
+    ``with_peak`` adds the peak of that map: worth saying only when no CLEAN image statistics are on record.
     """
     snr, fov = _finite(search.get("snr")), _finite(search.get("fov_mas"))
     if not search.get("detected"):
@@ -686,10 +715,7 @@ def _search_text(search: dict, with_peak: bool) -> str:
 
 
 def source_comments(context: dict) -> list[dict]:
-    """What came out per source: the search result and the statistics of its image (robust 0 if made).
-
-    One ``"source"`` comment per source, its sentence without the source name.
-    """
+    """What came out per source: the search result and the statistics of its CLEAN image (robust 0 if made)."""
     comments = []
     for entry in context.get("source_results") or []:
         role = entry.get("role") or "other"
@@ -703,7 +729,7 @@ def source_comments(context: dict) -> list[dict]:
         if images:
             image = next((i for i in images if _finite(i.get("robust")) == 0.0), images[0])
             peak, rms, dynamic = _finite(image["peak"]), _finite(image.get("rms")), _finite(image.get("dynamic_range"))
-            text = f"image (robust {float(image.get('robust') or 0.0):g}): peak {format_flux(peak)}/beam"
+            text = f"CLEAN image (robust {float(image.get('robust') or 0.0):g}): peak {format_flux(peak)}/beam"
             text += f", rms {format_flux(rms)}/beam" if rms is not None else ""
             if dynamic is not None:
                 text += f", dynamic range {dynamic:.0f}"
@@ -712,8 +738,8 @@ def source_comments(context: dict) -> list[dict]:
                     severity = "warning"
             parts.append(text)
         if parts:
-            comments.append(make_comment(severity, "source", _sentence(f"{'; '.join(parts)}."),
-                                         source=str(entry.get("source", ""))))
+            comments.append(make_comment(severity, "result",
+                                         f"{entry.get('source', '')} ({role}): {'; '.join(parts)}."))
     return comments
 
 
@@ -799,10 +825,9 @@ def build_comments(context: dict) -> list[dict]:
     Returns
     -------
     list of dict
-        Comments (see the module docstring): data and calibration first, then the sources in the order of
-        the context (each source comment carrying its ``role``), then the antennas in the order of the
-        context with one closing line naming those with nothing to report, then the pipeline. Within a
-        group, a source and an antenna the most serious comments come first.
+        Comments (see the module docstring): calibration and results first, then the antennas in the order
+        of the context with one closing line naming those with nothing to report, then the pipeline. Within
+        a group and an antenna the most serious comments come first.
     """
     general = (instrumental_delay_comments(context) + gain_comments(context) + flagging_comments(context)
                + source_comments(context) + table_comments(context) + step_comments(context)
@@ -814,12 +839,6 @@ def build_comments(context: dict) -> list[dict]:
     rank = SEVERITIES.index
     shared = sorted((c for c in everything if c["category"] in ("calibration", "result")),
                     key=lambda c: rank(c["severity"]))
-    roles = source_roles(context)
-    source_order = {name: index for index, name in enumerate(roles)}
-    per_source = sorted((c for c in everything if c["category"] == "source"),
-                        key=lambda c: (source_order.get(c.get("source", ""), len(source_order)), rank(c["severity"])))
-    for comment in per_source:
-        comment["role"] = roles.get(comment.get("source", ""), "other")
     stations = sorted((c for c in everything if c["category"] == "antenna"),
                       key=lambda c: (order.get(c["antenna"], len(order)), rank(c["severity"])))
     pipeline = sorted((c for c in everything if c["category"] == "pipeline"), key=lambda c: rank(c["severity"]))
@@ -827,20 +846,7 @@ def build_comments(context: dict) -> list[dict]:
     quiet = [name for name in order if name not in commented]
     if quiet:
         stations.append(make_comment("note", "antenna", f"Nothing to report for: {', '.join(quiet)}."))
-    return shared + per_source + stations + pipeline
-
-
-def source_roles(context: dict) -> dict[str, str]:
-    """Role of every source, in the order of the context's source table.
-
-    The role recorded with the source results wins over the source table, since it is the one the
-    reduction used; sources only known from the results come last.
-    """
-    roles = {str(s.get("name", "")): str(s.get("type") or "other") for s in context.get("sources") or []}
-    for entry in context.get("source_results") or []:
-        if entry.get("source") and entry.get("role"):
-            roles[str(entry["source"])] = str(entry["role"])
-    return roles
+    return shared + stations + pipeline
 
 
 def group_comments(comments: list[dict]) -> dict:
@@ -849,19 +855,15 @@ def group_comments(comments: list[dict]) -> dict:
     Returns
     -------
     dict
-        ``general`` (calibration and result comments about no single source), ``sources``
-        (``[(source, role, [comments])]`` in order of first appearance), ``antennas``
-        (``[(station, [comments])]`` in order of first appearance), ``antenna_notes`` (antenna comments about
-        no single station, e.g. the closing "nothing to report" line) and ``pipeline``.
+        ``general`` (calibration and result comments), ``antennas`` (``[(station, [comments])]`` in order of
+        first appearance), ``antenna_notes`` (antenna comments about no single station, e.g. the closing
+        "nothing to report" line) and ``pipeline``.
     """
-    groups = {"general": [], "sources": [], "antennas": [], "antenna_notes": [], "pipeline": []}
+    groups = {"general": [], "antennas": [], "antenna_notes": [], "pipeline": []}
     by_station: dict[str, list[dict]] = {}
-    by_source: dict[str, list[dict]] = {}
     for comment in comments or []:
         category = comment.get("category")
-        if category == "source":
-            by_source.setdefault(str(comment.get("source", "")), []).append(comment)
-        elif category == "antenna" and comment.get("antenna"):
+        if category == "antenna" and comment.get("antenna"):
             by_station.setdefault(comment["antenna"], []).append(comment)
         elif category == "antenna":
             groups["antenna_notes"].append(comment)
@@ -869,7 +871,6 @@ def group_comments(comments: list[dict]) -> dict:
             groups["pipeline"].append(comment)
         else:
             groups["general"].append(comment)
-    groups["sources"] = [(name, str(items[0].get("role") or "other"), items) for name, items in by_source.items()]
     groups["antennas"] = list(by_station.items())
     return groups
 
@@ -909,15 +910,9 @@ def comments_text(comments: Optional[list[dict]], project_code: str, width: int 
     if not any(groups.values()):
         return "\n".join(lines + ["  Nothing to report."])
     if groups["general"]:
-        lines.append("Data and calibration")
+        lines.append("Calibration and results")
         for comment in groups["general"]:
             lines.extend(_text_line("  ", comment, width))
-    if groups["sources"]:
-        lines.append("Sources")
-        for name, role, items in groups["sources"]:
-            lines.append(f"  {name} ({role})")
-            for comment in items:
-                lines.extend(_text_line("    ", comment, width))
     if groups["antennas"] or groups["antenna_notes"]:
         lines.append("Antennas")
         name_width = max([len(name) for name, _ in groups["antennas"]] + [2])

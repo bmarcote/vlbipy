@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Iterator, Optional, Union
 from .errors import ConfigError
 from .config import _deep_merge, kwargs_to_overrides, load_config
-from .logging_utils import get_logger, headline, run_logs, warnings
+from .logging_utils import get_logger, warnings
 from .observation import Observation
 from .results import ImageSet
 
@@ -102,11 +102,6 @@ class VLBIObs:
         Preferred reference antenna(s).
     mode : str
         Observing mode (``"continuum"`` by default).
-    inverse_phaseref : bool, optional
-        Inverse phase referencing: solve the phases on the target(s) and transfer them to the phase
-        calibrators (``[phase_referencing].inverse``; see :mod:`vlbipy.phaseref`).
-    phaseref_strategy : str, optional
-        ``"auto"``, ``"sequential"``, ``"interpolate"`` or ``"time"`` (``[phase_referencing].strategy``).
     config : str or pathlib.Path or dict, optional
         User TOML config path or dict.
     work_dir : str or pathlib.Path, optional
@@ -117,15 +112,13 @@ class VLBIObs:
 
     def __init__(self, project: ProjectLike, *, network: Optional[str] = None, backend: Optional[str] = None,
                  target=None, phasecal=None, fringe_finder=None, check_source=None,
-                 refant=None, mode: str = "continuum", inverse_phaseref: Optional[bool] = None,
-                 phaseref_strategy: Optional[str] = None, config=None, work_dir=None, **overrides) -> None:
+                 refant=None, mode: str = "continuum", config=None, work_dir=None, **overrides) -> None:
         codes: list[str] = [project] if isinstance(project, str) else list(project)
         if not codes:
             raise ValueError("At least one project code is required")
 
         kw_over = kwargs_to_overrides(
             network=network, backend=backend, mode=mode,
-            inverse_phaseref=inverse_phaseref, phaseref_strategy=phaseref_strategy,
             refant=refant if refant else None,
             target=_string_list(target) or None,
             phasecal=_string_list(phasecal) or None,
@@ -426,7 +419,6 @@ class VLBIObs:
         self.notebook()                                                # first notebook: what is there so far
         self.flag.apriori(force=force)                                 # step 4
         self.calibrate.a_priori(force=force)                           # steps 5-6 (EOP, Tsys, GC)
-        self.calibrate.ionosphere(force=force)                         # TEC maps, below tec_below_ghz
         self.plot.diagnostics(column="data", label="raw", force=force)  # step 7
         self.flag.quack(force=force)                                   # step 7 (slewing)
         self.flag.initial(force=force)                                 # step 8
@@ -435,23 +427,28 @@ class VLBIObs:
         # Every application before the last one is deferred where the backend can (dask-ms): the
         # steps in between read the corrected data through readers that calibrate DATA as they
         # read it, and CORRECTED_DATA is written once, with the final chain (write_corrected).
-        # A receptor much weaker than its pair goes first, so no solve averages it in.
-        self.flag.weak_polarizations(force=force)
         self.calibrate.instrumental(force=force)
         self.flag.edges(force=force)
         self.calibrate.apply(force=True, defer=True)
         # Step 12: deeper flagging on calibrated data, then re-solve on the cleaner data
         # and level the subband amplitudes.
+        # The band edges (and the bandpass gaps) are measured again on the bandpass of the last pass,
+        # the one applied: it is solved on more heavily flagged data than the first, and channels it no
+        # longer solves would otherwise be extrapolated by the apply rather than flagged.
+        reweight = self.config.get("calibration", {}).get("reweight", {}).get("enabled", True)
         self.flag.outliers(force=force)
         self.calibrate.second_pass(force=force)
+        if not reweight:
+            self.flag.edges(force=force, step="flag_edges_final")
         self.calibrate.scalar_bandpass(force=force)
         self.calibrate.apply(force=True, defer=True)                   # step 13
         # Step 14: weights from the calibrated scatter expose more bad data; flag it and
         # re-run the whole chain from the a-priori tables.
-        if self.config.get("calibration", {}).get("reweight", {}).get("enabled", True):
+        if reweight:
             self.calibrate.reweight(force=force)
             self.flag.outliers(force=force, step="flag_outliers_reweighted")
             self.calibrate.second_pass(force=force, step="third_pass")
+            self.flag.edges(force=force, step="flag_edges_final")
             self.calibrate.scalar_bandpass(force=force)
             self.calibrate.apply(force=True, defer=True)
         self._survey_all_sources()                                      # final calibrated SNR coverage
@@ -472,10 +469,6 @@ class VLBIObs:
             self._final_plots()                                            # step 18
         self.report()
         summary = warnings.summary()
-        anomalies = sum(1 for item in summary if item.startswith("ANOMALY"))
-        logs = ", ".join(str(path) for path in run_logs()) or "the run log"
-        headline("run finished: {} warning(s){}; details in {} and summary.md", len(summary),
-                 f", {anomalies} anomal{'y' if anomalies == 1 else 'ies'}" if anomalies else "", logs)
         if summary:
             logger.warning("run finished with {} warning(s):", len(summary))
             for item in summary:
@@ -567,11 +560,9 @@ class VLBIObs:
         """Image every source of :meth:`imaging_sources` at the configured robust values.
 
         Imaging is the last stage and must not throw away the calibration the
-        run just produced (split MSs and UVFITS are already on disk): an image that
+        run just produced (split MSs and UVFITS are already on disk): a clean that
         fails on one source is a warning recorded as a failed ``clean_<source>``
-        step, not a failed run. A backend without imaging skips the step. With
-        difmapy the sources are imaged side by side in worker processes
-        (:meth:`~vlbipy.namespaces.CleanNamespace.difmap_sources`).
+        step, not a failed run. A backend without imaging skips the step.
         """
         obs = obs or self._imaging_target()
         images: dict = {}
@@ -582,23 +573,14 @@ class VLBIObs:
             logger.warning("imaging skipped: backend {} does not implement image.clean", obs._backend.kind)
             return images
         robust = self.config.get("imaging", {}).get("robust", [-2, 0, 2])
-        pending = []
         for name in self.imaging_sources(obs):
             # ``reimage``: the calibration changed since the self-cal session made its images.
             if not reimage and name in obs._selfcal_results and obs._selfcal_results[name].images:
                 images[name] = ImageSet(obs._selfcal_results[name].images)   # imaged in its difmapy session
                 obs._state.mark_complete(f"clean_{name}", outputs=[i.paths.get("fits", "") for i in images[name]])
                 continue
-            if obs._state.should_run(f"clean_{name}", force=force):
-                pending.append(name)
-        if difmap_imager:
-            for name, result in obs.clean.difmap_sources(pending, robust=robust).items():
-                if isinstance(result, Exception):
-                    warnings.warn(f"imaging {name} failed: {result}")
-                else:
-                    images[name] = result
-            return images
-        for name in pending:
+            if not obs._state.should_run(f"clean_{name}", force=force):
+                continue
             try:
                 images[name] = obs.clean(target=name, robust=robust)
             except Exception as exc:  # noqa: BLE001 - imaging failure must not abort the run

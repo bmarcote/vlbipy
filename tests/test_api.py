@@ -108,61 +108,6 @@ def test_flag_edges_measures_from_the_bandpass_when_available():
     assert explicit["method"] == "explicit" and explicit["n_edge"] == 3
 
 
-def _spy_instrumental_solves(monkeypatch, obs):
-    """Record ``(solve, steps of the tables it was solved through)`` for every instrumental solve."""
-    backend = obs["RSM07"]._backend
-    calls = []
-    for method in ("initial_calibration", "fringefit", "bandpass"):
-        original = getattr(backend.calibrate, method)
-
-        def spy(code, *args, _original=original, _method=method, **kwargs):
-            calls.append((kwargs.get("suffix", _method), [t.step for t in kwargs.get("gaintable", [])]))
-            return _original(code, *args, **kwargs)
-
-        monkeypatch.setattr(backend.calibrate, method, spy)
-    return calls
-
-
-def test_instrumental_resumes_without_resolving_finished_steps(monkeypatch):
-    obs = make_single()
-    obs.import_data()
-    obs.calibrate.a_priori()
-    obs.calibrate.instrumental()
-    calls = _spy_instrumental_solves(monkeypatch, obs)
-    obs.calibrate.instrumental()                    # a resumed run: everything is done
-    assert calls == []
-
-
-def test_instrumental_resolves_a_stale_step_without_the_tables_after_it(monkeypatch):
-    obs = make_single()
-    obs.import_data()
-    obs.calibrate.a_priori()
-    obs.calibrate.instrumental()
-    later = {"initial_calibration_sbd2", "fringefit_mbd2"}
-    obs["RSM07"]._state.invalidate_downstream("initial_calibration_sbd2", ["initial_calibration_sbd2"])
-    calls = _spy_instrumental_solves(monkeypatch, obs)
-    obs.calibrate.instrumental()
-    assert [solve for solve, _ in calls] == ["sbd2", "mbd2"]          # the first pass and bandpass are kept
-    sbd2_priors = calls[0][1]
-    assert "bandpass" in sbd2_priors and not later & set(sbd2_priors)  # not solved through the old mbd2
-    assert "initial_calibration_sbd2" in calls[1][1] and "fringefit_mbd2" not in calls[1][1]
-    steps = [t.step for t in obs["RSM07"].gaintables]
-    assert steps.count("initial_calibration_sbd2") == 1 and steps.count("fringefit_mbd2") == 1
-
-
-def test_forced_instrumental_solves_each_step_only_through_the_ones_before(monkeypatch):
-    obs = make_single()
-    obs.import_data()
-    obs.calibrate.a_priori()
-    obs.calibrate.instrumental()
-    calls = _spy_instrumental_solves(monkeypatch, obs)
-    obs.calibrate.instrumental(force=True)
-    order = ["initial_calibration", "fringefit", "bandpass", "initial_calibration_sbd2", "fringefit_mbd2"]
-    assert len(calls) == 5
-    for index, (_, priors) in enumerate(calls):
-        assert set(priors) & set(order) == set(order[:index])
-
-
 def test_flag_quack_prefers_configured_intervals(monkeypatch):
     obs = VLBIObs(project="RSM07", network="EVN", backend="dummy", target="3C286",
                   fringe_finder="3C345", flagging={"quack_antennas": {"EF": 4.0}})

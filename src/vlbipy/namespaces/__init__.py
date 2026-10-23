@@ -17,16 +17,14 @@ from __future__ import annotations
 
 import glob
 import json
-import math
 from pathlib import Path
 from typing import Optional, Union
 
-from .. import phaseref
 from ..diagnostics import write_summary
 from ..errors import BackendError, StepError
 from ..logging_utils import get_logger, warnings
 from ..models import CalTable, QualityMetrics
-from ..plot_jobs import PlotJob, draw, plot_workers, run_plot_jobs
+from ..plot_jobs import PlotJob, draw, run_plot_jobs
 from ..results import Image, ImageSet, SelfcalResult
 from ..sources import Source
 from ..tools import natsort_key
@@ -38,10 +36,6 @@ _HIGH_FLAG_FRACTION = 0.3
 
 TargetLike = Union[str, Source, Image, None]
 
-
-#: The instrumental calibration steps in solving order (:meth:`CalibrateNamespace.instrumental`); each is
-#: solved through the tables of the steps before it.
-INSTRUMENTAL_STEPS = ("initial_calibration", "fringefit", "bandpass", "initial_calibration_sbd2", "fringefit_mbd2")
 
 class Namespace:
     """Base class for operation namespaces bound to one observation.
@@ -373,57 +367,6 @@ class CalibrateNamespace(Namespace):
                 obs.plot.caltable(table)
         obs._state.mark_complete("a_priori", outputs=[t.cal_type for t in tables])
         return tables
-
-    def ionosphere(self, *, force: bool = False) -> Optional[CalTable]:
-        """Ionospheric (TEC) correction from global ionosphere maps, as AIPS TECOR/VLBATECR (``[calibration.tec]``).
-
-        Runs for every array when the band centre is below the observatory's threshold
-        (``tec_below_ghz``: EVN 5 GHz, VLBA and LBA 7 GHz) unless ``enabled`` says otherwise (``true`` forces
-        it, ``false`` turns it off). The maps are downloaded once into ``ionex_dir`` (default
-        ``<work_dir>/ionex``). The table joins the chain like the a-priori tables, so every fringe fit, bandpass
-        and the final application see it, each field corrected for its own direction. Maps that cannot be
-        fetched skip the correction with a warning under ``"auto"`` and stop the step when it was asked for.
-
-        Parameters
-        ----------
-        force : bool
-            Re-run even if the step already completed.
-
-        Returns
-        -------
-        CalTable or None
-            The table, or None when the correction does not apply (frequency, configuration, backend, no maps).
-        """
-        obs = self._obs
-        cfg = dict(obs.config.get("calibration", {}).get("tec", {}))
-        enabled = cfg.pop("enabled", "auto")
-        threshold = float(obs._observatory_handler.tec_below_ghz or 0.0)
-        freq_ghz = float(obs.metadata.freq_setup.freq_ghz)
-        wanted = enabled is True or (str(enabled).lower() == "auto" and freq_ghz < threshold)
-        if enabled is False or not wanted:
-            logger.info("tec: no ionospheric correction ({:.2f} GHz, {} threshold {:.1f} GHz, enabled={})",
-                        freq_ghz, obs._observatory_handler.name, threshold, enabled)
-            return None
-        if not self._backend.supports("calibrate", "ionosphere"):
-            logger.info("tec: the {} backend has no ionospheric correction; skipped", self._backend.kind)
-            return None
-        existing = [t for t in obs.gaintables if t.cal_type == "tec"]
-        if not obs._state.should_run("tec", force=force):
-            return existing[0] if existing else None
-        ionex_dir = cfg.pop("ionex_dir", "") or str(Path(obs.work_dir) / "ionex")
-        try:
-            table = self._backend.calibrate.ionosphere(self._code, ionex_dir=ionex_dir, **cfg)
-        except (FileNotFoundError, ConnectionError) as exc:
-            if enabled is True:
-                raise StepError("tec", f"{self._code}: ionospheric correction requested but not possible: {exc}") \
-                    from exc
-            warnings.warn(f"{self._code}: no ionospheric correction, the TEC maps are not available ({exc})")
-            obs._state.mark_complete("tec", outputs=[])
-            return None
-        obs.set_gaintables([t for t in obs.gaintables if t.cal_type != "tec"])
-        obs.add_gaintable(table, "tec")
-        obs._state.mark_complete("tec", outputs=[table.cal_type])
-        return table
 
     def _smooth_table(self, table: CalTable, cal_cfg: dict) -> CalTable:
         """De-spike one a-priori table, leaving it untouched if the backend cannot smooth."""
@@ -909,40 +852,24 @@ class CalibrateNamespace(Namespace):
         logger.info("instrumental calibration: {} antenna(s) {} on scan(s) {}",
                     len(antennas), ",".join(antennas), scans)
 
-        # Each solve is made through the tables before it in this sequence and none after it. So
-        # from the first step that has to run, that step and every later one come out of the chain
-        # and are solved again; finished steps before it are kept (a resumed run skips them all).
-        sequence = INSTRUMENTAL_STEPS
-        pending = [force or obs._state.status(name) != "done" for name in sequence]
-        first = pending.index(True) if True in pending else len(sequence)
-        if first < len(sequence):
-            stale = obs.drop_gaintables(sequence[first:])
-            if stale:
-                logger.info("instrumental calibration: re-solving from {}; dropped {} from the chain",
-                            sequence[first], ", ".join(stale))
-        rerun = [index >= first for index in range(len(sequence))]
-
         # Pass 1: rough delays, so the bandpass is solved on delay-corrected data.
-        first_sbd = self.initial_calibration(force=rerun[0], scans=scans, antennas=antennas)
-        first_mbd = self.fringefit(force=rerun[1], plot=False)
+        first_sbd = self.initial_calibration(force=force, scans=scans, antennas=antennas)
+        first_mbd = self.fringefit(force=force, plot=False)
 
         # Bandpass, now that both delays are removed.
-        bandpass = self.bandpass(force=rerun[2], scans=scans, antennas=antennas)
+        bandpass = self.bandpass(force=force, scans=scans, antennas=antennas)
 
         # Pass 2: re-solve both delays *through* everything already in the chain. These
         # are incremental corrections on top of the first pass, not replacements — the
         # first-pass tables stay, and all of them are applied together.
-        refined_sbd = self.initial_calibration(force=rerun[3], scans=scans, antennas=antennas,
+        refined_sbd = self.initial_calibration(force=True, scans=scans, antennas=antennas,
                                                suffix="sbd2")
-        refined_mbd = self.fringefit(force=rerun[4], suffix="mbd2", plot=plot)
+        refined_mbd = self.fringefit(force=True, suffix="mbd2", plot=plot)
 
-        # Checked and plotted when solved: a resumed run that keeps the tables has already reported them.
-        if rerun[3]:
-            self.verify_solutions(refined_sbd, antennas)
+        self.verify_solutions(refined_sbd, antennas)
         if plot:
-            for table, solved in ((bandpass, rerun[2]), (refined_sbd, rerun[3])):
-                if solved:
-                    obs.plot.caltable(table)
+            for table in (bandpass, refined_sbd):
+                obs.plot.caltable(table)
         logger.info("instrumental: chain is now {}",
                     " -> ".join(t.cal_type for t in obs.gaintables))
         return [first_sbd, first_mbd, bandpass, refined_sbd, refined_mbd]
@@ -994,10 +921,9 @@ class CalibrateNamespace(Namespace):
         if not obs._state.should_run(step, force=force):
             return obs.gaintables
         # Everything the a-priori step made stays (Tsys, gain curve, and for DiFX data ACCOR and
-        # EOP), and so does the ionospheric correction; the types are named as well for chains recorded
-        # before tables carried their step.
+        # EOP); the types are named as well for chains recorded before tables carried their step.
         apriori = [t for t in obs.gaintables
-                   if t.step in ("a_priori", "tec") or t.cal_type in ("accor", "tsys", "gc", "eop", "tec")]
+                   if t.step == "a_priori" or t.cal_type in ("accor", "tsys", "gc", "eop")]
         dropped = [t.cal_type for t in obs.gaintables if t not in apriori]
         obs.set_gaintables(apriori)
         logger.info("{}: re-deriving {} from the a-priori tables on the flagged data",
@@ -1043,20 +969,14 @@ class CalibrateNamespace(Namespace):
         obs.drop_gaintables({"scalar_bandpass"})
         cal_cfg = obs.config.get("calibration", {})
         cfg = dict(cal_cfg.get("scalar_bandpass", {}))
-        # Solve on the phase-reference sources (the phase calibrators, or the targets with inverse phase
-        # referencing): gaincal assumes a point source, so a resolved fringe finder would have its
-        # structure absorbed into the antenna gains.
-        compact = obs.phaseref_plan().references or [s.name for s in obs.sources.calibrators]
+        # Solve on the phase calibrator: gaincal assumes a point source, so a resolved
+        # fringe finder would have its structure absorbed into the antenna gains.
+        compact = obs.sources.phase_calibrators or obs.sources.calibrators
         try:
             table = self._backend.calibrate.scalar_bandpass(
-                self._code, ",".join(compact) or obs.calibrator_field,
+                self._code, ",".join(s.name for s in compact) or obs.calibrator_field,
                 obs.refant, gaintable=list(obs.gaintables), metadata=obs.metadata,
                 callib=cal_cfg.get("callib", False), **cfg)
-            # The solve compares the two hands of every antenna on amplitudes: a much weaker one goes now,
-            # before the next pass re-solves and the Stokes I self-calibration averages it in.
-            hands = Path(table.path).with_name(f"{self._code}.scalar_bp.hands.json")
-            if hands.is_file():
-                obs.flag.weak_polarizations_from_gains(json.loads(hands.read_text()))
         except BackendError as exc:
             # Optional subband levelling: a re-solve on heavily-flagged data can fail. Keep
             # the previous pass's table if there is one; otherwise skip it rather than abort
@@ -1099,60 +1019,34 @@ class CalibrateNamespace(Namespace):
 
     def fringefit(self, *, force: bool = False, plot: bool = True,
                   suffix: str = "mbd") -> CalTable:
-        """Global (multi-band delay) fringe fit on the fringe finders and the phase-reference sources.
-
-        The reference sources (:meth:`Observation.phaseref_plan`: the phase calibrators, or the targets with
-        inverse phase referencing) are solved together and their solutions are what the other fields take.
-        With the ``sequential`` strategy only the first (brightest) one is solved with the fringe finders and
-        goes to every field; each next one is then solved on its own, on data corrected by the tables before
-        it, into ``<suffix>_<source>``, which goes to itself, the later references and the receivers.
-        """
+        """Global (multi-band delay) fringe fit on all calibrators."""
         obs = self._obs
         step = "fringefit" if suffix == "mbd" else f"fringefit_{suffix}"
         if not obs._state.should_run(step, force=force):
             return obs._table(suffix)
-        plan = obs.phaseref_plan()
-        finders = [s.name for s in obs.sources.fringe_finders]
-        first = plan.references[:1] if plan.strategy == "sequential" else plan.references
-        names = list(dict.fromkeys(finders + first)) or [s.name for s in obs.sources.targets]
+        cals = obs.sources.calibrators or obs.sources.targets
+        field = ",".join(s.name for s in cals)
         obs.drop_gaintables({step})
         cal_cfg = obs.config.get("calibration", {})
         mbd_cfg = dict(cal_cfg.get("mbd", {}))
         mbd_cfg.setdefault("dispersive", self._solve_dispersive(cal_cfg))
-        # The fringe solutions are what gets transferred to the other fields: tie them to the
-        # reference source(s) so applycal maps those solutions onto every field.
-        applied = self._fringefit_table(",".join(names), suffix, cal_cfg, mbd_cfg, gainfield=",".join(first),
-                                        plot=plot, step=step)
-        outputs = [suffix]
-        if plan.strategy == "sequential":
-            observed = obs.metadata.source_names if obs.metadata else list(obs.sources.names)
-            for name in plan.references[1:]:
-                logger.info("fringefit: {} solved on data already corrected by {} (sequential phase referencing)",
-                            name, ", ".join(plan.references[:plan.references.index(name)]))
-                self._fringefit_table(name, f"{suffix}_{name}", cal_cfg, mbd_cfg, gainfield=name,
-                                      apply_to=plan.apply_to(name, observed) or "", plot=plot, step=step)
-                outputs.append(f"{suffix}_{name}")
-        obs._state.mark_complete(step, outputs=outputs)
-        return applied
-
-    def _fringefit_table(self, field: str, suffix: str, cal_cfg: dict, mbd_cfg: dict, *, gainfield: str,
-                         step: str, apply_to: str = "", plot: bool = True) -> CalTable:
-        """Solve one fringe table on ``field``, smooth it and append it to the chain; return the applied table."""
-        obs = self._obs
         table = self._backend.calibrate.fringefit(
             self._code, field, obs.refant, gaintable=list(obs.gaintables),
             metadata=obs.metadata, suffix=suffix,
             callib=cal_cfg.get("callib", False), **mbd_cfg)
-        if gainfield:
-            table.gainfield = gainfield
+        # The fringe solutions are what gets transferred to the target: tie them to the
+        # phase calibrator(s) so applycal maps those solutions onto every field.
+        phase_cals = obs.sources.phase_calibrators
+        if phase_cals:
+            table.gainfield = ",".join(s.name for s in phase_cals)
             logger.info("fringefit: solutions will be applied from {}", table.gainfield)
-        table.apply_to = apply_to
         if plot:
             obs.plot.caltable(table)
         applied = self._smooth_fringe_table(table)
         obs.add_gaintable(applied, step)
         if plot and applied.path != table.path:
             obs.plot.caltable(applied)
+        obs._state.mark_complete(step, outputs=[suffix])
         return applied
 
     def _smooth_fringe_table(self, table: CalTable) -> CalTable:
@@ -1213,10 +1107,7 @@ class CalibrateNamespace(Namespace):
         """
         obs = self._obs
         cal_cfg = obs.config.get("calibration", {})
-        calibrators = list(obs.sources.calibrators or obs.sources.targets)
-        if obs.phaseref_settings.inverse:
-            # Inverse phase referencing solves on the targets: their brightness decides the strategy.
-            calibrators += [s for s in obs.sources.targets if s not in calibrators]
+        calibrators = obs.sources.calibrators or obs.sources.targets
         selection = field or ",".join(s.name for s in calibrators)
         cached = obs._snr_surveys.get(selection)
         if cached is not None and not force:
@@ -1310,25 +1201,9 @@ class CalibrateNamespace(Namespace):
         cal_cfg = self._obs.config.get("calibration", {})
         options = {"defer": True} if defer and getattr(self._backend.calibrate, "defers_apply", False) else {}
         self._backend.calibrate.apply(
-            self._code, field, self.transfer_chain(),
+            self._code, field, list(self._obs.gaintables),
             callib=cal_cfg.get("callib", False), **options)
         self._obs._state.mark_complete("apply")
-
-    def transfer_chain(self) -> list[CalTable]:
-        """The apply chain with the phase-reference transfer resolved (:func:`vlbipy.phaseref.transfer_chain`).
-
-        With the ``interpolate`` strategy every receiver (target, check source; the phase calibrators with
-        inverse phase referencing) takes tables interpolated between the two reference sources nearest to it,
-        rebuilt whenever a table they come from changed; otherwise this is the chain as solved.
-        """
-        obs = self._obs
-        tables = list(obs.gaintables)
-        if not self._backend.requires_data_files:
-            return tables
-        plan = obs.phaseref_plan()
-        if plan.strategy != "interpolate":
-            return tables
-        return phaseref.transfer_chain(tables, plan, obs.metadata, Path(obs.work_dir) / "caltables" / "phaseref")
 
     def write_corrected(self) -> None:
         """Write CORRECTED_DATA where an application was deferred (no-op when it is up to date, or on a
@@ -1434,7 +1309,8 @@ class FlagNamespace(Namespace):
         return self._run("autocorr", force=force)
 
     def edges(self, *, force: bool = False, edge_channels: Optional[int] = None,
-              table: Optional[CalTable] = None, plot: bool = True, **kwargs) -> dict:
+              table: Optional[CalTable] = None, plot: bool = True, step: str = "flag_edges",
+              **kwargs) -> dict:
         """Flag the subband edge channels, measuring how many from the bandpass when possible.
 
         Resolution order: an explicit ``edge_channels=N`` wins; otherwise, when a
@@ -1445,6 +1321,14 @@ class FlagNamespace(Namespace):
         same trim: they share a signal path, and a ragged per-subband trim would
         leave non-uniform channel coverage.
 
+        Parameters
+        ----------
+        step : str
+            State name this run is recorded under, so the pipeline can measure the
+            edges again on the bandpass of a later pass (``flag_edges_final``) and
+            still resume correctly. Flags only add up: a second run flags what the
+            re-solved bandpass shows and leaves the first trim in place.
+
         Returns
         -------
         dict
@@ -1453,7 +1337,7 @@ class FlagNamespace(Namespace):
             per-channel profiles.
         """
         obs = self._obs
-        if not obs._state.should_run("flag_edges", force=force):
+        if not obs._state.should_run(step, force=force):
             return {}
         cfg = obs.config.get("flagging", {})
         n_channels = int(obs.metadata.freq_setup.n_channels) if obs.metadata else 0
@@ -1495,7 +1379,7 @@ class FlagNamespace(Namespace):
             measurement["bandpass_gaps"] = {k: v for k, v in gaps.items() if k != "commands"}
         if plot and measurement["method"] == "measured":
             obs.plot.bandpass_profile(measurement)
-        obs._state.mark_complete("flag_edges", outputs=[f"edge={n_edge}", measurement["method"]])
+        obs._state.mark_complete(step, outputs=[f"edge={n_edge}", measurement["method"]])
         return measurement
 
     def quack(self, *, force: bool = False, per_antenna: Optional[dict] = None,
@@ -1706,123 +1590,6 @@ class FlagNamespace(Namespace):
         """Apply a manual flag selection (e.g. antenna/spw/timerange)."""
         return self._run("manual", force=force, **selection)
 
-<<<<<<< HEAD
-    def weak_polarizations(self, *, force: bool = False) -> dict[str, tuple[str, float]]:
-        """Flag the receptor of an antenna whose fringes are much weaker than those of its other one.
-
-        Decided on the fringe-SNR survey of the calibrators (:meth:`ScanSNRSurvey.weak_hands`): a hand
-        ``[flagging].weak_polarization_ratio`` (default 5) times weaker in amplitude than the other, or never
-        detected while the other is, loses its parallel hand and both cross hands on every baseline of the
-        antenna. Left in, a Stokes I calibration averages its near-zero signal with the good hand: V589A's CD,
-        with an LCP 11 times weaker than its RCP, had every baseline at ~0.55 of its RR. ``0`` turns it off.
-=======
-    def weak_polarizations(self, *, force: bool = False) -> dict[str, str]:
-        """Flag the receptor of an antenna that shows no signal while its other one does (before any solve).
-
-        Decided on the fringe-SNR survey of the calibrators (:meth:`ScanSNRSurvey.dead_hands`). A receptor
-        that is detected but weak is caught later, on amplitudes, when the scalar bandpass has solved both
-        hands of every antenna (:meth:`weak_polarizations_from_gains`). ``[flagging].weak_polarization_ratio
-        = 0`` turns both off.
->>>>>>> 5d3198be0e79117f058939871de32e9e7c0bf006
-
-        Returns
-        -------
-        dict
-<<<<<<< HEAD
-            ``{antenna: (flagged hand, amplitude ratio)}``.
-=======
-            ``{antenna: flagged hand}``.
->>>>>>> 5d3198be0e79117f058939871de32e9e7c0bf006
-        """
-        obs = self._obs
-        step = "flag_weak_polarization"
-        if not obs._state.should_run(step, force=force):
-            return {}
-<<<<<<< HEAD
-        cfg = obs.config.get("flagging", {})
-        ratio = float(cfg.get("weak_polarization_ratio", 5.0) or 0.0)
-        if ratio <= 0 or not self._backend.supports("calibrate", "scan_snr"):
-            obs._state.mark_complete(step, outputs=[])
-            return {}
-        survey = obs.calibrate.scan_snr()
-        detection = float(obs.config.get("calibration", {}).get("detection_snr", 7.0))
-        weak = survey.weak_hands(ratio, detection=detection)
-        for antenna, (hand, factor) in weak.items():
-            correlations = ",".join([hand, "RL", "LR"])
-            self._backend.flag.run(self._code, "manual", antenna=antenna, correlation=correlations)
-            strong = "RCP" if hand == "LL" else "LCP"
-            weak_name = "LCP" if hand == "LL" else "RCP"
-            how = "never detected while its " + strong + " is" if math.isinf(factor) else \
-                f"{factor:.1f} times weaker than its {strong}"
-            warnings.anomaly(f"{self._code}: {antenna} {weak_name} is {how} (fringe SNR on the calibrators); "
-                             f"flagged its {correlations} data")
-        if not weak:
-            logger.info("flag[weak_polarization]: both hands of every antenna within a factor {:g}", ratio)
-        obs._state.mark_complete(step, outputs=[f"{a}:{h}" for a, (h, _) in weak.items()])
-        return weak
-=======
-        if float(obs.config.get("flagging", {}).get("weak_polarization_ratio", 5.0) or 0.0) <= 0 or \
-                not self._backend.supports("calibrate", "scan_snr"):
-            obs._state.mark_complete(step, outputs=[])
-            return {}
-        detection = float(obs.config.get("calibration", {}).get("detection_snr", 7.0))
-        dead = obs.calibrate.scan_snr().dead_hands(detection=detection)
-        flagged = {}
-        for antenna, (hand, weak_snr, strong_snr) in dead.items():
-            flagged[antenna] = self._flag_hand(antenna, hand, f"has no fringes (median SNR {weak_snr:.1f} on the "
-                                                              f"calibrator scans where the other hand has "
-                                                              f"{strong_snr:.0f})")
-        if not flagged:
-            logger.info("flag[weak_polarization]: both hands of every antenna have fringes")
-        obs._state.mark_complete(step, outputs=[f"{a}:{h}" for a, h in flagged.items()])
-        return flagged
-
-    def weak_polarizations_from_gains(self, levels: dict) -> dict[str, str]:
-        """Flag the receptor of an antenna whose amplitude is much below that of its other one.
-
-        ``levels`` compares the two hands of every antenna in the scalar-bandpass solutions, before they are
-        normalised (:meth:`CasaCalibrationOps._hand_levels`): one amplitude per hand, subband and calibrator.
-        A hand ``[flagging].weak_polarization_ratio`` (5) times weaker in the median over the solutions both
-        have, or solved nowhere while the other is solved in three or more, loses its parallel hand and both
-        cross hands. Left in, a Stokes I calibration averages its near-zero signal with the good hand:
-        V589A's CD, with an LCP 11 times below its RCP, had every baseline at ~0.55 of its RR.
-
-        Returns
-        -------
-        dict
-            ``{antenna: flagged hand}`` (only the ones flagged now).
-        """
-        ratio = float(self._obs.config.get("flagging", {}).get("weak_polarization_ratio", 5.0) or 0.0)
-        flagged = {}
-        if ratio <= 0:
-            return flagged
-        for antenna, level in (levels or {}).items():
-            solved, value = level.get("solved", {}), level.get("ratio")
-            if solved.get("LL", 0) == 0 and solved.get("RR", 0) >= 3:
-                hand, how = "LL", "has no amplitude solution in any subband while its RCP has"
-            elif solved.get("RR", 0) == 0 and solved.get("LL", 0) >= 3:
-                hand, how = "RR", "has no amplitude solution in any subband while its LCP has"
-            elif value and level.get("pairs", 0) >= 3 and (value >= ratio or value <= 1.0 / ratio):
-                hand = "LL" if value >= ratio else "RR"
-                how = f"is {max(value, 1.0 / value):.1f} times weaker than its {'RCP' if hand == 'LL' else 'LCP'} " \
-                      "in amplitude (scalar bandpass)"
-            else:
-                continue
-            flagged[antenna] = self._flag_hand(antenna, hand, how)
-        return flagged
-
-    def _flag_hand(self, antenna: str, hand: str, why: str) -> str:
-        """Flag one receptor of ``antenna``: its parallel hand and both cross hands, on every baseline."""
-        correlations = ",".join([hand, "RL", "LR"])
-        self._backend.flag.run(self._code, "manual", antenna=antenna, correlation=correlations)
-        done = self._obs.__dict__.setdefault("_flagged_hands", set())
-        if (antenna, hand) not in done:
-            done.add((antenna, hand))
-            warnings.anomaly(f"{self._code}: {antenna} {'LCP' if hand == 'LL' else 'RCP'} {why}; flagged its "
-                             f"{correlations} data")
-        return hand
->>>>>>> 5d3198be0e79117f058939871de32e9e7c0bf006
-
 
 class PlotNamespace(Namespace):
     """Diagnostic plotting."""
@@ -1843,7 +1610,7 @@ class PlotNamespace(Namespace):
         Returns the paths written, in job order.
         """
         cfg = self._obs.config.get("plotting", {})
-        return run_plot_jobs(self._backend, self._code, jobs, max_workers=plot_workers(cfg.get("workers", "auto")),
+        return run_plot_jobs(self._backend, self._code, jobs, max_workers=int(cfg.get("workers", 1) or 1),
                              memory_fraction=float(cfg.get("memory_fraction", 0.8)), label=label)
 
     def _draw(self, job: PlotJob):
@@ -2502,60 +2269,26 @@ class CleanNamespace(Namespace):
                                                 metadata=obs.metadata))
         return str(path)
 
-    def difmap_sources(self, sources: list[str], *, robust=None, weighting: Optional[str] = None,
-                       **overrides) -> dict[str, Union[Image, ImageSet, Exception]]:
-        """Image ``sources`` with difmapy at every robust value, several at once (see :mod:`vlbipy.backends.difmap`).
+    def _image_with_difmap(self, src: str, robust_values: list[float], img_cfg: dict, weighting: str,
+                           niter: int, **kwargs) -> list[Image]:
+        """CLEAN ``src`` with difmapy at every robust value (see :mod:`vlbipy.backends.difmap`).
 
-        Each source is first searched for in a wide dirty map and re-centred only when a
+        The source is first searched for in a wide dirty map and re-centred only when a
         significant peak lies far from the phase centre (``[imaging].search_fov``,
-        ``search_sigma``, ``recentre_min_beams``), then imaged with ``[imaging].method``
-        (``overrides`` replace its settings, e.g. ``niter=``). The sources are imaged side by
-        side in worker processes (:func:`~vlbipy.backends.difmap.run_image_jobs`); each one's
-        PNG grid, image report and ``clean_<source>`` step are written as it is done here.
-
-        Returns
-        -------
-        dict
-            Source -> its :class:`Image` (one robust value) or :class:`ImageSet`, or the exception
-            that stopped it (the step is then recorded as failed).
+        ``search_sigma``, ``recentre_min_beams``).
         """
         from ..backends import difmap
         obs = self._obs
-        img_cfg = obs.config.get("imaging", {})
-        weighting = weighting or img_cfg.get("weighting", "briggs")
-        if robust is None:
-            robust = img_cfg.get("robust", [0.0])
-        robust_values = [float(r) for r in (robust if isinstance(robust, (list, tuple)) else [robust])]
-        settings = difmap.imaging_settings(img_cfg)
-        settings.update({key: value for key, value in overrides.items() if key in settings and value is not None})
+        split = self.split_ms(src)
         image_dir = Path(obs.work_dir) / "images"
         image_dir.mkdir(parents=True, exist_ok=True)
-        jobs = [{"split_ms": self.split_ms(src), "imagename": str(image_dir / f"{self._code}_{src}"),
-                 "robust_values": robust_values, "average_channels": bool(img_cfg.get("average_channels", True)),
-                 **_search_settings(img_cfg), **settings} for src in sources]
-        results: dict = {}
-        for src, report in zip(sources, difmap.run_image_jobs(jobs)):
-            if isinstance(report, Exception):
-                obs._state.mark_failed(f"clean_{src}", str(report))
-                results[src] = report
-                continue
-            _write_image_report(image_dir / f"{self._code}_{src}.search.json", report, settings)
-            images = [_image_from_difmap(src, info, weighting) for info in report["images"].values()]
-            results[src] = self._finish_images(src, images, produce_png=img_cfg.get("produce_png", True))
-        return results
-
-    def _finish_images(self, src: str, images: list[Image], *, produce_png: bool = True) -> Union[Image, ImageSet]:
-        """Render the PNG grid of a source's images, record its ``clean_<source>`` step and return them."""
-        fits_paths = {img.robust: img.paths["fits"] for img in images if img.paths.get("fits")}
-        if produce_png and fits_paths and self._backend.supports("plot", "image_grid"):
-            try:
-                png = self._backend.plot.image_grid(self._code, {src: fits_paths})
-                for img in images:
-                    img.paths["png"] = png[0] if png else img.paths.get("png", "")
-            except Exception as exc:  # noqa: BLE001 - a missing preview must not lose the images
-                warnings.warn(f"{self._code}: image preview of {src} failed ({exc})")
-        self._obs._state.mark_complete(f"clean_{src}", outputs=[img.paths.get("fits", "") for img in images])
-        return images[0] if len(images) == 1 else ImageSet(images)
+        report = difmap.image_source(split, str(image_dir / f"{self._code}_{src}"), robust_values=robust_values,
+                                     niter=int(niter), gain=float(img_cfg.get("clean_gain", 0.05)),
+                                     threshold_sigma=float(kwargs.get("threshold_sigma", 3.0)),
+                                     average_channels=bool(img_cfg.get("average_channels", True)),
+                                     **_search_settings(img_cfg))
+        _write_search_report(image_dir / f"{self._code}_{src}.search.json", report)
+        return [_image_from_difmap(src, info, weighting) for info in report["images"].values()]
 
     def _image(self, target, robust, imager, *, imsize=None, weighting=None, niter=None,
                **kwargs) -> Union[Image, ImageSet]:
@@ -2570,24 +2303,32 @@ class CleanNamespace(Namespace):
         src = self._resolve_source_name(target)
         imager = self._backend_imager(imager)
         img_cfg = obs.config.get("imaging", {})
-        if robust is None:
-            robust = img_cfg.get("robust", [0.0])
-        if imager == "difmap":
-            result = self.difmap_sources([src], robust=robust, weighting=weighting, niter=niter, **kwargs)[src]
-            if isinstance(result, Exception):
-                raise result
-            return result
         weighting = weighting or img_cfg.get("weighting", "briggs")
         niter = img_cfg.get("niter", 0) if niter is None else niter
+        if robust is None:
+            robust = img_cfg.get("robust", [0.0])
         robust_values = list(robust) if isinstance(robust, (list, tuple)) else [robust]
         kwargs.setdefault("threshold_sigma", img_cfg.get("threshold_sigma", 3.0))
         kwargs.setdefault("produce_fits", img_cfg.get("produce_fits", True))
         kwargs.setdefault("produce_png", img_cfg.get("produce_png", True))
         kwargs.setdefault("metadata", obs.metadata)
-        images = [self._backend.image.clean(self._code, src, robust=float(r), imager=imager,
-                                            imsize=imsize, weighting=weighting, niter=niter, **kwargs)
-                  for r in robust_values]
-        return self._finish_images(src, images, produce_png=kwargs["produce_png"])
+        if imager == "difmap":
+            images = self._image_with_difmap(src, [float(r) for r in robust_values], img_cfg, weighting, niter,
+                                             **kwargs)
+        else:
+            images = [self._backend.image.clean(self._code, src, robust=float(r), imager=imager,
+                                                imsize=imsize, weighting=weighting, niter=niter, **kwargs)
+                      for r in robust_values]
+        fits_paths = {img.robust: img.paths["fits"] for img in images if img.paths.get("fits")}
+        if kwargs["produce_png"] and fits_paths and self._backend.supports("plot", "image_grid"):
+            try:
+                png = self._backend.plot.image_grid(self._code, {src: fits_paths})
+                for img in images:
+                    img.paths["png"] = png[0] if png else img.paths.get("png", "")
+            except Exception as exc:  # noqa: BLE001 - a missing preview must not lose the images
+                warnings.warn(f"{self._code}: image preview of {src} failed ({exc})")
+        obs._state.mark_complete(f"clean_{src}", outputs=[img.paths.get("fits", "") for img in images])
+        return images[0] if len(images) == 1 else ImageSet(images)
 
 
 def _search_settings(img_cfg: dict) -> dict:
@@ -2598,23 +2339,11 @@ def _search_settings(img_cfg: dict) -> dict:
             "recentre_min_beams": float(img_cfg.get("recentre_min_beams", 10.0))}
 
 
-def _write_image_report(path: Path, report: dict, settings: Optional[dict] = None) -> None:
-    """Save what imaging a source with difmapy found, as JSON (``images/<code>_<source>.search.json``).
-
-    The source search (peak, significance, offset) and the shift applied, the statistics of every image
-    (the dashboard shows these: they are the latest images, also when a campaign re-imaged the epoch
-    after its self-calibration), the model the images are made of, and the imaging ``settings`` (the
-    keywords that matter for the method), by which a campaign tells whether images on disk were made
-    the way it would make them.
-    """
-    from ..backends.difmap import method_keywords
-    images = {str(robust): {key: value for key, value in info.items() if key != "fits"}
-              for robust, info in (report.get("images") or {}).items()}
-    model = report.get("model") if isinstance(report.get("model"), dict) else report.get("image_model") or {}
-    Path(path).write_text(json.dumps({"search": report.get("search") or {}, "shift_mas": report.get("shift_mas", [0, 0]),
-                                      "images": images, "model": model,
-                                      "imaging": method_keywords(settings) if settings else {}},
-                                     indent=2, default=str), encoding="utf-8")
+def _write_search_report(path: Path, report: dict) -> None:
+    """Save the source search of a difmapy report (peak, significance, offset, shift) as JSON, when there is one."""
+    if report.get("search"):
+        Path(path).write_text(json.dumps({"search": report["search"], "shift_mas": report.get("shift_mas", [0, 0])},
+                                         indent=2), encoding="utf-8")
 
 
 def _image_from_difmap(source: str, info: dict, weighting: str = "briggs") -> Image:
@@ -2656,19 +2385,13 @@ class SelfcalNamespace(Namespace):
         return dict(self._obs.config.get("selfcal", {}))
 
     def _apply_to(self, source: str) -> str:
-        """Fields a calibrator's solutions are applied to: FF -> all; others -> everything but the FFs.
-
-        A phase-reference source follows the plan (:meth:`vlbipy.phaseref.PhaseRefPlan.apply_to`):
-        ``sequential`` leaves out the references solved before it, ``interpolate`` every other reference.
-        """
+        """Fields a calibrator's solutions are applied to: FF -> all; others -> everything but the FFs."""
         obs = self._obs
         finders = {s.name for s in obs.sources.fringe_finders}
         if source in finders:
             return ""
-        names = [n for n in (obs.metadata.source_names if obs.metadata else list(obs.sources.names))
-                 if n not in finders]
-        planned = obs.phaseref_plan().apply_to(source, names)
-        return ",".join(names) if planned is None else planned
+        names = obs.metadata.source_names if obs.metadata else list(obs.sources.names)
+        return ",".join(n for n in names if n not in finders)
 
     def calibrator(self, target: TargetLike = None, *, force: bool = False, transfer_phases: Optional[bool] = None,
                    **kwargs) -> SelfcalResult:
@@ -2683,8 +2406,7 @@ class SelfcalNamespace(Namespace):
         from ..backends import difmap
         obs = self._obs
         src = self._resolve_source_name(target) if target is not None else \
-            ([s.name for s in obs.sources.fringe_finders] or obs.phaseref_plan().references
-             or [s.name for s in obs.sources.targets])[0]
+            (obs.sources.fringe_finders or obs.sources.phase_calibrators or obs.sources.targets)[0].name
         step = f"selfcal_{src}"
         if not obs._state.should_run(step, force=force):
             return obs._selfcal_results.get(src) or SelfcalResult(src, [], True)
@@ -2708,11 +2430,11 @@ class SelfcalNamespace(Namespace):
             min_improvement=float(cfg.get("min_improvement", 0.002)),
             max_bad_fraction=float(cfg.get("max_bad_fraction", 0.25)),
             bayes_models=tuple(cfg.get("bayes_models", ["clean", "gauss1", "gauss2", "gauss3"])),
-            prior_sigma=float(cfg.get("prior_sigma", 0.1)), outlier_sigma=float(cfg.get("outlier_sigma", 1.0)),
-            workers=cfg.get("workers") or None,
-            imagename=str(image_dir / f"{self._code}_{src}"),
-            **{**_search_settings(img_cfg), **difmap.imaging_settings(img_cfg), **kwargs})
-        _write_image_report(image_dir / f"{self._code}_{src}.search.json", report, difmap.imaging_settings(img_cfg))
+            prior_sigma=float(cfg.get("prior_sigma", 0.1)), workers=cfg.get("workers") or None,
+            imagename=str(image_dir / f"{self._code}_{src}"), niter=int(img_cfg.get("niter", 4000)),
+            gain=float(img_cfg.get("clean_gain", 0.05)), threshold_sigma=float(img_cfg.get("threshold_sigma", 3.0)),
+            **{**_search_settings(img_cfg), **kwargs})
+        _write_search_report(image_dir / f"{self._code}_{src}.search.json", report)
         apply_to = self._apply_to(src)
         amp_path = report["amplitude"].get("caltable", "")
         if amp_path and Path(amp_path).is_dir():
@@ -2752,18 +2474,15 @@ class SelfcalNamespace(Namespace):
         1. fringe finder(s), one after the other: difmapy sequence; the amplitude table
            goes to every field, the phases stay local (a fringe finder is too far from
            the target for its phases to transfer);
-        2. phase-reference sources (the phase calibrators, or the targets with inverse
-           phase referencing), in the order of the plan (:meth:`Observation.phaseref_plan`):
-           difmapy sequence on data that already carry those amplitudes; amplitude + phase
-           tables -> the fields of :meth:`_apply_to`, never the fringe finders;
+        2. phase calibrator(s): difmapy sequence on data that already carry those
+           amplitudes; amplitude + phase tables -> the phase calibrator, the targets and
+           the check sources, never the fringe finders;
         3. apply the whole chain to every field, then re-split every source (and
            UVFITS) so imaging sees the final calibration.
 
         Each calibrator is re-calibrated and re-split on its own just before its
-        session, so it sees the gains of the ones before it that apply to it: with the
-        ``sequential`` strategy (and ``time``) its table is then a refinement on top of
-        theirs; with ``interpolate`` every reference is self-calibrated independently and
-        the receivers take the interpolation of their tables.
+        session, so it sees the gains of the ones before it: its table is then a
+        refinement on top of theirs rather than a second copy of the same correction.
         """
         obs = self._obs
         results: dict[str, SelfcalResult] = {}
@@ -2775,8 +2494,8 @@ class SelfcalNamespace(Namespace):
             return results
         with_data = set(obs.metadata.source_names) if obs.metadata else set(obs.sources.names)
         finders = [s.name for s in obs.sources.fringe_finders if s.name in with_data]
-        references = [name for name in obs.phaseref_plan().references if name in with_data and name not in finders]
-        for name in finders + references:
+        phasecals = [s.name for s in obs.sources.phase_calibrators if s.name in with_data and s.name not in finders]
+        for name in finders + phasecals:
             if obs._state.should_run(f"selfcal_{name}", force=force):
                 # Deferred: only the split reads it, and calibrates while it reads (dask-ms).
                 obs.calibrate.apply(force=True, field=name, defer=True)

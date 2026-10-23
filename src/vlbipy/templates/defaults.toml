@@ -20,30 +20,12 @@ targets = []
 check_sources = []
 polarization_calibrators = []
 
-# Phase referencing: which sources the phases are solved on and how they reach the others (vlbipy.phaseref).
-# The reference sources are the phase calibrators, or the targets with `inverse = true` (inverse phase
-# referencing: solve on a bright target, transfer to the calibrators; "target" still names the source of
-# interest). With several reference sources:
-#   "sequential"  solve on the brightest and apply it everywhere, then solve each next one on data already
-#                 corrected by it: its second-order solutions go to the later references and the targets;
-#   "interpolate" solve each on its own; a target takes their phases, delays and rates combined along the
-#                 line joining the two nearest on the sky (1-D, by its projection onto that line);
-#   "time"        a target takes the solutions of whichever reference was observed closest in time;
-#   "auto"        "sequential" when the brightest is `brightness_ratio` times brighter (fringe SNR) than the
-#                 next one, "interpolate" otherwise.
-# Changing the strategy needs a re-run from the fringe fit (--from-step fringefit).
-# Any other key is a calibrator -> target map entry: key = target name, value = calibrator name or list.
+# Calibrator -> target phase-referencing map.
+# Key = target name, value = calibrator name or list of calibrator names.
 # Example:
 #   "3C286"     = "J1048+7143"
 #   "R20181030" = ["J1027+7428", "J1048+7143"]
 [phase_referencing]
-inverse = false              # --inverse-phaseref
-strategy = "auto"            # --phaseref-strategy: auto | sequential | interpolate | time
-brightness_ratio = 3.0
-order = []                   # sequential solve order; default brightest first
-max_extrapolation = 1.0      # interpolate: furthest beyond either reference, in units of their separation
-max_gap = 600.0              # interpolate (and auto): both references observed within this many seconds,
-                             # before and after, or a receiver time takes the time interpolation
 
 [import]
 scan_gap = 15                # seconds; gap defining a new scan boundary
@@ -81,13 +63,6 @@ outlier_sigma = 5.0          # robust-sigma cut for per-baseline outlier flaggin
 outlier_gross_departure = 0.25  # a baseline with too many outliers to trust the sigma cut still loses the
                              # time bins further than this fraction from its local level ...
 outlier_gross_max_fraction = 0.35  # ... unless they are more than this share of the baseline
-<<<<<<< HEAD
-weak_polarization_ratio = 5.0  # flag a receptor this many times weaker (fringe SNR on the calibrators) than
-                             # the antenna's other one, or never detected while it is; 0 = off
-=======
-weak_polarization_ratio = 5.0  # flag a receptor without fringes while its pair has them (before any solve),
-                             # or this many times weaker in amplitude (scalar bandpass); 0 = off
->>>>>>> 5d3198be0e79117f058939871de32e9e7c0bf006
 bandpass_min_gain = 0.5      # channels whose bandpass solution is flagged or below this (subband median = 1)
                              # are flagged per antenna and subband after the bandpass
 flag_off_source = true       # after the first apply: flag antennas while they are still slewing or have dropped
@@ -195,18 +170,6 @@ solint = "30s"               # accor solution interval
 smoothtype = "median"        # smoothcal filter
 smoothtime = 1800.0          # smoothcal filter width in seconds (0 = apply the table unsmoothed)
 
-[calibration.tec]
-# Ionospheric correction from global TEC maps (IONEX), as AIPS TECOR/VLBATECR, for every array.
-enabled = "auto"             # "auto": below the observatory's tec_below_ghz (EVN 5, VLBA/LBA 7); true; false
-model = "emrg"               # IONEX product (AIPS TECRTYPE): emrg, jplg, codg, esag, igsg, upcg, casg, ...
-fallback = true              # try the other products when this one is not available
-interval = 30.0              # seconds between table rows inside a scan (plus each scan's first/last time)
-shell_height = 0.0           # km; 0 = the height in the maps (HGT1, usually 450 km)
-rotation = 1.0               # AIPS APARM(2): interpolate in time between maps rotated with the Sun (0 = not)
-mapping = "thin_shell"       # "thin_shell" or "petrov" (Petrov 2023 modified mapping, AIPS APARM(4-6))
-ionex_files = []             # use these IONEX files instead of downloading
-ionex_dir = ""               # where the maps are cached; empty = <work_dir>/ionex
-
 [calibration.tsys_smooth]
 window = 5                   # running-median window, in solutions, used to de-spike Tsys
 
@@ -223,11 +186,10 @@ solints = []                 # phase ladder; empty = 30min, 10min, 5min, scan (+
 min_improvement = 0.002      # a step must lower the weighted chi-squared by this fraction (0.2%)
 max_bad_fraction = 0.25      # ... and fail in at most this fraction of its solution bins
 bayes_models = ["clean", "gauss1", "gauss2", "gauss3"]  # source models weighed by bayes_gscale
-prior_sigma = 0.1            # a-priori amplitude accuracy: a station within it is left alone (10%)
-outlier_sigma = 1.0          # spread of a station that is off (log amplitude): corrected almost in full
-joint_amplitude = true       # multi-epoch stage: also re-solve the station amplitudes of each epoch against the
-                             # joint calibrator model (bayes_gscale, prior_sigma/outlier_sigma as above; false:
-                             # phases only, the epochs keep the amplitudes their own models gave)
+prior_sigma = 0.1            # width of the prior on log-amplitude corrections (10%)
+joint_amplitude = false      # multi-epoch stage: also re-solve the station amplitudes of each epoch against the
+                             # joint calibrator model (off: phases only; the model comes from other epochs of a
+                             # source that varies, and amplitudes fitted to it degraded the targets in tests)
 workers = 0                  # threads for bayes_gscale (0 = difmapy's default)
 
 [imaging]
@@ -235,13 +197,7 @@ mapsize = 8192               # difmapy: width in pixels of the map the images ar
                              # valid inner half, 4096 px); cell = resolution / 10
 average_channels = true      # difmapy: average each subband to one channel before CLEAN (much faster; set
                              # false for fields wider than ~1 arcsec, where bandwidth smearing matters)
-imager = "difmap"            # "difmap" (difmapy on the per-source split) | "tclean"; dask-ms: always difmap
-method = "modelfit"          # difmapy: "modelfit" = circular Gaussians, CLEAN only for what they leave, one model
-                             # restored at every robust value | "clean" = CLEAN alone, each robust value on its own
-max_components = 10          # modelfit: most Gaussians per source
-component_sigma = 5.0        # modelfit: a Gaussian is kept only when the fit improves by this many sigma ...
-component_improvement = 0.01 # ... and (after the first) removes this fraction of the chi-squared
-clean_residual_sigma = 5.0   # modelfit: residual emission above this many sigma is CLEANed, in windows
+imager = "difmap"            # "difmap" (difmapy CLEAN on the per-source split) | "tclean"; dask-ms: always difmap
 weighting = "briggs"
 clean_gain = 0.05            # difmapy CLEAN loop gain
 robust = [-2, 0, 2]          # one image per robust value, shown side by side in the PNG preview
@@ -270,11 +226,7 @@ lightcurve_averaging = [0, 30, 120, -1]  # averaging scales (s) in the total lig
 [plotting]
 engine = "auto"              # standard plots (spectra, time series, time evolution): "jplotter" (jiveplot,
                              # fast), "matplotlib", or "auto" = jplotter when jiveplot is installed
-workers = "auto"             # most plots of the diagnostic and final-data sets drawn at the same time, each in
-                             # its own worker process reading its own data. "auto" = every CPU vlbipy may use
-                             # (its affinity and any container/batch-job CPU quota); a number caps it. Either
-                             # way only as many as their estimated peak memory allows (below), and never more
-                             # than the worker pool, which is sized to the CPUs and the available memory
-                             # (override with $VLBIPY_WORKERS / $VLBIPY_WORKER_MEMORY). 1 = one after another.
-memory_fraction = 0.8        # share of the available memory (the system's, or what a container, batch job or
-                             # systemd-run -p MemoryMax= limit leaves) the plots drawn together may take
+workers = 8                  # most plots of the diagnostic and final-data sets drawn at the same time, each in
+                             # its own worker process reading its own data; never more than the CPUs, and only
+                             # as many as their estimated peak memory allows (below). 1 = one after another.
+memory_fraction = 0.8        # share of the free memory the plots drawn together may take

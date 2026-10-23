@@ -213,11 +213,11 @@ def load_caltable(path) -> CalTableData:
 
     CPARAM tables give complex `param`, FPARAM tables float64.  All spws must have the same number of channels.
     """
-    from .msio import table_tool
+    import casatools
 
     t_start = _time.perf_counter()
     path = Path(path).absolute()
-    tb = table_tool()
+    tb = casatools.table()
     tb.open(str(path))
     keywords = tb.getkeywords()
     kind = str(keywords.get("VisCal", tb.info().get("subType", "")))
@@ -230,7 +230,7 @@ def load_caltable(path) -> CalTableData:
                                                                "ANTENNA1", "ANTENNA2", "SCAN_NUMBER")}
     if nrow == 0:
         raise ValueError(f"calibration table {path} has no rows")
-    # The casatools-style table returns Fortran order (npar, nchan_t, nrow); transpose to (nrow, nchan_t, npar).
+    # casatools returns Fortran order (npar, nchan_t, nrow); transpose to (nrow, nchan_t, npar).
     param = _row_major_column(tb.getcol(param_col), nrow, param_col, path)
     flag = _row_major_column(tb.getcol("FLAG"), nrow, "FLAG", path)
     snr = _row_major_column(tb.getcol("SNR"), nrow, "SNR", path)
@@ -732,18 +732,8 @@ def antenna_gains(table, antenna_ids, times, spw, chan_freq, *, field_id=None, i
     return (np.broadcast_to(gains.reshape(dense), shape).copy(), np.broadcast_to(flags.reshape(dense), shape).copy())
 
 
-#: Table kinds that are not gains (delays, TEC, leakages, antenna positions, baseline terms): applying their
-#: parameters as a G-like gain would be wrong, so they are refused instead. The TEC correction of this package
-#: is a Fringe Jones table (vlbipy.solvers.tec_task), never CASA's "F Jones".
-NON_GAIN_KINDS = ("F Jones", "K Jones", "KAntPos Jones", "KMBD Jones", "D Jones", "Df Jones", "X Jones",
-                  "Xf Jones", "M Mueller", "A Mueller")
-
-
 def _check_kind(table):
-    """Refuse a table kind that is known not to be a gain; warn about one that is applied as a plain gain
-    without being one of those known to be."""
-    if table.kind in NON_GAIN_KINDS:
-        raise NotImplementedError(f"{table.path}: {table.kind!r} tables are not applied natively")
+    """Warn about a table kind that is applied as a plain gain without being one of those known to be."""
     if table.kind not in ("G Jones", "T Jones", "B Jones", "B TSYS", "Fringe Jones", *GAIN_CURVE_KINDS):
         log.warning("table kind %r of %s not explicitly supported, applying as a G-like gain", table.kind,
                     table.path)

@@ -32,7 +32,6 @@ Two conversion paths produce identical stores:
   probed in a subprocess) or not installed.
 
 """
-import os
 import shutil
 import time
 from pathlib import Path
@@ -42,18 +41,14 @@ import numpy as np
 
 from ..errors import BackendError
 from ..logging_utils import get_logger, warnings
-from ..models import Antenna, CalTable, FreqSetup, ObsMetadata, Scan, Stokes
-from ..solvers.msio import compiled_engine
-from .base import Backend
+from ..models import Antenna, FreqSetup, ObsMetadata, Scan, Stokes
+from ..solvers.msio import table_engine
 from .casa import CasaBackend, CasaCalibrationOps, CasaDataOps, CasaExportOps, CasaFlagOps
 
 logger = get_logger()
 
 #: Main-table columns that can never be stored (variable shape / index-only).
 _SKIP_MAIN_COLUMNS = {"FLAG_CATEGORY"}
-
-#: Environment variable that turns the native FITS-IDI import off ("0": CASA's importfitsidi + partition).
-NATIVE_IMPORT_ENV = "VLBIPY_NATIVE_IMPORT"
 
 #: Default number of main-table rows per dask/zarr chunk (~100 MB of DATA for 64ch x 4pol).
 _DEFAULT_CHUNK_ROWS = 50_000
@@ -76,8 +71,8 @@ _VALUETYPE_DTYPES = {"complex": np.complex64, "dcomplex": np.complex128, "float"
 
 
 def _casacore_is_healthy() -> bool:
-    """Return True if python-casacore imports cleanly on this machine (see :func:`vlbipy.solvers.msio.compiled_engine`)."""
-    return compiled_engine() == "casacore"
+    """Return True if python-casacore imports cleanly on this machine (see :func:`vlbipy.solvers.msio.table_engine`)."""
+    return table_engine() == "casacore"
 
 
 def _column_dims(name: str, ndim: int) -> tuple[str, ...]:
@@ -243,14 +238,7 @@ def ms_to_daskms(ms, store, chunk_rows: int = _DEFAULT_CHUNK_ROWS) -> Path:
         The store path.
     """
     import dask
-    from daskms.experimental import zarr as daskms_zarr
     from daskms.experimental.zarr import xds_to_zarr
-
-    # dask-ms 0.2 needs zarr 2 (its zarr.convenience is gone in zarr 3); say so before converting anything.
-    if getattr(daskms_zarr, "zarr_import_error", None) is not None:
-        raise BackendError(f"the dask-ms zarr store needs a zarr that this dask-ms supports "
-                           f"({daskms_zarr.zarr_import_error}): install 'zarr<3' 'numcodecs<0.16' for dask-ms 0.2, "
-                           f"or dask-ms>=0.3 for zarr 3; or set [import].zarr_store = false")
 
     ms, store = Path(ms), Path(store)
     if not ms.is_dir():
@@ -488,118 +476,23 @@ class DaskMsPlotReads:
         return {"baselines": dict(sorted(baselines.items())), "times": ((edges[:-1] + edges[1:]) / 2.0).tolist(),
                 "polarizations": pol_labels, "refant": refant, "field": field, "column": column}
 
-    def _selected_scans(self, meta: ObsMetadata, field: str, scans: Optional[list]) -> tuple[list, list]:
-        """The field names and scan numbers a ``field``/``scans`` selection of the CASA readers covers."""
-        wanted = [f for f in field.split(",") if f]
-        numbers = sorted(int(s) for s in (scans or []))
-        return wanted, numbers
+    # The CASA readers below read the corrected column through the ``ms`` tool: a deferred calibration
+    # (vlbipy.solvers.corrected) is written first.
+    def _corrected_written(self, project_code: str, column: str) -> None:
+        if column == "corrected":
+            self.backend.calibrate.ensure_corrected(project_code)
 
-    def read_spectrum(self, project_code: str, *, field: str = "", scans: Optional[list] = None,
-                      refant: str = "", column: str = "corrected", all_pols: bool = False,
-                      metadata: Optional[ObsMetadata] = None) -> dict:
-        """Time-averaged spectra of the baselines to ``refant``, read in parallel (same output as
-        :meth:`CasaDataOps.read_spectrum`, which reads through the ``ms`` tool)."""
-        from ..solvers.plot_read import read_spectrum
-        from .casa import parallel_hand_indices
-        meta = metadata or self.get_metadata(project_code, [], "")
-        refant = refant or self.backend.calibrate.refant_chain(meta, "").split(",")[0]
-        antenna_names = list(meta.antennas)
-        if refant not in antenna_names:
-            raise BackendError(f"{project_code}: reference antenna {refant!r} is not in the array")
-        n_spw, n_chan = meta.freq_setup.n_subbands, meta.freq_setup.n_channels
-        if all_pols:
-            pol_indices = list(range(len(meta.freq_setup.polarizations)))
-            pol_labels = [p.name for p in meta.freq_setup.polarizations]
-        else:
-            pol_indices, pol_labels = parallel_hand_indices(meta)
-        wanted, numbers = self._selected_scans(meta, field, scans)
-        result = read_spectrum(self.backend.ms_path(project_code), fields=wanted or None, scans=numbers or None,
-                               column={"corrected": "CORRECTED_DATA", "data": "DATA", "model": "MODEL_DATA"}[column],
-                               corrs=list(pol_indices), refant=antenna_names.index(refant))
-        spectra = {antenna_names[k]: v for k, v in result["spectra"].items() if k < len(antenna_names)}
-        logger.info("read_spectrum[dask-ms]: {} baseline(s) to {} from the {} column ({} x {} channels) in {:.1f}s",
-                    len(spectra), refant, column, n_spw, n_chan, result["seconds"])
-        return {"antennas": sorted(spectra), "spectra": spectra, "refant": refant,
-                "n_spw": n_spw, "n_channels": n_chan, "polarizations": pol_labels,
-                "frequencies_ghz": [meta.freq_setup.frequencies_ghz(s) for s in range(n_spw)],
-                "column": column, "field": field, "scans": list(scans or [])}
+    def read_spectrum(self, project_code: str, **kwargs) -> dict:
+        self._corrected_written(project_code, kwargs.get("column", "corrected"))
+        return super().read_spectrum(project_code, **kwargs)
 
-    def read_autocorr_spectrum(self, project_code: str, *, field: str = "", scans: Optional[list] = None,
-                               column: str = "data", metadata: Optional[ObsMetadata] = None) -> dict:
-        """Time-averaged autocorrelation amplitude spectra, read in parallel (same output as
-        :meth:`CasaDataOps.read_autocorr_spectrum`)."""
-        from ..solvers.plot_read import read_autocorr_spectrum
-        from .casa import parallel_hand_indices
-        meta = metadata or self.get_metadata(project_code, [], "")
-        antenna_names = list(meta.antennas)
-        n_spw, n_chan = meta.freq_setup.n_subbands, meta.freq_setup.n_channels
-        pol_indices, pol_labels = parallel_hand_indices(meta)
-        wanted, numbers = self._selected_scans(meta, field, scans)
-        result = read_autocorr_spectrum(self.backend.ms_path(project_code), fields=wanted or None,
-                                        scans=numbers or None,
-                                        column={"corrected": "CORRECTED_DATA", "data": "DATA"}[column],
-                                        corrs=list(pol_indices))
-        spectra = {antenna_names[k]: v for k, v in result["spectra"].items() if k < len(antenna_names)}
-        logger.info("read_autocorr_spectrum[dask-ms]: {} antenna(s) on {} scan(s) of {} from the {} column in "
-                    "{:.1f}s", len(spectra), len(scans or []) or "all", field or "all fields", column,
-                    result["seconds"])
-        return {"antennas": sorted(spectra, key=antenna_names.index), "spectra": spectra,
-                "n_spw": n_spw, "n_channels": n_chan, "polarizations": pol_labels,
-                "frequencies_ghz": [meta.freq_setup.frequencies_ghz(s) for s in range(n_spw)],
-                "scans": list(scans or []), "field": field, "column": column}
+    def read_subband_phases(self, project_code: str, **kwargs) -> dict:
+        self._corrected_written(project_code, kwargs.get("column", "corrected"))
+        return super().read_subband_phases(project_code, **kwargs)
 
-    def read_subband_phases(self, project_code: str, *, fields: list[str], refant: str,
-                            column: str = "corrected", channel_fraction: float = 0.8,
-                            metadata: Optional[ObsMetadata] = None) -> dict:
-        """Per scan and baseline to ``refant`` the mean phase of every subband, read in parallel (same output as
-        :meth:`CasaDataOps.read_subband_phases`)."""
-        from ..solvers.plot_read import read_subband_phases
-        from .casa import parallel_hand_indices
-        meta = metadata or self.get_metadata(project_code, [], "")
-        antenna_names = list(meta.antennas)
-        if refant not in antenna_names:
-            raise BackendError(f"{project_code}: reference antenna {refant!r} not in the data")
-        n_spw, n_chan = meta.freq_setup.n_subbands, meta.freq_setup.n_channels
-        pol_indices, pol_labels = parallel_hand_indices(meta)
-        scans = [s for s in meta.scans if s.source in set(fields)]
-        margin = int(round(n_chan * (1.0 - channel_fraction) / 2.0))
-        result = read_subband_phases(self.backend.ms_path(project_code), fields=list(fields),
-                                     scans=[s.scan_number for s in scans],
-                                     column={"corrected": "CORRECTED_DATA", "data": "DATA"}[column],
-                                     corrs=list(pol_indices), refant=antenna_names.index(refant), first=margin,
-                                     last=max(margin + 1, n_chan - margin))
-        named = {}
-        for other, per_scan in result["phases"].items():
-            if other >= len(antenna_names):
-                continue
-            grid = np.full((len(scans), n_spw, len(pol_indices)), np.nan)
-            for row, scan in enumerate(scans):
-                if scan.scan_number in per_scan:
-                    grid[row] = per_scan[scan.scan_number]
-            named[antenna_names[other]] = grid
-        logger.info("read_subband_phases[dask-ms]: {} baseline(s) to {} over {} scan(s) of {} ({} column) in {:.1f}s",
-                    len(named), refant, len(scans), ",".join(fields), column, result["seconds"])
-        return {"antennas": sorted(named, key=antenna_names.index), "phases": named, "refant": refant,
-                "scans": [{"scan": s.scan_number, "source": s.source, "time": 0.5 * (s.time_start + s.time_end)}
-                          for s in scans],
-                "polarizations": pol_labels, "n_spw": n_spw, "column": column, "fields": list(fields)}
-
-    def read_uv_coverage(self, project_code: str, *, field: str = "", max_points: int = 200_000,
-                         metadata: Optional[ObsMetadata] = None) -> dict:
-        """The sampled (u, v) points per source in Mlambda, read in parallel (same output as
-        :meth:`CasaDataOps.read_uv_coverage`)."""
-        from ..solvers.plot_read import read_uv_coverage
-        meta = metadata or self.get_metadata(project_code, [], "")
-        names = {fid: name for name, fid in meta.source_ids.items()}
-        frequency = float(meta.freq_setup.ref_freq)
-        to_mlambda = frequency / 299792458.0 / 1e6
-        result = read_uv_coverage(self.backend.ms_path(project_code), fields=[f for f in field.split(",") if f] or None,
-                                  max_points=int(max_points))
-        fields = {names.get(fid, f"field{fid}"): {"u": (u * to_mlambda).tolist(), "v": (v * to_mlambda).tolist()}
-                  for fid, (u, v) in result["fields"].items()}
-        logger.info("read_uv_coverage[dask-ms]: {} field(s), {} point(s) on {} in {:.1f}s", len(fields),
-                    sum(len(f["u"]) for f in fields.values()), field or "all fields", result["seconds"])
-        return {"fields": fields, "unit": "Mlambda", "freq_ghz": frequency / 1e9}
+    def read_autocorr_spectrum(self, project_code: str, **kwargs) -> dict:
+        self._corrected_written(project_code, kwargs.get("column", "data"))
+        return super().read_autocorr_spectrum(project_code, **kwargs)
 
 
 class DaskMsDataOps(DaskMsPlotReads, CasaDataOps):
@@ -642,59 +535,13 @@ class DaskMsDataOps(DaskMsPlotReads, CasaDataOps):
             logger.info("dask-ms store {} already exists and there is no measurement set; skipping import", store)
             return
         kwargs.pop("keep_ms", None)  # legacy option: the measurement set is always kept now
-        if not self._import_native(project_code, files, scan_gap=scan_gap, delete=delete, mms=mms):
-            super().import_data(project_code, source_names, scan_gap=scan_gap, files=files, delete=delete, mms=mms,
-                                **kwargs)
+        super().import_data(project_code, source_names, scan_gap=scan_gap, files=files, delete=delete, mms=mms,
+                            **kwargs)
         if store.is_dir() and delete:
             logger.warning("removing existing dask-ms store {}", store)
             shutil.rmtree(store)
         if zarr_store and not store.is_dir():
             ms_to_daskms(self.backend.ms_path(project_code), store)
-
-    def _import_native(self, project_code: str, files: Optional[list[str]], *, scan_gap: int, delete: bool,
-                       mms: bool) -> bool:
-        """Write ``<code>.mms`` straight from the FITS-IDI files (:func:`vlbipy.solvers.idi_import.import_fitsidi`:
-        what importfitsidi + partition write, in parallel, with no intermediate plain MS).
-
-        Returns
-        -------
-        bool
-            True when the Multi-MS was written here; False when the CASA import must run instead: the native
-            import turned off (``$VLBIPY_NATIVE_IMPORT=0``) or not available, a plain MS only, an existing MS
-            to upgrade or keep, no files, or FITS-IDI the native import does not cover.
-        """
-        if os.environ.get(NATIVE_IMPORT_ENV, "").strip() == "0":
-            return False
-        try:
-            from ..solvers.idi_import import import_fitsidi
-            from ..solvers import idi_subtables  # noqa: F401 - the subtable writer the import needs
-        except ImportError as exc:
-            warnings.warn(f"importfitsidi: the native import is not available ({exc}); running the CASA import")
-            return False
-        from ..tools import space_available_gb
-        from .casa import IMPORT_FLAG_VERSION
-        work_dir = self.work_dir
-        target, plain_ms = work_dir / f"{project_code}.mms", work_dir / f"{project_code}.ms"
-        if not mms or not files or plain_ms.exists() or (target.exists() and not delete):
-            return False
-        needed = 1.6 * sum(Path(f).stat().st_size for f in files) / 1e9
-        if space_available_gb(work_dir) < needed:
-            raise BackendError(f"not enough disk space in {work_dir} to create the MMS (~{needed:.0f} GB needed)")
-        for stale in (target, target.with_name(f"{target.name}.flagversions")):
-            if stale.exists():
-                logger.warning("removing existing {}", stale)
-                shutil.rmtree(stale)
-        try:
-            import_fitsidi([str(f) for f in files], target, scan_gap=float(scan_gap))
-        except NotImplementedError as exc:
-            warnings.warn(f"importfitsidi: {exc}; running the CASA import instead")
-            if target.exists():
-                shutil.rmtree(target)
-            return False
-        self.backend.tasks.flagmanager(vis=str(target), mode="save", versionname=IMPORT_FLAG_VERSION,
-                                       comment="flags as imported", merge="replace")
-        logger.info("created {}", target)
-        return True
 
     # -- data access --
     def _store_datasets(self, project_code: str) -> list:
@@ -717,7 +564,7 @@ class DaskMsDataOps(DaskMsPlotReads, CasaDataOps):
         if not ms.is_dir():
             raise BackendError(f"data not found for {project_code}: neither a dask-ms store nor a measurement "
                                "set exists (run import_data first)")
-        if compiled_engine() != "casacore":
+        if table_engine() != "casacore":
             raise BackendError("lazy access to a measurement set needs a working python-casacore; "
                                f"export a store instead: vlbipy export -p {project_code} --format dask-ms")
         import daskms
@@ -729,11 +576,6 @@ class DaskMsDataOps(DaskMsPlotReads, CasaDataOps):
         if self._has_ms(project_code):
             return super().get_metadata(project_code, source_names, observatory)
         return self._metadata_from_store(project_code)
-
-    def _ms_summary(self, ms: Path) -> dict:
-        """The msmd quantities of :meth:`get_metadata`, read natively (:func:`vlbipy.solvers.ms_metadata.ms_summary`)."""
-        from ..solvers.ms_metadata import ms_summary
-        return ms_summary(ms)
 
     def _metadata_from_store(self, project_code: str) -> ObsMetadata:
         """Read the full observation metadata from the zarr store (no measurement set needed)."""
@@ -879,16 +721,7 @@ class DaskMsCalibrationOps(CasaCalibrationOps):
 
     def _run_gencal_task(self, params: dict) -> None:
         """``gencal(caltype='tsys')`` with :func:`vlbipy.solvers.apriori_task.write_tsys_table` (22 min -> 26 s on
-        GL048), ``gencal(caltype='gc')`` with :func:`vlbipy.solvers.gaincurve_task.write_gain_curve_table`
-        (bit-identical to CASA) and ``gencal(caltype='eop')`` with :func:`vlbipy.solvers.eop_task.write_eop_table`;
-        the other caltypes, and a Tsys spectrum, with CASA."""
-        if params.get("caltype") == "gc":
-            from ..solvers.gaincurve_task import write_gain_curve_table
-            return self._run_fast("gencal gc", write_gain_curve_table, params, super()._run_gencal_task)
-        if params.get("caltype") == "eop":
-            # Interpolates the EOPs between the right entries, where CASA's eop.py extrapolates (see eop_task).
-            from ..solvers.eop_task import write_eop_table
-            return self._run_fast("gencal eop", write_eop_table, params, super()._run_gencal_task)
+        GL048); the other caltypes, and a Tsys spectrum, with CASA."""
         if params.get("caltype") != "tsys" or params.get("uniform", True):
             return super()._run_gencal_task(params)
         from ..solvers.apriori_task import write_tsys_table
@@ -973,40 +806,6 @@ class DaskMsCalibrationOps(CasaCalibrationOps):
     #: ``apply(defer=True)`` is understood (see :meth:`apply`).
     defers_apply = True
 
-    def ionosphere(self, project_code: str, *, ionex_dir: str, **kwargs) -> CalTable:
-        """The ionospheric correction as a Fringe Jones table (:func:`vlbipy.solvers.tec_task.write_tec_table`:
-        the dispersive delay of AIPS TECOR from global ionosphere maps, per antenna, field and time).
-
-        Parameters
-        ----------
-        project_code : str
-            Project code (the MS must exist).
-        ionex_dir : str
-            Where the IONEX maps are cached or downloaded.
-        **kwargs
-            ``[calibration.tec]``: ``model``, ``fallback``, ``interval``, ``shell_height`` (0: the maps' own),
-            ``rotation``, ``mapping`` (``"thin_shell"`` or ``"petrov"``), ``ionex_files``.
-
-        Returns
-        -------
-        CalTable
-            The table (``cal_type="tec"``, linear interpolation, weights untouched), applied to every field with
-            that field's own rows (see :meth:`CasaCalibrationOps._resolve_table_gainfield`).
-        """
-        from ..solvers.tec_task import PETROV_MAPPING, write_tec_table
-        options = {k: v for k, v in kwargs.items() if k in ("model", "fallback", "interval", "rotation")}
-        mapping = str(kwargs.get("mapping", "thin_shell")).strip().lower()
-        if mapping == "petrov":
-            options.update(PETROV_MAPPING)
-        elif mapping != "thin_shell":
-            raise BackendError(f"[calibration.tec] mapping must be 'thin_shell' or 'petrov', not {mapping!r}")
-        options["shell_height"] = float(kwargs["shell_height"]) if kwargs.get("shell_height") else None
-        options["ionex_files"] = list(kwargs.get("ionex_files") or []) or None
-        caltable = self.backend.caldir() / f"{project_code}.tec"
-        report = write_tec_table(self.backend.ms_path(project_code), caltable, ionex_dir=ionex_dir, **options)
-        return CalTable(cal_type="tec", path=str(report["caltable"]), field=",".join(report["fields"]),
-                        gainfield="", interp="linear", calwt=False, step="tec")
-
     def ensure_corrected(self, project_code: str) -> list[int]:
         """Write CORRECTED_DATA of every field whose calibration was deferred; returns those fields.
 
@@ -1089,14 +888,12 @@ def _reads_corrected(task: str, kwargs: dict) -> bool:
 
 class NativeFlagTasks:
     """``casatasks`` with ``flagdata`` answered natively where it can be (see :mod:`vlbipy.solvers.flag_task`),
-    ``flagmanager`` always native (:mod:`vlbipy.solvers.flagversions`), ``clearcal``, ``accor`` and ``smoothcal``
-    native where they can be, and the deferred calibrations written before a task reads CORRECTED_DATA.
+    and the deferred calibrations written before a task reads CORRECTED_DATA.
 
     Every flagging call of the CASA flag operations goes through ``backend.tasks.flagdata``, so wrapping it
     here moves all of them (a-priori file, autocorrelations, quack, band edges, bandpass gaps, off-source and
-    outlier commands) and the tfcrop autoflagging (:mod:`vlbipy.solvers.tfcrop_task`) off ``casatasks.flagdata``
-    at once. A call the native engine does not reproduce exactly (rflag, clip, an unusual selection) is passed to
-    CASA unchanged; every other attribute is casatasks'.
+    outlier commands) off ``casatasks.flagdata`` at once. A call the native engine does not reproduce exactly
+    (tfcrop, rflag, an unusual selection) is passed to CASA unchanged; every other attribute is casatasks'.
 
     A measurement set whose calibration was deferred (:mod:`vlbipy.solvers.corrected`) has a CORRECTED_DATA
     that is out of date: any other task that may read it gets it written first, and after CASA's applycal or
@@ -1127,69 +924,11 @@ class NativeFlagTasks:
 
         return guarded
 
-    def accor(self, **kwargs):
-        """``accor`` natively (:func:`vlbipy.solvers.accor_task.run_accor`: CASA's table, cell for cell); a request
-        it does not reproduce is run by CASA."""
-        from ..solvers.accor_task import run_accor
-        try:
-            run_accor(**kwargs)
-        except NotImplementedError as exc:
-            warnings.warn(f"accor: {exc}; running the CASA task instead")
-            return self.__getattr__("accor")(**kwargs)
-
-    def smoothcal(self, **kwargs):
-        """``smoothcal`` of an accor table natively (:func:`vlbipy.solvers.accor_task.smooth_caltable`); anything
-        else with CASA."""
-        from ..solvers.accor_task import smooth_caltable
-        try:
-            smooth_caltable(**kwargs)
-        except NotImplementedError as exc:
-            warnings.warn(f"smoothcal: {exc}; running the CASA task instead")
-            return self.__getattr__("smoothcal")(**kwargs)
-
-    def clearcal(self, **kwargs):
-        """``clearcal`` natively (:mod:`vlbipy.solvers.clearcal_task`) without a selection; with one, CASA's."""
-        from ..solvers.clearcal_task import clearcal_ms
-        if any(kwargs.get(key) for key in ("field", "spw", "intent")) or set(kwargs) - {"vis", "addmodel", "field",
-                                                                                       "spw", "intent"}:
-            return self.__getattr__("clearcal")(**kwargs)
-        clearcal_ms(kwargs["vis"], addmodel=bool(kwargs.get("addmodel", False)))
-
-    def flagmanager(self, **kwargs):
-        """``flagmanager`` natively (:mod:`vlbipy.solvers.flagversions`, CASA's files): no CASA needed."""
-        from ..solvers.flagversions import flagmanager
-        return flagmanager(**kwargs)
-
-    def _tfcrop_natively(self, vis, kwargs: dict) -> bool:
-        """Run ``flagdata(mode='tfcrop')`` with :func:`vlbipy.solvers.tfcrop_task.tfcrop_ms` (CASA's flags, cell for
-        cell); False when the call is one it does not reproduce (nothing is written then) and CASA must run it."""
-        from ..solvers.tfcrop_task import check_tfcrop_kwargs, tfcrop_ms
-        options = {k: v for k, v in kwargs.items() if k not in ("vis", "flagbackup")}
-        try:
-            # The keywords are checked first, so the backup below is made only for a run that goes native.
-            check_tfcrop_kwargs({k: v for k, v in options.items()
-                                 if k not in ("datacolumn", "field", "timecutoff", "freqcutoff")})
-        except NotImplementedError as exc:
-            logger.debug("flagdata[tfcrop]: {}; using casatasks.flagdata", exc)
-            return False
-        if kwargs.get("flagbackup"):
-            self._tasks.flagmanager(vis=str(vis), mode="save", versionname=f"flagdata_{int(time.time())}")
-        try:
-            stats = tfcrop_ms(vis, **options)
-        except NotImplementedError as exc:
-            logger.debug("flagdata[tfcrop]: {}; using casatasks.flagdata", exc)
-            return False
-        logger.info("flagdata[native]: tfcrop on {} part(s), {} cell(s) newly flagged, {:.1f}s", stats["parts"],
-                    stats["newly_flagged"], stats["seconds"])
-        return True
-
     def flagdata(self, **kwargs):
-        """Run ``flagdata`` natively when the call is a supported selection or a tfcrop, otherwise through CASA."""
+        """Run ``flagdata`` natively when the call is a supported selection, otherwise through CASA."""
         from ..solvers.flag_task import Unsupported, apply_flag_selections, compile_flagdata, read_flag_setup
         vis = kwargs.get("vis")
         if vis and Path(str(vis)).is_dir():
-            if str(kwargs.get("mode", "")).strip().lower() == "tfcrop" and self._tfcrop_natively(vis, kwargs):
-                return {}
             try:
                 setup = read_flag_setup(vis)
                 selections = compile_flagdata(kwargs, setup)
@@ -1325,35 +1064,7 @@ def _timebin_seconds(timebin) -> Optional[float]:
 
 
 class DaskMsExportOps(CasaExportOps):
-    """CASA export with the per-source split, the epoch merge and the UVFITS export done natively."""
-
-    def merge(self, project_codes: list[str], source_names: list[str], *, inputs: Optional[list[str]] = None,
-              outputvis: str = "", scales: Optional[list[float]] = None, **kwargs) -> str:
-        """Concatenate the per-source splits of several epochs like :meth:`CasaExportOps.merge`, natively
-        (:func:`vlbipy.solvers.concat_task.concat_ms`: CASA's ``concat`` and the epoch scaling, cell for cell).
-
-        A single input, Multi-MS inputs (CASA's ``split(keepmms=False)`` re-sorts them first) and anything else
-        ``concat_ms`` does not reproduce are merged by CASA.
-        """
-        if not inputs or len(inputs) < 2 or not outputvis or any(not Path(p).is_dir() for p in inputs):
-            return super().merge(project_codes, source_names, inputs=inputs, outputvis=outputvis, scales=scales,
-                                 **kwargs)
-        from ..solvers.concat_task import concat_ms
-        target = Path(outputvis)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists():
-            shutil.rmtree(target)
-        logger.info("concat[dask-ms]: {} [{}] -> {}", ",".join(source_names), ", ".join(project_codes), target.name)
-        try:
-            concat_ms([str(p) for p in inputs], str(target), respectname=True, copypointing=False,
-                      scales=[float(s) for s in scales] if scales else None)
-            return str(target)
-        except NotImplementedError as exc:
-            warnings.warn(f"concat: {exc}; merging with CASA instead")
-            if target.exists():
-                shutil.rmtree(target)
-        return super().merge(project_codes, source_names, inputs=inputs, outputvis=outputvis, scales=scales,
-                             **kwargs)
+    """CASA export with the per-source split done natively (see :mod:`vlbipy.solvers.split_task`)."""
 
     def ms(self, project_code: str, source: str, *, datacolumn: str = "corrected",
            chanbin: int = -1, timebin: str = "", keepflags: bool = True,
@@ -1367,8 +1078,8 @@ class DaskMsExportOps(CasaExportOps):
         from ..solvers.split_task import split_field
         seconds = _timebin_seconds(timebin)
         column = {"corrected": "CORRECTED_DATA", "data": "DATA"}.get(str(datacolumn).lower())
-        # The output is written natively (vlbipy.casacore_format); options it does not reproduce go to mstransform.
-        if kwargs or not keepflags or seconds is None or column is None:
+        # The output table is created with python-casacore; where it is broken (some macOS builds) use CASA.
+        if kwargs or not keepflags or seconds is None or column is None or table_engine() != "casacore":
             return super().ms(project_code, source, datacolumn=datacolumn, chanbin=chanbin, timebin=timebin,
                               keepflags=keepflags, outputvis=outputvis, metadata=metadata, **kwargs)
         ms = self.backend.ms_path(project_code)
@@ -1393,16 +1104,6 @@ class DaskMsExportOps(CasaExportOps):
             logger.debug("could not snapshot the flags of {}: {}", target, exc)
         return str(target)
 
-    def _run_exportuvfits(self, params: dict) -> None:
-        """``exportuvfits`` with :func:`vlbipy.solvers.uvfits_task.export_uvfits` (bit-identical visibilities,
-        weights and random parameters); options it does not reproduce run the CASA task."""
-        from ..solvers.uvfits_task import export_uvfits
-        try:
-            export_uvfits(**params)
-        except NotImplementedError as exc:
-            warnings.warn(f"exportuvfits: {exc}; running the CASA task instead")
-            super()._run_exportuvfits(params)
-
 
 class DaskMsBackend(CasaBackend):
     """CASA backend with numpy/dask-ms calibration (fringe fits, bandpass, gains, applycal) and difmapy imaging.
@@ -1424,19 +1125,13 @@ class DaskMsBackend(CasaBackend):
     export_ops = DaskMsExportOps
 
     def __init__(self, work_dir: str = ".") -> None:
-        from ..casacore_format.compat import LazyModule, NativeTools
         try:
             import daskms  # noqa: F401
         except ImportError as exc:
             raise BackendError("the dask-ms backend requires dask-ms: "
                                "pip install vlbipy[daskms]") from exc
-        from ..solvers.msio import set_default_engine
-        # CASA is imported only when a step still needs one of its tasks or tools; its log is redirected then.
-        self.tasks = NativeFlagTasks(LazyModule("casatasks", on_import=lambda _: self.redirect_casa_log()))
-        self.tools = NativeTools()
-        set_default_engine("native")        # every table read and written natively, here and in the workers
-        self._ms_overrides: dict[str, Path] = {}
-        Backend.__init__(self, work_dir)
+        super().__init__(work_dir)
+        self.tasks = NativeFlagTasks(self.tasks)
 
     def store_path(self, project_code: str) -> Path:
         """Return the zarr-store path for a project (work_dir/<code>.zarr)."""

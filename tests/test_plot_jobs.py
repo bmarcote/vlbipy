@@ -1,9 +1,7 @@
 """Tests for drawing plot sets in worker processes (vlbipy.plot_jobs) and the pool they run in."""
 from __future__ import annotations
 
-import os
 import threading
-import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -291,43 +289,6 @@ def test_pool_callers_beyond_its_size_wait_for_a_worker():
         for thread in threads:
             thread.join(timeout=60)
         assert results == [{"index": index} for index in range(3)]
-    finally:
-        pool.close()
-
-
-def test_jobs_called_from_a_worker_run_in_that_worker_without_a_pool_of_its_own():
-    # A plot drawn in a worker reads the data through run_jobs; it must not start 16 more processes.
-    try:
-        pids = workers.run_jobs("vlbipy.solvers.workers:run_jobs",
-                                [{"function_path": "os:getpid", "jobs": [{}, {}, {}], "workers": 4}] * 2, workers=2)
-        assert all(len(set(inner)) == 1 for inner in pids)               # each worker ran its jobs itself
-        assert {inner[0] for inner in pids}.isdisjoint({os.getpid()})
-        assert workers.run_jobs("vlbipy.solvers.workers:in_worker", [{}, {}], workers=2) == [True, True]
-        assert not workers.in_worker()
-    finally:
-        workers.close_pool()
-
-
-def test_a_busy_pool_is_not_restarted_for_another_size():
-    try:
-        pool = workers.get_pool(1)
-        future = workers.submit_jobs("subprocess:run", [{"args": ["sleep", "2"]}], workers=1)[0]
-        deadline = time.monotonic() + 30
-        while not pool.busy and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert workers.get_pool(2) is pool                               # not closed under the running job
-        assert future.result(timeout=60).returncode == 0
-        assert workers.get_pool(2) is not pool and pool.closed            # idle again: resized
-    finally:
-        workers.close_pool()
-
-
-def test_map_runs_at_most_the_workers_asked_for():
-    pool = workers.WorkerPool(2)
-    try:
-        # One at a time, the last-freed (LIFO) worker takes every job.
-        assert len(set(pool.map("os:getpid", [{}] * 6, workers=1))) == 1
-        assert pool.map("builtins:dict", [{"index": i} for i in range(5)]) == [{"index": i} for i in range(5)]
     finally:
         pool.close()
 

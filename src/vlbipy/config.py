@@ -98,10 +98,8 @@ def kwargs_to_overrides(**kwargs) -> dict:
     """Map convenience constructor kwargs onto the nested config structure.
 
     Recognised keys: ``network``, ``backend``, ``mode``, ``refant`` (str or
-    list), the source roles ``target`` / ``phasecal`` / ``fringe_finder`` /
-    ``check_source`` (each str or list), and ``inverse_phaseref`` (bool) /
-    ``phaseref_strategy`` (str) for ``[phase_referencing]``. ``None`` values
-    are ignored.
+    list), and the source roles ``target`` / ``phasecal`` / ``fringe_finder`` /
+    ``check_source`` (each str or list). ``None`` values are ignored.
 
     Returns
     -------
@@ -126,17 +124,9 @@ def kwargs_to_overrides(**kwargs) -> dict:
         if value is not None:
             sources[cfg_key] = [value] if isinstance(value, str) else list(value)
 
-    phaseref: dict = {}
-    if kwargs.get("inverse_phaseref") is not None:
-        phaseref["inverse"] = bool(kwargs["inverse_phaseref"])
-    if kwargs.get("phaseref_strategy") is not None:
-        phaseref["strategy"] = str(kwargs["phaseref_strategy"])
-
     out: dict = {}
     if glob:
         out["global"] = glob
     if sources:
         out["sources"] = sources
-    if phaseref:
-        out["phase_referencing"] = phaseref
     return out

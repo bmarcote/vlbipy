@@ -15,14 +15,7 @@ daskms = pytest.importorskip("daskms")
 import dask  # noqa: E402
 import dask.array as da  # noqa: E402
 from daskms import Dataset  # noqa: E402
-from daskms.experimental import zarr as daskms_zarr  # noqa: E402
 from daskms.experimental.zarr import xds_to_zarr  # noqa: E402
-
-# dask-ms 0.2 supports only zarr 2: with zarr 3 installed every store write fails, so say why and skip.
-pytestmark = pytest.mark.skipif(
-    getattr(daskms_zarr, "zarr_import_error", None) is not None,
-    reason=f"dask-ms cannot use the installed zarr ({getattr(daskms_zarr, 'zarr_import_error', '')}): "
-           "install 'zarr<3' 'numcodecs<0.16' (dask-ms 0.2) or dask-ms>=0.3 (zarr 3)")
 
 from vlbipy import load_config  # noqa: E402
 from vlbipy.backends.dask_ms import DaskMsBackend, _zero_pad_cells  # noqa: E402
@@ -165,7 +158,7 @@ def test_casa_tasks_get_a_deferred_calibration_written_before_reading_it(tmp_pat
     monkeypatch.setattr(corrected, "record_external", lambda vis, fields, label: calls.append(f"external:{label}"))
     monkeypatch.setattr(corrected, "load_record", lambda vis: {"fields": {0: {}}, "written": {}})
     tasks = SimpleNamespace(**{name: (lambda name: lambda **kw: calls.append(name))(name)
-                               for name in ("tclean", "gencal", "plotms", "clearcal", "applycal", "split")})
+                               for name in ("tclean", "flagmanager", "plotms", "clearcal", "applycal", "split")})
     wrapped = NativeFlagTasks(tasks)
 
     def run(task, vis=ms, **kwargs):
@@ -176,103 +169,8 @@ def test_casa_tasks_get_a_deferred_calibration_written_before_reading_it(tmp_pat
     assert run("tclean") == ["write", "tclean"]                       # tclean reads the corrected data
     assert run("split", datacolumn="data") == ["split"]
     assert run("split", datacolumn="corrected") == ["write", "split"]
-    assert run("gencal", caltype="gc") == ["gencal"]                  # never reads the corrected data
+    assert run("flagmanager", mode="save") == ["flagmanager"]
     assert run("plotms") == ["plotms"] and run("plotms", ydatacolumn="corrected") == ["write", "plotms"]
-    assert run("clearcal", field="3C345") == ["clearcal", "forget"]  # a selection: CASA's clearcal
+    assert run("clearcal") == ["clearcal", "forget"]
     assert run("applycal") == ["write", "applycal", "external:casa"]
     assert run("tclean", vis=plain) == ["tclean"]                     # no record: nothing deferred there
-
-
-def test_native_tables_are_the_default_only_under_the_dask_ms_backend(tmp_path, monkeypatch):
-    pytest.importorskip("casatasks")
-    from vlbipy.backends.casa import CasaBackend
-    from vlbipy.backends.dask_ms import DaskMsBackend
-    from vlbipy.solvers import msio
-    monkeypatch.delenv(msio.ENGINE_ENV, raising=False)
-    monkeypatch.chdir(tmp_path)
-    assert msio.table_engine() == msio.compiled_engine()             # no backend: casacore / casatools
-    DaskMsBackend(str(tmp_path))
-    assert msio.table_engine() == "native"
-    CasaBackend(str(tmp_path))
-    assert msio.table_engine() == msio.compiled_engine()
-    monkeypatch.setenv(msio.ENGINE_ENV, "native")                     # the explicit choice wins
-    assert msio.table_engine() == "native"
-
-
-def test_accor_and_smoothcal_run_natively_and_fall_back_to_casa(monkeypatch):
-    from types import SimpleNamespace
-
-    from vlbipy.backends.dask_ms import NativeFlagTasks
-    from vlbipy.solvers import accor_task
-    calls = []
-    tasks = NativeFlagTasks(SimpleNamespace(accor=lambda **kw: calls.append("casa accor"),
-                                            smoothcal=lambda **kw: calls.append("casa smoothcal")))
-    monkeypatch.setattr(accor_task, "run_accor", lambda **kw: calls.append("native accor"))
-    monkeypatch.setattr(accor_task, "smooth_caltable", lambda **kw: calls.append("native smoothcal"))
-    tasks.accor(vis="x.ms", caltable="x.accor", solint="30s", corrdepflags=True)
-    tasks.smoothcal(vis="x.ms", tablein="x.accor", caltable="x.accor_smooth", smoothtype="median", smoothtime=1800.0)
-    assert calls == ["native accor", "native smoothcal"]
-
-    def unsupported(**kw):
-        raise NotImplementedError("a selection")
-    monkeypatch.setattr(accor_task, "run_accor", unsupported)
-    calls.clear()
-    tasks.accor(vis="x.ms", caltable="x.accor", field="3C84")
-    assert calls == ["casa accor"]
-
-
-def test_tfcrop_runs_natively_and_falls_back_to_casa(tmp_path, monkeypatch):
-    from types import SimpleNamespace
-
-    from vlbipy.backends.dask_ms import NativeFlagTasks
-    from vlbipy.solvers import flag_task, tfcrop_task
-    vis = tmp_path / "x.ms"
-    vis.mkdir()
-    calls = []
-    tasks = NativeFlagTasks(SimpleNamespace(flagdata=lambda **kw: calls.append("casa")))
-    monkeypatch.setattr(tfcrop_task, "tfcrop_ms", lambda ms, **kw: calls.append(("native", sorted(kw))) or
-                        {"parts": 1, "newly_flagged": 0, "seconds": 0.0})
-
-    def unsupported(*args, **kwargs):
-        raise flag_task.Unsupported("not a selection")
-    monkeypatch.setattr(flag_task, "read_flag_setup", unsupported)
-    tasks.flagdata(vis=str(vis), mode="tfcrop", datacolumn="data", timecutoff=4.0, freqcutoff=3.0,
-                   extendflags=False, flagbackup=False)
-    assert calls == [("native", ["datacolumn", "extendflags", "freqcutoff", "mode", "timecutoff"])]
-    calls.clear()
-    tasks.flagdata(vis=str(vis), mode="tfcrop", ntime="60s", flagbackup=False)     # not reproduced natively
-    assert calls == ["casa"]
-
-
-def test_gencal_eop_is_written_natively(monkeypatch, tmp_path):
-    from vlbipy.backends.dask_ms import DaskMsBackend
-    from vlbipy.solvers import eop_task
-    monkeypatch.chdir(tmp_path)
-    calls = []
-    monkeypatch.setattr(eop_task, "write_eop_table", lambda vis, caltable, **kw: calls.append((vis, caltable, kw)))
-    DaskMsBackend(str(tmp_path)).calibrate._run_gencal_task({"vis": "x.ms", "caltable": "x.eop", "caltype": "eop",
-                                                             "infile": "usno_finals.erp"})
-    assert calls == [("x.ms", "x.eop", {"caltype": "eop", "infile": "usno_finals.erp"})]
-
-
-def test_merge_concatenates_epochs_natively_and_falls_back_to_casa(tmp_path, monkeypatch):
-    from vlbipy.backends.casa import CasaExportOps
-    from vlbipy.backends.dask_ms import DaskMsBackend
-    from vlbipy.solvers import concat_task
-    monkeypatch.chdir(tmp_path)
-    inputs = [tmp_path / "e1.ms", tmp_path / "e2.ms"]
-    for path in inputs:
-        path.mkdir()
-    calls = []
-    monkeypatch.setattr(concat_task, "concat_ms", lambda paths, out, **kw: calls.append(("native", kw["scales"])))
-    monkeypatch.setattr(CasaExportOps, "merge", lambda self, codes, names, **kw: calls.append("casa") or "x")
-    export = DaskMsBackend(str(tmp_path)).export
-    out = str(tmp_path / "all.ms")
-    assert export.merge(["A", "B"], ["SRC"], inputs=[str(p) for p in inputs], outputvis=out, scales=[1, 0.5]) == out
-    export.merge(["A"], ["SRC"], inputs=[str(inputs[0])], outputvis=out)          # one epoch: CASA's copy path
-
-    def unsupported(paths, out, **kw):
-        raise NotImplementedError("Multi-MS input")
-    monkeypatch.setattr(concat_task, "concat_ms", unsupported)
-    export.merge(["A", "B"], ["SRC"], inputs=[str(p) for p in inputs], outputvis=out)
-    assert calls == [("native", [1.0, 0.5]), "casa", "casa"]

@@ -27,9 +27,8 @@ def test_aips_is_stub():
         get_backend("aips")
 
 
-def test_casa_backend_needs_casatools(tmp_path, monkeypatch):
+def test_casa_backend_needs_casatools():
     """CasaBackend constructs when casatools is present, raises BackendError otherwise."""
-    monkeypatch.chdir(tmp_path)                       # its work directory (and CASA's logs/) is the current one
     try:
         import casatools  # noqa: F401
         backend = get_backend("casa")
@@ -224,7 +223,7 @@ def test_edge_spw_selection_never_flags_everything():
 
 
 def test_edge_trim_takes_the_consensus_not_the_widest():
-    """Two of the three indicators must agree before bandwidth is given up."""
+    """Phase scatter alone does not widen the trim beyond the amplitude roll-off."""
     import numpy as np
     ops = _flag_ops()
     rng = np.random.default_rng(7)
@@ -235,6 +234,25 @@ def test_edge_trim_takes_the_consensus_not_the_widest():
     solved = np.zeros(n)
     left, right = ops._edge_trim(amp, phase, solved, threshold=6.0, max_trim=16, n_channels=n)
     assert (left, right) == (4, 4)      # the median vote, not the widest (8)
+
+
+def test_edge_trim_follows_an_amplitude_roll_off_alone():
+    """A strong station: clean roll-off, flat phases, every channel solved (EB104D TR, left untrimmed)."""
+    import numpy as np
+    ops = _flag_ops()
+    rng = np.random.default_rng(11)
+    n = 64
+    amp = 1.02 + rng.normal(0.0, 0.01, n)
+    amp[:4] = [0.55, 0.70, 0.82, 0.90]; amp[-4:] = [0.92, 0.82, 0.69, 0.56]
+    phase = 0.05 + rng.normal(0.0, 0.005, n)
+    solved = np.zeros(n)
+    assert ops._edge_trim(amp, phase, solved, threshold=6.0, max_trim=16, n_channels=n) == (4, 4)
+    # Phase scatter alone never trims; together with unsolved channels it trims beyond the roll-off.
+    flat = 1.0 + rng.normal(0.0, 0.01, n)
+    phase[:6] = 5.0
+    assert ops._edge_trim(flat, phase, solved, threshold=6.0, max_trim=16, n_channels=n) == (0, 0)
+    solved[:6] = 1.0
+    assert ops._edge_trim(amp, phase, solved, threshold=6.0, max_trim=16, n_channels=n) == (6, 4)
 
 
 def test_single_channel_subbands_survive_every_channel_decision():
@@ -594,8 +612,7 @@ def test_scalar_bandpass_is_normalised_per_antenna(tmp_path, monkeypatch):
     antennas = np.repeat([0, 1], 4)                                   # two antennas, four subbands each
     amplitude = np.array([0.40, 0.44, 0.36, 0.40, 1.2, 1.3, 1.25, 0.3])
     FakeTable.store.update(CPARAM=np.tile(amplitude.astype(complex), (2, 1, 1)), FLAG=np.zeros((2, 1, 8), bool),
-                           ANTENNA1=antennas, SPECTRAL_WINDOW_ID=np.tile(np.arange(4), 2), FIELD_ID=np.zeros(8, int),
-                           SNR=np.full((2, 1, 8), 50.0))
+                           ANTENNA1=antennas, SPECTRAL_WINDOW_ID=np.tile(np.arange(4), 2))
     ops = CasaCalibrationOps.__new__(CasaCalibrationOps)
     ops._backend = type("B", (), {"tools": type("T", (), {"table": staticmethod(FakeTable)})()})()
     monkeypatch.setattr(ops, "_table_antenna_names", lambda path: ["AA", "BB"])
@@ -631,8 +648,7 @@ def test_scalar_bandpass_leaves_unsolved_solutions_at_one(tmp_path, monkeypatch)
     flags[:, 0, 2] = True                                             # AA spw 2 unsolved
     flags[:, 0, 4:] = True                                            # BB unsolved everywhere
     FakeTable.store.update(CPARAM=np.tile(amplitude.astype(complex), (2, 1, 1)), FLAG=flags,
-                           ANTENNA1=np.repeat([0, 1], 4), SPECTRAL_WINDOW_ID=np.tile(np.arange(4), 2),
-                           FIELD_ID=np.zeros(8, int), SNR=np.full((2, 1, 8), 50.0))
+                           ANTENNA1=np.repeat([0, 1], 4), SPECTRAL_WINDOW_ID=np.tile(np.arange(4), 2))
     ops = CasaCalibrationOps.__new__(CasaCalibrationOps)
     ops._backend = type("B", (), {"tools": type("T", (), {"table": staticmethod(FakeTable)})()})()
     monkeypatch.setattr(ops, "_table_antenna_names", lambda path: ["AA", "BB"])
@@ -643,44 +659,6 @@ def test_scalar_bandpass_leaves_unsolved_solutions_at_one(tmp_path, monkeypatch)
     assert np.allclose(gains[[2, 4, 5, 6, 7]], 1.0)
     assert len(filled) == 10 and "AA spw 2 pol 0" in filled and "BB spw 3 pol 1" in filled
     assert CasaCalibrationOps._summarise_labels(filled) == "AA (2), BB (8)"
-
-
-def test_scalar_bandpass_merges_calibrators_of_different_flux(tmp_path, monkeypatch):
-    """Two calibrators solved against a 1 Jy model sit at different levels: each is levelled on its own and
-    the table ends with one level per subband, the same for both fields (no step when the field changes)."""
-    import numpy as np
-    from vlbipy.backends.casa import CasaCalibrationOps
-
-    class FakeTable:
-        store: dict = {}
-
-        def open(self, path, nomodify=True):
-            return True
-
-        def getcol(self, name):
-            return FakeTable.store[name].copy()
-
-        def putcol(self, name, value):
-            FakeTable.store[name] = np.array(value)
-
-        def close(self):
-            pass
-
-    shape = np.array([1.0, 1.2, 0.9, 1.0])                            # the subband steps of the one antenna
-    amplitude = np.concatenate([1.5 * shape, 0.7 * shape * [1.0, 1.0, 1.0, 0.2]])  # field 3: spw 3 broken
-    snr = np.concatenate([np.full(4, 100.0), np.full(4, 25.0)])
-    FakeTable.store.update(CPARAM=np.tile(amplitude.astype(complex), (2, 1, 1)), FLAG=np.zeros((2, 1, 8), bool),
-                           ANTENNA1=np.zeros(8, int), SPECTRAL_WINDOW_ID=np.tile(np.arange(4), 2),
-                           FIELD_ID=np.repeat([1, 3], 4), SNR=np.tile(snr, (2, 1, 1)))
-    ops = CasaCalibrationOps.__new__(CasaCalibrationOps)
-    ops._backend = type("B", (), {"tools": type("T", (), {"table": staticmethod(FakeTable)})()})()
-    monkeypatch.setattr(ops, "_table_antenna_names", lambda path: ["AA"])
-    dropped, filled = ops._normalise_per_antenna(tmp_path, max_factor=2.0)
-    gains = np.abs(FakeTable.store["CPARAM"][0, 0])
-    assert np.allclose(gains[:4], gains[4:])                          # identical for both fields: no step
-    assert np.allclose(gains[[0, 1, 2]], shape[[0, 1, 2]], rtol=0.02)  # the 1.5 vs 0.7 flux levels are gone
-    assert np.isclose(gains[3], 1.0, rtol=0.02)                       # field 1 alone levels the broken subband
-    assert not FakeTable.store["FLAG"].any() and dropped == [] and filled == []
 
 
 class _FakeCalTables:

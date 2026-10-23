@@ -106,6 +106,9 @@ STEP_INFO: dict[str, tuple[str, str, str]] = {
     "third_pass": ("Third pass", "The whole chain re-derived once more on the re-weighted, re-flagged data. Its "
                    "plots, in the sections of those steps above, are overwritten by this pass.",
                    "obs.calibrate.second_pass(force=FORCE, step='third_pass')"),
+    "flag_edges_final": ("Subband edges, final bandpass", "Edge channels and bandpass gaps measured again on the "
+                         "bandpass of the last pass (the one applied) and flagged on top of the first trim.",
+                         "obs.flag.edges(force=FORCE, step='flag_edges_final')"),
     "split": ("Split & export", "Per-source calibrated measurement sets (one channel per subband) and UVFITS in "
               "`calibrated_data/`.", "obs.export.per_source(force=FORCE)"),
     "final_plots": ("Final-data plots", "uv coverage, radplots, spectra and light curves of every source on the "
@@ -132,6 +135,7 @@ STEP_PLOTS: dict[str, list[tuple[str, ...]]] = {
     "fringefit": [("plots/caltables/{code}.mbd.*.png",)],
     "fringefit_mbd2": [("plots/caltables/{code}.mbd2.*.png",)],
     "flag_edges": [("plots/caltables/{code}.bandpass_profile.png",)],
+    "flag_edges_final": [("plots/caltables/{code}.bandpass_profile.png",)],
 }
 
 #: Same as :data:`STEP_PLOTS` for the per-source steps, keyed by step-name prefix. ``{src}`` is the source name
@@ -150,7 +154,7 @@ CALIBRATOR_PLOTS: list[tuple[str, ...]] = [
     ("plots/calibrated/{code}.calibrated_*.corner.*.png",),
 ]
 
-#: Image grids per source, relative to ``<work_dir>``.
+#: CLEAN image grids per source, relative to ``<work_dir>``.
 IMAGE_PLOTS: list[tuple[str, ...]] = [("images/{code}.images.*.png",)]
 
 #: A markdown image, as :func:`image_markdown` and :func:`embedded_markdown` write it; group 1 is the URL
@@ -468,7 +472,7 @@ def _calibrated_data_cells(obs, notebook_dir: Path, embed: bool) -> list:
                match_plots(work, CALIBRATOR_PLOTS, code))]
     for title, blurb, patterns, fallback in FINAL_GROUPS:
         groups.append((title, blurb, find_plots(work / "plots", patterns) or find_plots(work / "plots", fallback)))
-    groups.append(("Images", "Images per source at Briggs robust -2, 0, +2 (difmapy).",
+    groups.append(("Images", "CLEAN images per source at Briggs robust -2, 0, +2 (difmapy).",
                    match_plots(work, IMAGE_PLOTS, code)))
     cells = [_md("## Calibrated data\n\nThe data after the whole calibration chain, as written by the pipeline: "
                  "first the calibrators, then every source (uv coverage, amplitude and phase vs uv distance, "

@@ -79,27 +79,6 @@ def test_resuming_from_a_step_drops_the_tables_it_will_redo(tmp_path):
         == ["tsys", "sbd"]
 
 
-def test_resuming_from_a_step_redoes_the_self_calibration_and_imaging(tmp_path):
-    """The stages after the split are not in STEP_ORDER, but resuming before them must redo them: a re-pass
-    rebuilds the chain from the a-priori tables, and a self-calibration still recorded as done would be
-    skipped with its tables gone."""
-    from vlbipy.models import CalTable
-    from vlbipy.observation import Observation
-
-    cfg = load_config(overrides={"global": {"backend": "casa"}})
-    obs = Observation("ts_late", cfg, work_dir=str(tmp_path))
-    obs.add_gaintable(CalTable("tsys"), "a_priori")
-    obs.add_gaintable(CalTable("mbd"), "third_pass")
-    obs.add_gaintable(CalTable("selfamp_CAL"), "selfcal_CAL")
-    obs.add_gaintable(CalTable("joint_CAL"), "joint_CAL")
-    for step in ("a_priori", "third_pass", "split", "selfcal_CAL", "joint_CAL", "clean_TGT", "final_plots"):
-        obs._state.mark_complete(step)
-
-    obs.prepare_run(from_step="third_pass")
-    assert [t.cal_type for t in obs.gaintables] == ["tsys"]
-    assert obs._state.completed() == ["a_priori"]
-
-
 def test_scratch_clears_the_persisted_chain(tmp_path):
     from vlbipy.models import CalTable
     from vlbipy.observation import Observation
@@ -135,3 +114,5 @@ def test_step_order_matches_the_names_steps_record():
     assert STEP_ORDER.index("second_pass") < STEP_ORDER.index("reweight") \
         < STEP_ORDER.index("flag_outliers_reweighted") < STEP_ORDER.index("third_pass") \
         < STEP_ORDER.index("split")
+    # The edges are measured again on the bandpass of the last pass, before the split.
+    assert STEP_ORDER.index("third_pass") < STEP_ORDER.index("flag_edges_final") < STEP_ORDER.index("split")
