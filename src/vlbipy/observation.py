@@ -45,7 +45,8 @@ STEP_ORDER = [
     "scan_snr", "initial_calibration", "fringefit", "bandpass",
     "initial_calibration_sbd2", "fringefit_mbd2", "flag_edges",
     "apply", "flag_aoflagger", "flag_outliers",
-    "second_pass", "scalar_bandpass", "reweight", "flag_outliers_reweighted", "third_pass", "split",
+    "second_pass", "scalar_bandpass", "reweight", "flag_outliers_reweighted", "third_pass",
+    "flag_edges_final", "split",
 ]
 
 

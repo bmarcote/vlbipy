@@ -114,3 +114,5 @@ def test_step_order_matches_the_names_steps_record():
     assert STEP_ORDER.index("second_pass") < STEP_ORDER.index("reweight") \
         < STEP_ORDER.index("flag_outliers_reweighted") < STEP_ORDER.index("third_pass") \
         < STEP_ORDER.index("split")
+    # The edges are measured again on the bandpass of the last pass, before the split.
+    assert STEP_ORDER.index("third_pass") < STEP_ORDER.index("flag_edges_final") < STEP_ORDER.index("split")

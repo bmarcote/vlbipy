@@ -106,6 +106,9 @@ STEP_INFO: dict[str, tuple[str, str, str]] = {
     "third_pass": ("Third pass", "The whole chain re-derived once more on the re-weighted, re-flagged data. Its "
                    "plots, in the sections of those steps above, are overwritten by this pass.",
                    "obs.calibrate.second_pass(force=FORCE, step='third_pass')"),
+    "flag_edges_final": ("Subband edges, final bandpass", "Edge channels and bandpass gaps measured again on the "
+                         "bandpass of the last pass (the one applied) and flagged on top of the first trim.",
+                         "obs.flag.edges(force=FORCE, step='flag_edges_final')"),
     "split": ("Split & export", "Per-source calibrated measurement sets (one channel per subband) and UVFITS in "
               "`calibrated_data/`.", "obs.export.per_source(force=FORCE)"),
     "final_plots": ("Final-data plots", "uv coverage, radplots, spectra and light curves of every source on the "
@@ -132,6 +135,7 @@ STEP_PLOTS: dict[str, list[tuple[str, ...]]] = {
     "fringefit": [("plots/caltables/{code}.mbd.*.png",)],
     "fringefit_mbd2": [("plots/caltables/{code}.mbd2.*.png",)],
     "flag_edges": [("plots/caltables/{code}.bandpass_profile.png",)],
+    "flag_edges_final": [("plots/caltables/{code}.bandpass_profile.png",)],
 }
 
 #: Same as :data:`STEP_PLOTS` for the per-source steps, keyed by step-name prefix. ``{src}`` is the source name

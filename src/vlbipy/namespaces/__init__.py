@@ -1309,7 +1309,8 @@ class FlagNamespace(Namespace):
         return self._run("autocorr", force=force)
 
     def edges(self, *, force: bool = False, edge_channels: Optional[int] = None,
-              table: Optional[CalTable] = None, plot: bool = True, **kwargs) -> dict:
+              table: Optional[CalTable] = None, plot: bool = True, step: str = "flag_edges",
+              **kwargs) -> dict:
         """Flag the subband edge channels, measuring how many from the bandpass when possible.
 
         Resolution order: an explicit ``edge_channels=N`` wins; otherwise, when a
@@ -1320,6 +1321,14 @@ class FlagNamespace(Namespace):
         same trim: they share a signal path, and a ragged per-subband trim would
         leave non-uniform channel coverage.
 
+        Parameters
+        ----------
+        step : str
+            State name this run is recorded under, so the pipeline can measure the
+            edges again on the bandpass of a later pass (``flag_edges_final``) and
+            still resume correctly. Flags only add up: a second run flags what the
+            re-solved bandpass shows and leaves the first trim in place.
+
         Returns
         -------
         dict
@@ -1328,7 +1337,7 @@ class FlagNamespace(Namespace):
             per-channel profiles.
         """
         obs = self._obs
-        if not obs._state.should_run("flag_edges", force=force):
+        if not obs._state.should_run(step, force=force):
             return {}
         cfg = obs.config.get("flagging", {})
         n_channels = int(obs.metadata.freq_setup.n_channels) if obs.metadata else 0
@@ -1370,7 +1379,7 @@ class FlagNamespace(Namespace):
             measurement["bandpass_gaps"] = {k: v for k, v in gaps.items() if k != "commands"}
         if plot and measurement["method"] == "measured":
             obs.plot.bandpass_profile(measurement)
-        obs._state.mark_complete("flag_edges", outputs=[f"edge={n_edge}", measurement["method"]])
+        obs._state.mark_complete(step, outputs=[f"edge={n_edge}", measurement["method"]])
         return measurement
 
     def quack(self, *, force: bool = False, per_antenna: Optional[dict] = None,

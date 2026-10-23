@@ -223,7 +223,7 @@ def test_edge_spw_selection_never_flags_everything():
 
 
 def test_edge_trim_takes_the_consensus_not_the_widest():
-    """Two of the three indicators must agree before bandwidth is given up."""
+    """Phase scatter alone does not widen the trim beyond the amplitude roll-off."""
     import numpy as np
     ops = _flag_ops()
     rng = np.random.default_rng(7)
@@ -234,6 +234,25 @@ def test_edge_trim_takes_the_consensus_not_the_widest():
     solved = np.zeros(n)
     left, right = ops._edge_trim(amp, phase, solved, threshold=6.0, max_trim=16, n_channels=n)
     assert (left, right) == (4, 4)      # the median vote, not the widest (8)
+
+
+def test_edge_trim_follows_an_amplitude_roll_off_alone():
+    """A strong station: clean roll-off, flat phases, every channel solved (EB104D TR, left untrimmed)."""
+    import numpy as np
+    ops = _flag_ops()
+    rng = np.random.default_rng(11)
+    n = 64
+    amp = 1.02 + rng.normal(0.0, 0.01, n)
+    amp[:4] = [0.55, 0.70, 0.82, 0.90]; amp[-4:] = [0.92, 0.82, 0.69, 0.56]
+    phase = 0.05 + rng.normal(0.0, 0.005, n)
+    solved = np.zeros(n)
+    assert ops._edge_trim(amp, phase, solved, threshold=6.0, max_trim=16, n_channels=n) == (4, 4)
+    # Phase scatter alone never trims; together with unsolved channels it trims beyond the roll-off.
+    flat = 1.0 + rng.normal(0.0, 0.01, n)
+    phase[:6] = 5.0
+    assert ops._edge_trim(flat, phase, solved, threshold=6.0, max_trim=16, n_channels=n) == (0, 0)
+    solved[:6] = 1.0
+    assert ops._edge_trim(amp, phase, solved, threshold=6.0, max_trim=16, n_channels=n) == (6, 4)
 
 
 def test_single_channel_subbands_survive_every_channel_decision():

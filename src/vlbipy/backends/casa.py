@@ -5029,11 +5029,14 @@ class CasaFlagOps(FlagOps):
         """Return ``(left, right)`` channels to trim, from three independent indicators.
 
         Amplitude roll-off, rising phase scatter and channels the solver could not solve
-        each vote on where the usable band starts and ends. The verdict is their *median*
-        per side, not the widest of them: one indicator running away — phase scatter is
-        noisy on a weak antenna — would otherwise throw away good bandwidth on the word of
-        a single measurement, and every flagged channel costs sensitivity in the final
-        image. Two indicators must agree before a channel is given up.
+        each say where the usable band starts and ends. The amplitude roll-off is enough on
+        its own: it is a median over every solution of the antenna, and a strong station
+        shows a clean roll-off with flat phases and every channel solved, so a vote of the
+        three would let the other two overrule it (EB104D: TR and EF were left untrimmed with
+        their outer channels 15-30% down, and those channels came out of the calibration
+        low). Phase scatter and unsolved channels only trim further where *both* agree:
+        either one alone runs away on a weak antenna (phase scatter is noisy there), and
+        every flagged channel costs sensitivity in the final image.
 
         Parameters
         ----------
@@ -5059,10 +5062,9 @@ class CasaFlagOps(FlagOps):
                                       max_edge_fraction=max_trim / max(n_channels, 1))
         solved = np.where(np.asarray(flagged_fraction) < 0.5)[0]
         solved_range = (int(solved[0]), int(solved[-1])) if solved.size else (0, n_channels - 1)
-        lefts = sorted((amp_range[0], phase_range[0], solved_range[0]))
-        rights = sorted((n_channels - 1 - amp_range[1], n_channels - 1 - phase_range[1],
-                         n_channels - 1 - solved_range[1]))
-        return (int(min(max(lefts[1], 0), max_trim)), int(min(max(rights[1], 0), max_trim)))
+        left = max(amp_range[0], min(phase_range[0], solved_range[0]))
+        right = n_channels - 1 - min(amp_range[1], max(phase_range[1], solved_range[1]))
+        return (int(min(max(left, 0), max_trim)), int(min(max(right, 0), max_trim)))
 
     def _edge_spw_selection(self, project_code: str, *, edge_fraction: float = 0.1,
                             n_channels: int = 0, edge_channels: int = 0,

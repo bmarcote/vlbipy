@@ -432,16 +432,23 @@ class VLBIObs:
         self.calibrate.apply(force=True, defer=True)
         # Step 12: deeper flagging on calibrated data, then re-solve on the cleaner data
         # and level the subband amplitudes.
+        # The band edges (and the bandpass gaps) are measured again on the bandpass of the last pass,
+        # the one applied: it is solved on more heavily flagged data than the first, and channels it no
+        # longer solves would otherwise be extrapolated by the apply rather than flagged.
+        reweight = self.config.get("calibration", {}).get("reweight", {}).get("enabled", True)
         self.flag.outliers(force=force)
         self.calibrate.second_pass(force=force)
+        if not reweight:
+            self.flag.edges(force=force, step="flag_edges_final")
         self.calibrate.scalar_bandpass(force=force)
         self.calibrate.apply(force=True, defer=True)                   # step 13
         # Step 14: weights from the calibrated scatter expose more bad data; flag it and
         # re-run the whole chain from the a-priori tables.
-        if self.config.get("calibration", {}).get("reweight", {}).get("enabled", True):
+        if reweight:
             self.calibrate.reweight(force=force)
             self.flag.outliers(force=force, step="flag_outliers_reweighted")
             self.calibrate.second_pass(force=force, step="third_pass")
+            self.flag.edges(force=force, step="flag_edges_final")
             self.calibrate.scalar_bandpass(force=force)
             self.calibrate.apply(force=True, defer=True)
         self._survey_all_sources()                                      # final calibrated SNR coverage
