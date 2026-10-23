@@ -72,6 +72,8 @@ GAIN_WARN_DEVIATION: float = 0.10
 GAIN_BAD_DEVIATION: float = 0.30
 #: An applied correction within this of 1.0 "stayed at 1" although the unconstrained gscale wanted more.
 GAIN_UNFIXED_DEVIATION: float = 0.05
+#: Fewest antennas with an unconstrained gscale for their median to stand for the array's flux scale.
+MIN_ANTENNAS_FOR_SCALE: int = 4
 #: Most single subbands listed per antenna in the "single subband beyond 30%" comment.
 MAX_SUBBANDS_LISTED: int = 4
 #: From this many "off but not corrected" antennas (and at least half of those solved) the source itself
@@ -532,10 +534,19 @@ def _entry_gains(entry: dict) -> dict:
         single subbands beyond :data:`GAIN_BAD_DEVIATION` when the median is not), ``off`` (``{antenna:
         {"naive", "applied", "sigma", "p"}}``: the unconstrained gscale differs from 1 by more than
         :data:`GAIN_WARN_DEVIATION` while the applied factor stayed within :data:`GAIN_UNFIXED_DEVIATION`
-        of 1) and ``trusted`` (antennas whose unconstrained and applied factors agree within
-        :data:`GAIN_UNFIXED_DEVIATION`, i.e. whose gain this source pins down).
+        of 1), ``trusted`` (antennas whose unconstrained and applied factors agree within
+        :data:`GAIN_UNFIXED_DEVIATION`, i.e. whose gain this source pins down) and ``misscaled``
+        (``{antenna: {"relative", "applied"}}``, see below).
+
+    ``misscaled`` is judged on the unconstrained gscale *relative to the median of the array*: one
+    station with a wrong a-priori scale pulls the source model towards its own error, and against that
+    model every *other* antenna comes out off by a common factor, which says nothing about them (EB104D:
+    T6 ~20x low, every other antenna "x0.4-0.7"). An antenna is misscaled when, relative to the array, it
+    is beyond :data:`GAIN_BAD_DEVIATION` and the correction applied recovered less than half of it (in
+    log): the Bayesian self-calibration shrinks every correction to its ~10% prior, so a station-scale
+    error is never fixed there. Such an antenna is left out of ``off``.
     """
-    reading = {"solved": [], "medians": {}, "outliers": {}, "off": {}, "trusted": set()}
+    reading = {"solved": [], "medians": {}, "outliers": {}, "off": {}, "trusted": set(), "misscaled": {}}
     labels = entry.get("subband_labels") or []
     for name in entry.get("antennas") or []:
         median = _finite((entry.get("gain_median") or {}).get(name))
@@ -559,6 +570,17 @@ def _entry_gains(entry: dict) -> dict:
             reading["off"][name] = {"naive": naive, "applied": median,
                                     "sigma": _finite((entry.get("sigma") or {}).get(name)),
                                     "p": _finite((entry.get("p_correction") or {}).get(name))}
+    naive_gains = {name: _finite((entry.get("naive_gscale") or {}).get(name)) for name in reading["solved"]}
+    naive_gains = {name: value for name, value in naive_gains.items() if value is not None and value > 0}
+    if len(naive_gains) >= MIN_ANTENNAS_FOR_SCALE:
+        scale = statistics.median(naive_gains.values())
+        for name, naive in naive_gains.items():
+            relative = naive / scale
+            applied = _finite((entry.get("gain_median") or {}).get(name)) or 1.0
+            if gain_level(relative) == "bad" and applied > 0 \
+                    and abs(math.log(applied)) < 0.5 * abs(math.log(relative)):
+                reading["misscaled"][name] = {"relative": relative, "applied": applied}
+                reading["off"].pop(name, None)
     return reading
 
 
@@ -575,12 +597,24 @@ def _unfixed_text(cases: list[tuple[str, dict]]) -> str:
             f"source constrain its gain: {'; '.join(parts)}; take a careful look at its amplitudes")
 
 
+def _misscaled_text(cases: list[tuple[str, dict]]) -> str:
+    """Sentence for an antenna whose amplitude scale is off against the rest of the array on ``[(source, values)]``."""
+    wanted = ", ".join(f"x{values['relative']:.{GAIN_DECIMALS}f} on {source}" for source, values in cases)
+    applied = max((values["applied"] for _, values in cases), key=lambda gain: abs(math.log(gain)))
+    return (f"amplitude scale looks wrong against the rest of the array: relative to the array median, an "
+            f"unconstrained gscale asks for {wanted}, but at most x{applied:.{GAIN_DECIMALS}f} was applied (the "
+            "self-calibration keeps its corrections near the a-priori calibration); check the a-priori amplitude "
+            "calibration of this station (ANTAB Tsys, DPFU, FT)")
+
+
 def gain_comments(context: dict) -> list[dict]:
     """Amplitude corrections of the self-calibration that deserve a remark, one line per antenna and kind.
 
     * the median correction of an antenna beyond :data:`GAIN_WARN_DEVIATION` (warning) or
       :data:`GAIN_BAD_DEVIATION` (problem), over every self-calibrated source;
     * single subbands beyond :data:`GAIN_BAD_DEVIATION` when the median is not;
+    * antennas whose amplitude scale is off against the rest of the array and that the self-calibration
+      did not correct (``misscaled`` of :func:`_entry_gains`): a problem, on every source it shows on;
     * antennas that look off but were not corrected (``off`` of :func:`_entry_gains`). When that is true of
       at least half the antennas of a source (and of :data:`MIN_UNFIXED_FOR_SOURCE`), the source is
       reported as poorly constrained instead of every antenna; and an antenna whose gain another source
@@ -591,6 +625,7 @@ def gain_comments(context: dict) -> list[dict]:
     medians: dict[str, list[tuple[str, float, str]]] = {}
     outliers: dict[str, list[tuple[str, str, float]]] = {}
     unfixed: dict[str, list[tuple[str, dict]]] = {}
+    misscaled: dict[str, list[tuple[str, dict]]] = {}
     comments = []
     for entry, reading in readings:
         source = entry.get("source", "")
@@ -598,15 +633,21 @@ def gain_comments(context: dict) -> list[dict]:
             medians.setdefault(name, []).append((source, median, level))
         for name, values in reading["outliers"].items():
             outliers.setdefault(name, []).extend((source, label, gain) for label, gain in values)
+        for name, values in reading["misscaled"].items():
+            misscaled.setdefault(name, []).append((source, values))
         off, solved = reading["off"], reading["solved"]
         if len(off) >= MIN_UNFIXED_FOR_SOURCE and len(off) >= 0.5 * len(solved):
             wanted = ", ".join(f"{name} x{values['naive']:.{GAIN_DECIMALS}f}" for name, values in off.items())
+            blamed = list(reading["misscaled"])
+            cause = (f" The common offset is most likely the model following {' and '.join(blamed)}, whose own "
+                     f"{'scale is' if len(blamed) == 1 else 'scales are'} off against the rest of the array (see "
+                     f"{'that antenna' if len(blamed) == 1 else 'those antennas'})." if blamed else "")
             comments.append(make_comment(
                 "warning", "calibration", f"The amplitude self-calibration of {source} is poorly constrained: an "
                 f"unconstrained gscale would change {len(off)} of its {len(solved)} antennas by more than "
                 f"{GAIN_WARN_DEVIATION:.0%} ({wanted}), but the corrections applied stayed within "
-                f"{GAIN_UNFIXED_DEVIATION:.0%} of 1. Treat the amplitude scale of this source, and its model, "
-                "with care."))
+                f"{GAIN_UNFIXED_DEVIATION:.0%} of 1.{cause} Treat the amplitude scale of this source, and its "
+                "model, with care."))
         else:
             for name, values in off.items():
                 if not any(name in other["trusted"] for _, other in readings if other is not reading):
@@ -633,6 +674,8 @@ def gain_comments(context: dict) -> list[dict]:
                                      f"{GAIN_BAD_DEVIATION:.0%} although the median did not: {listed}{more}", name))
     for name, cases in unfixed.items():
         comments.append(make_comment("warning", "antenna", _unfixed_text(cases), name))
+    for name, cases in misscaled.items():
+        comments.append(make_comment("problem", "antenna", _misscaled_text(cases), name))
     return comments
 
 

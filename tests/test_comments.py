@@ -293,6 +293,25 @@ def test_a_source_where_half_the_antennas_look_off_is_reported_as_poorly_constra
     assert comments[0]["text"].startswith("The amplitude self-calibration of 3C345 is poorly constrained")
 
 
+def test_one_station_with_a_wrong_scale_is_blamed_instead_of_the_source():
+    """EB104D: T6 ~20x low drags the model down; the others all look "x0.5", T6 is the one that is off."""
+    names = ("WB", "EF", "O6", "T6", "UR", "TR", "YS")
+    pc = gains("J1031", {"WB": 0.99, "EF": 0.99, "O6": 0.98, "T6": 1.29, "UR": 0.99, "TR": 0.99, "YS": 0.99},
+               naive={"WB": 0.54, "EF": 0.54, "O6": 0.48, "T6": 4.70, "UR": 0.50, "TR": 0.45, "YS": 0.40})
+    ff = gains("J1048", {"WB": 0.99, "EF": 1.0, "O6": 1.0, "T6": 1.03, "UR": 1.0, "TR": 0.99, "YS": 0.99},
+               naive={"WB": 0.65, "EF": 0.91, "O6": 0.75, "T6": 2.83, "UR": 0.76, "TR": 0.68, "YS": 0.60})
+    comments = cm.gain_comments(context([antenna(a) for a in names], gain_corrections=[pc, ff]))
+    problems = [c for c in comments if c["severity"] == "problem"]
+    assert [c["antenna"] for c in problems] == ["T6"]
+    assert problems[0]["text"].startswith("amplitude scale looks wrong against the rest of the array: relative to "
+                                          "the array median, an unconstrained gscale asks for x9.40 on J1031, x3.77 "
+                                          "on J1048, but at most x1.29 was applied")
+    assert "(ANTAB Tsys, DPFU, FT)" in problems[0]["text"]
+    source_level = [c for c in comments if c["category"] == "calibration"]
+    assert source_level and all("most likely the model following T6" in c["text"] for c in source_level)
+    assert not any(c["antenna"] == "T6" and "could not be fixed" in c["text"] for c in comments)
+
+
 def test_report_findings_about_the_source_are_passed_on_condensed_and_unapplied_gains_are_flagged():
     findings = ["Best source model: clean (posterior probability 1.000)",
                 "JB: leaving it out of the model moves its gain by -77.6% (median over IFs)",

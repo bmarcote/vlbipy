@@ -110,3 +110,20 @@ def test_incomplete_campaign_report_is_not_reused(tmp_path):
     assert stale_reason(epochs, report, {"failed": []}) == ""
     assert stale_reason(epochs, report, {}) == ""                      # a report written before failures were recorded
     assert "incomplete" in stale_reason(epochs, report, {"failed": ["joint model of J1346-6024"]})
+
+
+def test_antab_ft_scales_the_tsys_values_of_its_group():
+    """``FT`` multiplies the Tsys of the group, as in AIPS (EB104D: T6 FT = 484 on a nominal Tsys of 48)."""
+    import calendar
+    from io import StringIO
+    from types import SimpleNamespace
+    from vlbipy.casavlbitools import key
+    from vlbipy.casavlbitools.fitsidi import TSysTable, process_values
+
+    reftime = calendar.timegm((2025, 3, 3, 0, 0, 0))
+    idi = SimpleNamespace(reftime=reftime, antenna_map={"T6": 4}, n_band=2, find_source=lambda t: 1)
+    header = "TSYS T6\nFT = 484\nINDEX = 'L1', 'L2', 'R1', 'R2'\n/\n"
+    values = StringIO("062 16:01:00 48.0 48.0 50.0 999.9\n/\n")
+    data, pols = TSysTable(), []
+    process_values(values, key.read_keyfile(StringIO(header)), pols, idi, data)
+    assert data.tsys_1 == [[50.0 * 484, -999.9]] and data.tsys_2 == [[48.0 * 484, 48.0 * 484]]
