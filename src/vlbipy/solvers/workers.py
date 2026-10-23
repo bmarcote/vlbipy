@@ -47,7 +47,9 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import traceback
+from pathlib import Path
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from multiprocessing.connection import Client, Listener
@@ -268,12 +270,17 @@ class WorkerPool:
         logger.debug("worker pool: starting {} process(es) ({}; {:.1f} GB planned per worker)", self.size,
                      describe(), worker_memory() / 2**30)
         authkey = os.urandom(32)
-        listener = Listener(authkey=authkey)
+        # Every worker connects at once: with the default backlog of 1 a Unix socket refuses the others outright.
+        listener = Listener(authkey=authkey, backlog=max(16, self.size))
         environment = dict(os.environ)
         # One job per core: numerical libraries inside a worker must not start their own thread teams.
         for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VLBIPY_FFT_WORKERS"):
             environment[name] = "1"
         environment[AUTHKEY_ENV] = authkey.hex()
+        # The workers must import the vlbipy this process runs (a source tree, a test run), not another copy.
+        package_root = str(Path(__file__).resolve().parents[2])
+        environment["PYTHONPATH"] = os.pathsep.join([package_root] + [p for p in
+                                                     environment.get("PYTHONPATH", "").split(os.pathsep) if p])
         command = [sys.executable, "-m", "vlbipy.solvers.workers", str(listener.address)]
         self._processes = [subprocess.Popen(command, env=environment, stdin=subprocess.DEVNULL)
                            for _ in range(self.size)]
@@ -470,11 +477,22 @@ def kwargs_digests(value, depth: int = 0) -> list[str]:
     return []
 
 
+def _connect(address: str, authkey: bytes, attempts: int = 50):
+    """Connect to the pool's listener, retrying while its accept queue is full (refused) for up to ~5 s."""
+    for attempt in range(attempts):
+        try:
+            return Client(address, authkey=authkey)
+        except (ConnectionRefusedError, FileNotFoundError):
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.1)
+
+
 def _serve(address: str) -> None:
     """Worker main loop: receive ``(function path, kwargs, shared objects, threads)``, reply ``(True, result)``
     or ``(False, traceback)``; shared objects are kept for later jobs (see :func:`_share`)."""
     global _JOB_THREADS
-    connection = Client(address, authkey=bytes.fromhex(os.environ[AUTHKEY_ENV]))
+    connection = _connect(address, bytes.fromhex(os.environ[AUTHKEY_ENV]))
     cache: OrderedDict = OrderedDict()
     while True:
         try:

@@ -496,6 +496,7 @@ class ScanSNRSurvey:
             ranked.append((source, _median(best, default=0.0), detected))
         return sorted(ranked, key=lambda entry: (entry[1], entry[2]), reverse=True)
 
+<<<<<<< HEAD
     def weak_hands(self, ratio: float = 5.0, *, detection: float = 7.0,
                    min_scans: int = 3) -> dict[str, tuple[str, float]]:
         """Antennas whose one parallel hand is much weaker than the other.
@@ -515,15 +516,32 @@ class ScanSNRSurvey:
             SNR from which the stronger hand counts as detected in a scan.
         min_scans : int
             Fewest scans with the stronger hand detected for a decision.
+=======
+    def dead_hands(self, *, detection: float = 7.0, min_scans: int = 3) -> dict[str, tuple[str, float, float]]:
+        """Antennas with one parallel hand that never rises above the noise while the other is detected.
+
+        Over the scans where one hand of an antenna is detected (fringe SNR >= ``detection``), the median
+        SNR the other hand has there stays below ``detection`` (the fringe search only found noise peaks), or
+        the other hand has no solution in any of them and the antenna is not a reference one (a missing value
+        can also be the reference antenna's own solution, so it never counts as zero). Fringe SNRs are not
+        compared otherwise - they are not proportional to the amplitude (V589D: MP's LCP at 3-7 times the SNR
+        of an RCP of the same amplitude) - so a hand that is detected but weak is left to the amplitude
+        comparison of the scalar bandpass.
+>>>>>>> 5d3198be0e79117f058939871de32e9e7c0bf006
 
         Returns
         -------
         dict
+<<<<<<< HEAD
             ``{antenna: (weak hand, median ratio)}``, e.g. ``{"CD": ("LL", 11.0)}``.
+=======
+            ``{antenna: (dead hand, its median SNR, the median SNR of the other)}``.
+>>>>>>> 5d3198be0e79117f058939871de32e9e7c0bf006
         """
         hands = [hand for hand in ("RR", "LL") if hand in self.snr]
         if len(hands) < 2:
             return {}
+<<<<<<< HEAD
         weak: dict[str, tuple[str, float]] = {}
         for column, name in enumerate(self.antennas):
             for strong, other in ((hands[0], hands[1]), (hands[1], hands[0])):
@@ -539,6 +557,30 @@ class ScanSNRSurvey:
                         weak[name] = (other, middle)
                         break
         return weak
+=======
+        reference = set(self.refant_names)
+        dead: dict[str, tuple[str, float, float]] = {}
+        for column, name in enumerate(self.antennas):
+            for strong, other in ((hands[0], hands[1]), (hands[1], hands[0])):
+                pairs = []
+                for row in range(len(self.scan_numbers)):
+                    good, bad = self.snr[strong][row][column], self.snr[other][row][column]
+                    if good == good and good >= detection:
+                        pairs.append((good, bad))
+                if len(pairs) < min_scans:
+                    continue
+                finite = [bad for _, bad in pairs if bad == bad]
+                if len(finite) >= min_scans:
+                    weak_snr = _median(finite)
+                elif not finite and name not in reference:
+                    weak_snr = 0.0
+                else:
+                    continue
+                if weak_snr < detection:
+                    dead[name] = (other, weak_snr, _median([good for good, _ in pairs]))
+                    break
+        return dead
+>>>>>>> 5d3198be0e79117f058939871de32e9e7c0bf006
 
     def source_of_scan(self) -> dict[int, str]:
         """Return ``{scan_number: source}`` for the surveyed scans."""

@@ -162,98 +162,90 @@ def split_job(*, specs: list[dict], engine: str, column: str, columns: list[str]
     return out
 
 
+#: Main-table columns stored in tiled storage managers in the output (as CASA lays out an MS).
+_TILED_OUTPUT = ("DATA", "FLAG", "WEIGHT_SPECTRUM", "SIGMA_SPECTRUM", "FLAG_CATEGORY", "WEIGHT", "SIGMA", "UVW")
+
+
 def _write_ms(source_ms: Path, part: str, target: Path, rows: dict, field_id: int, setup: dict, chanbin: int,
               column_names: list[str], engine: str) -> None:
-    """Create ``target`` with the main-table layout of ``part`` and the averaged ``rows``, then its subtables."""
-    from casacore.tables import table
-    template = table(part, ack=False)
-    try:
-        desc = template.getdesc()
-        dminfo = template.getdminfo()
-        keywords = template.getkeywords()
-    finally:
-        template.close()
-    dropped = {"CORRECTED_DATA", "MODEL_DATA"} | {c for c in desc if c not in column_names and c != "FLAG_CATEGORY"}
-    if "WEIGHT_SPECTRUM" not in rows:
-        dropped |= {"WEIGHT_SPECTRUM", "SIGMA_SPECTRUM"}
-    for name in dropped:
-        desc.pop(name, None)
-    # The channel axis changes: cube columns declared with a fixed shape become variable-shaped.
-    for name in ("DATA", "FLAG", "WEIGHT_SPECTRUM", "SIGMA_SPECTRUM", "FLAG_CATEGORY"):
-        if name in desc and "shape" in desc[name]:
-            desc[name] = {k: v for k, v in desc[name].items() if k != "shape"}
-            desc[name]["option"] = 0
-    hypercolumns = desc.get("_define_hypercolumn_", {})
-    for name in [h for h, spec in hypercolumns.items() if set(spec.get("HCdatanames", [])) & dropped]:
-        hypercolumns.pop(name)
-    nrow = len(rows["TIME"])
-    nchan_out, ncorr = rows["DATA"].shape[1:] if nrow else (1, setup["ncorr"])
-    managers = {}
-    for key, manager in dminfo.items():
-        columns = [c for c in manager["COLUMNS"] if c not in dropped]
-        if not columns:
-            continue
-        manager = dict(manager, COLUMNS=columns)
-        if manager["TYPE"] == "TiledShapeStMan" and columns[0] in ("DATA", "FLAG", "WEIGHT_SPECTRUM",
-                                                                    "SIGMA_SPECTRUM"):
-            tile_rows = max(1024, 65536 // max(1, int(nchan_out) * int(ncorr)))
-            manager["SPEC"] = dict(manager.get("SPEC", {}), DEFAULTTILESHAPE=np.array([ncorr, nchan_out, tile_rows]))
-            manager.get("SPEC", {}).pop("HYPERCUBES", None)
-        managers[key] = manager
-    if target.exists():
-        shutil.rmtree(target)
-    out = table(str(target), desc, dminfo=managers, nrow=nrow, ack=False)
-    try:
-        out.putinfo({"type": "Measurement Set", "subType": "", "readme": ""})   # as mstransform labels its output
-        for name, values in rows.items():
-            if name in out.colnames() and nrow:
-                out.putcol(name, values)
-        if "FIELD_ID" in out.colnames() and nrow:
-            out.putcol("FIELD_ID", np.zeros(nrow, dtype=np.int32))
-        if "FLAG_ROW" in out.colnames() and nrow:
-            out.putcol("FLAG_ROW", np.zeros(nrow, dtype=bool))
-        # Subtables: copied from the input (a Multi-MS links them to its first part), then adjusted. Those
-        # referenced by a keyword, and any other table directory next to the main table.
-        subtables = {name: Path(value[len("Table: "):]) for name, value in keywords.items()
-                     if isinstance(value, str) and value.startswith("Table: ")}
+    """Create ``target`` with the main-table columns of ``part`` and the averaged ``rows``, then its subtables.
+
+    Written with :mod:`vlbipy.casacore_format` (no casacore library): bulk columns in tiled storage managers,
+    the scalars in a StandardStMan; subtables copied file by file, then FIELD reduced to the source and
+    SPECTRAL_WINDOW describing the averaged channels.
+    """
+    import copy
+
+    from ..casacore_format.aipsio import TableRef
+    from ..casacore_format.table import Table
+    from ..casacore_format.writer import create_table
+
+    with Table(part) as template:
+        descs = [copy.deepcopy(c) for c in template.dat.columns]
+        keywords = dict(template.dat.keywords)
+        subtables = {name: template.subtable(name) for name, value in keywords.items() if isinstance(value, TableRef)}
         for child in Path(part).iterdir():
             if child.is_dir() and (child / "table.dat").is_file() and child.name not in subtables:
                 subtables[child.name] = child
-        for name, value in keywords.items():
-            if name not in subtables:
-                out.putkeyword(name, value)
-        for name, path in subtables.items():
-            shutil.copytree(path.resolve(), target / name)
-            out.putkeyword(name, f"Table: {target / name}")
-    finally:
-        out.close()
-    fields = table(str(target / "FIELD"), readonly=False, ack=False)
-    try:
-        fields.removerows([r for r in range(fields.nrows()) if r != int(field_id)])
-    finally:
-        fields.close()
+    dropped = {"CORRECTED_DATA", "MODEL_DATA"} | {c.name for c in descs if c.name not in column_names
+                                                  and c.name != "FLAG_CATEGORY"}
+    if "WEIGHT_SPECTRUM" not in rows:
+        dropped |= {"WEIGHT_SPECTRUM", "SIGMA_SPECTRUM"}
+    columns = [c for c in descs if c.name not in dropped]
+    nrow = len(rows["TIME"])
+    for column in columns:
+        column.shape_col_def, column.shape_col = False, ()
+        if column.name in ("DATA", "FLAG", "WEIGHT_SPECTRUM", "SIGMA_SPECTRUM", "FLAG_CATEGORY"):
+            # The channel axis changes: cube columns declared with a fixed shape become variable-shaped.
+            column.shape, column.option = None, 0
+    values = {name: values for name, values in rows.items() if name in {c.name for c in columns}}
+    if nrow:
+        values["FIELD_ID"] = np.zeros(nrow, dtype=np.int32)
+        values["FLAG_ROW"] = np.zeros(nrow, dtype=bool)
+    tiled = {}
+    for column in columns:
+        if column.name not in _TILED_OUTPUT:
+            continue
+        if column.name in values:
+            tiled[column.name] = [tuple(np.shape(values[column.name])[1:])] * nrow
+        else:
+            tiled[column.name] = [None] * nrow                 # e.g. FLAG_CATEGORY: cells stay undefined
+    keywords = {name: value for name, value in keywords.items() if name not in subtables}
+    keywords.update({name: TableRef(f"././{name}") for name in subtables})
+    create_table(target, columns, nrow, values, keywords=keywords, info=("Measurement Set", ""), tiled=tiled)
+    for name, path in subtables.items():
+        shutil.copytree(Path(path).resolve(), target / name)
+    _reduce_field(target / "FIELD", field_id)
     _average_spectral_windows(target / "SPECTRAL_WINDOW", chanbin)
+
+
+def _reduce_field(path: Path, field_id: int) -> None:
+    """Keep only row ``field_id`` of the FIELD subtable (the split source becomes FIELD_ID 0)."""
+    from ..casacore_format.writer import rewrite_table, select_rows
+    rewrite_table(path, lambda values, nrow: (select_rows(values, [field_id]), 1))
 
 
 def _average_spectral_windows(path: Path, chanbin: int) -> None:
     """Describe the averaged channels in SPECTRAL_WINDOW (frequency means, widths summed)."""
-    from casacore.tables import table
-    spw = table(str(path), readonly=False, ack=False)
-    try:
-        for row in range(spw.nrows()):
-            freq = np.asarray(spw.getcell("CHAN_FREQ", row), dtype=np.float64)
+    from ..casacore_format.writer import rewrite_table
+
+    def average(values: dict, nrow: int):
+        names = [n for n in ("CHAN_WIDTH", "EFFECTIVE_BW", "RESOLUTION") if n in values]
+        freqs, others = [], {n: [] for n in names}
+        for row in range(nrow):
+            freq = np.asarray(values["CHAN_FREQ"][row], dtype=np.float64).reshape(-1)
             starts = _channel_bins(freq.size, chanbin)
             counts = np.diff(np.concatenate([starts, [freq.size]]))
-            new_freq = np.add.reduceat(freq, starts) / counts
-            spw.putcell("CHAN_FREQ", row, new_freq)
-            for name in ("CHAN_WIDTH", "EFFECTIVE_BW", "RESOLUTION"):
-                if name in spw.colnames():
-                    spw.putcell(name, row, np.add.reduceat(np.asarray(spw.getcell(name, row), dtype=np.float64),
-                                                           starts))
-            spw.putcell("NUM_CHAN", row, int(new_freq.size))
-            spw.putcell("REF_FREQUENCY", row, float(new_freq[0]))
-    finally:
-        spw.close()
+            freqs.append(np.add.reduceat(freq, starts) / counts)
+            for n in names:
+                others[n].append(np.add.reduceat(np.asarray(values[n][row], dtype=np.float64).reshape(-1), starts))
+        values["CHAN_FREQ"] = freqs
+        values.update(others)
+        values["NUM_CHAN"] = np.array([f.size for f in freqs], dtype=np.int32)
+        values["REF_FREQUENCY"] = np.array([f[0] for f in freqs], dtype=np.float64)
+        return values, nrow
+
+    rewrite_table(path, average)
 
 
 def split_field(ms, target, field: str, *, column: str = "CORRECTED_DATA", chanbin: int = 1,

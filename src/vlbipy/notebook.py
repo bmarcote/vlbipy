@@ -150,7 +150,7 @@ CALIBRATOR_PLOTS: list[tuple[str, ...]] = [
     ("plots/calibrated/{code}.calibrated_*.corner.*.png",),
 ]
 
-#: CLEAN image grids per source, relative to ``<work_dir>``.
+#: Image grids per source, relative to ``<work_dir>``.
 IMAGE_PLOTS: list[tuple[str, ...]] = [("images/{code}.images.*.png",)]
 
 #: A markdown image, as :func:`image_markdown` and :func:`embedded_markdown` write it; group 1 is the URL
@@ -468,7 +468,7 @@ def _calibrated_data_cells(obs, notebook_dir: Path, embed: bool) -> list:
                match_plots(work, CALIBRATOR_PLOTS, code))]
     for title, blurb, patterns, fallback in FINAL_GROUPS:
         groups.append((title, blurb, find_plots(work / "plots", patterns) or find_plots(work / "plots", fallback)))
-    groups.append(("Images", "CLEAN images per source at Briggs robust -2, 0, +2 (difmapy).",
+    groups.append(("Images", "Images per source at Briggs robust -2, 0, +2 (difmapy).",
                    match_plots(work, IMAGE_PLOTS, code)))
     cells = [_md("## Calibrated data\n\nThe data after the whole calibration chain, as written by the pipeline: "
                  "first the calibrators, then every source (uv coverage, amplitude and phase vs uv distance, "

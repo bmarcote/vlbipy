@@ -189,7 +189,11 @@ calibrator name or list).
 | `outlier_sigma` | float | `5.0` | Robust-sigma cut for per-baseline outlier flagging |
 | `outlier_gross_departure` | float | `0.25` | A baseline with more outliers than the sigma cut can be trusted on (over 10%) still loses the time bins further than this fraction from its local level |
 | `outlier_gross_max_fraction` | float | `0.35` | ... unless those bins are more than this share of the baseline, which is then left untouched and reported |
+<<<<<<< HEAD
 | `weak_polarization_ratio` | float | `5.0` | Before the instrumental calibration (step `flag_weak_polarization`), a receptor whose fringe SNR on the calibrators is this many times below the antenna's other one (median over the scans where the other is detected at `[calibration] detection_snr`), or that is never detected while the other is, is flagged: its parallel hand and both cross hands on every baseline of the antenna. Otherwise a Stokes I calibration averages its near-zero signal with the good hand. `0` turns it off |
+=======
+| `weak_polarization_ratio` | float | `5.0` | A receptor much weaker than the other one of its antenna is flagged: its parallel hand and both cross hands on every baseline of the antenna. Before the instrumental calibration (step `flag_weak_polarization`), one whose median fringe SNR stays below `[calibration] detection_snr` on the calibrator scans where the other is detected (no signal at all); and at each scalar bandpass, one whose amplitude solutions are this many times below the other hand's (median over the subbands and calibrators both have), or that has none while the other has. Fringe SNRs are not compared otherwise: they are not proportional to the amplitude. Otherwise a Stokes I calibration averages the near-zero signal with the good hand (V589A's CD: LCP 11 times weaker, every baseline at ~0.55 of its RR). `0` turns it off |
+>>>>>>> 5d3198be0e79117f058939871de32e9e7c0bf006
 | `bandpass_min_gain` | float | `0.5` | After the bandpass, channels whose solution is flagged or whose amplitude (subband median = 1) is below this are flagged per antenna and subband |
 | `flag_off_source` | bool | `true` | After the first apply, flag antennas while they are not on source: measured per integration on the fringe finders and phase calibrators (one factor per antenna and time sample, so a late antenna is told from a late partner) and transferred to the fainter fields as the time each antenna typically arrives late |
 | `off_source_level` | float | `0.8` | An antenna counts as off source when all its baselines sit below this fraction of their own level |
@@ -300,6 +304,33 @@ Difmap's per-antenna gain corrections).
 | `minsnr` | float | `3.0` | Minimum signal-to-noise ratio |
 | `solnorm` | bool | `true` | Keep the a-priori flux scale; level the subbands only |
 
+### `[calibration.tec]`
+
+The ionospheric correction from global TEC maps (IONEX), computed as AIPS `TECOR` does (run by `VLBATECR`, which
+also fetches the maps), for every array: the slant TEC at each antenna's ionospheric pierce point towards each
+field, every `interval` seconds, written as an ordinary Fringe Jones table (`<code>.tec`) and evaluated at every
+channel's own frequency. It joins the calibration chain right after the a-priori tables, so every fringe fit, the
+bandpass and the final application see it; each field is corrected with its own direction. Only the dask-ms backend
+computes it. The dispersive delay the fringe fit solves below `ionos_max_ghz` then only absorbs what the maps miss.
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | `"auto"`/bool | `"auto"` | `"auto"`: when the band centre is below the observatory's threshold (EVN 5 GHz, VLBA and LBA 7 GHz); `true` always (and failing to get the maps stops the step); `false` never |
+| `model` | string | `"emrg"` | IONEX product (AIPS `TECRTYPE`): `emrg` (the VLBATECR default), `jplg`, `codg`, `esag`, `igsg`, `upcg`, `casg`, and their rapid versions |
+| `fallback` | bool | `true` | Use another product when `model` is not available for the dates |
+| `interval` | float | `30.0` | Seconds between rows inside a scan (each scan also gets its first and last integration) |
+| `shell_height` | float | `0.0` | Height of the ionospheric shell [km]; 0 takes the maps' own (`HGT1`, normally 450 km) |
+| `rotation` | float | `1.0` | AIPS `APARM(2)`: interpolate in time between maps rotated with the Sun (IONEX's recommendation); 0 interpolates the maps as they are |
+| `mapping` | string | `"thin_shell"` | `"thin_shell"` (1/cos of the zenith angle at the shell) or `"petrov"` (Petrov 2023's modified mapping, AIPS `APARM(4-6)`) |
+| `ionex_files` | list[str] | `[]` | Use these IONEX files instead of downloading |
+| `ionex_dir` | string | `""` | Where the maps are downloaded and cached; empty = `<work_dir>/ionex` (kept across `--scratch`) |
+
+The maps come from CDDIS (anonymous FTP-SSL, as for the EOP file) or JPL. A run that cannot get them (no network)
+skips the correction with a warning. The sign of the correction is the one that removes the ionospheric delays
+the fringe fit measures: CASA's own TEC correction (`gencal(caltype='tecim')`) uses the opposite one, and its
+`applycal` gives an antenna the correction of its neighbour once an antenna before it has no valid TEC, so neither
+is used.
+
 ### `[calibration.tsys_smooth]`
 
 | Parameter | Type | Default | Description |
@@ -324,6 +355,9 @@ Controls `obs.selfcal`. Not implemented for the CASA backend yet — see
 | `phase_rounds` | int | `4` | Number of phase-only self-calibration iterations |
 | `ampphase_rounds` | int | `5` | Number of amplitude+phase self-calibration iterations |
 | `convergence_threshold` | float | `0.05` | Stop iterating when dynamic range improvement falls below this fraction |
+| `prior_sigma` | float | `0.1` | Amplitude step (difmapy `bayes_gscale`): the a-priori calibration accuracy. A station/subband within it of the median station is left alone |
+| `outlier_sigma` | float | `1.0` | Amplitude step: the spread (log amplitude) of a station/subband that is off; such one is corrected almost in full. Must exceed `prior_sigma` |
+| `joint_amplitude` | bool | `true` | Campaigns: also re-solve each epoch's station amplitudes against the joint model of the phase calibrator (`bayes_gscale`, with `prior_sigma` / `outlier_sigma`); `false` refines the phases only |
 
 ### `[imaging]`
 
@@ -333,11 +367,16 @@ robust values.
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
+| `method` | string | `"modelfit"` | difmapy imaging. `"modelfit"`: the source is modelled with circular Gaussians (flux, position and size free), added one at a time near the brightest emission; what they leave is CLEANed in windows; the one model is restored at every robust value. `"clean"`: Högbom CLEAN alone, each robust value on its own, over the whole map. See [Imaging](pipeline.md#imaging) |
+| `max_components` | int | `10` | Modelfit: most Gaussians per source |
+| `component_sigma` | float | `5.0` | Modelfit: a Gaussian is kept only when the fit improves by this many sigma (the drop of chi-squared, in units of the reduced chi-squared, is at least its square) |
+| `component_improvement` | float | `0.01` | Modelfit: ... and, after the first, when it removes this fraction of the chi-squared. On a bright source the calibration errors of the most sensitive baselines make any extra component pass the first test |
+| `clean_residual_sigma` | float | `5.0` | Modelfit: residual emission above this many times the noise is CLEANed, in windows around it (and around the Gaussians) |
 | `weighting` | string | `"briggs"` | Visibility weighting scheme |
 | `robust` | list[float] | `[-2, -1, 0, 1, 2]` | Briggs robust values to image at (−2 = uniform, +2 = natural) |
 | `pixels_per_beam` | int | `10` | Used to auto-compute cell size from the synthesised beam |
-| `niter` | int | `4000` | Number of CLEAN deconvolution iterations |
-| `threshold_sigma` | float | `3.0` | CLEAN stops when the residual peak is below this many times the residual rms *and* the last batch of components lowered that rms by less than 1% (while it is still falling it is made of the sidelobes of uncleaned flux, not of noise); also when the rms starts to rise, or at `niter` |
+| `niter` | int | `4000` | Most CLEAN components (with `modelfit`, of the CLEAN of the residual) |
+| `threshold_sigma` | float | `3.0` | CLEAN stops when the residual peak (with `modelfit`, inside its windows) is below this many times the residual rms *and* the last batch of components lowered that rms by less than 1% (while it is still falling it is made of the sidelobes of uncleaned flux, not of noise); also when the rms starts to rise, or at `niter` |
 | `deconvolver` | string | `"hogbom"` | CLEAN deconvolution algorithm (`hogbom`, `clark`, `multiscale`) |
 | `search_fov` | float | `1000.0` | Width (mas) of the dirty map searched for each source before difmapy images or self-calibrates it. `0` disables the search. |
 | `search_sigma` | float | `10.0` | A peak in that map counts as the source only above this many rms. |

@@ -161,7 +161,7 @@ def _options_epilog(sub: argparse._SubParsersAction, common: argparse.ArgumentPa
                               if action.option_strings)
     lines.append(f"  {common_detail}")
     lines.append("")
-    lines.append("For more information, visit: https://vlbipy.readthedocs.io/")
+    lines.append("For more information, visit: https://bmarcote.github.io/vlbipy")
     return "\n".join(lines)
 
 
@@ -441,7 +441,7 @@ def _cmd_pipeline(obs: VLBIObs, args: argparse.Namespace) -> int:
         obs.import_data(force=False)
         for observation in obs.observations:
             observation.flag.statistics()
-        serve_dashboard(obs)
+            serve_dashboard(observation)     # one dashboard per epoch
         return 0
     if args.summary_only:
         obs.import_data(force=args.force)
@@ -685,9 +685,10 @@ def _cmd_export(obs: VLBIObs, args: argparse.Namespace) -> int:
 
 
 def _cmd_combine(obs: VLBIObs, args: argparse.Namespace) -> int:
-    """Multi-epoch stage on already-calibrated epochs."""
+    """Multi-epoch stage on already-calibrated epochs; the epochs' pages are rebuilt with its calibration."""
     obs.import_data(force=False)
     obs.combine(force=args.force)
+    obs.report()
     return 0
 
 
@@ -707,7 +708,7 @@ def _cmd_notebook(obs: VLBIObs, args: argparse.Namespace) -> int:
 
 
 def _cmd_report(obs: VLBIObs, args: argparse.Namespace) -> int:
-    """Build the static HTML dashboard from the products already on disk."""
+    """Build the static HTML dashboard of every epoch from the products already on disk."""
     from .dashboard import build_dashboard, serve_dashboard
     try:
         obs.import_data(force=False)
@@ -718,8 +719,8 @@ def _cmd_report(obs: VLBIObs, args: argparse.Namespace) -> int:
             observation.flag.statistics()
         except Exception:  # noqa: BLE001 - without the MS there are no flags to count
             logger.debug("report: flag statistics unavailable for {}", observation.project_code)
-    index = serve_dashboard(obs) if args.open else build_dashboard(obs)
-    print(index)
+        index = serve_dashboard(observation) if args.open else build_dashboard(observation)
+        print(index)
     return 0
 
 

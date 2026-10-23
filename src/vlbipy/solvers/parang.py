@@ -449,7 +449,7 @@ def _row_time_column(row_time, ntime, time_index):
 def ms_parang_inputs(ms_path, field_id):
     """Read antenna positions, mounts and the phase centre of ``field_id`` from a measurement set.
 
-    Tries casatools first and falls back to python-casacore; both are imported lazily.
+    Read with the selected table engine (:func:`vlbipy.solvers.msio.table_engine`).
 
     Parameters
     ----------
@@ -463,28 +463,18 @@ def ms_parang_inputs(ms_path, field_id):
     dict
         {"antenna_xyz": (nant, 3) float array [m], "mounts": list of str, "ra_rad": float, "dec_rad": float}.
     """
-    ms_path = str(ms_path)
+    from .msio import open_table
+    table = open_table(f"{ms_path}/ANTENNA")
     try:
-        from casatools import table as _casa_table
-    except ImportError:
-        _casa_table = None
-    if _casa_table is not None:
-        tb = _casa_table()
-        tb.open(f"{ms_path}/ANTENNA")
-        antenna_xyz = np.asarray(tb.getcol("POSITION"), dtype=float).T
-        mounts = [str(m) for m in tb.getcol("MOUNT")]
-        tb.close()
-        tb.open(f"{ms_path}/FIELD")
-        phase_dir = np.asarray(tb.getcol("PHASE_DIR"))  # casatools: (2, npoly, nfield)
-        tb.close()
-        ra_rad, dec_rad = float(phase_dir[0, 0, field_id]), float(phase_dir[1, 0, field_id])
-    else:
-        from casacore.tables import table as _cc_table
-        with _cc_table(f"{ms_path}/ANTENNA", ack=False) as t:
-            antenna_xyz = np.asarray(t.getcol("POSITION"), dtype=float)
-            mounts = [str(m) for m in t.getcol("MOUNT")]
-        with _cc_table(f"{ms_path}/FIELD", ack=False) as t:
-            phase_dir = np.asarray(t.getcell("PHASE_DIR", int(field_id)))  # (npoly, 2)
-        ra_rad, dec_rad = float(phase_dir[0, 0]), float(phase_dir[0, 1])
+        antenna_xyz = np.asarray(table.getcol("POSITION"), dtype=float)
+        mounts = [str(m) for m in table.getcol("MOUNT")]
+    finally:
+        table.close()
+    table = open_table(f"{ms_path}/FIELD")
+    try:
+        phase_dir = np.asarray(table.getcol("PHASE_DIR"))[int(field_id)]  # (npoly, 2)
+    finally:
+        table.close()
+    ra_rad, dec_rad = float(phase_dir[0, 0]), float(phase_dir[0, 1])
     logger.debug(f"ms_parang_inputs: {len(mounts)} antennas, field {field_id} at ra={ra_rad:.6f} dec={dec_rad:.6f} rad")
     return {"antenna_xyz": antenna_xyz, "mounts": mounts, "ra_rad": ra_rad, "dec_rad": dec_rad}

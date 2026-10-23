@@ -307,3 +307,20 @@ def test_second_pass_keeps_every_apriori_table(monkeypatch):
     monkeypatch.setattr(CalibrateNamespace, "instrumental", lambda self, **kwargs: [])
     obs.calibrate.second_pass(force=True, plot=False)
     assert [t.cal_type for t in observation.gaintables] == ["accor", "tsys", "gc", "eop"]
+
+
+@pytest.mark.parametrize("network, expected", [("EVN", (False, False)), ("VLBA", (True, True)),
+                                               ("LBA", (True, True))])
+def test_apriori_asks_the_backend_for_eop_and_accor_where_the_array_needs_them(network, expected, monkeypatch):
+    obs = VLBIObs("ts03", network=network, backend="dummy", target="SRC")
+    obs.import_data()
+    calibrate = obs.observations[0]._backend.calibrate
+    seen = {}
+    original = calibrate.a_priori
+
+    def recording(project_code, field, **kwargs):
+        seen.update(kwargs)
+        return original(project_code, field, **kwargs)
+    monkeypatch.setattr(calibrate, "a_priori", recording)
+    obs.calibrate.a_priori()
+    assert (seen["needs_eop"], seen["needs_accor"]) == expected

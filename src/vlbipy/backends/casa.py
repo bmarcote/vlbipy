@@ -762,70 +762,58 @@ class CasaDataOps(DataOps):
         participating antennas, subbands, integration time), the frequency setup
         and the sources that actually have data. Array geometry (baseline lengths,
         resolution) is derived from this by :class:`~vlbipy.models.ObsMetadata`.
+        The msmd quantities come from :meth:`_ms_summary` (the dask-ms backend reads them natively).
         """
         ms = self.backend.ms_path(project_code)
-        msmd = self.backend.tools.msmetadata()
-        if not msmd.open(str(ms)):
-            raise BackendError(f"could not open MS {ms}")
-        try:
-            antenna_names = list(msmd.antennanames())
-            telescope = msmd.observatorynames()[0] if msmd.observatorynames() else ""
-            # DiFX labels every array it correlates "VLBA", so an LBA dataset saying so is expected.
-            expected = {observatory.upper()} | _TELESCOPE_ALIASES.get(observatory.upper(), set())
-            if telescope and observatory and telescope.upper() not in expected:
-                logger.warning("observatory mismatch: config says {} but the MS says {}",
-                               observatory, telescope)
+        summary = self._ms_summary(ms)
+        antenna_names = summary["antenna_names"]
+        telescope = summary["telescopes"][0] if summary["telescopes"] else ""
+        # Accept aliases (e.g. VLBA and LBA observations recorded under other telescope names).
+        expected = {observatory.upper()} | _TELESCOPE_ALIASES.get(observatory.upper(), set())
+        if telescope and observatory and telescope.upper() not in expected:
+            logger.warning("observatory mismatch: config says {} but the MS says {}",
+                           observatory, telescope)
 
-            field_names = list(msmd.fieldnames())
-            source_coords: dict[str, tuple[float, float]] = {}
-            for i, name in enumerate(field_names):
-                center = msmd.phasecenter(i)
-                to_deg = (180.0 / math.pi) if center["m0"].get("unit", "rad") == "rad" else 1.0
-                ra_deg = float(center["m0"]["value"]) * to_deg
-                dec_deg = float(center["m1"]["value"]) * to_deg
-                source_coords[name] = (ra_deg % 360.0, dec_deg)
+        field_names = summary["field_names"]
+        source_coords: dict[str, tuple[float, float]] = {}
+        for i, name in enumerate(field_names):
+            ra_deg = float(summary["phase_dirs"][i][0]) * 180.0 / math.pi
+            dec_deg = float(summary["phase_dirs"][i][1]) * 180.0 / math.pi
+            source_coords[name] = (ra_deg % 360.0, dec_deg)
 
-            timerange = msmd.timerangeforobs(0)
-            t_start = float(timerange["begin"]["m0"]["value"]) * 86400.0
-            t_end = float(timerange["end"]["m0"]["value"]) * 86400.0
-            obs_date = (dt.datetime(1858, 11, 17) + dt.timedelta(seconds=t_start)).date()
+        t_start, t_end = summary["time_range"]
+        obs_date = (dt.datetime(1858, 11, 17) + dt.timedelta(seconds=t_start)).date()
 
-            n_spw = int(msmd.nspw())
-            mean_freq = (msmd.meanfreq(0) + msmd.meanfreq(n_spw - 1)) / 2.0
-            bandwidths = msmd.bandwidths()
-            freq = FreqSetup(ref_freq=float(mean_freq),
-                             total_bandwidth=float(sum(bandwidths)) if hasattr(bandwidths, "__len__")
-                             else float(bandwidths) * n_spw,
-                             n_subbands=n_spw, n_channels=int(msmd.nchan(0)),
-                             channel_width=float(abs(msmd.chanwidths(0)[0])),
-                             polarizations=[Stokes(int(c)) for c in msmd.corrtypesforpol(0)
-                                            if 0 <= int(c) <= 12],
-                             channel_freqs=[[float(f) for f in msmd.chanfreqs(s)]
-                                            for s in range(n_spw)])
+        chan_freq = summary["chan_freq"]
+        n_spw = len(chan_freq)
+        mean_freq = (float(np.mean(chan_freq[0])) + float(np.mean(chan_freq[n_spw - 1]))) / 2.0
+        freq = FreqSetup(ref_freq=float(mean_freq), total_bandwidth=float(np.sum(summary["bandwidths"])),
+                         n_subbands=n_spw, n_channels=int(len(chan_freq[0])),
+                         channel_width=float(abs(summary["chan_width"][0][0])),
+                         polarizations=[Stokes(int(c)) for c in summary["corr_types"] if 0 <= int(c) <= 12],
+                         channel_freqs=[[float(f) for f in chan_freq[s]] for s in range(n_spw)])
 
-            scans: list[Scan] = []
-            observed: set[str] = set()
-            observed_fields: set[int] = set()
-            scan_counts: dict[str, int] = {}
-            for scan_number in msmd.scannumbers():
-                scan_fields = msmd.fieldsforscan(scan_number)
-                observed_fields.update(int(f) for f in scan_fields)
-                source = field_names[int(scan_fields[0])] if len(scan_fields) else ""
-                times = msmd.timesforscan(scan_number)
-                ants = [antenna_names[a] for a in msmd.antennasforscan(scan_number)]
-                observed.update(ants)
-                for ant in ants:
-                    scan_counts[ant] = scan_counts.get(ant, 0) + 1
-                scans.append(Scan(scan_number=int(scan_number), source=source,
-                                  time_start=float(times.min()) if len(times) else 0.0,
-                                  time_end=float(times.max()) if len(times) else 0.0,
-                                  antennas=ants,
-                                  integration_time=self._exposure_time(msmd, scan_number),
-                                  subbands=tuple(int(s) for s in msmd.spwsforscan(scan_number))))
-        finally:
-            msmd.close()
+        scans: list[Scan] = []
+        observed: set[str] = set()
+        observed_fields: set[int] = set()
+        scan_counts: dict[str, int] = {}
+        for scan_number in sorted(summary["scans"]):
+            entry = summary["scans"][scan_number]
+            scan_fields = entry["fields"]
+            observed_fields.update(int(f) for f in scan_fields)
+            source = field_names[int(scan_fields[0])] if len(scan_fields) else ""
+            times = np.asarray(entry["times"])
+            ants = [antenna_names[a] for a in entry["antennas"]]
+            observed.update(ants)
+            for ant in ants:
+                scan_counts[ant] = scan_counts.get(ant, 0) + 1
+            scans.append(Scan(scan_number=int(scan_number), source=source,
+                              time_start=float(times.min()) if len(times) else 0.0,
+                              time_end=float(times.max()) if len(times) else 0.0,
+                              antennas=ants, integration_time=float(entry["exposure"]),
+                              subbands=tuple(int(s) for s in entry["spws"])))
 
-        # The FIELD table lists every scheduled source; keep only those with actual data.
+        # Keep only the fields that actually have data (FIELD lists every scheduled source).
         source_ids = {field_names[i]: i for i in sorted(observed_fields) if i < len(field_names)}
         source_names = list(source_ids)
         source_coords = {name: source_coords[name] for name in source_names if name in source_coords}
@@ -846,6 +834,40 @@ class CasaDataOps(DataOps):
                     meta.max_baseline / 1e3, meta.resolution_mas,
                     meta.min_baseline / 1e3, meta.largest_angular_scale_mas)
         return meta
+
+    def _ms_summary(self, ms: Path) -> dict:
+        """The msmd quantities :meth:`get_metadata` needs (see :func:`vlbipy.solvers.ms_metadata.ms_summary`)."""
+        msmd = self.backend.tools.msmetadata()
+        if not msmd.open(str(ms)):
+            raise BackendError(f"could not open MS {ms}")
+        try:
+            field_names = list(msmd.fieldnames())
+            phase_dirs = []
+            for i in range(len(field_names)):
+                center = msmd.phasecenter(i)
+                to_rad = 1.0 if center["m0"].get("unit", "rad") == "rad" else math.pi / 180.0
+                phase_dirs.append((float(center["m0"]["value"]) * to_rad, float(center["m1"]["value"]) * to_rad))
+            timerange = msmd.timerangeforobs(0)
+            n_spw = int(msmd.nspw())
+            bandwidths = msmd.bandwidths()
+            scans = {}
+            for scan_number in msmd.scannumbers():
+                scans[int(scan_number)] = {"fields": np.asarray(msmd.fieldsforscan(scan_number), dtype=int),
+                                           "times": np.asarray(msmd.timesforscan(scan_number), dtype=float),
+                                           "antennas": np.asarray(msmd.antennasforscan(scan_number), dtype=int),
+                                           "spws": np.asarray(msmd.spwsforscan(scan_number), dtype=int),
+                                           "exposure": self._exposure_time(msmd, scan_number)}
+            return {"antenna_names": list(msmd.antennanames()), "telescopes": list(msmd.observatorynames()),
+                    "field_names": field_names, "phase_dirs": np.asarray(phase_dirs).reshape(-1, 2),
+                    "time_range": (float(timerange["begin"]["m0"]["value"]) * 86400.0,
+                                   float(timerange["end"]["m0"]["value"]) * 86400.0),
+                    "chan_freq": [np.asarray(msmd.chanfreqs(s), dtype=float) for s in range(n_spw)],
+                    "chan_width": [np.asarray(msmd.chanwidths(s), dtype=float) for s in range(n_spw)],
+                    "bandwidths": (np.asarray(bandwidths, dtype=float) if hasattr(bandwidths, "__len__")
+                                   else np.full(n_spw, float(bandwidths))),
+                    "corr_types": [int(c) for c in msmd.corrtypesforpol(0)], "scans": scans}
+        finally:
+            msmd.close()
 
     def _exposure_time(self, msmd, scan_number: int) -> float:
         """Return the correlator integration time of a scan in seconds (0.0 if unavailable)."""
@@ -3242,6 +3264,9 @@ class CasaCalibrationOps(CalibrationOps):
             shutil.rmtree(table_path)
         new_path.rename(table_path)
         spread = self._subband_gain_spread(table_path)
+        # The normalisation removes each hand's level: compare the two hands first.
+        (self.backend.caldir() / f"{project_code}.scalar_bp.hands.json").write_text(
+            json.dumps(self._hand_levels(table_path), indent=1))
         dropped, filled = self._normalise_per_antenna(table_path, max_factor=max_factor,
                                                       fill_unsolved=fill_unsolved)
         if filled:
@@ -3353,6 +3378,42 @@ class CasaCalibrationOps(CalibrationOps):
             return [str(n) for n in handle.getcol("NAME")]
         finally:
             handle.close()
+
+    def _hand_levels(self, table_path: Path) -> dict:
+        """How the two hands of every antenna compare in the scalar-bandpass solutions, before normalising.
+
+        Each solution is the amplitude of one hand of one antenna in one subband against the 1 Jy model of
+        one calibrator, so the ratio of the two hands' solutions of the same subband and calibrator is the
+        ratio of their amplitudes, whatever the calibrator's flux density or structure.
+
+        Returns
+        -------
+        dict
+            ``{antenna: {"ratio": median |g_RR| / |g_LL| over the (field, subband) solutions both hands have
+            (None without any), "pairs": their number, "solved": {"RR": n, "LL": n}}}``.
+        """
+        handle = self.backend.tools.table()
+        if not handle.open(str(table_path)):
+            return {}
+        try:
+            gains = np.abs(np.asarray(handle.getcol("CPARAM")))[:, 0]   # (npol, nrow)
+            flags = np.asarray(handle.getcol("FLAG")).astype(bool)[:, 0]
+            antennas = np.asarray(handle.getcol("ANTENNA1"))
+        finally:
+            handle.close()
+        names = self._table_antenna_names(table_path)
+        if gains.shape[0] < 2:
+            return {}
+        solved = ~flags & np.isfinite(gains) & (gains > 0)
+        levels = {}
+        for antenna in np.unique(antennas):
+            rows = antennas == antenna
+            both = rows & solved[0] & solved[1]
+            ratios = gains[0, both] / gains[1, both]
+            name = names[int(antenna)] if int(antenna) < len(names) else f"#{int(antenna)}"
+            levels[name] = {"ratio": float(np.median(ratios)) if ratios.size else None, "pairs": int(both.sum()),
+                            "solved": {"RR": int((rows & solved[0]).sum()), "LL": int((rows & solved[1]).sum())}}
+        return levels
 
     def _subband_gain_spread(self, table_path: Path) -> float:
         """Return the median across antennas of the relative spread of gain across subbands.
@@ -3512,6 +3573,11 @@ class CasaCalibrationOps(CalibrationOps):
         table, CASA's ``nearest`` mapping uses each field's own solution. Otherwise
         the stored ``gainfield`` supplies the phase-reference solution.
         """
+        if table.cal_type == "tec":
+            # Direction-dependent: a field is corrected with the rows of its own direction (the table has rows for
+            # every field and scan), also where several phase centres were observed at the same time.
+            own = [f.strip() for f in str(apply_field).split(",") if f.strip()]
+            return own[0] if len(own) == 1 else ""
         if not table.gainfield or not apply_field:
             return table.gainfield
         requested = {f.strip() for f in apply_field.split(",") if f.strip()}
@@ -5510,13 +5576,16 @@ class CasaExportOps(ExportOps):
         logger.info("exportuvfits: {} -> {} (combinespw={}, padwithflags={})",
                     source_ms.name, target.name, combinespw, padwithflags)
         try:
-            self.backend.tasks.exportuvfits(vis=str(source_ms), fitsfile=str(target),
-                                            datacolumn="data", multisource=multisource,
-                                            combinespw=combinespw, padwithflags=padwithflags,
-                                            overwrite=overwrite)
+            self._run_exportuvfits({"vis": str(source_ms), "fitsfile": str(target), "datacolumn": "data",
+                                    "multisource": multisource, "combinespw": combinespw,
+                                    "padwithflags": padwithflags, "overwrite": overwrite})
         except RuntimeError as exc:
             raise BackendError(f"{project_code}: exportuvfits of {source!r} failed: {exc}") from exc
         return str(target)
+
+    def _run_exportuvfits(self, params: dict) -> None:
+        """Run ``exportuvfits`` with ``params`` (engine hook: the dask-ms backend writes the file natively)."""
+        self.backend.tasks.exportuvfits(**params)
 
 
 def robust_tag(robust: float) -> str:
@@ -5994,9 +6063,11 @@ class CasaBackend(Backend):
         except ImportError as exc:
             raise BackendError("the CASA backend requires casatools/casatasks: "
                                "pip install vlbipy[casa]") from exc
+        from ..solvers.msio import set_default_engine
         self.tasks = casatasks
         self.tools = casatools
         self._ms_overrides: dict[str, Path] = {}
+        set_default_engine(None)            # tables through casacore/casatools (the dask-ms backend reads natively)
         super().__init__(work_dir)
         self.redirect_casa_log()
 

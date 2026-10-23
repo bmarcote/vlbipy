@@ -94,7 +94,7 @@ The combination writes to `<cwd>/combined`:
 | Path | Content |
 |---|---|
 | `selfcal/<name>.<calibrator>.joint.mod` | model of the phase calibrator from all epochs together (+ its images and `.json`) |
-| `<code>/selfcal/<code>.<calibrator>.joint*` | per-epoch refinement against that model: the gain table and its report |
+| `<code>/selfcal/<code>.<calibrator>.joint*` | per-epoch refinement against that model: the gain table, its report and the amplitude step's (`.joint.amp.json`, `.png`) |
 | `data/<name>_<source>.ms` | the calibrated epochs of each source, concatenated |
 | `images/<name>_<source>.robust*.fits` | image of all epochs together (+ PNG preview) |
 | `<name>.campaign.json` | fluxes per epoch, accepted steps, image statistics of every epoch before and after |

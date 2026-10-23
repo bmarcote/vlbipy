@@ -27,8 +27,9 @@ def test_aips_is_stub():
         get_backend("aips")
 
 
-def test_casa_backend_needs_casatools():
+def test_casa_backend_needs_casatools(tmp_path, monkeypatch):
     """CasaBackend constructs when casatools is present, raises BackendError otherwise."""
+    monkeypatch.chdir(tmp_path)                       # its work directory (and CASA's logs/) is the current one
     try:
         import casatools  # noqa: F401
         backend = get_backend("casa")

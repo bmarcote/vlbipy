@@ -422,7 +422,7 @@ def _source_downloads(work_dir: Path, project_code: str, source_names: list[str]
             if match:
                 robusts.append((int(match.group(1)), match.group(1), file_name))
         for _, robust, file_name in sorted(robusts):
-            label = f"CLEAN image FITS (robust {robust})"
+            label = f"Image FITS (robust {robust})"
             entries.append(_download_entry(image_dir / file_name, work_dir, label, "fits"))
         out[name] = entries
     return out
@@ -782,9 +782,10 @@ def _step_statuses(observation) -> dict:
 
 
 def _source_results(work_dir: Path, project_code: str, sources: list[dict]) -> list[dict]:
-    """What the imaging left on disk per source: the source search and the CLEAN image statistics.
+    """What the imaging left on disk per source: the source search and the image statistics.
 
-    Reads ``images/<code>_<source>.search.json`` (written for every source difmapy imaged) and the
+    Reads ``images/<code>_<source>.search.json`` (written for every source difmapy imaged, with the
+    statistics of its latest images) and, for images made before that report carried them, the
     self-calibration report ``selfcal/<code>.<source>.json`` (calibrators only), whose ``images`` hold the
     peak, rms and dynamic range per robust value. The images themselves are never opened.
 
@@ -817,7 +818,9 @@ def _source_results(work_dir: Path, project_code: str, sources: list[dict]) -> l
                       **{key: _finite_or_none(search.get(key)) for key in numbers}}
         else:
             search = None
-        recorded = report.get("images") if isinstance(report.get("images"), dict) else {}
+        # The image report is rewritten whenever a source is imaged (a campaign re-images after the self-cal).
+        recorded = next((images for images in (found.get("images"), report.get("images"))
+                         if isinstance(images, dict) and images), {})
         measured = [info for info in recorded.values()
                     if isinstance(info, dict) and _finite_or_none(info.get("peak")) is not None]
         images = [{key: _finite_or_none(info.get(key)) for key in ("robust", "peak", "rms", "dynamic_range")}
@@ -1852,8 +1855,8 @@ def _final_source_panel(ctx: dict, html_dir: Path, slug: str, entries: list[dict
         parts.append(_section(anchor, title, _plot_grid(paths, html_dir, code, wide=len(paths) <= 2), blurb))
     if images:
         parts.append(_section(f"{slug}-images", "Images",
-                              _plot_grid(images, html_dir, code, "CLEAN images at robust -2 (uniform), 0 and 2 (natural).", wide=True),
-                              "CLEAN images with Briggs robust -2 (uniform), 0 and +2 (natural) weighting."))
+                              _plot_grid(images, html_dir, code, "Images at robust -2 (uniform), 0 and 2 (natural).", wide=True),
+                              "Images with Briggs robust -2 (uniform), 0 and +2 (natural) weighting: the model (Gaussians and the CLEAN of their residual, or CLEAN alone) restored with each beam, plus the residuals."))
     return "".join(parts)
 
 
@@ -1914,6 +1917,7 @@ def render_pages(ctx: dict, work_dir: Path) -> Path:
     (html_dir / "style.css").write_text(CSS, encoding="utf-8")
     (html_dir / "dashboard.js").write_text(JS, encoding="utf-8")
     (html_dir / "dashboard.json").write_text(json.dumps(ctx, indent=2, default=str), encoding="utf-8")
+    logger.bind(headline=True).info("report: {}", html_dir / "index.html")
     logger.info("dashboard: wrote {} page(s) to {}", len(pages), html_dir)
     return html_dir / "index.html"
 

@@ -221,9 +221,40 @@ outside vlbipy in the meantime.
 
 ### Imaging
 
-*Not implemented.* `run()` checks whether the active backend implements
-`image.clean`; if not (true of CASA today), it logs a warning and returns
-without images rather than failing the whole run.
+With difmapy (the dask-ms backend always; CASA with `[imaging].imager =
+"difmap"`), every source is imaged from its split at each robust value of
+`[imaging].robust`. The sources of an epoch are imaged side by side in worker
+processes (difmapy works on one core): as many at a time as there are CPUs and
+as fit in the free memory, about 3.5 GB each on an 8192-pixel map. Each source
+is first looked for in a wide dirty map (`search_fov`); one that is not
+detected there gets no model, and its images are its dirty maps.
+
+The default (`method = "modelfit"`) models the source rather than CLEANing it:
+
+1. circular Gaussians (flux, position and size free) are added one at a time:
+   the first at the peak of the naturally weighted map, each later one at the
+   brightest residual within three beams of the first (plus its size), and all
+   of them fitted again together (difmap `modelfit`). A Gaussian is kept when
+   it improves the fit by `component_sigma` (5σ) and removes
+   `component_improvement` (1%) of the chi-squared, and stays physical
+   (positive flux, no larger than that region), up to `max_components`;
+2. what the Gaussians leave is CLEANed in windows around them; residual
+   emission elsewhere above `clean_residual_sigma` times the noise gets a
+   window of its own. CLEAN stops as below, at `threshold_sigma`;
+3. that one model is restored at every robust value, each with its own beam
+   and residuals.
+
+The Gaussians stay near the source on purpose. Further out, the residual peaks
+of a bright source are mostly the sidelobes of its calibration errors, which a
+fit would chase: in V589 the misfit of every calibrator is 64-89% on the most
+sensitive baseline, AT-PA, which lays stripes 26 mas apart over the map. Plain
+CLEAN over the whole map (`method = "clean"`) spreads thousands of components
+over those stripes; they lower the residual rms but put spurious spots in the
+image, and take minutes per image on an 8192-pixel map, where the modelfit
+images take seconds.
+
+`run()` checks whether the backend can image at all; if not, it logs a warning
+and returns without images rather than failing the whole run.
 
 ## Campaigns
 
@@ -233,17 +264,32 @@ are then combined (`combine()`, see [Full pipeline — Campaigns](usage/pipeline
 
 1. the calibrated data of each phase calibrator are concatenated across the
    epochs, each scaled to a common flux density (calibrators vary), and
-   modelled together: phase self-calibration, then CLEAN. The joint uv coverage
-   constrains structure that no single track does;
+   modelled together: phase self-calibration, then the images (see
+   [Imaging](#imaging)), whose model is the joint model. The joint uv coverage
+   constrains structure that no single track does. A previous combination's
+   tables are taken out of the chains first; the epochs are imaged again for
+   the comparison only when their images were made with those tables or with
+   other imaging settings;
 2. each epoch of that calibrator is self-calibrated against the joint model
    (scaled back to that epoch's flux density, and never re-fitted): the phase
-   ladder, each step kept only if it improves the fit. Station amplitudes are
-   left as the epoch's own self-calibration set them unless
-   `[selfcal].joint_amplitude = true` (the model is built from other epochs of
-   a variable source; amplitudes fitted to it made the V589 targets worse). The gains become a `joint_<source>` table in that
-   epoch's chain, applied to the fields the calibrator's own self-calibration
-   goes to;
-3. every epoch is re-applied, re-split and re-imaged;
+   ladder, each step kept only if it improves the fit, then the station
+   amplitudes with `bayes_gscale` against the same model: the median station
+   holds the flux scale of every subband, a station within `prior_sigma` of it
+   is left alone and one clearly off is corrected. The joint model is not
+   rebuilt without each station, so the uncertainty of each station's gain
+   due to the model is the one the epoch's own amplitude step measured (a
+   station whose baselines no other station constrains, such as HH in V589,
+   is not corrected on the strength of the model alone). A calibrator that a single
+   track models poorly (V589: J1346-6024, reduced chi-squared 200-440 with its
+   own models) gives amplitude corrections that absorb its structure; against
+   the joint model all epochs are calibrated on the same one.
+   `[selfcal].joint_amplitude = false` keeps the epochs' own amplitudes. The
+   gains become a `joint_<source>` table in that epoch's chain, applied to the
+   fields the calibrator's own self-calibration goes to (with the
+   `interpolate` strategy, the target gets the two calibrators' tables
+   combined by its position);
+3. every epoch is re-applied, re-split and re-imaged, and its plots of the
+   calibrated data (and its HTML pages) are redone with the final calibration;
 4. the epochs of every source are concatenated and imaged together.
 
 A source declared for the campaign but absent from an epoch is ignored in that

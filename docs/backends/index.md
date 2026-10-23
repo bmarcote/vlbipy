@@ -51,10 +51,12 @@ backend = "casa"   # casa (default) | dask-ms (CASA + fast numpy calibration) | 
 
 ## The dask-ms backend
 
-`backend = "dask-ms"` is a complete pipeline backend. It is the CASA backend
-— import, flagging, plotting and export are all still CASA — with
-the calibration engine replaced by numpy solvers that read and write the
-measurement set directly from parallel worker processes, and with all imaging
+`backend = "dask-ms"` is a complete pipeline backend. It runs the CASA
+backend's pipeline, but the tasks that do the work are replaced by native
+Python/numpy code that reads and writes the measurement set and the
+calibration tables directly, in parallel worker processes, without
+casacore, casatools or casatasks. CASA is imported only when a step still
+needs one of the few tasks that have no native version yet. All imaging is
 done by difmapy.
 
 Imaging and self-calibration always run in difmapy on the per-source split
@@ -79,14 +81,31 @@ pip install "vlbipy[casa,daskms]"
 
 ### What it replaces
 
-| Step | Where it is used |
-| --- | --- |
-| Fringe fitting | single-band delay (`initial_calibration`), multi-band delay (`fringefit`), the per-scan SNR survey (`scan_snr`) |
-| `bandpass` | the instrumental bandpass |
-| `gaincal` | the pipeline's `scalar_bandpass` |
-| `applycal` | `calibrate.apply` |
+| CASA task or tool | Native replacement | Where it is used |
+| --- | --- | --- |
+| `importfitsidi` + `partition` | `solvers/idi_import.py`, `solvers/idi_subtables.py` | the import: FITS-IDI straight to the Multi-MS, one worker per sub-MS (`VLBIPY_NATIVE_IMPORT=0` uses CASA) |
+| `fringefit` | `solvers/fringefit_task.py` | single-band delay (`initial_calibration`), multi-band delay (`fringefit`), the per-scan SNR survey (`scan_snr`) |
+| `bandpass` | `solvers/gain_task.py` | the instrumental bandpass |
+| `gaincal` | `solvers/gain_task.py` | the pipeline's `scalar_bandpass` |
+| `applycal` | `solvers/apply_task.py` | `calibrate.apply` |
+| `gencal` (`tsys`, `gc`, `eop`) | `solvers/apriori_task.py`, `solvers/gaincurve_task.py`, `solvers/eop_task.py` | the a-priori calibration (the EOP delays are interpolated between the right daily entries, where CASA's `eop.py` extrapolates from the second and third entry for any time after the fourth) |
+| `flagdata` (`manual`, `list`, `quack`, `unflag`; the flag statistics) | `solvers/flag_task.py` | every selection-based flagging step |
+| `flagdata(mode='tfcrop')` | `solvers/tfcrop_task.py` | the `flag_tfcrop` autoflagging (CASA's flags, cell for cell) |
+| `flagmanager` | `solvers/flagversions.py` | flag versions (same files as CASA's) |
+| `statwt` (default binning) | `solvers/statwt_task.py` | `reweight` |
+| `accor`, `smoothcal` (of the accor table) | `solvers/accor_task.py` | the correlator amplitude correction (VLBA, LBA) |
+| `clearcal` (no selection) | `solvers/clearcal_task.py` | resetting a dataset for a `--scratch` run |
+| `mstransform`/`split` | `solvers/split_task.py` | the per-source splits |
+| `exportuvfits` | `solvers/uvfits_task.py` | the UVFITS files for difmap |
+| `concat` (+ the epoch scaling) | `solvers/concat_task.py` | combining the epochs of a campaign (`merge`) |
+| AIPS `TECOR` (CASA `tec_maps` + `gencal('tecim')`) | `ionex.py`, `solvers/tec_task.py` | the ionospheric correction from global TEC maps (`[calibration.tec]`), written as a Fringe Jones table |
+| `msmetadata`, the `ms` tool readers | `solvers/ms_metadata.py`, `solvers/plot_read.py` | metadata, the diagnostic and final plots |
+| `casatools.table`, python-casacore | `vlbipy/casacore_format/` | every table read and write |
 
-Everything else runs through CASA exactly as on the `casa` backend.
+Still CASA: `rflag` and `clip` flagging (run on every sub-MS in parallel),
+`listobs` and `importuvfits`. A call the native code does not reproduce exactly (an unusual
+selection, a cal library, `bandtype='BPOLY'`...) is handed to the CASA task
+with a warning.
 
 ### How it works
 
@@ -191,7 +210,8 @@ The engine lives in `vlbipy.solvers`:
 | `VLBIPY_WORKERS=N` (environment) | Number of worker processes. Default: the number of CPU cores, capped at 16. `1` runs everything in-process. |
 | `VLBIPY_THREADS=N` (environment) | Threads a job uses for its array work. Default: its share of the cores (the cores divided by the jobs running at once). |
 | `VLBIPY_NUMBA=0` (environment) | Uses numpy for the calibration loops even when numba is installed. |
-| `VLBIPY_TABLE_ENGINE=casacore` or `VLBIPY_TABLE_ENGINE=casatools` (environment) | Forces the table I/O library. By default python-casacore (pulled in by dask-ms) is used when it works on the machine, otherwise `casatools.table` is used automatically (python-casacore is broken on some macOS builds). |
+| `VLBIPY_TABLE_ENGINE=native`, `casacore` or `casatools` (environment) | Forces the table I/O library. Under the dask-ms backend the default is the native reader/writer (`vlbipy.casacore_format`), which opens a table it cannot handle (an unusual storage manager) with python-casacore when it works on the machine, otherwise with `casatools.table`. Under the `casa` backend the default stays python-casacore / `casatools.table`. |
+| `VLBIPY_NATIVE_IMPORT=0` (environment) | Imports the FITS-IDI files with CASA's `importfitsidi` + `partition` instead of the native import. The native import also hands over to CASA by itself for data it does not cover (DiFX/VLBA weights, files whose tables do not match one to one, Stokes I/Q/U/V). |
 | `[import] mms` | `true` (default) imports to a Multi-MS, which lets `applycal` run in parallel over its sub-MSs. |
 | `[import] zarr_store` | `true` also writes the zarr store `<code>.zarr` (default `false`). |
 

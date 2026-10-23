@@ -326,6 +326,13 @@ class CalibrationOps(BackendComponent):
         """Produce a-priori calibration tables (Tsys, gain curve, EOP, TEC, ...)."""
         raise self._unsupported("a_priori")
 
+    def ionosphere(self, project_code: str, *, ionex_dir: str, **kwargs) -> CalTable:
+        """Ionospheric (TEC) correction from global ionosphere maps, applied to every field (AIPS TECOR).
+
+        ``kwargs`` are the ``[calibration.tec]`` settings (model, interval, shell height, mapping, ...).
+        """
+        raise self._unsupported("ionosphere")
+
     def initial_calibration(self, project_code: str, field: str, refant: str, **kwargs) -> CalTable:
         """Single-band delay (instrumental) calibration on the fringe finder."""
         raise self._unsupported("initial_calibration")
