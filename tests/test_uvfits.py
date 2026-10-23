@@ -11,9 +11,9 @@ EARTH_ORIENTATION = ("GSTIA0", "DEGPDY", "POLARX", "POLARY", "UT1UTC", "IATUTC")
 
 
 def test_multisource_export_is_left_to_casa(tmp_path):
-    from vlbipy.solvers.uvfits_task import export_uvfits
+    from vlbipy.solvers.uvfits import exportuvfits
     with pytest.raises(NotImplementedError):
-        export_uvfits(tmp_path / "missing.ms", tmp_path / "out.uvfits", multisource=True)
+        exportuvfits(tmp_path / "missing.ms", tmp_path / "out.uvfits", multisource=True)
 
 
 @pytest.mark.skipif(not SPLIT.is_dir(), reason="RSM07 split measurement set not available")
@@ -22,11 +22,11 @@ def test_rsm07_split_exports_like_casa(tmp_path, monkeypatch):
     pytest.importorskip("casatools")
     casatasks = pytest.importorskip("casatasks")
     from astropy.io import fits
-    from vlbipy.solvers.uvfits_task import export_uvfits
+    from vlbipy.solvers.uvfits import exportuvfits
     options = {"datacolumn": "data", "multisource": False, "combinespw": True, "padwithflags": True,
                "overwrite": True}
     casatasks.exportuvfits(vis=str(SPLIT), fitsfile=str(tmp_path / "casa.uvfits"), **options)
-    report = export_uvfits(SPLIT, tmp_path / "native.uvfits", **options)
+    report = exportuvfits(SPLIT, tmp_path / "native.uvfits", **options)
     assert report["groups"] > 0
     assert os.path.getsize(tmp_path / "casa.uvfits") == os.path.getsize(tmp_path / "native.uvfits")
     with fits.open(tmp_path / "casa.uvfits") as casa, fits.open(tmp_path / "native.uvfits") as ours:

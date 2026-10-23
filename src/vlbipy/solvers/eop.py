@@ -1,6 +1,6 @@
 """The Earth-orientation correction table (the dask-ms backend's ``gencal eop``), without CASA.
 
-:func:`write_eop_table` writes what ``casatasks.gencal(caltype='eop', infile=<file>)`` writes: CASA's
+:func:`eop` writes what ``casatasks.gencal(caltype='eop', infile=<file>)`` writes: CASA's
 ``task_gencal.EOPGencal`` creates an empty ``Fringe Jones`` table (``calibrater.createcaltable(partype='Real',
 caltype='Fringe Jones', singlechan=True)``) and ``casatasks/private/eop.py`` (``do_generate_eop``) fills it in
 Python with erfa. This module is a port of that code, with the same erfa calls in the same order, so every cell
@@ -29,7 +29,7 @@ What CASA does, and this module repeats:
   ``INTERVAL = 0``, ``ANTENNA2 = SCAN_NUMBER = -1``;
 * antenna positions and phase centres go through msmd's spherical form first (``atan2(y, x)``, ``asin(z / r)``,
   ``r``; the phase centre via its unit vector) and back with ``erfa.s2p`` / ``erfa.s2c``, as CASA does;
-* subtables OBSERVATION, ANTENNA, FIELD and an empty HISTORY as :mod:`vlbipy.solvers.gaincurve_task` writes
+* subtables OBSERVATION, ANTENNA, FIELD and an empty HISTORY as :mod:`vlbipy.solvers.gaincurve` writes
   them, and SPECTRAL_WINDOW as ``NewCalTable::makeSpwSingleChan``: a subband with more than one channel gets
   the frequency of channel ``nchan // 2`` and ``TOTAL_BANDWIDTH`` as its width, effective bandwidth and
   resolution (one channel); the other columns, FLAG_ROW included, are the MS values. A table with no row is
@@ -54,7 +54,7 @@ from ..casacore_format.table import Table
 from ..casacore_format.tabledat import UnsupportedTable
 from ..logging_utils import get_logger
 from .caltable import _create, _link_subtables, history_table_desc, main_table_desc
-from .gaincurve_task import HISTORY_ORDER, SUBTABLE_DESCS, _cells, write_calibration_subtable
+from .gaincurve import HISTORY_ORDER, SUBTABLE_DESCS, _cells, write_calibration_subtable
 from .msio import ms_parts, open_table, table_engine
 
 logger = get_logger()
@@ -71,7 +71,7 @@ IGNORED_KEYWORDS = ("uniform", "endpoint", "timeout", "retry", "retry_wait_time"
 INDEX_COLUMNS = ("OBSERVATION_ID", "SCAN_NUMBER", "FIELD_ID", "TIME", "ANTENNA1", "ANTENNA2", "DATA_DESC_ID")
 
 
-def write_eop_table(vis, caltable, *, infile=None, engine=None, casa_compatible: bool = False,
+def eop(vis, caltable, *, infile=None, engine=None, casa_compatible: bool = False,
                     **gencal_kwargs) -> dict:
     """Write the table ``gencal(vis=vis, caltable=caltable, caltype='eop', infile=infile)`` writes.
 

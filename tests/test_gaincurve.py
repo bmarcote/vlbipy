@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from vlbipy.casacore_format.table import Table
-from vlbipy.solvers.gaincurve_task import NCOEF, el_to_za_matrix, gain_curve_parameters, write_gain_curve_table
+from vlbipy.solvers.gaincurve import NCOEF, el_to_za_matrix, gain_curve_parameters, gaincurve
 
 RSM07 = Path(__file__).resolve().parents[1] / "test" / "RSM07"
 
@@ -34,7 +34,7 @@ def test_power_curve_is_scaled_by_dpfu_and_a_voltage_curve_squares_only_its_firs
                     reason="RSM07 test data not available")
 def test_rsm07_gain_curve_table_is_identical_to_casa(tmp_path):
     native = tmp_path / "RSM07.gcal"
-    report = write_gain_curve_table(RSM07 / "RSM07.mms", native, caltype="gc")
+    report = gaincurve(RSM07 / "RSM07.mms", native, caltype="gc")
     assert report["rows"] == 48
     with Table(RSM07 / "caltables" / "RSM07.gcal") as casa, Table(native) as ours:
         assert ours.colnames() == casa.colnames() and ours.nrows() == casa.nrows()

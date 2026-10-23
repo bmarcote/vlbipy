@@ -1,4 +1,4 @@
-"""The ionospheric (TEC) correction (``vlbipy.ionex``, ``vlbipy.solvers.tec_task``): IONEX names, parsing and
+"""The ionospheric (TEC) correction (``vlbipy.ionex``, ``vlbipy.solvers.tec``): IONEX names, parsing and
 interpolation on synthetic maps, the TECOR geometry, the exact Fringe Jones representation, the table of a
 synthetic measurement set applied by the native apply, and (when the data are here) RSM07 with CASA's applycal.
 No test uses the network."""
@@ -17,11 +17,11 @@ from vlbipy import ionex
 from vlbipy.casacore_format.aipsio import TableRef
 from vlbipy.casacore_format.table import Table
 from vlbipy.casacore_format.writer import create_table, scalar_column
-from vlbipy.solvers import tec_task
+from vlbipy.solvers import tec
 from vlbipy.solvers.apply import antenna_gains, load_caltable
 from vlbipy.solvers.caltable import _columns
 from vlbipy.solvers.fringe import k_disp
-from vlbipy.solvers.gaincurve_task import SUBTABLE_DESCS
+from vlbipy.solvers.gaincurve import SUBTABLE_DESCS
 
 RSM07_MMS = Path(__file__).resolve().parents[1] / "test" / "RSM07_import_ref" / "RSM07.mms"
 #: 2025-09-16 13:00 UTC, the start of RSM07 [MJD seconds].
@@ -254,22 +254,22 @@ def test_vertical_tec_is_exact_on_linear_maps_and_follows_ionex_eq3(tmp_path):
 # ----------------------------------------------------------------------------------------------------------------
 def test_pierce_point_and_mapping_function_follow_tecor():
     height = 450e3
-    lat_ipp, dlon, za_ipp = tec_task.pierce_points(np.radians(50.0), np.radians(30.0), np.radians(90.0), height)
+    lat_ipp, dlon, za_ipp = tec.pierce_points(np.radians(50.0), np.radians(30.0), np.radians(90.0), height)
     assert lat_ipp == pytest.approx(np.radians(50.0)) and dlon == pytest.approx(0.0) and za_ipp == pytest.approx(0.0)
     ratio = 6378.0 / (6378.0 + 450.0)
-    assert tec_task.slant_factor(0.0, height) == pytest.approx(1.0 / np.sqrt(1.0 - ratio ** 2))
-    assert tec_task.slant_factor(np.radians(90.0), height) == pytest.approx(1.0)
+    assert tec.slant_factor(0.0, height) == pytest.approx(1.0 / np.sqrt(1.0 - ratio ** 2))
+    assert tec.slant_factor(np.radians(90.0), height) == pytest.approx(1.0)
     # The thin-shell factor is 1 / cos(zenith angle at the shell).
     el = np.radians(20.0)
-    assert tec_task.slant_factor(el, height) == pytest.approx(
-        1.0 / np.cos(tec_task.pierce_points(0.0, 0.0, el, height)[2]))
-    petrov = tec_task.slant_factor(el, height, **tec_task.PETROV_MAPPING)
+    assert tec.slant_factor(el, height) == pytest.approx(
+        1.0 / np.cos(tec.pierce_points(0.0, 0.0, el, height)[2]))
+    petrov = tec.slant_factor(el, height, **tec.PETROV_MAPPING)
     ratio = 6378.0 / (6378.0 + 450.0 + 56.7)
     assert petrov == pytest.approx(0.85 / np.sqrt(1.0 - (ratio * np.cos(0.9782 * el)) ** 2))
     # A source due north (azimuth 0) pierces the shell north of the antenna, at the same longitude.
-    lat_ipp, dlon, _ = tec_task.pierce_points(np.radians(50.0), 0.0, np.radians(30.0), height)
+    lat_ipp, dlon, _ = tec.pierce_points(np.radians(50.0), 0.0, np.radians(30.0), height)
     assert lat_ipp > np.radians(50.0) and dlon == pytest.approx(0.0, abs=1e-12)
-    lat_ipp, dlon, _ = tec_task.pierce_points(np.radians(50.0), np.radians(90.0), np.radians(30.0), height)
+    lat_ipp, dlon, _ = tec.pierce_points(np.radians(50.0), np.radians(90.0), np.radians(30.0), height)
     assert dlon > 0.0
 
 
@@ -280,23 +280,23 @@ def test_fringe_parameters_reproduce_the_dispersive_phase_on_every_channel():
         freq = fmin + rng.uniform(4e6, 128e6) * np.linspace(0.0, 1.0, 33)
         f_ref = freq[16] + rng.uniform(-1e6, 1e6)
         stec = rng.uniform(1.0, 150.0)
-        phase, delay, disp = tec_task.fringe_parameters(stec, freq[0], freq[-1], f_ref)
+        phase, delay, disp = tec.fringe_parameters(stec, freq[0], freq[-1], f_ref)
         model = phase + 2e-9 * np.pi * delay * (freq - f_ref) + disp * k_disp(freq, freq[0], freq[-1])
-        exact = tec_task.ionospheric_phase(stec, freq)
+        exact = tec.ionospheric_phase(stec, freq)
         assert np.abs(np.angle(np.exp(1j * (model - exact)))).max() < 1e-7
     # 1 TECU at 1.6 GHz is 5.28 rad; the sign is IONOSPHERE_SIGN (+: measured on RSM07).
-    assert tec_task.ionospheric_phase(1.0, 1.6e9) == pytest.approx(tec_task.IONOSPHERE_SIGN * 5.27998, rel=1e-5)
-    assert np.sign(tec_task.fringe_parameters(10.0, 1.6e9, 1.632e9, 1.616e9)[1]) == -tec_task.IONOSPHERE_SIGN
+    assert tec.ionospheric_phase(1.0, 1.6e9) == pytest.approx(tec.IONOSPHERE_SIGN * 5.27998, rel=1e-5)
+    assert np.sign(tec.fringe_parameters(10.0, 1.6e9, 1.632e9, 1.616e9)[1]) == -tec.IONOSPHERE_SIGN
     # Applied to a channel selection the error is a nearly constant phase of ~1e-3 rad per 10 TECU at L band.
     freq = 1594.99e6 + 0.5e6 * np.arange(64)
-    error = tec_task.selection_error(10.0, freq[0], freq[-1], freq[4], freq[59], freq[4:60])
+    error = tec.selection_error(10.0, freq[0], freq[-1], freq[4], freq[59], freq[4:60])
     assert np.abs(error).max() < 2e-3 and np.ptp(error) < 1e-4
 
 
 def test_row_times_cover_every_scan():
-    assert np.allclose(tec_task.row_times(0.0, 100.0, 30.0), [0.0, 30.0, 60.0, 90.0, 100.0])
-    assert np.allclose(tec_task.row_times(0.0, 60.0, 30.0), [0.0, 30.0, 60.0])
-    assert np.allclose(tec_task.row_times(5.0, 5.0, 30.0), [5.0])
+    assert np.allclose(tec.row_times(0.0, 100.0, 30.0), [0.0, 30.0, 60.0, 90.0, 100.0])
+    assert np.allclose(tec.row_times(0.0, 60.0, 30.0), [0.0, 30.0, 60.0])
+    assert np.allclose(tec.row_times(5.0, 5.0, 30.0), [5.0])
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -305,10 +305,10 @@ def test_row_times_cover_every_scan():
 def test_write_tec_table_applies_each_field_its_own_correction(tmp_path, native_engine, no_network):
     ms = make_ms(tmp_path / "sim.ms")
     write_ionex(tmp_path / "ionex" / "EMR0OPSFIN_20252590000_01D_01H_GIM.INX", dt.date(2025, 9, 16), linear_tec)
-    report = tec_task.write_tec_table(ms, tmp_path / "sim.tec", ionex_dir=tmp_path / "ionex", interval=30.0)
+    report = tec.tec(ms, tmp_path / "sim.tec", ionex_dir=tmp_path / "ionex", interval=30.0)
     assert report["product"] == "emrg" and report["fields"] == ["3C345", "J1848+3219"] and not no_network
     assert report["shell_height_km"] == 450.0 and not report["simultaneous_fields"]
-    ntime = sum(tec_task.row_times(T0 + lo, T0 + hi, 30.0).size for _, _, lo, hi in SCANS)
+    ntime = sum(tec.row_times(T0 + lo, T0 + hi, 30.0).size for _, _, lo, hi in SCANS)
     assert report["nrow"] == ntime * 2 * 3
     with Table(tmp_path / "sim.tec") as table:
         keywords = table.getkeywords()
@@ -321,10 +321,10 @@ def test_write_tec_table_applies_each_field_its_own_correction(tmp_path, native_
     maps = ionex.read_ionex(tmp_path / "ionex" / "EMR0OPSFIN_20252590000_01D_01H_GIM.INX")
     for field_id, _, first, last in SCANS:
         times = T0 + np.arange(first, last + 0.5, 2.0)
-        stec = tec_task.slant_tec(maps, ANTENNA_XYZ, *FIELD_RADEC[field_id], times)["stec"]
-        other = tec_task.slant_tec(maps, ANTENNA_XYZ, *FIELD_RADEC[1 - field_id], times)["stec"]
+        stec = tec.slant_tec(maps, ANTENNA_XYZ, *FIELD_RADEC[field_id], times)["stec"]
+        other = tec.slant_tec(maps, ANTENNA_XYZ, *FIELD_RADEC[1 - field_id], times)["stec"]
         for spw in range(2):
-            exact = tec_task.ionospheric_phase(stec[:, :, None], CHAN_FREQ[spw][None, None, :])
+            exact = tec.ionospheric_phase(stec[:, :, None], CHAN_FREQ[spw][None, None, :])
             for gainfield in ([field_id], None):          # the field's own rows, or every row: the same
                 gains, gflags = antenna_gains(table, np.arange(3), times, spw, CHAN_FREQ[spw], field_id=gainfield)
                 assert not gflags.any()
@@ -332,7 +332,7 @@ def test_write_tec_table_applies_each_field_its_own_correction(tmp_path, native_
                 assert np.abs(error).max() < 2e-3
                 assert np.allclose(gains[..., 0], gains[..., 1])
             # The other field's direction gives another correction: the table is direction-dependent.
-            wrong = tec_task.ionospheric_phase(other[:, :, None], CHAN_FREQ[spw][None, None, :])
+            wrong = tec.ionospheric_phase(other[:, :, None], CHAN_FREQ[spw][None, None, :])
             assert np.abs(np.angle(np.exp(1j * (wrong - exact)))).max() > 0.1
     assert report["interp_error"] < 2e-3
 
@@ -340,11 +340,11 @@ def test_write_tec_table_applies_each_field_its_own_correction(tmp_path, native_
 def test_write_tec_table_fails_clearly_without_maps(tmp_path, native_engine, no_network):
     ms = make_ms(tmp_path / "sim.ms")
     with pytest.raises(FileNotFoundError, match="no IONEX product covers days 2025/259"):
-        tec_task.write_tec_table(ms, tmp_path / "sim.tec", ionex_dir=tmp_path / "ionex")
+        tec.tec(ms, tmp_path / "sim.tec", ionex_dir=tmp_path / "ionex")
     # Maps that end before the data do not cover them.
     write_ionex(tmp_path / "early.inx", dt.date(2025, 9, 15), linear_tec)
     with pytest.raises(ValueError, match="not the data"):
-        tec_task.write_tec_table(ms, tmp_path / "sim.tec", ionex_dir=tmp_path / "ionex",
+        tec.tec(ms, tmp_path / "sim.tec", ionex_dir=tmp_path / "ionex",
                                  ionex_files=[tmp_path / "early.inx"])
 
 
@@ -369,7 +369,7 @@ def test_rsm07_table_native_apply_and_casa_applycal_agree(tmp_path, monkeypatch,
     small = tmp_path / "scan47.ms"
     casatasks.split(vis=str(clone), outputvis=str(small), scan="47", datacolumn="data", keepmms=False)
     shutil.rmtree(clone, ignore_errors=True)
-    report = tec_task.write_tec_table(small, tmp_path / "scan47.tec", ionex_dir=ionex_dir, fallback=False)
+    report = tec.tec(small, tmp_path / "scan47.tec", ionex_dir=ionex_dir, fallback=False)
     assert report["fields"] == ["3C395"] and report["interp_error"] < 0.01
     casatasks.applycal(vis=str(small), gaintable=[str(tmp_path / "scan47.tec")], interp=["linear"], calwt=[False],
                        parang=False, flagbackup=False)
@@ -390,7 +390,7 @@ def test_rsm07_table_native_apply_and_casa_applycal_agree(tmp_path, monkeypatch,
     maps = ionex.read_ionex(ionex_dir / "EMR0OPSFIN_20252590000_01D_01H_GIM.INX")
     utimes, index = np.unique(time, return_inverse=True)
     field = setup["field_names"].index("3C395")
-    stec = tec_task.slant_tec(maps, setup["antenna_xyz"], *setup["field_dirs"][field], utimes)["stec"]
-    exact = tec_task.ionospheric_phase((stec[a1, index] - stec[a2, index])[:, None], setup["chan_freq"][spw])
+    stec = tec.slant_tec(maps, setup["antenna_xyz"], *setup["field_dirs"][field], utimes)["stec"]
+    exact = tec.ionospheric_phase((stec[a1, index] - stec[a2, index])[:, None], setup["chan_freq"][spw])
     removed = np.angle(vis * np.conj(native))[..., 0]
     assert np.abs(np.angle(np.exp(1j * (removed - exact))))[good[..., 0]].max() < 5e-3

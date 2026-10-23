@@ -1,4 +1,4 @@
-"""Tests of the native ``flagdata(mode='tfcrop')`` (:mod:`vlbipy.solvers.tfcrop_task`).
+"""Tests of the native ``flagdata(mode='tfcrop')`` (:mod:`vlbipy.solvers.tfcrop`).
 
 A small synthetic measurement set written without casacore (:mod:`vlbipy.casacore_format.writer`) carries a
 smooth bandpass with bounded noise and injected RFI (a broadband burst, a narrowband line, a single spike):
@@ -16,8 +16,8 @@ import pytest
 
 from vlbipy.casacore_format.table import Table
 from vlbipy.casacore_format.writer import array_column, create_table, scalar_column
-from vlbipy.solvers import tfcrop_task
-from vlbipy.solvers.tfcrop_task import crop_series, tfcrop_ms
+from vlbipy.solvers import tfcrop as tfcrop_module
+from vlbipy.solvers.tfcrop import crop_series, numba_available, tfcrop
 
 NANT, NSPW, NCHAN, NCORR, NTIME = 4, 2, 32, 4, 40
 RSM07_REF = Path(__file__).resolve().parent.parent / "test" / "RSM07_import_ref" / "RSM07.mms"
@@ -95,7 +95,7 @@ def synthetic(tmp_path, monkeypatch):
 # Without CASA
 # ----------------------------------------------------------------------------------------------------------------
 def test_tfcrop_flags_the_rfi_and_nothing_else(synthetic):
-    report = tfcrop_ms(synthetic["ms"], workers=1)
+    report = tfcrop(synthetic["ms"], workers=1)
     flag, flag_row = _flags(synthetic["ms"])
     clean = ~synthetic["rfi"] & ~synthetic["preflag"]
     assert flag[synthetic["rfi"]].all()
@@ -108,19 +108,19 @@ def test_tfcrop_flags_the_rfi_and_nothing_else(synthetic):
 
 
 def test_field_selection_flags_only_the_selected_field(synthetic):
-    tfcrop_ms(synthetic["ms"], field="TGT", workers=1)
+    tfcrop(synthetic["ms"], field="TGT", workers=1)
     flag, _ = _flags(synthetic["ms"])
     in_target = (synthetic["scan"] == 2)[:, None, None]
     assert flag[synthetic["rfi"] & in_target].all()
     np.testing.assert_array_equal(flag[~in_target[:, 0, 0]], synthetic["preflag"][~in_target[:, 0, 0]])
 
 
-@pytest.mark.skipif(not tfcrop_task.numba_available(), reason="numba is not installed")
+@pytest.mark.skipif(not numba_available(), reason="numba is not installed")
 def test_compiled_and_numpy_implementations_agree(synthetic, monkeypatch, tmp_path):
     other = _write_ms(tmp_path / "copy.ms")
-    tfcrop_ms(synthetic["ms"], workers=1)
-    monkeypatch.setattr(tfcrop_task, "numba_available", lambda: False)
-    tfcrop_ms(other["ms"], workers=1)
+    tfcrop(synthetic["ms"], workers=1)
+    monkeypatch.setattr(tfcrop_module, "numba_available", lambda: False)
+    tfcrop(other["ms"], workers=1)
     np.testing.assert_array_equal(_flags(synthetic["ms"])[0], _flags(other["ms"])[0])
     # Awkward planes: one-row and short series, few channels, zeros, constant data, NaNs, flagged throughout.
     rng = np.random.default_rng(5)
@@ -149,12 +149,12 @@ def test_compiled_and_numpy_implementations_agree(synthetic, monkeypatch, tmp_pa
 def test_unsupported_requests_raise_before_writing(synthetic, kwargs):
     before, _ = _flags(synthetic["ms"])
     with pytest.raises(NotImplementedError):
-        tfcrop_ms(synthetic["ms"], workers=1, **kwargs)
+        tfcrop(synthetic["ms"], workers=1, **kwargs)
     np.testing.assert_array_equal(_flags(synthetic["ms"])[0], before)
 
 
 def test_keywords_tfcrop_ignores_are_accepted(synthetic):
-    report = tfcrop_ms(synthetic["ms"], workers=1, mode="tfcrop", autocorr=True, growtime=10.0, chanbin=4,
+    report = tfcrop(synthetic["ms"], workers=1, mode="tfcrop", autocorr=True, growtime=10.0, chanbin=4,
                        ntime="scan", maxnpieces=7, field="CAL,TGT")
     assert report["newly_flagged"] == int((synthetic["rfi"] & ~synthetic["preflag"]).sum())
 
@@ -172,7 +172,7 @@ def _clone(source: Path, dest: Path) -> None:
 def test_tfcrop_is_identical_to_casa_on_rsm07(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)                       # casatasks writes its log in the working directory
     casatasks = pytest.importorskip("casatasks")
-    from vlbipy.solvers.flag_task import apply_flag_selections, compile_flagdata, read_flag_setup
+    from vlbipy.solvers.flagdata import apply_flag_selections, compile_flagdata, read_flag_setup
     monkeypatch.setenv("VLBIPY_TABLE_ENGINE", "native")
     base = tmp_path / "base.mms"
     _clone(RSM07_REF, base)
@@ -189,9 +189,9 @@ def test_tfcrop_is_identical_to_casa_on_rsm07(tmp_path, monkeypatch):
     cases = [("RSM07.mms.0000.ms", {"field": "J1848+3219,3C345"}), ("RSM07.mms.0001.ms", {})]
     for part, extra in cases:
         casatasks.flagdata(vis=str(tmp_path / "casa.mms" / "SUBMSS" / part), **TFCROP, **extra)
-        tfcrop_ms(tmp_path / "native.mms" / "SUBMSS" / part, workers=1, **extra)
-    monkeypatch.setattr(tfcrop_task, "numba_available", lambda: False)
-    tfcrop_ms(tmp_path / "numpy.mms" / "SUBMSS" / cases[1][0], workers=1)
+        tfcrop(tmp_path / "native.mms" / "SUBMSS" / part, workers=1, **extra)
+    monkeypatch.setattr(tfcrop_module, "numba_available", lambda: False)
+    tfcrop(tmp_path / "numpy.mms" / "SUBMSS" / cases[1][0], workers=1)
     for part, _ in cases:
         before, before_row = _flags(base / "SUBMSS" / part)
         casa, casa_row = _flags(tmp_path / "casa.mms" / "SUBMSS" / part)

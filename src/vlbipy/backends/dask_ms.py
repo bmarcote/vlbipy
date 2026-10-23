@@ -10,7 +10,7 @@ and exports it; what changes is every step that used to dominate the run time:
   "difmap"`` on the backend): a request for tclean or WSClean is redirected.
 
 Those read and write the measurement set directly, in parallel worker processes,
-through :mod:`vlbipy.solvers` (``fringefit_task``, ``gain_task``, ``apply_task``),
+through :mod:`vlbipy.solvers` (``fringefit``, ``gain``, ``applycal``),
 and write ordinary CASA calibration tables, so the two backends can be mixed
 freely on the same working directory. A request the fast engine does not cover
 (a cal library, ``bandtype='BPOLY'``, ...) falls back to the CASA task with a
@@ -715,28 +715,48 @@ class DaskMsCalibrationOps(CasaCalibrationOps):
             casa_task(params)
 
     def _run_fringefit_task(self, params: dict) -> None:
-        """Fringe fit with :func:`vlbipy.solvers.fringefit_task.run_fringefit` (same keywords, same table format)."""
-        from ..solvers.fringefit_task import run_fringefit
-        self._run_fast("fringefit", run_fringefit, params, super()._run_fringefit_task)
+        """Fringe fit with :func:`vlbipy.solvers.fringefit.fringefit` (same keywords, same table format)."""
+        from ..solvers.fringefit import fringefit
+        self._run_fast("fringefit", fringefit, params, super()._run_fringefit_task)
 
     def _run_gencal_task(self, params: dict) -> None:
-        """``gencal(caltype='tsys')`` with :func:`vlbipy.solvers.apriori_task.write_tsys_table` (22 min -> 26 s on
-        GL048); the other caltypes, and a Tsys spectrum, with CASA."""
-        if params.get("caltype") != "tsys" or params.get("uniform", True):
+        """``gencal(caltype='tsys')`` with :func:`vlbipy.solvers.apriori.tsys` (22 min -> 26 s on
+        GL048) and ``caltype='eop'`` with :func:`vlbipy.solvers.eop.eop` (which also fixes a
+        CASA eop.py extrapolation bug); the other caltypes, and a Tsys spectrum, with CASA."""
+        caltype = params.get("caltype")
+        if caltype == "eop":
+            from ..solvers.eop import eop
+            return self._run_fast("gencal eop", eop, params, super()._run_gencal_task)
+        if caltype != "tsys" or params.get("uniform", True):
             return super()._run_gencal_task(params)
-        from ..solvers.apriori_task import write_tsys_table
-        self._run_fast("gencal tsys", lambda vis, caltable, **_: write_tsys_table(vis, caltable), params,
+        from ..solvers.apriori import tsys
+        self._run_fast("gencal tsys", lambda vis, caltable, **_: tsys(vis, caltable), params,
                        super()._run_gencal_task)
 
+    def _run_accor_task(self, params: dict) -> None:
+        """Solve the correlator amplitude correction with :func:`vlbipy.solvers.accor.accor`."""
+        from ..solvers.accor import accor
+        self._run_fast("accor", accor, params, super()._run_accor_task)
+
+    def _run_smoothcal_task(self, params: dict) -> None:
+        """Smooth a calibration table with :func:`vlbipy.solvers.accor.smoothcal`."""
+        from ..solvers.accor import smoothcal
+        self._run_fast("smoothcal", smoothcal, params, super()._run_smoothcal_task)
+
+    def _set_model_column(self, ms: Path, field: str, model: str) -> None:
+        """Fill MODEL_DATA natively (:func:`vlbipy.solvers.setjy.setjy`)."""
+        from ..solvers.setjy import setjy
+        setjy(ms, field, model)
+
     def _run_bandpass_task(self, params: dict) -> None:
-        """Solve the bandpass with :func:`vlbipy.solvers.gain_task.run_bandpass` (CASA "B Jones" output)."""
-        from ..solvers.gain_task import run_bandpass
-        self._run_fast("bandpass", run_bandpass, params, super()._run_bandpass_task)
+        """Solve the bandpass with :func:`vlbipy.solvers.gain.bandpass` (CASA "B Jones" output)."""
+        from ..solvers.gain import bandpass
+        self._run_fast("bandpass", bandpass, params, super()._run_bandpass_task)
 
     def _run_gaincal_task(self, params: dict) -> None:
-        """Solve gains with :func:`vlbipy.solvers.gain_task.run_gaincal` (CASA "G Jones" output)."""
-        from ..solvers.gain_task import run_gaincal
-        self._run_fast("gaincal", run_gaincal, params, super()._run_gaincal_task)
+        """Solve gains with :func:`vlbipy.solvers.gain.gaincal` (CASA "G Jones" output)."""
+        from ..solvers.gain import gaincal
+        self._run_fast("gaincal", gaincal, params, super()._run_gaincal_task)
 
     def apply(self, project_code: str, field: str, tables: list, *, gainfield: str = "", parang: bool = True,
               flagbackup: bool = False, callib: bool = False, defer: bool = False, **kwargs) -> None:
@@ -744,16 +764,16 @@ class DaskMsCalibrationOps(CasaCalibrationOps):
 
         Same contract as :meth:`CasaCalibrationOps.apply`: ``field`` empty corrects every observed source,
         each with the table chain and field mapping resolved for it. All of them are corrected in a single
-        pass over the data by :func:`vlbipy.solvers.apply_task.apply_to_ms`. A cal library (``callib=True``) or
+        pass over the data by :func:`vlbipy.solvers.applycal.applycal`. A cal library (``callib=True``) or
         an applycal keyword the fast path does not know is handed to CASA instead.
 
         ``defer=True`` writes only the calibration flags and records the chains
-        (:func:`vlbipy.solvers.apply_task.defer_to_ms`): the readers of the corrected column then calibrate
+        (:func:`vlbipy.solvers.applycal.defer_to_ms`): the readers of the corrected column then calibrate
         DATA as they read it, and CORRECTED_DATA is written when something needs the column itself
         (:meth:`ensure_corrected`).
         """
-        from ..solvers.apply_task import APPLY_MODES, apply_to_ms, defer_to_ms
-        from ..solvers.fringefit_task import _prior_entries
+        from ..solvers.applycal import APPLY_MODES, apply_to_ms, defer_to_ms
+        from ..solvers.fringefit import _prior_entries
         from ..solvers.msio import read_setup
 
         unknown = sorted(set(kwargs) - set(self._FAST_APPLY_KEYWORDS))
@@ -820,9 +840,9 @@ class DaskMsCalibrationOps(CasaCalibrationOps):
         """statwt with its default binning (one integration, a whole spw), computed natively in parallel.
 
         Same weights, flags and report as :meth:`CasaCalibrationOps.reweight` (see
-        :mod:`vlbipy.solvers.statwt_task`); a coarser time binning or any other statwt option goes to CASA.
+        :mod:`vlbipy.solvers.statwt`); a coarser time binning or any other statwt option goes to CASA.
         """
-        from ..solvers.statwt_task import statwt_ms
+        from ..solvers.statwt import statwt
         options = {k: v for k, v in kwargs.items() if v not in (None, "")}
         single_integration = str(timebin).strip() in ("", "1")
         if options or not single_integration or column not in ("corrected", "data"):
@@ -833,13 +853,13 @@ class DaskMsCalibrationOps(CasaCalibrationOps):
         logger.info("statwt[dask-ms]: datacolumn={!r} minsamp={} flagbackup={}", column, minsamp, flagbackup)
         if flagbackup:
             # CASA's statwt names its backups statwt_1, statwt_2, ...
-            listing = Path(f"{ms}.flagversions") / "FLAG_VERSION_LIST"
+            listing = Path(f"{ms}.flagmanager") / "FLAG_VERSION_LIST"
             names = [line.split(":")[0].strip() for line in listing.read_text().splitlines()] if listing.is_file() else []
             number = 1 + max([int(n.split("_")[1]) for n in names if n.startswith("statwt_") and n[7:].isdigit()],
                              default=0)
             self.backend.tasks.flagmanager(vis=str(ms), mode="save", versionname=f"statwt_{number}")
         try:
-            report = statwt_ms(ms, column={"corrected": "CORRECTED_DATA", "data": "DATA"}[column],
+            report = statwt(ms, column={"corrected": "CORRECTED_DATA", "data": "DATA"}[column],
                                minsamp=int(minsamp))
         except RuntimeError as exc:
             raise BackendError(f"{project_code}: statwt failed: {exc}") from exc
@@ -847,17 +867,28 @@ class DaskMsCalibrationOps(CasaCalibrationOps):
         return report
 
     def a_priori(self, project_code: str, field: str, *, needs_eop: bool = False,
-                 eop_file: Optional[str] = None, **kwargs) -> list:
-        """A-priori amplitude calibration (gencal Tsys + GC, + EOP for VLBA/LBA).
+                 eop_file: Optional[str] = None, needs_tec: bool = False, **kwargs) -> list:
+        """A-priori amplitude calibration (gencal Tsys + GC, + EOP for VLBA/LBA, + TEC below the
+        observatory's ionosphere threshold).
 
-        Runs gencal on the measurement set like the CASA backend. When only a dask-ms store is left, tables
-        generated earlier are registered as they are; without them the step cannot run.
+        Runs gencal on the measurement set like the CASA backend — except the ionospheric table, which
+        CASA gets wrong (its F Jones sign doubles the dispersive delay), so it is computed natively by
+        :func:`vlbipy.solvers.tec.tec` from IONEX maps cached under ``<work_dir>/ionex``.
+        When only a dask-ms store is left, tables generated earlier are registered as they are; without
+        them the step cannot run.
         """
-        if self.backend.ms_path(project_code).is_dir():
-            return super().a_priori(project_code, field, needs_eop=needs_eop, eop_file=eop_file, **kwargs)
         from ..models import CalTable
         from .casa import APRIORI_TABLE_SPECS
+        tec_path = self.backend.caldir() / f"{project_code}{APRIORI_TABLE_SPECS['tec'][0]}"
+        if self.backend.ms_path(project_code).is_dir():
+            tables = super().a_priori(project_code, field, needs_eop=needs_eop, eop_file=eop_file,
+                                      needs_tec=False, **kwargs)
+            if needs_tec:
+                tables.append(self._tec_table(project_code, field, tec_path))
+            return tables
         paths = self.backend.apriori_table_paths(project_code, needs_eop)
+        if needs_tec:
+            paths["tec"] = tec_path
         if all(path.is_dir() for path in paths.values()):
             logger.info("a_priori: no measurement set; using the existing a-priori caltables")
             return [CalTable(cal_type=cal_type, path=str(path), field=field,
@@ -866,6 +897,21 @@ class DaskMsCalibrationOps(CasaCalibrationOps):
         missing = ", ".join(t for t, p in paths.items() if not p.is_dir())
         raise BackendError(f"{project_code}: a-priori caltables missing ({missing}) and there is no measurement "
                            "set; re-run import_data(force=True) to regenerate them")
+
+    def _tec_table(self, project_code: str, field: str, tec_path: "Path") -> "CalTable":
+        """Write (or reuse) the ionospheric Fringe Jones table and return it as a CalTable."""
+        from ..models import CalTable
+        from ..solvers.tec import tec
+        from .casa import APRIORI_TABLE_SPECS
+        ionex_dir = Path(self.work_dir) / "ionex"
+        ionex_dir.mkdir(parents=True, exist_ok=True)
+        if tec_path.is_dir():
+            shutil.rmtree(tec_path)
+        report = tec(self.backend.ms_path(project_code), tec_path, ionex_dir=ionex_dir)
+        logger.info("a_priori: TEC table {} (IONEX {}, {:.1f}-{:.1f} TECU)", tec_path.name,
+                    report["product"], *report["stec_range"])
+        return CalTable(cal_type="tec", path=str(tec_path), field=field,
+                        interp=APRIORI_TABLE_SPECS["tec"][1])
 
 
 #: casatasks that never read CORRECTED_DATA: they need no deferred calibration written first.
@@ -887,7 +933,7 @@ def _reads_corrected(task: str, kwargs: dict) -> bool:
 
 
 class NativeFlagTasks:
-    """``casatasks`` with ``flagdata`` answered natively where it can be (see :mod:`vlbipy.solvers.flag_task`),
+    """``casatasks`` with ``flagdata`` answered natively where it can be (see :mod:`vlbipy.solvers.flagdata`),
     and the deferred calibrations written before a task reads CORRECTED_DATA.
 
     Every flagging call of the CASA flag operations goes through ``backend.tasks.flagdata``, so wrapping it
@@ -907,6 +953,9 @@ class NativeFlagTasks:
         task = getattr(self._tasks, name)
         if not callable(task) or name.startswith("_"):
             return task
+        if name == "flagmanager":
+            from ..solvers.flagmanager import flagmanager
+            return flagmanager
 
         def guarded(*args, **kwargs):
             from ..solvers import corrected
@@ -926,7 +975,7 @@ class NativeFlagTasks:
 
     def flagdata(self, **kwargs):
         """Run ``flagdata`` natively when the call is a supported selection, otherwise through CASA."""
-        from ..solvers.flag_task import Unsupported, apply_flag_selections, compile_flagdata, read_flag_setup
+        from ..solvers.flagdata import Unsupported, apply_flag_selections, compile_flagdata, read_flag_setup
         vis = kwargs.get("vis")
         if vis and Path(str(vis)).is_dir():
             try:
@@ -943,7 +992,7 @@ class NativeFlagTasks:
                             != "list" else _count_commands(kwargs), stats["commands"], stats["rows_touched"],
                             stats["rows"], stats["cells_changed"], stats["parts"], stats["seconds"])
                 return {}
-            from ..solvers.flag_task import parallel_casa_flagdata
+            from ..solvers.flagdata import parallel_casa_flagdata
             if "corrected" in str(kwargs.get("datacolumn", "")).lower():
                 from ..solvers.corrected import write_pending
                 write_pending(vis)
@@ -981,7 +1030,7 @@ class DaskMsFlagOps(CasaFlagOps):
     def _quack_series(self, project_code: str, meta: ObsMetadata, scans: list, wanted: list[str],
                       column_name: str, pol_indices: list[int]) -> dict:
         """Same series as the CASA reader, read in parallel over the table parts (one pass, wanted fields only)."""
-        from ..solvers.flag_task import read_row_amplitudes
+        from ..solvers.flagdata import read_row_amplitudes
         if column_name.lower() == "corrected_data":
             self.backend.calibrate.ensure_corrected(project_code)     # read as it is on disk
         ncorr = len(meta.freq_setup.polarizations)
@@ -1013,7 +1062,7 @@ class DaskMsFlagOps(CasaFlagOps):
     def flagged_fraction(self, project_code: str, *, where: str = "") -> float:
         if where:
             return super().flagged_fraction(project_code, where=where)
-        from ..solvers.flag_task import count_flags
+        from ..solvers.flagdata import count_flags
         counts = count_flags(self.backend.ms_path(project_code))
         observable = int(counts["observable"].sum())
         return int(counts["flagged"].sum()) / observable if observable else 0.0
@@ -1021,7 +1070,7 @@ class DaskMsFlagOps(CasaFlagOps):
     def summary(self, project_code: str, *, where: str = "") -> dict:
         if where:
             return super().summary(project_code, where=where)
-        from ..solvers.flag_task import count_flags
+        from ..solvers.flagdata import count_flags
         counts = count_flags(self.backend.ms_path(project_code))
         flagged, observable, names = counts["flagged"], counts["observable"], counts["antenna_names"]
 
@@ -1064,7 +1113,13 @@ def _timebin_seconds(timebin) -> Optional[float]:
 
 
 class DaskMsExportOps(CasaExportOps):
-    """CASA export with the per-source split done natively (see :mod:`vlbipy.solvers.split_task`)."""
+    """CASA export with the per-source split done natively (see :mod:`vlbipy.solvers.split`)."""
+
+    def split_band(self, project_code: str, spws: list[int], target: str) -> str:
+        """Split the subbands ``spws`` natively (:func:`vlbipy.solvers.split.split`)."""
+        from ..solvers.split import split
+        split(self.backend.ms_path(project_code), target, field="", column="DATA", spws=spws)
+        return str(target)
 
     def ms(self, project_code: str, source: str, *, datacolumn: str = "corrected",
            chanbin: int = -1, timebin: str = "", keepflags: bool = True,
@@ -1075,7 +1130,7 @@ class DaskMsExportOps(CasaExportOps):
         averaging here gives the same rows (checked column by column). Options it does not reproduce
         (dropping flagged rows, other columns, extra mstransform keywords) go to mstransform.
         """
-        from ..solvers.split_task import split_field
+        from ..solvers.split import split
         seconds = _timebin_seconds(timebin)
         column = {"corrected": "CORRECTED_DATA", "data": "DATA"}.get(str(datacolumn).lower())
         # The output table is created with python-casacore; where it is broken (some macOS builds) use CASA.
@@ -1094,7 +1149,7 @@ class DaskMsExportOps(CasaExportOps):
             chanbin = 1
         width = n_channels if chanbin == -1 else max(chanbin, 1)
         try:
-            split_field(ms, target, source, column=column, chanbin=width, timebin=seconds)
+            split(ms, target, source, column=column, chanbin=width, timebin=seconds)
         except (RuntimeError, ValueError) as exc:
             raise BackendError(f"{project_code}: split of {source!r} failed: {exc}") from exc
         try:

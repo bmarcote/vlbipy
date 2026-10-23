@@ -1,4 +1,4 @@
-"""The native gencal eop (``vlbipy.solvers.eop_task``): sampling, EOP parsing and interpolation (no CASA, no data),
+"""The native gencal eop (``vlbipy.solvers.eop``): sampling, EOP parsing and interpolation (no CASA, no data),
 the table written for an RSM07 clone, and every cell against ``casatasks.gencal(caltype='eop')``."""
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ import numpy as np
 import pytest
 
 from vlbipy.casacore_format.table import Table
-from vlbipy.solvers import eop_task
-from vlbipy.solvers.eop_task import eops_from_file, eops_from_ms, sample_times, write_eop_table
+from vlbipy.solvers import eop as eop_module
+from vlbipy.solvers.eop import eops_from_file, eops_from_ms, sample_times, eop
 
 RSM07_MMS = Path(__file__).resolve().parents[1] / "test" / "RSM07_import_ref" / "RSM07.mms"
 MAIN_COLUMNS = ("TIME", "FIELD_ID", "SPECTRAL_WINDOW_ID", "ANTENNA1", "ANTENNA2", "INTERVAL", "SCAN_NUMBER",
@@ -67,31 +67,31 @@ def test_parse_usno_and_c04(tmp_path):
 def test_interpolation_uses_the_entries_around_each_time_unlike_eop_py():
     eops = {"MJD": np.arange(6.0), "UT1_UTC": np.zeros(6), "PM_x": np.array([0.0, 1, 2, 3, 10, 20]),
             "PM_y": np.zeros(6)}
-    xp, _ = eop_task.pm_xy(eops, 2400000.5, 4.5)
-    assert xp == pytest.approx(15.0 * eop_task.ARCSEC)                 # between entries 4 and 5
-    xp, _ = eop_task.pm_xy(eops, 2400000.5, 4.5, casa_compatible=True)
-    assert xp == pytest.approx(4.5 * eop_task.ARCSEC)                  # CASA: extrapolated from entries 2 and 3
+    xp, _ = eop_module.pm_xy(eops, 2400000.5, 4.5)
+    assert xp == pytest.approx(15.0 * eop_module.ARCSEC)                 # between entries 4 and 5
+    xp, _ = eop_module.pm_xy(eops, 2400000.5, 4.5, casa_compatible=True)
+    assert xp == pytest.approx(4.5 * eop_module.ARCSEC)                  # CASA: extrapolated from entries 2 and 3
     eops["UT1_UTC"] = np.array([0.4, -0.5, -0.4, -0.3, -0.2, -0.1])      # leap second between entries 0 and 1
-    assert eop_task.ut1_utc(eops, 2400000.5, 0.5) == pytest.approx(0.45)
+    assert eop_module.ut1_utc(eops, 2400000.5, 0.5) == pytest.approx(0.45)
     short = {name: values[:2] for name, values in eops.items()}
-    assert eop_task.pm_xy(short, 2400000.5, 0.5)[0] == pytest.approx(0.5 * eop_task.ARCSEC)
+    assert eop_module.pm_xy(short, 2400000.5, 0.5)[0] == pytest.approx(0.5 * eop_module.ARCSEC)
     with pytest.raises(NotImplementedError):                           # CASA fails with an IndexError there
-        eop_task.pm_xy(short, 2400000.5, 1.5, casa_compatible=True)
+        eop_module.pm_xy(short, 2400000.5, 1.5, casa_compatible=True)
     with pytest.raises(NotImplementedError):                           # one entry cannot be interpolated
-        eop_task.pm_xy({name: values[:1] for name, values in eops.items()}, 2400000.5, 0.5)
+        eop_module.pm_xy({name: values[:1] for name, values in eops.items()}, 2400000.5, 0.5)
 
 
 def test_keywords_and_infile(tmp_path):
     with pytest.raises(NotImplementedError):
-        write_eop_table(tmp_path / "x.ms", tmp_path / "x.eop", infile=None)
+        eop(tmp_path / "x.ms", tmp_path / "x.eop", infile=None)
     with pytest.raises(NotImplementedError):
-        write_eop_table(tmp_path / "x.ms", tmp_path / "x.eop", infile=tmp_path / "missing.erp")
+        eop(tmp_path / "x.ms", tmp_path / "x.eop", infile=tmp_path / "missing.erp")
     path = tmp_path / "f.erp"
     path.write_text("")
     with pytest.raises(NotImplementedError):
-        write_eop_table(tmp_path / "x.ms", tmp_path / "x.eop", infile=path, caltype="gc")
+        eop(tmp_path / "x.ms", tmp_path / "x.eop", infile=path, caltype="gc")
     with pytest.raises(NotImplementedError):
-        write_eop_table(tmp_path / "x.ms", tmp_path / "x.eop", infile=path, caltype="eop", bogus=1)
+        eop(tmp_path / "x.ms", tmp_path / "x.eop", infile=path, caltype="eop", bogus=1)
 
 
 @pytest.fixture(scope="module")
@@ -103,9 +103,9 @@ def rsm07(tmp_path_factory):
     ms = work / "RSM07.mms"
     subprocess.run(["cp", "-cR", str(RSM07_MMS), str(ms)], check=True)
     infile = write_usno_from_ms(ms, work / "usno_finals.erp")
-    report = write_eop_table(ms, work / "native.eop", infile=infile, caltype="eop", spw="", antenna="", pol="",
+    report = eop(ms, work / "native.eop", infile=infile, caltype="eop", spw="", antenna="", pol="",
                              parameter=[], engine="native")
-    write_eop_table(ms, work / "casa_compatible.eop", infile=infile, caltype="eop", engine="native",
+    eop(ms, work / "casa_compatible.eop", infile=infile, caltype="eop", engine="native",
                     casa_compatible=True)
     return {"work": work, "ms": ms, "infile": infile, "table": work / "native.eop", "report": report,
             "casa_compatible": work / "casa_compatible.eop"}
@@ -132,7 +132,7 @@ def test_rsm07_table_without_casa(rsm07):
     with Table(rsm07["ms"] / "FIELD") as table:
         lon, lat = np.asarray(table.getcol("PHASE_DIR")[field[0]]).reshape(-1, 2)[0]
     pc = erfa.s2c(lon, lat)
-    delays = [eop_task.calc_delay(e, pos, pc, time[0] / 86400) for e in (new, old)]
+    delays = [eop_module.calc_delay(e, pos, pc, time[0] / 86400) for e in (new, old)]
     delay = delays[0] - delays[1]
     assert fparam[0, 0, 1] == pytest.approx(delay * 1e9, rel=1e-6)
     assert fparam[0, 0, 0] == pytest.approx(2 * math.pi * delay * freq[0], rel=1e-6)

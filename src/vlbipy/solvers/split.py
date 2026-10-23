@@ -1,6 +1,6 @@
 """Split one source out of a measurement set with channel and time averaging (the dask-ms backend's split).
 
-:func:`split_field` writes what ``casatasks.mstransform(field=..., datacolumn=..., chanaverage=True,
+:func:`split` writes what ``casatasks.mstransform(field=..., datacolumn=..., chanaverage=True,
 timeaverage=True, keepflags=True)`` writes, as a plain measurement set:
 
 * time bins of ``timebin`` seconds per (scan, subband, baseline), counted from the first integration of
@@ -32,7 +32,7 @@ from typing import Optional
 import numpy as np
 
 from ..logging_utils import get_logger
-from .apply_task import read_view_runs
+from .applycal import read_view_runs
 from .corrected import view as corrected_view
 from .msio import read_layout, read_setup, run_specs, select_runs, table_engine
 from .workers import run_jobs
@@ -60,7 +60,8 @@ def split_job(*, specs: list[dict], engine: str, column: str, columns: list[str]
     are computed from DATA while they are read, as applycal would have written them.
     """
     weight_spectrum = "WEIGHT_SPECTRUM" in columns
-    names = [column, "FLAG", "WEIGHT", "UVW", "TIME", "TIME_CENTROID", "EXPOSURE", "INTERVAL", *_CARRIED]
+    names = [column, "FLAG", "WEIGHT", "UVW", "TIME", "TIME_CENTROID", "EXPOSURE", "INTERVAL", "FIELD_ID",
+             *_CARRIED]
     names += ["WEIGHT_SPECTRUM"] if weight_spectrum else []
     block = read_view_runs(specs, [n for n in names if n in columns or n == column], engine=engine, view=view)
     if not block:
@@ -142,6 +143,7 @@ def split_job(*, specs: list[dict], engine: str, column: str, columns: list[str]
         "TIME_CENTROID": np.where(use_ok, centroid_ok / np.where(use_ok, w_sum, 1.0), centroid_all / count),
         "UVW": np.where(use_ok[:, None], uvw_ok / np.where(use_ok, w_sum, 1.0)[:, None], uvw_all / count[:, None]),
         "SCAN_NUMBER": keys[starts, 0], "DATA_DESC_ID": keys[starts, 1],
+        "FIELD_ID": np.asarray(block["FIELD_ID"], dtype=np.int32)[order][starts],
     }
     first = order[starts]
     for name in _CARRIED:
@@ -197,7 +199,9 @@ def _write_ms(source_ms: Path, part: str, target: Path, rows: dict, field_id: in
             if name in out.colnames() and nrow:
                 out.putcol(name, values)
         if "FIELD_ID" in out.colnames() and nrow:
-            out.putcol("FIELD_ID", np.zeros(nrow, dtype=np.int32))
+            # field_id None: all fields split, keep the ids; else one source -> FIELD_ID 0.
+            out.putcol("FIELD_ID", rows["FIELD_ID"] if field_id is None
+                       else np.zeros(nrow, dtype=np.int32))
         if "FLAG_ROW" in out.colnames() and nrow:
             out.putcol("FLAG_ROW", np.zeros(nrow, dtype=bool))
         # Subtables: copied from the input (a Multi-MS links them to its first part), then adjusted. Those
@@ -215,11 +219,12 @@ def _write_ms(source_ms: Path, part: str, target: Path, rows: dict, field_id: in
             out.putkeyword(name, f"Table: {target / name}")
     finally:
         out.close()
-    fields = table(str(target / "FIELD"), readonly=False, ack=False)
-    try:
-        fields.removerows([r for r in range(fields.nrows()) if r != int(field_id)])
-    finally:
-        fields.close()
+    if field_id is not None:
+        fields = table(str(target / "FIELD"), readonly=False, ack=False)
+        try:
+            fields.removerows([r for r in range(fields.nrows()) if r != int(field_id)])
+        finally:
+            fields.close()
     _average_spectral_windows(target / "SPECTRAL_WINDOW", chanbin)
 
 
@@ -244,18 +249,22 @@ def _average_spectral_windows(path: Path, chanbin: int) -> None:
         spw.close()
 
 
-def split_field(ms, target, field: str, *, column: str = "CORRECTED_DATA", chanbin: int = 1,
-                timebin: float = 0.0, workers: Optional[int] = None) -> dict:
+def split(ms, target, field: str = "", *, column: str = "CORRECTED_DATA", chanbin: int = 1,
+                timebin: float = 0.0, spws=None, workers: Optional[int] = None) -> dict:
     """Average the rows of ``field`` into the new measurement set ``target`` (see the module docstring).
 
     Parameters
     ----------
+    field : str
+        Field to split; empty keeps every field (their FIELD_IDs are preserved, for band splits).
     column : str
         Input column written to the output DATA.
     chanbin : int
         Channels per output channel (1 keeps them all).
     timebin : float
         Seconds per output integration (0 keeps them all).
+    spws : list of int, optional
+        Restrict the split to these subbands (all fields).
 
     Returns
     -------
@@ -267,14 +276,23 @@ def split_field(ms, target, field: str, *, column: str = "CORRECTED_DATA", chanb
     engine = table_engine()
     setup = read_setup(ms, engine=engine)
     layout = read_layout(ms, engine=engine)
-    if field not in setup["field_names"]:
-        raise ValueError(f"{ms.name} has no field {field!r}")
-    field_id = setup["field_names"].index(field)
+    field_id = None
+    if field:
+        if field not in setup["field_names"]:
+            raise ValueError(f"{ms.name} has no field {field!r}")
+        field_id = setup["field_names"].index(field)
+    ddids = None
+    if spws is not None:
+        wanted = {int(s) for s in spws}
+        ddids = {d for d, s in enumerate(setup["ddid_to_spw"]) if int(s) in wanted}
+        if not ddids:
+            raise ValueError(f"{ms.name} has no data in subband(s) {sorted(wanted)}")
+    field_ids = {field_id} if field_id is not None else set(range(len(setup["field_names"])))
     # A deferred calibration (vlbipy.solvers.corrected) is applied while the data are read.
-    view = corrected_view(ms, column, {field_id}, setup=setup, columns=layout["columns"])
+    view = corrected_view(ms, column, field_ids, setup=setup, columns=layout["columns"])
     if column not in layout["columns"] and view is None:
         raise RuntimeError(f"{ms.name} has no {column} column")
-    selected = select_runs(layout, fields={field_id})
+    selected = select_runs(layout, fields=field_ids, ddids=ddids)
     scan_starts: dict[int, float] = {}
     for index in selected:
         scan = int(layout["scan"][index])
@@ -296,7 +314,7 @@ def split_field(ms, target, field: str, *, column: str = "CORRECTED_DATA", chanb
     jobs = [{"specs": run_specs(layout, group), "engine": engine, "column": column, "columns": layout["columns"],
              "scan_starts": {s: scan_starts[s] for s in {int(layout["scan"][i]) for i in group}},
              "timebin": float(timebin), "chanbin": int(chanbin), "view": view} for group in groups]
-    parts = [p for p in run_jobs("vlbipy.solvers.split_task:split_job", jobs, workers) if p]
+    parts = [p for p in run_jobs("vlbipy.solvers.split:split_job", jobs, workers) if p]
     if not parts:
         raise RuntimeError(f"{ms.name}: no rows of {field!r}")
     rows = {name: np.concatenate([p[name] for p in parts]) for name in parts[0]}

@@ -1,6 +1,6 @@
 """Export a measurement set to UVFITS without casacore: what ``casatasks.exportuvfits`` writes.
 
-:func:`export_uvfits` reproduces casacore's ``MSFitsOutput`` (the engine behind ``exportuvfits`` and
+:func:`exportuvfits` reproduces casacore's ``MSFitsOutput`` (the engine behind ``exportuvfits`` and
 ``ms.tofits``) for single-source exports of every channel of every spectral window; the file is written
 card by card and byte by byte as casacore writes it, so it is identical to CASA's except for the AIPS AN
 keywords that casacore takes from its measures tables (see below). The rules, all read off
@@ -82,7 +82,7 @@ class UvfitsExportError(RuntimeError):
     """The data cannot be exported (CASA's ``exportuvfits`` refuses them too)."""
 
 
-def export_uvfits(vis, fitsfile, *, datacolumn: str = "data", multisource: bool = False, combinespw: bool = True,
+def exportuvfits(vis, fitsfile, *, datacolumn: str = "data", multisource: bool = False, combinespw: bool = True,
                   padwithflags: bool = True, overwrite: bool = True) -> dict:
     """Write ``vis`` as a single-source UVFITS file, as ``casatasks.exportuvfits`` does with these options.
 
@@ -123,7 +123,7 @@ def export_uvfits(vis, fitsfile, *, datacolumn: str = "data", multisource: bool 
     if multisource:
         raise NotImplementedError("exportuvfits: multisource=True (AIPS SU table) is not implemented natively")
     vis, fitsfile = Path(vis), Path(fitsfile)
-    logger.info("export_uvfits: {} -> {} (datacolumn={}, combinespw={}, padwithflags={})", vis.name, fitsfile.name,
+    logger.info("exportuvfits: {} -> {} (datacolumn={}, combinespw={}, padwithflags={})", vis.name, fitsfile.name,
                 datacolumn, combinespw, padwithflags)
     with Table(vis) as table:
         main = _read_main(table)
@@ -157,7 +157,7 @@ def export_uvfits(vis, fitsfile, *, datacolumn: str = "data", multisource: bool 
             fitsfile.unlink(missing_ok=True)
             raise
     seconds = _time.perf_counter() - start
-    logger.info("export_uvfits: {} rows -> {} groups ({} time-baseline groups, {:.2f}% of IFs padded) in {:.2f} s",
+    logger.info("exportuvfits: {} rows -> {} groups ({} time-baseline groups, {:.2f}% of IFs padded) in {:.2f} s",
                 main["nrow"], len(first), ntbf, 100.0 * padded, seconds)
     return {"fitsfile": str(fitsfile), "rows": int(main["nrow"]), "groups": int(len(first)),
             "padded_fraction": padded, "seconds": seconds}
@@ -174,9 +174,9 @@ def _data_column(datacolumn: str, colnames: list) -> str:
         wanted = name if name.endswith("_DATA") else f"{name}_DATA"
         if wanted in colnames:
             return wanted
-        logger.info("export_uvfits: {} does not exist, writing DATA", wanted)
+        logger.info("exportuvfits: {} does not exist, writing DATA", wanted)
         return "DATA"
-    logger.warning("export_uvfits: unrecognized column {}, writing DATA", datacolumn)
+    logger.warning("exportuvfits: unrecognized column {}, writing DATA", datacolumn)
     return "DATA"
 
 
@@ -491,7 +491,7 @@ def _output_rows(main: dict, order: np.ndarray, if_of_row: np.ndarray, nif: int,
     index[chunk[leak], stream_if[leak + 1]] = order[stream[leak + 1]]
     first = order[np.flatnonzero(new)]
     if index.shape[0] > ends.size:
-        logger.warning("export_uvfits: repeated IFs in time-baseline groups; {} rows beyond the {} expected are "
+        logger.warning("exportuvfits: repeated IFs in time-baseline groups; {} rows beyond the {} expected are "
                        "dropped, as CASA does", index.shape[0] - ends.size, ends.size)
         index, first = index[:ends.size], first[:ends.size]
     return index, first, int(ends.size)
@@ -666,7 +666,7 @@ def _primary_cards(main: dict, sub: dict, setup: dict, names: list, comments: li
     elif "1950" in sub["direction_ref"]:
         epoch = 1950.0
     else:
-        logger.warning("export_uvfits: cannot deduce the epoch of {} directions, assuming J2000", sub["direction_ref"])
+        logger.warning("exportuvfits: cannot deduce the epoch of {} directions, assuming J2000", sub["direction_ref"])
         epoch = 2000.0
     bunit = table.getcolkeywords(column).get("QuantumUnit")
     bunit = bunit.upper() if isinstance(bunit, str) else "UNCALIB"
@@ -771,7 +771,7 @@ def _earth_orientation(time_utc: float) -> dict:
     def ut1_utc(mjd: float) -> float:
         value, status = table.ut1_utc(Time(mjd, format="mjd", scale="utc"), return_status=True)
         if status < 0:
-            logger.warning("export_uvfits: MJD {} outside the bundled IERS table, UT1 - UTC = 0", mjd)
+            logger.warning("exportuvfits: MJD {} outside the bundled IERS table, UT1 - UTC = 0", mjd)
             return 0.0
         return float(value.to_value("s"))
 
@@ -785,7 +785,7 @@ def _earth_orientation(time_utc: float) -> dict:
     degpdy = 360.0 + (math.degrees(gst[1]) - gstdeg) % 360.0
     pm_x, pm_y, status = table.pm_xy(Time(float(utc_day), format="mjd", scale="utc"), return_status=True)
     if status < 0:
-        logger.warning("export_uvfits: MJD {} outside the bundled IERS table, polar motion = 0", utc_day)
+        logger.warning("exportuvfits: MJD {} outside the bundled IERS table, polar motion = 0", utc_day)
         polar = (0.0, 0.0)
     else:
         polar = (float(pm_x.to_value("rad")) * POLAR_RADIUS, float(pm_y.to_value("rad")) * POLAR_RADIUS)
@@ -824,7 +824,7 @@ def _feed_polarizations(sub: dict, nant: int) -> list:
             if len(types) >= 2:
                 poltyb, polab = types[1], float(angles[1])
         else:
-            logger.warning("export_uvfits: no polarization types for antenna {}", antenna)
+            logger.warning("exportuvfits: no polarization types for antenna {}", antenna)
         out.append((poltya, polaa, poltyb, polab))
     return out
 
@@ -866,7 +866,7 @@ def _wx_table(main: dict, weather: dict, antnums: np.ndarray) -> bytes:
     """The AIPS WX table (weather per antenna and time; absent WEATHER columns give zeros)."""
     nrow = weather["nrow"]
     if nrow == 0:
-        logger.warning("export_uvfits: WEATHER table has no rows, no AIPS WX table written")
+        logger.warning("exportuvfits: WEATHER table has no rows, no AIPS WX table written")
         return b""
     ref_time = math.floor(float(main["TIME"][0]) / SECONDS_PER_DAY) * SECONDS_PER_DAY
 

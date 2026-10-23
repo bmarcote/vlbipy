@@ -7,12 +7,12 @@ CORRECTED_DATA each time is an unaveraged copy of the whole data set (about 60 G
 calibration in CL tables and applies it while reading (``DOCAL``):
 
 * :func:`record_deferred` stores the chain of each field, with a frozen copy of its tables (later solves
-  rewrite them in place), and :func:`vlbipy.solvers.apply_task.defer_to_ms` writes the calibration flags
+  rewrite them in place), and :func:`vlbipy.solvers.applycal.defer_to_ms` writes the calibration flags
   (data without a valid solution), which only need FLAG and the tables. CORRECTED_DATA of those fields is
   then *pending*;
 * a native reader of the corrected column asks :func:`view` about the fields it reads: the pending ones are
   read from DATA and corrected in memory with the code that writes CORRECTED_DATA
-  (:func:`vlbipy.solvers.apply_task.correct_rows`), so it sees what applycal would have written —
+  (:func:`vlbipy.solvers.applycal.correct_rows`), so it sees what applycal would have written —
   visibilities, flags and weights;
 * :func:`record_written` notes what an applycal wrote, and :func:`write_pending` writes the pending
   chains, which anything else reading CORRECTED_DATA needs first (CASA tasks, the ``ms`` tool, jplotter).
@@ -247,7 +247,7 @@ def view(ms, column: str = "CORRECTED_DATA", field_ids=None, *, setup: Optional[
         entries}`` of the pending fields), ``parang``, ``write_flags`` and ``weights`` (``{field id: bool}``;
         ``weights`` False when the WEIGHT columns are to be read as they are, see :func:`weights_set`), ``setup``
         (:func:`vlbipy.solvers.msio.read_setup`) and ``columns`` (main-table column names): what
-        :func:`vlbipy.solvers.apply_task.correct_block` needs. Picklable, so it can go to worker jobs.
+        :func:`vlbipy.solvers.applycal.correct_block` needs. Picklable, so it can go to worker jobs.
     """
     if str(column).upper() != "CORRECTED_DATA":
         return None
@@ -276,7 +276,7 @@ def write_pending(ms, field_ids=None, *, workers: Optional[int] = None) -> list[
 
     Returns the fields written (none when nothing was pending).
     """
-    from .apply_task import apply_to_ms
+    from .applycal import apply_to_ms
     stale = pending(ms)
     if field_ids is not None:
         stale = {f: c for f, c in stale.items() if f in {int(i) for i in field_ids}}

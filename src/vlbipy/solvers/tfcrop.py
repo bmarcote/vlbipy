@@ -1,6 +1,6 @@
 """``flagdata(mode='tfcrop')`` natively: CASA's TFCrop auto-flagger on every part of a Multi-MS (dask-ms backend).
 
-:func:`tfcrop_ms` writes the FLAG column ``casatasks.flagdata(mode='tfcrop', datacolumn=..., field=...,
+:func:`tfcrop` writes the FLAG column ``casatasks.flagdata(mode='tfcrop', datacolumn=..., field=...,
 timecutoff=..., freqcutoff=..., extendflags=False)`` writes with every other keyword at its default
 (``ntime='scan'``, ``combinescans=False``, ``timefit='line'``, ``freqfit='poly'``, ``maxnpieces=7``,
 ``flagdimension='freqtime'``, ``usewindowstats='none'``, ``correlation=''``). It is a port of
@@ -713,7 +713,7 @@ def _read_chunk(handle, runs: list[tuple[int, int]], column: str, field: int, dd
     with the calibration flags applycal would have added.
     """
     if view is not None and field in view["entries_by_field"]:
-        from .apply_task import corrected_chunks
+        from .applycal import corrected_chunks
         segments = [{"start": start, "nrow": nrow, "field": field, "ddid": ddid} for start, nrow in runs]
         vis, flag, on_disk = [], [], [0] * len(runs)
         run = 0
@@ -813,10 +813,10 @@ def _same(value, required) -> bool:
 
 
 def check_tfcrop_kwargs(kwargs: dict) -> None:
-    """Raise NotImplementedError unless every flagdata keyword in ``kwargs`` is reproduced by :func:`tfcrop_ms`.
+    """Raise NotImplementedError unless every flagdata keyword in ``kwargs`` is reproduced by :func:`tfcrop`.
 
     ``kwargs`` excludes ``vis``, ``datacolumn``, ``field``, ``timecutoff`` and ``freqcutoff`` (arguments of
-    :func:`tfcrop_ms`).
+    :func:`tfcrop`).
     """
     for key, value in kwargs.items():
         if key in IGNORED_KEYWORDS:
@@ -870,7 +870,7 @@ def _cutoff(name: str, value) -> float:
     return float(value)
 
 
-def tfcrop_ms(ms, *, datacolumn: str = "data", field=None, timecutoff: float = 4.0, freqcutoff: float = 3.0,
+def tfcrop(ms, *, datacolumn: str = "data", field=None, timecutoff: float = 4.0, freqcutoff: float = 3.0,
               workers: Optional[int] = None, **flagdata_kwargs) -> dict:
     """Flag ``ms`` in place as ``casatasks.flagdata(vis=ms, mode='tfcrop', ...)`` would (FLAG column only).
 
@@ -887,7 +887,7 @@ def tfcrop_ms(ms, *, datacolumn: str = "data", field=None, timecutoff: float = 4
     workers : int, optional
         Worker processes (one job per table part).
     **flagdata_kwargs
-        Any other flagdata keyword (not ``vis``): accepted only at the values :func:`tfcrop_ms` reproduces
+        Any other flagdata keyword (not ``vis``): accepted only at the values :func:`tfcrop` reproduces
         (:data:`REQUIRED_VALUES`, or any value of :data:`IGNORED_KEYWORDS`).
 
     Returns
@@ -930,7 +930,7 @@ def tfcrop_ms(ms, *, datacolumn: str = "data", field=None, timecutoff: float = 4
                 raise NotImplementedError(f"tfcrop: {Path(ms).name} has no {column} column")
     jobs = [{"path": part, "engine": engine, "column": column, "field_ids": field_ids, "timecutoff": time_tol,
              "freqcutoff": freq_tol, "view": view} for part in parts]
-    results = run_jobs("vlbipy.solvers.tfcrop_task:tfcrop_part_job", jobs, workers)
+    results = run_jobs("vlbipy.solvers.tfcrop:tfcrop_part_job", jobs, workers)
     total = {name: sum(r[name] for r in results)
              for name in ("rows", "chunks", "series", "cells", "flagged_before", "flagged_after")}
     if field_ids is not None and total["rows"] == 0:

@@ -1,6 +1,6 @@
 """The system-temperature table of the a-priori amplitude calibration (the dask-ms backend's ``gencal tsys``).
 
-:func:`write_tsys_table` writes what ``casatasks.gencal(caltype='tsys')`` writes for a SYSCAL subtable with
+:func:`tsys` writes what ``casatasks.gencal(caltype='tsys')`` writes for a SYSCAL subtable with
 one Tsys per receptor (no ``TSYS_SPECTRUM``): a ``B TSYS`` table with one row per SYSCAL row, FPARAM the
 system temperature, flagged where it is not positive, PARAMERR and SNR 0.1. Each row belongs to the scan
 whose integrations span its time, or else to the next scan (a measurement in the gap before a scan, as
@@ -40,7 +40,7 @@ def scan_of_times(layout: dict, times: np.ndarray) -> tuple[np.ndarray, np.ndarr
     return np.where(known, numbers[safe], -1), np.where(known, fields[safe], -1)
 
 
-def write_tsys_table(ms, caltable) -> dict:
+def tsys(ms, caltable) -> dict:
     """Write the ``B TSYS`` table of ``ms`` from its SYSCAL subtable (see the module docstring).
 
     Raises

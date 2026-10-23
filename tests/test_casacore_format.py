@@ -230,25 +230,25 @@ def test_casatools_compatible_tool(written):
 
 
 def test_flag_versions_save_restore_delete(written, tmp_path):
-    from vlbipy.solvers import flagversions
+    from vlbipy.solvers import flagmanager
     vis = tmp_path / "vis.ms"
     path, values = written
     create_table(vis, [array_column("FLAG", "boolean", shape=(16, 4)), scalar_column("FLAG_ROW", "boolean")], NROW,
                  {"FLAG_ROW": np.zeros(NROW, dtype=bool)}, tiled={"FLAG": (16, 4)})
     with Table(vis, readonly=False) as table:
         table.putcol("FLAG", values["FLAG"])
-    flagversions.flagmanager(vis=str(vis), mode="save", versionname="v1", comment="first")
+    flagmanager.flagmanager(vis=str(vis), mode="save", versionname="v1", comment="first")
     with Table(vis, readonly=False) as table:
         table.putcol("FLAG", np.ones((NROW, 16, 4), dtype=bool))
-    assert flagversions.flagmanager(vis=str(vis), mode="list")[0] == {"name": "v1", "comment": "first"}
-    flagversions.flagmanager(vis=str(vis), mode="restore", versionname="v1")
+    assert flagmanager.flagmanager(vis=str(vis), mode="list")[0] == {"name": "v1", "comment": "first"}
+    flagmanager.flagmanager(vis=str(vis), mode="restore", versionname="v1")
     with Table(vis) as table:
         np.testing.assert_array_equal(table.getcol("FLAG"), values["FLAG"])
-    flagversions.flagmanager(vis=str(vis), mode="save", versionname="v1", comment="again")   # old one renamed
-    names = [name for name, _ in flagversions.list_versions(vis)]
+    flagmanager.flagmanager(vis=str(vis), mode="save", versionname="v1", comment="again")   # old one renamed
+    names = [name for name, _ in flagmanager.list_versions(vis)]
     assert names[-1] == "v1" and names[0].startswith("v1.old.")
-    flagversions.flagmanager(vis=str(vis), mode="delete", versionname="v1")
-    assert [name for name, _ in flagversions.list_versions(vis)] == names[:1]
+    flagmanager.flagmanager(vis=str(vis), mode="delete", versionname="v1")
+    assert [name for name, _ in flagmanager.list_versions(vis)] == names[:1]
 
 
 def test_flag_versions_interoperate_with_casa(tmp_path):
@@ -258,13 +258,13 @@ def test_flag_versions_interoperate_with_casa(tmp_path):
     from pathlib import Path
 
     casatasks = pytest.importorskip("casatasks")
-    from vlbipy.solvers import flagversions
+    from vlbipy.solvers import flagmanager
     source = Path(__file__).resolve().parent.parent / "test" / "e2e_daskms" / "calibrated_data" / "RSM07_3C345.ms"
     if not source.is_dir():
         pytest.skip("RSM07 test data not present")
     vis = tmp_path / source.name
     shutil.copytree(source, vis)
-    parts = flagversions._parts(vis)
+    parts = flagmanager._parts(vis)
 
     def set_flags(value=None):
         for part in parts:
@@ -274,17 +274,17 @@ def test_flag_versions_interoperate_with_casa(tmp_path):
 
     with Table(vis) as table:
         original = table.getcol("FLAG")
-    flagversions.save_version(vis, "native")
+    flagmanager.save_version(vis, "native")
     casatasks.flagmanager(vis=str(vis), mode="save", versionname="casa")
     set_flags(True)
     casatasks.flagmanager(vis=str(vis), mode="restore", versionname="native")      # CASA reads ours
     with Table(vis) as table:
         np.testing.assert_array_equal(table.getcol("FLAG"), original)
     set_flags(False)
-    flagversions.restore_version(vis, "casa")                                       # we read CASA's
+    flagmanager.restore_version(vis, "casa")                                       # we read CASA's
     with Table(vis) as table:
         np.testing.assert_array_equal(table.getcol("FLAG"), original)
-    assert [n for n, _ in flagversions.list_versions(vis)] == ["native", "casa"]
+    assert [n for n, _ in flagmanager.list_versions(vis)] == ["native", "casa"]
 
 
 def test_tiled_column_without_defined_cells_opens_in_casacore(tmp_path):

@@ -509,7 +509,7 @@ def apply_flag_selections(ms, selections: list[dict], *, setup: Optional[dict] =
     selections = merge_selections(selections)
     quack = [s for s in selections if s["quack"] is not None]
     if quack:
-        found = run_jobs("vlbipy.solvers.flag_task:quack_starts_job",
+        found = run_jobs("vlbipy.solvers.flagdata:quack_starts_job",
                          [{"path": p, "selections": quack, "setup": setup, "engine": engine} for p in parts], workers)
         for index, selection in enumerate(quack):
             starts: dict[int, float] = {}
@@ -517,7 +517,7 @@ def apply_flag_selections(ms, selections: list[dict], *, setup: Optional[dict] =
                 for key, value in per_part[index].items():
                     starts[key] = min(value, starts.get(key, np.inf))
             selection["quack_starts"] = starts
-    results = run_jobs("vlbipy.solvers.flag_task:flag_part_job",
+    results = run_jobs("vlbipy.solvers.flagdata:flag_part_job",
                        [{"path": p, "selections": selections, "setup": setup, "engine": engine} for p in parts],
                        workers)
     total = {name: sum(r[name] for r in results) for name in ("rows", "rows_touched", "cells_changed")}
@@ -611,7 +611,7 @@ def count_flags(ms, *, workers: Optional[int] = None) -> dict:
     engine = table_engine()
     setup = read_setup(ms, engine=engine)
     nant, nddid = len(setup["antenna_names"]), len(setup["ddid_to_spw"])
-    results = run_jobs("vlbipy.solvers.flag_task:count_part_job",
+    results = run_jobs("vlbipy.solvers.flagdata:count_part_job",
                        [{"path": p, "engine": engine, "nant": nant, "nddid": nddid} for p in ms_parts(ms)], workers)
     shape = (nant, nant, nddid)
     return {"flagged": sum(r["flagged"] for r in results).reshape(shape),
@@ -675,7 +675,7 @@ def read_row_amplitudes(ms, *, fields: Optional[list[str]] = None, column: str =
     selected = select_runs(layout, fields=field_ids)
     jobs = [{"specs": chunk, "column": column, "corrs": corrs, "ncorr": int(setup["ncorr"]), "engine": engine}
             for chunk in split_rows(run_specs(layout, selected), AMPLITUDE_ROWS)]
-    results = [r for r in run_jobs("vlbipy.solvers.flag_task:row_amplitude_job", jobs, workers) if r]
+    results = [r for r in run_jobs("vlbipy.solvers.flagdata:row_amplitude_job", jobs, workers) if r]
     names = ("time", "ant1", "ant2", "ddid", "amplitude")
     if not results:
         out = {name: np.zeros(0) for name in names}
@@ -723,7 +723,7 @@ def parallel_casa_flagdata(kwargs: dict, *, logfile: str = "", workers: Optional
         return None
     started = _time.perf_counter()
     jobs = [{"kwargs": dict(kwargs, vis=part, flagbackup=False), "logfile": logfile} for part in parts]
-    results = run_jobs("vlbipy.solvers.flag_task:casa_flagdata_job", jobs, workers)
+    results = run_jobs("vlbipy.solvers.flagdata:casa_flagdata_job", jobs, workers)
     # A part the selection does not reach has nothing to flag; on the whole MS that is an error only when no
     # part has any of the selected data.
     empty = [error for error in results if "MSSelectionNullSelection" in error]

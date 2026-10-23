@@ -1,6 +1,6 @@
 """Visibility weights from the scatter of the data (the dask-ms backend's ``statwt``).
 
-:func:`statwt_ms` writes what ``casatasks.statwt`` writes with its default
+:func:`statwt` writes what ``casatasks.statwt`` writes with its default
 binning (one integration per bin, ``chanbin='spw'``, correlations separately,
 ``statalg='classic'``): for every row and correlation, the unflagged channels of
 the data column give the population variances of the real and imaginary parts,
@@ -66,7 +66,7 @@ def statwt_part_job(*, path: str, segments: list[dict], engine: str, column: str
     With ``view`` (:func:`vlbipy.solvers.corrected.view`), the segments of its fields are read from DATA and
     corrected as applycal would have written CORRECTED_DATA.
     """
-    from .apply_task import corrected_chunks
+    from .applycal import corrected_chunks
     stats = {"rows": 0, "flagged_before": 0, "flagged_after": 0, "samples": 0,
              "wsum": 0.0, "wsum2": 0.0, "wcount": 0}
     live = set(view["entries_by_field"]) if view is not None else set()
@@ -116,7 +116,7 @@ def statwt_part_job(*, path: str, segments: list[dict], engine: str, column: str
     return stats
 
 
-def statwt_ms(ms, *, column: str = "CORRECTED_DATA", minsamp: int = 2, workers: Optional[int] = None,
+def statwt(ms, *, column: str = "CORRECTED_DATA", minsamp: int = 2, workers: Optional[int] = None,
               chunk_rows: int = STATWT_ROWS) -> dict:
     """Recompute WEIGHT (and WEIGHT_SPECTRUM) of every row of ``ms`` from the scatter of ``column``.
 
@@ -146,7 +146,7 @@ def statwt_ms(ms, *, column: str = "CORRECTED_DATA", minsamp: int = 2, workers: 
                      "segments": [{"start": int(layout["start"][i]), "nrow": int(layout["nrow"][i]),
                                    "field": int(layout["field"][i]), "ddid": int(layout["ddid"][i])} for i in runs],
                      "view": view})
-    results = run_jobs("vlbipy.solvers.statwt_task:statwt_part_job", jobs, workers)
+    results = run_jobs("vlbipy.solvers.statwt:statwt_part_job", jobs, workers)
     # A deferred calibration (vlbipy.solvers.corrected) now weighs its data with these weights, as an applycal
     # written before statwt would.
     weights_set(ms, np.unique(layout["field"]).tolist())

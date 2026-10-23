@@ -62,7 +62,7 @@ def test_selection_strings_restrict_the_solve_to_the_usable_band():
 
 def test_combined_reference_frequency_comes_from_the_selection():
     """``combine='spw'`` references its delay to the centre of the selected band, not of one interval."""
-    from vlbipy.solvers.fringefit_task import group_reference_freq
+    from vlbipy.solvers.fringefit import group_reference_freq
 
     chan_freq = np.array([[1.0e9, 1.2e9], [2.0e9, 2.2e9], [5.0e9, 5.4e9]])
     assert group_reference_freq(chan_freq, [0, 1, 2]) == 3.2e9

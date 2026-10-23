@@ -41,7 +41,6 @@ class LBAObservatory(ObservatoryHandler):
     auto_download = False
     needs_eop = True
     needs_accor = True
-    tec_below_ghz = 7.0
     #: A-priori flag records longer than this many hours are not applied (0 = apply all). The
     #: station flag files mark slews; a record of hours is an interval the station log never
     #: closed (V589A: one "Mixed" record flags ATCA, the best antenna, for 12 of 13 hours).

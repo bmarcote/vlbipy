@@ -14,6 +14,8 @@ from dataclasses import dataclass, field as dcfield
 from enum import Enum, IntEnum
 from typing import Optional
 
+import numpy as np
+
 #: Speed of light in m/s (avoids a scipy/astropy import in this dependency-free module).
 _C_M_S = 299792458.0
 
@@ -201,6 +203,41 @@ class FreqSetup:
         subbands = range(self.n_subbands) if subband is None else [subband]
         return [(start + s * span + c * self.channel_width) / 1e9
                 for s in subbands for c in range(n_chan)]
+
+    @property
+    def bands(self) -> list[list[int]]:
+        """Subband index groups forming separate frequency bands (e.g. S/X).
+
+        Subbands are sorted by sky frequency and a new band starts where the gap
+        between consecutive subband ranges exceeds ten times the median subband
+        width (a typical S/X gap is ~5 GHz, while same-band gaps are at most a
+        few subband widths). One group for single-band data, empty without
+        recorded frequencies.
+        """
+        if not self.channel_freqs:
+            return []
+        spans = sorted(((min(freqs), max(freqs), i) for i, freqs in enumerate(self.channel_freqs)))
+        width = float(np.median([hi - lo for lo, hi, _ in spans])) if len(spans) > 1 else 0.0
+        groups, current, prev_hi = [], [spans[0][2]], spans[0][1]
+        for lo, hi, index in spans[1:]:
+            if lo - prev_hi > max(10.0 * width, 0.02 * lo):
+                groups.append(current)
+                current = []
+            current.append(index)
+            prev_hi = max(prev_hi, hi)
+        groups.append(current)
+        return groups
+
+    def band_label(self, subbands: list[int]) -> str:
+        """Standard letter of the band covering ``subbands`` (P/L/S/C/X/Ku/K/Ka/Q/W), by centre frequency."""
+        freqs = [f for i in subbands for f in self.channel_freqs[i]]
+        ghz = (min(freqs) + max(freqs)) / 2e9 if freqs else self.freq_ghz
+        for label, lo, hi in (("P", 0.3, 1.0), ("L", 1.0, 2.0), ("S", 2.0, 4.0), ("C", 4.0, 8.0),
+                              ("X", 8.0, 12.0), ("Ku", 12.0, 18.0), ("K", 18.0, 27.0), ("Ka", 27.0, 40.0),
+                              ("Q", 40.0, 50.0), ("W", 50.0, 100.0)):
+            if lo <= ghz < hi:
+                return label
+        return f"{ghz:.2f}g"
 
     def to_dict(self) -> dict:
         """Serialise to plain JSON types."""

@@ -92,7 +92,7 @@ produce_png = true
 
 [export]
 split_per_source = true
-export_uvfits = true
+exportuvfits = true
 time_average = "10s"         # Time averaging of the per-source split / UVFITS
 channel_average = -1         # Calibrators: -1 = one channel per subband, N = average N, 1 = keep all
 target_channel_average = 4   # The same for the target(s)
@@ -306,7 +306,7 @@ Controls `obs.export.per_source`.
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | `split_per_source` | bool | `true` | Write each source to its own MS file |
-| `export_uvfits` | bool | `true` | Export a UVFITS file alongside each split MS |
+| `exportuvfits` | bool | `true` | Export a UVFITS file alongside each split MS |
 | `time_average` | string | `"10s"` | Time averaging interval of the split and UVFITS. Empty = no averaging. |
 | `channel_average` | int | `-1` | Channel averaging of calibrators and check sources. `-1` = one channel per subband; `N` = average N channels (a subband with fewer is left as is); `1` = keep all. |
 | `target_channel_average` | int | `4` | The same for the target(s). |

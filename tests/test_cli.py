@@ -82,7 +82,7 @@ def test_applycal_runs_natively_with_broadcast_values_in_any_order(tmp_path, mon
     first = _casa_table(tmp_path / "one.G", "Calibration")
     second = _casa_table(tmp_path / "two.K", "Calibration")
     native = MagicMock(return_value={})
-    monkeypatch.setattr("vlbipy.solvers.apply_task.applycal", native)
+    monkeypatch.setattr("vlbipy.solvers.applycal.applycal", native)
     # The tables first and the set last: recognised by their table type.
     assert main(["applycal", str(first), str(second), str(ms), "--gainfield", "A",
                  "--interp", "nearest", "--spwmap", "0,0", "--calwt", "false"]) == 0

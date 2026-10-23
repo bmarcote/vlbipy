@@ -1,6 +1,6 @@
 """Flag versions (CASA ``flagmanager``) without CASA: save, restore, delete, rename and list.
 
-The files are CASA's, so either implementation reads what the other wrote: ``<vis>.flagversions/`` holds one
+The files are CASA's, so either implementation reads what the other wrote: ``<vis>.flagmanager/`` holds one
 table ``flags.<name>`` per version — FLAG (TiledShapeStMan) and FLAG_ROW, one row per main-table row, the parts of a
 Multi-MS concatenated in order — and ``FLAG_VERSION_LIST``, one ``"<name> : <comment>"`` line per version.
 Saving over an existing name first renames it to ``<name>.old.<unix time>``, as the CASA task does.
@@ -24,9 +24,9 @@ LIST_NAME = "FLAG_VERSION_LIST"
 
 
 def versions_dir(vis) -> Path:
-    """``<vis>.flagversions``."""
+    """``<vis>.flagmanager``."""
     vis = Path(vis)
-    return vis.parent / f"{vis.name}.flagversions"
+    return vis.parent / f"{vis.name}.flagmanager"
 
 
 def _parts(vis) -> list[Path]:
@@ -143,7 +143,7 @@ def rename_version(vis, oldname: str, versionname: str, comment: str = "") -> No
     """Rename version ``oldname`` to ``versionname`` (with a new comment)."""
     folder = versions_dir(vis)
     if not (folder / f"flags.{oldname}").is_dir():
-        raise ValueError(f"No such flagversions: {oldname}")
+        raise ValueError(f"No such flagmanager: {oldname}")
     if (folder / f"flags.{versionname}").exists():
         raise ValueError(f"Flagversions {versionname} already exists!")
     (folder / f"flags.{oldname}").rename(folder / f"flags.{versionname}")

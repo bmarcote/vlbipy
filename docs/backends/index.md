@@ -176,9 +176,9 @@ The engine lives in `vlbipy.solvers`:
 | `solvers/workers.py` | worker pool |
 | `solvers/msio.py` | measurement-set layout index, chunked reads and writes |
 | `solvers/calblock.py` | read and calibrate one block of data |
-| `solvers/fringefit_task.py`, `solvers/fringe.py` | fringe fitting |
-| `solvers/gain_task.py` | bandpass and gaincal |
-| `solvers/apply_task.py`, `solvers/apply.py` | applycal and calibration-table interpolation |
+| `solvers/fringefit.py`, `solvers/fringe.py` | fringe fitting |
+| `solvers/gain.py` | bandpass and gaincal |
+| `solvers/applycal.py`, `solvers/apply.py` | applycal and calibration-table interpolation |
 | `solvers/kernels.py` | compiled loops of the calibration (numba, optional) |
 | `solvers/corrected.py` | the record of what CORRECTED_DATA holds (deferred applications) |
 | `solvers/parang.py` | parallactic angle |

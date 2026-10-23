@@ -138,6 +138,9 @@ retry_below = 0.5            # observed is re-solved on the rest at this SNR; th
 max_delay_step = 0.0         # ...and only if its delays are consistent: median change between solutions
                              # at most this (ns; 0 = 1/total bandwidth). Noise peaks jump across the
                              # search window; an antenna failing this is lost (its solutions flagged)
+# delaywindow = [-200, 200]  # fringe-search delay window limits in ns (unset = full window; restricting
+                             # it cuts false detections on weak calibrators — check no real solution is clipped)
+# ratewindow = [-50, 50]     # the same for the rate, in mHz
 
 # Time smoothing of the fringe (MBD, MBD2, ...) solutions. Each solution carries the noise
 # of one solution interval, while the residual atmospheric delay and rate it measures drift
@@ -161,6 +164,16 @@ min_points = 3               # leave a solution alone when its window holds fewe
 enabled = true
 column = "corrected"
 minsamp = 2
+
+# e-MERLIN flux scale from a modelled calibrator (3C286; model images cover L and C band only).
+# Runs when e-MERLIN outstations (not Jb) are in the array and the calibrator was observed: the
+# model goes into MODEL_DATA, amplitude gains are solved on the outstation(+Jb) baselines with Jb
+# held at 1, and the resulting table corrects only those antennas in the apply chain.
+[calibration.emerlin]
+enabled = true
+model = ""                    # FITS model image; overrides the band choice below
+model_l = ""                  # L band (<3 GHz); empty = src/vlbipy/data/3C286_L.fits
+model_c = ""                  # C band (3-8.5 GHz); empty = src/vlbipy/data/3C286_C.fits
 
 # Correlator amplitude correction from the autocorrelations, for DiFX data (VLBA, LBA): CASA accor,
 # then smoothcal. Applied with nearest interpolation, like the EOP correction.
@@ -191,6 +204,14 @@ joint_amplitude = false      # multi-epoch stage: also re-solve the station ampl
                              # joint calibrator model (off: phases only; the model comes from other epochs of a
                              # source that varies, and amplitudes fitted to it degraded the targets in tests)
 workers = 0                  # threads for bayes_gscale (0 = difmapy's default)
+fix_stage1 = true            # hold the short/intermediate-baseline antennas' gains while the
+                             # long-baseline antennas are added and solved in selfcal stage 2
+
+# Antennas on the longest baselines, ignored until the model has converged on the rest of the
+# array; they join for a second selfcal loop against the improved model. Per network.
+[selfcal.defer_antennas]
+EVN = ["Hh", "Ur", "T6", "Sh"]
+LBA = ["Hh"]
 
 [imaging]
 mapsize = 8192               # difmapy: width in pixels of the map the images are made on (the FITS keeps the

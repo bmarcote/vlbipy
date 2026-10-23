@@ -1,7 +1,7 @@
 """Concatenate measurement sets without casacore: what ``casatasks.concat(respectname=True, copypointing=False)``
 writes for the per-source splits of several epochs, plus the per-epoch amplitude scaling of the campaign merge.
 
-:func:`concat_ms` repeats the task (``task_concat.py``) and casacore's ``MSConcat::concatenate`` on plain
+:func:`concat` repeats the task (``task_concat.py``) and casacore's ``MSConcat::concatenate`` on plain
 measurement sets, rule by rule as read off ``MSConcat.cc`` and the ``MS*Columns::match*`` functions:
 
 * The inputs are processed in the order of their earliest main-table TIME (stable). The first is copied; each
@@ -744,7 +744,7 @@ def _write_main(target: Path, first: Path, pieces: list, main: dict, windows: li
 
 # -- entry point ----------------------------------------------------------------------------------------------
 
-def concat_ms(inputs, output, *, respectname: bool = True, copypointing: bool = False,
+def concat(inputs, output, *, respectname: bool = True, copypointing: bool = False,
               scales: Optional[list] = None) -> dict:
     """Concatenate the plain measurement sets ``inputs`` into the new ``output`` (see the module docstring).
 

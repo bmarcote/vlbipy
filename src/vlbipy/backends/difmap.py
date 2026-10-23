@@ -349,7 +349,8 @@ def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_value
                      max_bad_fraction: float = 0.25, bayes_models=("clean", "gauss1", "gauss2", "gauss3"),
                      prior_sigma: float = 0.1, workers: Optional[int] = None, imagename: Optional[str] = None,
                      search_fov_mas: float = 0.0, search_sigma: float = 10.0, recentre_min_beams: float = 10.0,
-                     mapsize: int = IMAGE_PIXELS, **clean_kwargs) -> dict:
+                     mapsize: int = IMAGE_PIXELS, fixed_antennas: tuple = (), deferred_antennas: tuple = (),
+                     fix_stage1: bool = True, **clean_kwargs) -> dict:
     """Full difmapy calibrator sequence: model, phase ladder, amplitude gains, images, tables.
 
     Products (``prefix`` is a path stem, e.g. ``<work_dir>/selfcal/<code>.<source>``):
@@ -367,17 +368,52 @@ def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_value
     from the phase centre.
     """
     obs = load(split_ms, average_channels=True)
+    known = {a.lower(): a for a in obs.antennas}
+    fixed = [known[n] for n in (a.lower() for a in fixed_antennas) if n in known]
+    deferred = [known[n] for n in (a.lower() for a in deferred_antennas) if n in known]
+    if fixed:
+        obs.selfant(fixed, fix=True, quiet=True)
+        logger.info("difmapy: {} fixed in self-calibration (a-priori amplitudes held)", ", ".join(fixed))
     search, shift = locate_source(obs, imagename or prefix, search_fov_mas=search_fov_mas, search_sigma=search_sigma,
                                   recentre_min_beams=recentre_min_beams)
+    # Stage 1 ignores the longest-baseline antennas: they see a resolved source and would bias the
+    # model while it is still coarse. They join for stage 2, when the model is good enough to hold them.
+    if deferred and len(deferred) < len(obs.antennas):
+        obs.ignore(deferred)
+        logger.info("difmapy: stage 1 ignores the longest-baseline antenna(s): {}", ", ".join(deferred))
     model = fit_starting_model(obs)
     ladder = solints or selfcal_ladder(scan_lengths(obs))
     snapshot = obs.gain_snapshot()
-    obs, rounds = phase_selfcal(obs, ladder, min_improvement=min_improvement, max_bad_fraction=max_bad_fraction)
+    rounds: list[dict] = []
+    obs, stage1 = phase_selfcal(obs, ladder, min_improvement=min_improvement, max_bad_fraction=max_bad_fraction)
+    rounds += stage1
+    if deferred and len(deferred) < len(obs.antennas):
+        obs.unignore(deferred)
+        obs.modelfit(quiet=True)               # the model now has to describe the long baselines too
+        if fix_stage1:
+            stage1_names = [a for a in obs.antennas if a not in deferred]
+            obs.selfant(stage1_names, fix=True, quiet=True)
+        obs, stage2 = phase_selfcal(obs, ladder, min_improvement=min_improvement,
+                                    max_bad_fraction=max_bad_fraction)
+        for r in stage2:
+            r["stage"] = "long-baselines"
+        rounds += stage2
+        if fix_stage1:
+            obs.selfant(stage1_names, fix=False, quiet=True)
     phase_table = export_phase_table(obs, f"{prefix}.phase", parent_ms, snapshot) if any(r["accepted"] for r in rounds) \
         else {}
     amplitude = amplitude_calibration(obs, f"{prefix}.amp", parent_ms, models=bayes_models, prior_sigma=prior_sigma,
                                       workers=workers)
     gains = write_gain_record(obs, f"{prefix}.gains.json", amplitude)
+    # One accumulated table (phase + amplitude corrections since the first model) is what
+    # gets transferred to the targets and check sources.
+    accumulated = ""
+    try:
+        info = obs.savecaltable(f"{prefix}.all", outformat="CASA", ms=str(parent_ms), since=snapshot,
+                                quiet=True)
+        accumulated = str(info.get("path", f"{prefix}.all"))
+    except Exception as exc:  # noqa: BLE001 - the separate phase/amp tables still cover it
+        logger.warning("difmapy: could not export the accumulated gain table ({})", exc)
     obs.auto_mapsize(npix=int(mapsize))
     images = image_all_robust(obs, imagename or prefix, robust_values, **clean_kwargs)
     if any(shift):
@@ -387,6 +423,7 @@ def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_value
               "search": search, "shift_mas": list(shift),
               "model_rchisq": model.get("rchisq"), "ladder": ladder, "rounds": rounds,
               "phase_table": phase_table.get("path", ""), "amplitude": amplitude, "images": images,
+              "accumulated_table": accumulated,
               "station_gains": {k: float(v) for k, v in obs.station_gains().items()},
               "station_gains_per_if": gains["gain_per_if"], "gains_file": f"{prefix}.gains.json"}
     Path(f"{prefix}.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")

@@ -1,7 +1,7 @@
-"""Tests for the native flagging engine of the dask-ms backend (vlbipy.solvers.flag_task).
+"""Tests for the native flagging engine of the dask-ms backend (vlbipy.solvers.flagdata).
 
 The expected behaviour is CASA's ``flagdata``, measured selection by selection on
-real data (GL048): see the module docstring of :mod:`vlbipy.solvers.flag_task`.
+real data (GL048): see the module docstring of :mod:`vlbipy.solvers.flagdata`.
 These tests pin those semantics down on a small synthetic measurement set, and
 check the statistics and amplitudes against brute-force numpy.
 """
@@ -16,8 +16,8 @@ import pytest
 
 casatools = pytest.importorskip("casatools")
 
-from vlbipy.solvers import flag_task  # noqa: E402
-from vlbipy.solvers.flag_task import (Unsupported, apply_flag_selections, compile_flagdata,  # noqa: E402
+from vlbipy.solvers import flagdata  # noqa: E402
+from vlbipy.solvers.flagdata import (Unsupported, apply_flag_selections, compile_flagdata,  # noqa: E402
                                       count_flags, parse_antenna, parse_command, parse_spw, parse_timerange,
                                       read_flag_setup, read_row_amplitudes)
 
@@ -285,7 +285,7 @@ def test_count_flags_counts_observable_cross_correlations_and_caches_the_zero_ro
         recorded = main["DATA"] != 0
         flagged += int((main["FLAG"] & recorded)[cross].sum())
         observable += int(recorded[cross].sum())
-        assert (part / flag_task.OBSERVABLE_CACHE).is_file()
+        assert (part / flagdata.OBSERVABLE_CACHE).is_file()
     assert int(counts["flagged"].sum()) == flagged and int(counts["observable"].sum()) == observable
     assert counts["observable"][2, 3].sum() < counts["observable"][1, 3].sum()     # 2&3 not recorded in scan 2
     again = count_flags(mms, workers=1)

@@ -1,6 +1,6 @@
 """Reset the corrected (and model) data of a measurement set: what ``casatasks.clearcal`` writes.
 
-:func:`clearcal_ms` repeats ``clearcal(vis, addmodel=...)`` without a selection: CORRECTED_DATA is created
+:func:`clearcal` repeats ``clearcal(vis, addmodel=...)`` without a selection: CORRECTED_DATA is created
 (laid out like DATA) when it is missing and then set to DATA on every row; MODEL_DATA, when the measurement
 set has one, is set to 1 + 0j; ``addmodel=True`` creates it first. Weights and flags are left alone, as
 CASA's ``initcalset`` does. The parts of a Multi-MS are copied by parallel worker processes, each on its own
@@ -42,7 +42,7 @@ def clearcal_part_job(*, path: str, engine: str, chunk_rows: int) -> dict:
     return {"rows": nrow, "model": has_model}
 
 
-def clearcal_ms(ms, *, addmodel: bool = False, workers: Optional[int] = None,
+def clearcal(ms, *, addmodel: bool = False, workers: Optional[int] = None,
                 chunk_rows: int = CLEARCAL_ROWS) -> dict:
     """Set CORRECTED_DATA to DATA (and MODEL_DATA to 1) on every row of ``ms``.
 
@@ -63,14 +63,14 @@ def clearcal_ms(ms, *, addmodel: bool = False, workers: Optional[int] = None,
         ``rows``, ``parts``, ``model`` (whether MODEL_DATA was reset) and ``seconds``.
     """
     from . import corrected
-    from .apply_task import ensure_column
+    from .applycal import ensure_column
     started = _time.perf_counter()
     engine = table_engine()
     ensure_column(ms, "CORRECTED_DATA", "DATA", engine=engine)
     if addmodel:
         ensure_column(ms, "MODEL_DATA", "DATA", engine=engine)
     jobs = [{"path": part, "engine": engine, "chunk_rows": int(chunk_rows)} for part in ms_parts(ms)]
-    results = run_jobs("vlbipy.solvers.clearcal_task:clearcal_part_job", jobs, workers)
+    results = run_jobs("vlbipy.solvers.clearcal:clearcal_part_job", jobs, workers)
     corrected.forget(ms)
     report = {"rows": int(sum(r["rows"] for r in results)), "parts": len(jobs),
               "model": bool(results) and all(r["model"] for r in results), "seconds": _time.perf_counter() - started}

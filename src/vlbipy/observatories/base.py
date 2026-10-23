@@ -59,8 +59,6 @@ class ObservatoryHandler:
     needs_eop: bool = False
     #: Whether ACCOR (correlator amplitude) corrections apply.
     needs_accor: bool = False
-    #: Apply ionospheric TEC correction when the lowest frequency is below this (GHz); 0 disables.
-    tec_below_ghz: float = 0.0
 
     def find_data_files(self, project_code: str, directory: str) -> list[str]:
         """Return already-present raw data files for a project (empty if none)."""

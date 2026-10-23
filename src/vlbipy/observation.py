@@ -46,7 +46,7 @@ STEP_ORDER = [
     "initial_calibration_sbd2", "fringefit_mbd2", "flag_edges",
     "apply", "flag_aoflagger", "flag_outliers",
     "second_pass", "scalar_bandpass", "reweight", "flag_outliers_reweighted", "third_pass",
-    "flag_edges_final", "split",
+    "flag_edges_final", "emerlin_scale", "split",
 ]
 
 
@@ -103,6 +103,8 @@ class Observation:
         self._cal_stages: list[dict] = []
         self._cal_selection: Optional[tuple[list[str], list[int]]] = self._load_cal_selection()
         self._scratch = False
+        #: Project code this observation was band-split from (None for a full observation).
+        self._band_of: Optional[str] = None
 
         # Callable operation namespaces.
         self.import_data = ImportDataNamespace(self)

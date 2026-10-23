@@ -54,7 +54,6 @@ class EVNObservatory(ObservatoryHandler):
     auto_download = True
     needs_eop = False
     needs_accor = False
-    tec_below_ghz = 5.0
 
     def find_data_files(self, project_code: str, directory: str) -> list[str]:
         """Return the FITS-IDI files for the project already present in the directory."""

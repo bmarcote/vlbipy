@@ -1,7 +1,7 @@
 """Correlator amplitude correction from the autocorrelations: the dask-ms backend's ``accor`` and ``smoothcal``.
 
-:func:`run_accor` writes the table ``casatasks.accor(vis, caltable, solint=..., corrdepflags=...)`` writes with
-every other keyword at its default, and :func:`smooth_caltable` the table ``casatasks.smoothcal`` makes of it
+:func:`accor` writes the table ``casatasks.accor(vis, caltable, solint=..., corrdepflags=...)`` writes with
+every other keyword at its default, and :func:`smoothcal` the table ``casatasks.smoothcal`` makes of it
 (``smoothtype`` ``'median'`` or ``'mean'``, any ``smoothtime``). Checked against CASA 6.7.6 on RSM07: every
 cell of both tables is identical (only the ``CASA_Version`` keyword reads ``vlbipy``). Anything else raises
 NotImplementedError so that the caller runs CASA instead.
@@ -32,7 +32,7 @@ operation by operation in float32 where CASA works in float:
   row's TIME_CENTROID mean weighted by the summed weights of its correlations, then the rows weighted by
   their parallel-hand weights;
 * rows sorted (stably) by subband, time and antenna (``NewCalTable::writeToDisk``). Subtables as for every CASA
-  calibration table (see :mod:`vlbipy.solvers.gaincurve_task`); SPECTRAL_WINDOW has one channel per subband: for
+  calibration table (see :mod:`vlbipy.solvers.gaincurve`); SPECTRAL_WINDOW has one channel per subband: for
   a solved subband the sequential mean of the channel frequencies, the summed widths as CHAN_WIDTH and
   EFFECTIVE_BW, and the frequency itself as RESOLUTION and TOTAL_BANDWIDTH (as CASA's
   ``SolvableVisCal::setCTFrequencies`` writes them); an unsolved subband keeps the collapsed MS values and is
@@ -66,7 +66,7 @@ from ..casacore_format.table import Table
 from ..casacore_format.writer import create_table
 from ..logging_utils import get_logger
 from .caltable import _array_column, _create, _link_subtables, history_table_desc, main_table_desc
-from .gaincurve_task import HISTORY_ORDER, SUBTABLE_DESCS, write_calibration_subtable
+from .gaincurve import HISTORY_ORDER, SUBTABLE_DESCS, write_calibration_subtable
 from .msio import ms_parts, open_table, table_engine
 from .workers import run_jobs
 
@@ -103,7 +103,7 @@ _UNITS = {"s": 1.0, "sec": 1.0, "min": 60.0, "h": 3600.0, "d": 86400.0}
 # ---------------------------------------------------------------------------
 # accor
 # ---------------------------------------------------------------------------
-def run_accor(vis, caltable, *, solint="30s", corrdepflags: bool = True, workers: Optional[int] = None,
+def accor(vis, caltable, *, solint="30s", corrdepflags: bool = True, workers: Optional[int] = None,
               **accor_kwargs) -> dict:
     """Write the ``Accor Jones`` table ``casatasks.accor(vis, caltable, solint, corrdepflags)`` writes.
 
@@ -145,12 +145,12 @@ def run_accor(vis, caltable, *, solint="30s", corrdepflags: bool = True, workers
     engine = table_engine()
     setup = read_accor_setup(vis, engine=engine)
     parts = ms_parts(vis)
-    firsts = run_jobs("vlbipy.solvers.accor_task:accor_index_job",
+    firsts = run_jobs("vlbipy.solvers.accor:accor_index_job",
                       [{"path": part, "engine": engine} for part in parts], workers)
     bounds = time_bounds(firsts)
     jobs = [{"path": part, "engine": engine, "bounds": bounds, "interval": interval, "corrdepflags": bool(corrdepflags),
              "weight_column": setup["weight_column"], "read_rows": READ_ROWS} for part in parts]
-    results = run_jobs("vlbipy.solvers.accor_task:accor_part_job", jobs, workers)
+    results = run_jobs("vlbipy.solvers.accor:accor_part_job", jobs, workers)
     segments = merge_segments(results)
     solution = solve_intervals(segments, nant=setup["nant"], ncorr=setup["ncorr"],
                                ddid_to_spw=setup["ddid_to_spw"])
@@ -718,7 +718,7 @@ def solution_spectral_windows(values: dict, nrow: int, solved: np.ndarray) -> di
 # ---------------------------------------------------------------------------
 # smoothcal
 # ---------------------------------------------------------------------------
-def smooth_caltable(vis, tablein, caltable, *, smoothtype: str = "median", smoothtime: float = 1800.0,
+def smoothcal(vis, tablein, caltable, *, smoothtype: str = "median", smoothtime: float = 1800.0,
                     **smoothcal_kwargs) -> dict:
     """Write what ``casatasks.smoothcal(vis, tablein, caltable, smoothtype=..., smoothtime=...)`` writes.
 
@@ -727,7 +727,7 @@ def smooth_caltable(vis, tablein, caltable, *, smoothtype: str = "median", smoot
     vis : str or pathlib.Path
         The measurement set (must exist, as for CASA; not read).
     tablein : str or pathlib.Path
-        An ``Accor Jones`` table (written by CASA's ``accor`` or :func:`run_accor`).
+        An ``Accor Jones`` table (written by CASA's ``accor`` or :func:`accor`).
     caltable : str or pathlib.Path
         The smoothed table to write (replaced if it exists); ``''`` overwrites ``tablein`` as CASA does.
     smoothtype : str

@@ -1,6 +1,6 @@
 """Ionospheric (TEC) correction table from global ionosphere maps, as AIPS TECOR computes it (dask-ms backend).
 
-:func:`write_tec_table` reproduces the dispersive part of AIPS ``TECOR`` (run by the ``VLBATECR`` procedure,
+:func:`tec` reproduces the dispersive part of AIPS ``TECOR`` (run by the ``VLBATECR`` procedure,
 which also fetches the maps; see :mod:`vlbipy.ionex` for the maps, their names and their interpolation) and
 writes it as an ordinary CASA ``Fringe Jones`` table, which the native apply (:mod:`vlbipy.solvers.apply`) and
 CASA's ``applycal``/``fringefit`` both apply without any special code.
@@ -376,7 +376,7 @@ def _field_rows(maps: IonexMaps, setup: dict, field_id: int, scans: list, interv
             "vtec": (float(np.nanmin(geometry["vtec"])), float(np.nanmax(geometry["vtec"]))), "error": error}
 
 
-def write_tec_table(vis, caltable, *, ionex_dir, model: str = "emrg", shell_height: Optional[float] = None,
+def tec(vis, caltable, *, ionex_dir, model: str = "emrg", shell_height: Optional[float] = None,
                     interval: float = 30.0, fields=None, rotation: float = 1.0, scale: float = 1.0,
                     height_offset_km: float = 0.0, elevation_factor: float = 1.0, ionex_files=None,
                     fallback: bool = True, rates: bool = True, engine: Optional[str] = None) -> dict:

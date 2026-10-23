@@ -36,7 +36,7 @@ Reads observation metadata from UVDATA catalog entries using ParselTongue's `AIP
 
 - **`get_metadata()`**: Reads the AN (antenna), SU (source), and NX (index) tables
 - **`split()`**: Wraps the AIPS `SPLIT` task
-- **`export_uvfits()`**: Wraps the AIPS `FITTP` task
+- **`exportuvfits()`**: Wraps the AIPS `FITTP` task
 
 ### AipsImportBackend
 

@@ -11,7 +11,6 @@ class VLBAObservatory(ObservatoryHandler):
     auto_download = False
     needs_eop = True
     needs_accor = True
-    tec_below_ghz = 7.0
 
     def manual_download_instructions(self) -> str:
         return ("VLBA: NRAO does not support automated archive downloads. Retrieve the "

@@ -1,6 +1,6 @@
 """The gain-curve table of the a-priori amplitude calibration (the dask-ms backend's ``gencal gc``), without CASA.
 
-:func:`write_gain_curve_table` writes what ``casatasks.gencal(caltype='gc')`` writes for a measurement set with a
+:func:`gaincurve` writes what ``casatasks.gencal(caltype='gc')`` writes for a measurement set with a
 ``GAIN_CURVE`` subtable: an ``EPowerCurve`` table (CASA ``EJones.cc``, ``EPowerCurve::specify``), with the same
 arithmetic, row order, columns, keywords and subtables.
 
@@ -123,7 +123,7 @@ SELECTION_KEYWORDS = ("spw", "antenna", "pol", "parameter")
 CASA_VERSION = "vlbipy"
 
 
-def write_gain_curve_table(vis, caltable, **gencal_kwargs) -> dict:
+def gaincurve(vis, caltable, **gencal_kwargs) -> dict:
     """Write the ``EPowerCurve`` table ``gencal(vis=vis, caltable=caltable, caltype='gc')`` writes.
 
     Parameters

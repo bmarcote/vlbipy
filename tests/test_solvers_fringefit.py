@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from vlbipy.solvers import fringefit_task as task
+from vlbipy.solvers import fringefit as task
 
 RSM07_MS = Path("/home/marcote/Programing/vlbipy/rsm07_manual/rsm07.ms")
 
@@ -78,7 +78,7 @@ def test_run_fringefit_matches_casa_on_rsm07(tmp_path):
     """Single-band delay on scan 63 (refant EF, channels 6~57, zerorates) against the CASA table of the same solve."""
     pytest.importorskip("daskms")
     casa_table = Path("/tmp/vlbipy_spec/casa_ab/sbd_parang1")
-    out = task.run_fringefit(vis=str(RSM07_MS), caltable=str(tmp_path / "sbd"), field="3C345", spw="*:6~57",
+    out = task.fringefit(vis=str(RSM07_MS), caltable=str(tmp_path / "sbd"), field="3C345", spw="*:6~57",
                              scan="63", solint="inf", refant="EF", minsnr=10.0, zerorates=True, parang=True, workers=1)
     from vlbipy.solvers.caltable import read_fringe_table
     ours = read_fringe_table(out)

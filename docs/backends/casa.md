@@ -33,7 +33,7 @@ Reads observation metadata from MeasurementSets using `casatools.table` and `cas
 
 - **`get_metadata()`**: Extracts sources, antennas, scans, and frequency setup
 - **`split()`**: Wraps `casatasks.split` to extract single-source datasets
-- **`export_uvfits()`**: Wraps `casatasks.exportuvfits`
+- **`exportuvfits()`**: Wraps `casatasks.exportuvfits`
 
 ### CasaImportBackend
 

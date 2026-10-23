@@ -96,7 +96,7 @@ Provide the only backend for this milestone plus observatory handler stubs.
 **Scope**
 - `backends/base.py`: single cohesive `Backend` interface (import, metadata read,
   a-priori cal, fringefit, bandpass, gaincal, applycal, flag ops, clean/wsclean/tclean,
-  split, export_uvfits).
+  split, exportuvfits).
 - `backends/dummy.py`: `DummyBackend` — writes no files; logs each op with resolved
   parameters and data selection; returns synthetic `CalTable`/`Image`/`ImageSet`/
   `QualityMetrics`; synthesizes configurable fake array/sources/scans/freq setup; mutates

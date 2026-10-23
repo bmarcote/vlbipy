@@ -416,6 +416,7 @@ class VLBIObs:
 
         # The sequence follows the reduce-vlbi-data procedure step by step.
         self.import_data(force=force)                                  # steps 1-3
+        self._split_frequency_bands(force=force)                       # multi-band (S/X): one pipeline per band
         self.notebook()                                                # first notebook: what is there so far
         self.flag.apriori(force=force)                                 # step 4
         self.calibrate.a_priori(force=force)                           # steps 5-6 (EOP, Tsys, GC)
@@ -451,6 +452,11 @@ class VLBIObs:
             self.flag.edges(force=force, step="flag_edges_final")
             self.calibrate.scalar_bandpass(force=force)
             self.calibrate.apply(force=True, defer=True)
+        # e-MERLIN flux scale: a model-based amplitude correction of the outstations,
+        # appended to the chain before the split sees it.
+        for obs in self._observations:
+            if obs.calibrate.emerlin_scale(force=force):
+                obs.calibrate.apply(force=True, defer=True)
         self._survey_all_sources()                                      # final calibrated SNR coverage
         if self._per_epoch_products:
             images = self._finish_campaign(force=force)
@@ -476,6 +482,46 @@ class VLBIObs:
 
         return images
 
+    def _split_frequency_bands(self, *, force: bool = False) -> None:
+        """Expand every multi-band observation into one observation per band.
+
+        A data set whose subbands form several widely separated frequency bands
+        (e.g. simultaneous S/X) is calibrated band by band: each band is split
+        into ``<code>_<band>/<code>_<band>.ms`` (DATA column, every field) and a
+        new :class:`Observation` takes its place, marked ``_band_of`` the parent
+        so the campaign combination is skipped for them later.
+        """
+        expanded: list[Observation] = []
+        for obs in self._observations:
+            freq = obs.metadata.freq_setup if obs.metadata and obs.metadata.freq_setup else None
+            bands = freq.bands if freq else []
+            if len(bands) <= 1:
+                expanded.append(obs)
+                continue
+            labels = [freq.band_label(spws) for spws in bands]
+            warnings.warn(f"{obs.project_code}: the subbands form {len(bands)} frequency bands "
+                          f"({', '.join(labels)}); each band is calibrated independently as "
+                          + ", ".join(f"{obs.project_code}_{label}" for label in labels))
+            for spws, label in zip(bands, labels):
+                band_code = f"{obs.project_code}_{label}"
+                work = Path(obs.work_dir).parent / band_code
+                work.mkdir(parents=True, exist_ok=True)
+                band_ms = work / f"{band_code}.ms"
+                if band_ms.exists() and not force:
+                    logger.info("band split: {} already exists", band_ms)
+                else:
+                    obs._backend.export.split_band(obs.project_code, list(spws), str(band_ms))
+                band_obs = Observation(band_code, obs.config, work_dir=work)
+                band_obs._band_of = obs.project_code
+                band_obs._backend.data.adopt_ms(band_code, str(band_ms))
+                band_obs._metadata = band_obs._backend.data.get_metadata(
+                    band_code, [], obs.observatory)
+                band_obs._state.mark_complete("import_data", outputs=[str(band_ms)])
+                expanded.append(band_obs)
+            logger.info("{}: split into {} bands -> {}", obs.project_code, len(bands),
+                        ", ".join(o.project_code for o in expanded[-len(bands):]))
+        self._observations = expanded
+
     def _finish_campaign(self, *, force: bool = False) -> dict:
         """Steps 16-21 for a campaign: split, self-calibrate and image every epoch, then combine them.
 
@@ -490,7 +536,9 @@ class VLBIObs:
             images[obs.project_code] = self._image_all(obs, force=force)
             self._final_plots(obs)
         try:
-            images["combined"] = self.combine(force=force)
+            # Band splits share one epoch: combining them into a joint model would be wrong.
+            if not all(getattr(o, "_band_of", None) for o in self._observations):
+                images["combined"] = self.combine(force=force)
         except Exception as exc:  # noqa: BLE001 - the per-epoch products are complete and must survive
             warnings.warn(f"multi-epoch combination failed: {exc}")
         return images

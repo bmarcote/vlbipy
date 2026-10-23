@@ -1,6 +1,6 @@
 """A drop-in replacement for ``casatasks.fringefit`` for the dask-ms backend (numpy fringe solver).
 
-:func:`run_fringefit` accepts the keyword set of the CASA task (``vis``, ``caltable``, the data
+:func:`fringefit` accepts the keyword set of the CASA task (``vis``, ``caltable``, the data
 selection, the solve options and the on-the-fly prior lists). Each (field, scan) is one job run in
 a worker process (:mod:`vlbipy.solvers.workers`): it reads the parallel hands of the selected
 channels straight from the measurement set (:mod:`vlbipy.solvers.msio`), applies the priors, and
@@ -260,7 +260,7 @@ def solve_scan_job(*, specs: list[dict], setup: dict, engine: str, columns: list
                         int(specs[0]["scan"]))
 
 
-def run_fringefit(vis: str, caltable: str, *, field="", spw="", scan="", timerange="", antenna="",
+def fringefit(vis: str, caltable: str, *, field="", spw="", scan="", timerange="", antenna="",
                   solint="inf", combine="", refant="", minsnr=3.0, zerorates=False, globalsolve=True, niter=100,
                   paramactive=None, delaywindow=None, ratewindow=None, parang=False, gaintable=None,
                   gainfield=None, interp=None, spwmap=None, docallib=False, workers: Optional[int] = None,
@@ -274,7 +274,7 @@ def run_fringefit(vis: str, caltable: str, *, field="", spw="", scan="", timeran
     (``corrdepflags``, ``selectdata``, ...) are ignored. Returns the table path.
     """
     if docallib:
-        raise NotImplementedError("run_fringefit: cal-library files are not supported; pass gaintable lists")
+        raise NotImplementedError("fringefit: cal-library files are not supported; pass gaintable lists")
     t_start = _time.time()
     vis, caltable = str(vis), Path(caltable)
     engine = table_engine()
@@ -288,7 +288,7 @@ def run_fringefit(vis: str, caltable: str, *, field="", spw="", scan="", timeran
     antennas, among = parse_antennas(antenna, setup["antenna_names"])
     refant_chain = parse_names(refant, setup["antenna_names"]) if str(refant).strip() else []
     if not refant_chain:
-        raise ValueError("run_fringefit: a reference antenna (chain) is required")
+        raise ValueError("fringefit: a reference antenna (chain) is required")
     solint_sec = parse_solint(solint)
     combine_spw = "spw" in str(combine)
     spw_groups = [sorted(spw_sel)] if combine_spw else [[s] for s in sorted(spw_sel)]
@@ -314,7 +314,7 @@ def run_fringefit(vis: str, caltable: str, *, field="", spw="", scan="", timeran
     ddids = {ddid for ddid, s in enumerate(setup["ddid_to_spw"]) if int(s) in spw_sel}
     selected = select_runs(layout, fields=field_ids, scans=scans, ddids=ddids, timerange=trange)
     if not selected.size:
-        raise ValueError(f"run_fringefit: no data for field={field!r} scan={scan!r}")
+        raise ValueError(f"fringefit: no data for field={field!r} scan={scan!r}")
     common = {"setup": setup, "engine": engine, "columns": layout["columns"], "data_column": data_column,
               "spw_sel": spw_sel, "spw_groups": spw_groups, "refant_chain": refant_chain, "solint_sec": solint_sec,
               "solve_kwargs": solve_kwargs, "antennas": antennas, "among": among, "timerange": trange,
@@ -326,10 +326,10 @@ def run_fringefit(vis: str, caltable: str, *, field="", spw="", scan="", timeran
             for field_id, scan_no in keys]
     # Longest scans first: the pool then finishes with short jobs instead of waiting on one long straggler.
     order = np.argsort([-sum(spec["nrow"] for spec in job["specs"]) for job in jobs], kind="stable")
-    results = run_jobs("vlbipy.solvers.fringefit_task:solve_scan_job", [jobs[i] for i in order], workers)
+    results = run_jobs("vlbipy.solvers.fringefit:solve_scan_job", [jobs[i] for i in order], workers)
     rows = [r for group in results for r in group]
     if not rows:
-        raise RuntimeError("run_fringefit: no solution interval had data")
+        raise RuntimeError("fringefit: no solution interval had data")
     _write_table(caltable, vis, setup, rows, spw_sel, combine_spw)
     n_ok = sum(r["n_ok"] for r in rows)
     logger.info("fringefit[dask-ms]: {} interval(s) on {} scan(s), {} antenna solutions, median SNR {:.0f}; "

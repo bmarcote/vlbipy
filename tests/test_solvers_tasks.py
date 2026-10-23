@@ -16,10 +16,10 @@ import pytest
 casatools = pytest.importorskip("casatools")
 
 from vlbipy.solvers import caltable, msio, workers  # noqa: E402
-from vlbipy.solvers.apply_task import apply_to_ms  # noqa: E402
-from vlbipy.solvers.fringefit_task import run_fringefit  # noqa: E402
-from vlbipy.solvers.gain_task import (_solve_shape_and_continuum, fill_channel_gaps, normalise_bandpass,  # noqa: E402
-                                      reference_gains, run_bandpass, run_gaincal, solve_antenna_gains)
+from vlbipy.solvers.applycal import apply_to_ms  # noqa: E402
+from vlbipy.solvers.fringefit import fringefit  # noqa: E402
+from vlbipy.solvers.gain import (_solve_shape_and_continuum, fill_channel_gaps, normalise_bandpass,  # noqa: E402
+                                      reference_gains, bandpass, gaincal, solve_antenna_gains)
 
 NANT, NSPW, NCHAN, NCORR, NTIME = 5, 2, 16, 4, 24
 CHAN_FREQ = np.array([[1.60e9 + 1e6 * c for c in range(NCHAN)], [1.70e9 + 1e6 * c for c in range(NCHAN)]])
@@ -277,12 +277,12 @@ def _read_table(path):
 def test_run_bandpass_recovers_the_bandpass(sim, tmp_path):
     # CASA's estimator (a point-source fit per channel) and the default (band shape x continuum gain).
     for divide, tolerance in ((False, 0.02), (True, 0.03)):
-        table = run_bandpass(str(sim["ms"]), str(tmp_path / "sim.B"), field="CAL", solint="inf", combine="scan",
+        table = bandpass(str(sim["ms"]), str(tmp_path / "sim.B"), field="CAL", solint="inf", combine="scan",
                              refant="A0", minsnr=3.0, solnorm=False, workers=2, divide_continuum=divide)
         param, flag, snr, ant, spw, ref = _read_table(table)
         assert param.shape == (NANT * NSPW, NCHAN, 2) and not flag.any() and np.all(ref == 0) and np.all(snr > 3)
         np.testing.assert_allclose(param, sim["gains"][ant, spw], atol=tolerance)
-    normalised = run_bandpass(str(sim["ms"]), str(tmp_path / "norm.B"), field="CAL", solint="inf", combine="scan",
+    normalised = bandpass(str(sim["ms"]), str(tmp_path / "norm.B"), field="CAL", solint="inf", combine="scan",
                               refant="A0", solnorm=True, spw="0:2~13", workers=1)
     param, flag, _, ant, spw, _ = _read_table(normalised)
     assert set(spw) == {0} and flag[:, [0, 1, 14, 15]].all() and not flag[:, 2:14].any()
@@ -290,10 +290,10 @@ def test_run_bandpass_recovers_the_bandpass(sim, tmp_path):
 
 
 def test_run_gaincal_solves_amplitudes_per_interval(sim, tmp_path):
-    bandpass = run_bandpass(str(sim["ms"]), str(tmp_path / "sim.B"), field="CAL", solint="inf", combine="scan",
-                            refant="A0", solnorm=True, workers=1)
-    table = run_gaincal(str(sim["ms"]), str(tmp_path / "sim.G"), field="CAL", solint="inf", combine="", calmode="a",
-                        refant="A0", gaintable=[str(bandpass)], interp=["nearest,nearest"], workers=2)
+    bp = bandpass(str(sim["ms"]), str(tmp_path / "sim.B"), field="CAL", solint="inf", combine="scan",
+                        refant="A0", solnorm=True, workers=1)
+    table = gaincal(str(sim["ms"]), str(tmp_path / "sim.G"), field="CAL", solint="inf", combine="", calmode="a",
+                        refant="A0", gaintable=[str(bp)], interp=["nearest,nearest"], workers=2)
     param, flag, _, ant, spw, _ = _read_table(table)
     assert param.shape == (2 * NANT * NSPW, 1, 2) and not flag.any()               # one solution per scan and subband
     level = np.sqrt(np.mean(np.abs(sim["gains"]) ** 2, axis=2))                    # what solnorm took out of the bandpass
@@ -304,11 +304,11 @@ def test_run_gaincal_solves_amplitudes_per_interval(sim, tmp_path):
     assert list(tb.getcol("NUM_CHAN")) == [1, 1]                                    # CASA cannot read it otherwise
     tb.close()
     with pytest.raises(NotImplementedError):
-        run_gaincal(str(sim["ms"]), str(tmp_path / "bad.G"), field="CAL", gaintype="K")
+        gaincal(str(sim["ms"]), str(tmp_path / "bad.G"), field="CAL", gaintype="K")
 
 
 def test_run_fringefit_recovers_delays(sim, tmp_path):
-    table = run_fringefit(str(sim["ms"]), str(tmp_path / "sim.sbd"), field="CAL", scan="1", solint="inf",
+    table = fringefit(str(sim["ms"]), str(tmp_path / "sim.sbd"), field="CAL", scan="1", solint="inf",
                           refant="A0", minsnr=5.0, zerorates=True, workers=2)
     param, flag, snr, ant, spw, ref = _read_table(table)
     assert param.shape == (NANT * NSPW, 1, 8) and not flag.any() and np.all(ref == 0)
@@ -323,17 +323,17 @@ def test_run_fringefit_recovers_delays(sim, tmp_path):
 
 
 def test_apply_to_ms_writes_corrected_data_flags_and_weights(sim, tmp_path):
-    bandpass = run_bandpass(str(sim["ms"]), str(tmp_path / "sim.B"), field="CAL", solint="inf", combine="scan",
+    bp = bandpass(str(sim["ms"]), str(tmp_path / "sim.B"), field="CAL", solint="inf", combine="scan",
                             refant="A0", solnorm=False, workers=1)
-    gain = run_gaincal(str(sim["ms"]), str(tmp_path / "sim.G"), field="CAL", solint="inf", combine="scan",
-                       calmode="a", refant="A0", gaintable=[str(bandpass)], interp=["nearest,nearest"], workers=1)
+    gain = gaincal(str(sim["ms"]), str(tmp_path / "sim.G"), field="CAL", solint="inf", combine="scan",
+                       calmode="a", refant="A0", gaintable=[str(bp)], interp=["nearest,nearest"], workers=1)
     tb = casatools.table()
-    tb.open(str(bandpass), nomodify=False)                                         # flag antenna 4, subband 1
+    tb.open(str(bp), nomodify=False)                                         # flag antenna 4, subband 1
     rows = [r for r in range(tb.nrows()) if tb.getcell("ANTENNA1", r) == 4 and tb.getcell("SPECTRAL_WINDOW_ID", r) == 1]
     for row in rows:
         tb.putcell("FLAG", row, np.ones((2, NCHAN), dtype=bool))
     tb.close()
-    entries = [{"path": str(bandpass), "interp": "nearest,nearest", "calwt": True},
+    entries = [{"path": str(bp), "interp": "nearest,nearest", "calwt": True},
                {"path": str(gain), "interp": "nearest", "calwt": True}]
     stats = apply_to_ms(sim["ms"], {0: entries}, parang=False, workers=2, chunk_rows=97)
     assert stats["rows"] == sim["data"].shape[0] and stats["flagged_after"] > stats["flagged_before"] == 0
@@ -387,13 +387,13 @@ def _columns(ms, *names):
 
 
 def test_apply_in_batches_matches_one_batch(sim, tmp_path, monkeypatch):
-    from vlbipy.solvers import apply_task
-    fringe = run_fringefit(str(sim["ms"]), str(tmp_path / "sim.K"), field="CAL", solint="20s", refant="A0",
+    from vlbipy.solvers import applycal as applycal_module
+    fringe = fringefit(str(sim["ms"]), str(tmp_path / "sim.K"), field="CAL", solint="20s", refant="A0",
                            minsnr=3.0, workers=1)
     entries = [{"path": str(fringe), "interp": "linear", "calwt": True}]
     apply_to_ms(sim["ms"], {0: entries}, parang=False, workers=1)
     whole = _columns(sim["ms"], "CORRECTED_DATA", "FLAG", "WEIGHT")
-    monkeypatch.setattr(apply_task, "BATCH_ROWS", 37)          # many batches, runs split across them
+    monkeypatch.setattr(applycal_module, "BATCH_ROWS", 37)   # many batches, runs split across them
     apply_to_ms(sim["ms"], {0: entries}, parang=False, workers=1, chunk_rows=11)
     for before, after in zip(whole, _columns(sim["ms"], "CORRECTED_DATA", "FLAG", "WEIGHT")):
         np.testing.assert_array_equal(before, after)
@@ -401,7 +401,7 @@ def test_apply_in_batches_matches_one_batch(sim, tmp_path, monkeypatch):
 
 def test_gain_grid_on_a_union_of_blocks_equals_each_block_alone(sim, tmp_path):
     from vlbipy.solvers.apply import apply_gain_grid, apply_tables, gain_grid, normalise_entries
-    fringe = run_fringefit(str(sim["ms"]), str(tmp_path / "sim.K"), field="CAL", solint="20s", refant="A0",
+    fringe = fringefit(str(sim["ms"]), str(tmp_path / "sim.K"), field="CAL", solint="20s", refant="A0",
                            minsnr=3.0, workers=1)
     entries = normalise_entries([{"path": str(fringe), "interp": "linear"}])
     rows = np.flatnonzero(sim["spw"] == 1)
@@ -422,7 +422,7 @@ def test_gain_grid_on_a_union_of_blocks_equals_each_block_alone(sim, tmp_path):
 
 def test_caltable_rows_are_indexed_once_and_found_like_a_search_of_each_antenna(sim, tmp_path):
     from vlbipy.solvers.apply import _bracket, _brackets, _lookup, load_caltable
-    table = load_caltable(run_fringefit(str(sim["ms"]), str(tmp_path / "sim.K"), field="CAL", solint="20s",
+    table = load_caltable(fringefit(str(sim["ms"]), str(tmp_path / "sim.K"), field="CAL", solint="20s",
                                         refant="A0", minsnr=3.0, workers=1))
     table.field_id[::3] = 1                                       # two fields, interleaved
     rng = np.random.default_rng(3)
@@ -454,7 +454,7 @@ def test_caltable_rows_are_indexed_once_and_found_like_a_search_of_each_antenna(
 
 def test_workers_receive_each_shared_table_once(sim, tmp_path):
     from vlbipy.solvers.apply import antenna_gains, load_caltable
-    table = load_caltable(run_fringefit(str(sim["ms"]), str(tmp_path / "sim.K"), field="CAL", solint="20s",
+    table = load_caltable(fringefit(str(sim["ms"]), str(tmp_path / "sim.K"), field="CAL", solint="20s",
                                         refant="A0", minsnr=3.0, workers=1))
     other = load_caltable(table.path)
     other.param = other.param.copy()
@@ -488,7 +488,7 @@ def test_workers_receive_each_shared_table_once(sim, tmp_path):
 
 
 def test_statwt_weights_rows_like_casa(sim):
-    from vlbipy.solvers.statwt_task import row_weights, statwt_ms
+    from vlbipy.solvers.statwt import row_weights, statwt
     tb = casatools.table()
     tb.open(str(sim["ms"]), nomodify=False)
     tb.addcols({"CORRECTED_DATA": _array("complex", [NCORR, NCHAN])})
@@ -498,7 +498,7 @@ def test_statwt_weights_rows_like_casa(sim):
     flag[1, :5, 0] = True
     tb.putcol("FLAG", np.asfortranarray(flag.T))
     tb.close()
-    report = statwt_ms(sim["ms"], column="CORRECTED_DATA", minsamp=2, workers=2)
+    report = statwt(sim["ms"], column="CORRECTED_DATA", minsamp=2, workers=2)
     weight, new_flag, flag_row = _columns(sim["ms"], "WEIGHT", "FLAG", "FLAG_ROW")
     values = sim["data"][1, 5:, 0]
     expected = 2.0 / (np.var(values.real) + np.var(values.imag))
@@ -549,7 +549,7 @@ def _split_reference(ms, column, chanbin, timebin):
 
 
 def test_split_field_averages_like_mstransform(sim, tmp_path):
-    from vlbipy.solvers.split_task import split_field
+    from vlbipy.solvers.split import split
     pytest.importorskip("casacore.tables")
     tb = casatools.table()
     tb.open(str(sim["ms"]), nomodify=False)
@@ -570,7 +570,7 @@ def test_split_field_averages_like_mstransform(sim, tmp_path):
     tb.putcol("TIME_CENTROID", sim["time"] + 0.1)
     tb.close()
     target = tmp_path / "split.ms"
-    report = split_field(sim["ms"], target, "CAL", chanbin=4, timebin=3 * DT, workers=2)
+    report = split(sim["ms"], target, "CAL", chanbin=4, timebin=3 * DT, workers=2)
     expected = _split_reference(sim["ms"], "CORRECTED_DATA", 4, 3 * DT)
     assert report["rows_out"] == len(expected)
     got = _columns(target, "SCAN_NUMBER", "DATA_DESC_ID", "ANTENNA1", "ANTENNA2", "TIME", "INTERVAL", "EXPOSURE",
@@ -606,19 +606,20 @@ def test_total_visibility_sums_every_unflagged_cross_correlation(sim):
 
 
 def test_tsys_table_assigns_each_measurement_to_its_scan_or_the_next(sim, tmp_path):
-    from vlbipy.solvers.apriori_task import write_tsys_table
+    from vlbipy.solvers.apriori import tsys
     scan_start, scan_end = T0, T0 + DT * (NTIME - 1)               # scan 1; scan 2 starts 600 s later
     times = np.array([scan_start, scan_end, scan_end + 30.0, scan_start + 600.0, scan_start + 640.0])
     rows = [(t, a, s) for t in times for a in range(NANT) for s in range(NSPW)]
     t, a, s = (np.array(c) for c in zip(*rows))
-    tsys = np.full((len(rows), 2), 80.0)
-    tsys[0] = [-1.0, 90.0]                                        # a bad value is flagged, the other hand kept
+    values = np.full((len(rows), 2), 80.0)
+    values[0] = [-1.0, 90.0]                                      # a bad value is flagged, the other hand kept
     _create(sim["ms"] / "SYSCAL", {"TIME": _scalar("double"), "ANTENNA_ID": _scalar("int"),
                                     "SPECTRAL_WINDOW_ID": _scalar("int"), "INTERVAL": _scalar("double"),
                                     "FEED_ID": _scalar("int"), "TSYS": _array("float", [2])}, len(rows),
             {"TIME": t, "ANTENNA_ID": a.astype(np.int32), "SPECTRAL_WINDOW_ID": s.astype(np.int32),
-             "INTERVAL": np.zeros(len(rows)), "FEED_ID": np.zeros(len(rows), dtype=np.int32), "TSYS": tsys})
-    report = write_tsys_table(sim["ms"], tmp_path / "sim.tsys")
+             "INTERVAL": np.zeros(len(rows)), "FEED_ID": np.zeros(len(rows), dtype=np.int32),
+             "TSYS": values})
+    report = tsys(sim["ms"], tmp_path / "sim.tsys")
     assert report["rows"] == len(rows) and report["flagged"] == 1
     tb = casatools.table()
     tb.open(str(tmp_path / "sim.tsys"))
@@ -659,19 +660,19 @@ def _add_split_columns(ms, rng):
 
 def _chain(ms, tmp_path):
     """A bandpass, an amplitude gain and a fringe table (with calwt), antenna 4 of subband 1 flagged."""
-    bandpass = run_bandpass(str(ms), str(tmp_path / "sim.B"), field="CAL", solint="inf", combine="scan",
+    bp = bandpass(str(ms), str(tmp_path / "sim.B"), field="CAL", solint="inf", combine="scan",
                             refant="A0", solnorm=False, workers=1)
-    gain = run_gaincal(str(ms), str(tmp_path / "sim.G"), field="CAL", solint="inf", combine="scan",
-                       calmode="a", refant="A0", gaintable=[str(bandpass)], interp=["nearest,nearest"], workers=1)
-    fringe = run_fringefit(str(ms), str(tmp_path / "sim.K"), field="CAL", solint="20s", refant="A0",
-                           minsnr=3.0, gaintable=[str(bandpass)], workers=1)
+    gain = gaincal(str(ms), str(tmp_path / "sim.G"), field="CAL", solint="inf", combine="scan",
+                       calmode="a", refant="A0", gaintable=[str(bp)], interp=["nearest,nearest"], workers=1)
+    fringe = fringefit(str(ms), str(tmp_path / "sim.K"), field="CAL", solint="20s", refant="A0",
+                           minsnr=3.0, gaintable=[str(bp)], workers=1)
     tb = casatools.table()
-    tb.open(str(bandpass), nomodify=False)
+    tb.open(str(bp), nomodify=False)
     for row in range(tb.nrows()):
         if tb.getcell("ANTENNA1", row) == 4 and tb.getcell("SPECTRAL_WINDOW_ID", row) == 1:
             tb.putcell("FLAG", row, np.ones((2, NCHAN), dtype=bool))
     tb.close()
-    return [{"path": str(bandpass), "interp": "nearest,linear", "calwt": True},
+    return [{"path": str(bp), "interp": "nearest,linear", "calwt": True},
             {"path": str(gain), "interp": "nearest", "calwt": True},
             {"path": str(fringe), "interp": "linear", "calwt": True}]
 
@@ -696,11 +697,11 @@ def _assert_same(left, right):
 def test_deferred_application_reads_exactly_like_the_written_one(sim, tmp_path):
     import shutil
     from vlbipy.solvers import corrected
-    from vlbipy.solvers.apply_task import apply_to_ms, defer_to_ms
+    from vlbipy.solvers.applycal import apply_to_ms, defer_to_ms
     from vlbipy.solvers.plot_read import (read_baseline_timeline, read_dynamic_spectra, read_timeseries,
                                           read_total_visibility, read_uvdistance)
-    from vlbipy.solvers.split_task import split_field
-    from vlbipy.solvers.statwt_task import statwt_ms
+    from vlbipy.solvers.split import split
+    from vlbipy.solvers.statwt import statwt
     pytest.importorskip("casacore.tables")
     _add_split_columns(sim["ms"], np.random.default_rng(5))
     entries = _chain(sim["ms"], tmp_path)
@@ -714,7 +715,7 @@ def test_deferred_application_reads_exactly_like_the_written_one(sim, tmp_path):
     # The calibration flags are the ones applycal writes, without touching a visibility.
     np.testing.assert_array_equal(*(_columns(ms, "FLAG")[0] for ms in (written, deferred)))
     # A later solve rewrites a table in place: the deferred chain keeps the version it was given.
-    run_gaincal(str(sim["ms"]), entries[1]["path"], field="CAL", solint="20s", calmode="ap", refant="A0",
+    gaincal(str(sim["ms"]), entries[1]["path"], field="CAL", solint="20s", calmode="ap", refant="A0",
                 workers=1)
     edges = np.linspace(sim["time"].min(), sim["time"].max() + 1, 7)
     reads = [
@@ -731,12 +732,12 @@ def test_deferred_application_reads_exactly_like_the_written_one(sim, tmp_path):
     for read in reads:
         _assert_same(read(written), read(deferred))
     # statwt measures the scatter of the corrected data; afterwards its weights are the ones the split uses.
-    reports = [statwt_ms(ms, column="CORRECTED_DATA", workers=2) for ms in (written, deferred)]
+    reports = [statwt(ms, column="CORRECTED_DATA", workers=2) for ms in (written, deferred)]
     assert reports[0]["flagged_after"] == reports[1]["flagged_after"] and reports[0]["mean"] == reports[1]["mean"]
     for name in ("WEIGHT", "FLAG", "FLAG_ROW"):
         _assert_same(*(_columns(ms, name)[0] for ms in (written, deferred)))
     for ms in (written, deferred):
-        split_field(ms, tmp_path / f"{ms.stem}.split.ms", "CAL", chanbin=4, timebin=3 * DT, workers=2)
+        split(ms, tmp_path / f"{ms.stem}.split.ms", "CAL", chanbin=4, timebin=3 * DT, workers=2)
     names = ("DATA", "FLAG", "WEIGHT", "SIGMA", "TIME", "UVW", "TIME_CENTROID", "EXPOSURE")
     for left, right in zip(_columns(tmp_path / "written.split.ms", *names),
                            _columns(tmp_path / "deferred.split.ms", *names)):
@@ -760,9 +761,9 @@ def _main_columns(ms):
 def test_a_new_deferred_chain_rebuilds_the_weights_and_an_applycal_clears_the_record(sim, tmp_path):
     import shutil
     from vlbipy.solvers import corrected
-    from vlbipy.solvers.apply_task import apply_to_ms, defer_to_ms
-    from vlbipy.solvers.split_task import split_field
-    from vlbipy.solvers.statwt_task import statwt_ms
+    from vlbipy.solvers.applycal import apply_to_ms, defer_to_ms
+    from vlbipy.solvers.split import split
+    from vlbipy.solvers.statwt import statwt
     pytest.importorskip("casacore.tables")
     _add_split_columns(sim["ms"], np.random.default_rng(6))
     entries = _chain(sim["ms"], tmp_path)
@@ -772,9 +773,9 @@ def test_a_new_deferred_chain_rebuilds_the_weights_and_an_applycal_clears_the_re
     # applycal -> statwt -> applycal again (other tables) -> split, against the same with deferred applications.
     for ms, apply in ((written, apply_to_ms), (deferred, defer_to_ms)):
         apply(ms, {0: entries}, parang=False, workers=2)
-        statwt_ms(ms, column="CORRECTED_DATA", workers=2)
+        statwt(ms, column="CORRECTED_DATA", workers=2)
         apply(ms, {0: entries[:2]}, parang=False, workers=2)
-        split_field(ms, tmp_path / f"{ms.stem}.split.ms", "CAL", chanbin=4, timebin=3 * DT, workers=2)
+        split(ms, tmp_path / f"{ms.stem}.split.ms", "CAL", chanbin=4, timebin=3 * DT, workers=2)
     for left, right in zip(_columns(tmp_path / "written.split.ms", "DATA", "WEIGHT", "FLAG"),
                            _columns(tmp_path / "deferred.split.ms", "DATA", "WEIGHT", "FLAG")):
         _assert_same(left, right)
@@ -787,7 +788,7 @@ def test_a_new_deferred_chain_rebuilds_the_weights_and_an_applycal_clears_the_re
 
 def test_applycal_on_top_of_corrected_data_equals_the_whole_chain(sim, tmp_path):
     import shutil
-    from vlbipy.solvers.apply_task import apply_to_ms, applycal
+    from vlbipy.solvers.applycal import apply_to_ms, applycal
     entries = _chain(sim["ms"], tmp_path)
     whole, stepwise = tmp_path / "whole.ms", tmp_path / "stepwise.ms"
     shutil.copytree(sim["ms"], whole)
@@ -808,7 +809,7 @@ def test_applycal_on_top_of_corrected_data_equals_the_whole_chain(sim, tmp_path)
 
 def test_a_table_of_another_set_is_matched_by_antenna_name(sim, tmp_path):
     from vlbipy.solvers.apply import adapt_table, load_caltable
-    gain = load_caltable(run_gaincal(str(sim["ms"]), str(tmp_path / "sim.G"), field="CAL", solint="inf",
+    gain = load_caltable(gaincal(str(sim["ms"]), str(tmp_path / "sim.G"), field="CAL", solint="inf",
                                      combine="scan", calmode="ap", refant="A0", workers=1))
     # The same table numbered for an array listed backwards, with an extra antenna and without A0.
     order = ["A4", "XX", "A3", "A2", "A1"]
@@ -828,8 +829,8 @@ def test_interleaved_subbands_are_corrected_like_blocked_ones(sim, tmp_path):
     """A split or an mstransform output interleaves the subbands row by row: every run of the layout is one row.
     The correction must not depend on that order (nor take a pass per row)."""
     import shutil
-    from vlbipy.solvers.apply_task import apply_to_ms, defer_to_ms
-    from vlbipy.solvers.split_task import split_field
+    from vlbipy.solvers.applycal import apply_to_ms, defer_to_ms
+    from vlbipy.solvers.split import split
     tables = pytest.importorskip("casacore.tables")
     _add_split_columns(sim["ms"], np.random.default_rng(7))
     entries = _chain(sim["ms"], tmp_path)
@@ -856,7 +857,7 @@ def test_interleaved_subbands_are_corrected_like_blocked_ones(sim, tmp_path):
         np.testing.assert_array_equal(left, right)
     np.testing.assert_array_equal(*(by_row(ms, "FLAG")[0] for ms in (interleaved, deferred)))
     for ms in (interleaved, deferred):
-        split_field(ms, tmp_path / f"{ms.stem}.split.ms", "CAL", chanbin=4, timebin=3 * DT, workers=2)
+        split(ms, tmp_path / f"{ms.stem}.split.ms", "CAL", chanbin=4, timebin=3 * DT, workers=2)
     for left, right in zip(_columns(tmp_path / "interleaved.split.ms", "DATA", "FLAG", "WEIGHT"),
                            _columns(tmp_path / "interleaved_deferred.split.ms", "DATA", "FLAG", "WEIGHT")):
         np.testing.assert_array_equal(left, right)
@@ -915,8 +916,8 @@ def _rows_only_in_the_lock_file(path):
 def test_frozen_tables_keep_the_rows_only_their_lock_files_hold(sim, tmp_path):
     from vlbipy.solvers import corrected
     from vlbipy.solvers.apply import load_caltable
-    from vlbipy.solvers.apply_task import defer_to_ms
-    table = run_fringefit(str(sim["ms"]), str(tmp_path / "sim.K"), field="CAL", solint="20s", refant="A0",
+    from vlbipy.solvers.applycal import defer_to_ms
+    table = fringefit(str(sim["ms"]), str(tmp_path / "sim.K"), field="CAL", solint="20s", refant="A0",
                           minsnr=3.0, workers=1)
     nspw = _rows_only_in_the_lock_file(Path(table) / "SPECTRAL_WINDOW")
     ms = tmp_path / "deferred.ms"

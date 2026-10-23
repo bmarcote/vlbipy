@@ -614,7 +614,7 @@ class DummyExportOps(ExportOps):
     def uvfits(self, project_code: str, source: str, **kwargs) -> str:
         """Return the path a real UVFITS export would produce."""
         path = _synthetic_path(self.work_dir, "export", f"{project_code}_{source}.uvfits")
-        _log("export_uvfits", project=project_code, source=source, output=path, **kwargs)
+        _log("exportuvfits", project=project_code, source=source, output=path, **kwargs)
         return path
 
     def ms(self, project_code: str, source: str, **kwargs) -> str:

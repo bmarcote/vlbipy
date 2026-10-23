@@ -546,7 +546,7 @@ def _cmd_applycal(obs: Optional[VLBIObs], args: argparse.Namespace) -> int:
         return 0
     if not caltables:
         raise SystemExit("applycal: no calibration table given")
-    from .solvers.apply_task import applycal
+    from .solvers.applycal import applycal
     if args.flagbackup:
         import casatasks
         casatasks.flagmanager(vis=ms, mode="save", versionname="before_applycal", merge="replace")

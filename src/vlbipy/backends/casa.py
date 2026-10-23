@@ -34,7 +34,8 @@ logger = get_logger()
 
 #: A-priori caltable name suffix and apply-interpolation per calibration type.
 APRIORI_TABLE_SPECS = {"accor": (".accor", "nearest"), "tsys": (".tsys", "nearest"),
-                       "gc": (".gcal", "nearest"), "eop": (".eop", "nearest")}
+                       "gc": (".gcal", "nearest"), "eop": (".eop", "nearest"),
+                       "tec": (".tec", "linear")}
 
 #: SNR value CASA writes for the reference antenna's own (trivial) solution.
 _REFANT_SNR_SENTINEL = 999.0
@@ -566,7 +567,7 @@ class CasaDataOps(DataOps):
 
         if mms:
             # Flag versions of a previous (deleted) MMS make partition refuse to write.
-            stale_flags = target.with_name(f"{target.name}.flagversions")
+            stale_flags = target.with_name(f"{target.name}.flagmanager")
             if stale_flags.exists():
                 shutil.rmtree(stale_flags)
             logger.info("partition: {} -> {} (Multi-MS for parallel I/O)", plain_ms.name, target.name)
@@ -656,7 +657,7 @@ class CasaDataOps(DataOps):
         except RuntimeError as exc:
             raise BackendError(f"{project_code}: clearcal failed: {exc}") from exc
         if unflag:
-            imported = ms.with_name(f"{ms.name}.flagversions") / f"flags.{IMPORT_FLAG_VERSION}"
+            imported = ms.with_name(f"{ms.name}.flagmanager") / f"flags.{IMPORT_FLAG_VERSION}"
             try:
                 if imported.exists():
                     # Back to the flags of the import (zero-weight data), not to no flags at all.
@@ -1979,7 +1980,7 @@ class CasaCalibrationOps(CalibrationOps):
     """Calibration solves via casatasks (a-priori and the SNR survey so far)."""
 
     def a_priori(self, project_code: str, field: str, *, needs_eop: bool = False,
-                 eop_file: Optional[str] = None, **kwargs) -> list[CalTable]:
+                 eop_file: Optional[str] = None, needs_tec: bool = False, **kwargs) -> list[CalTable]:
         """A-priori amplitude calibration: gencal Tsys + gain curve (+ EOP where needed).
 
         Runs ``gencal(caltype='tsys', uniform=False)`` (from the SYSCAL subtable) and
@@ -2037,6 +2038,15 @@ class CasaCalibrationOps(CalibrationOps):
                 self._record_gain_curve_dpfu(ms, table_path)
         if not needs_eop:
             logger.info("EOP corrections not needed for this network; skipped")
+        if needs_tec:
+            # CASA's ionospheric corrections (gencal 'tecim' / F Jones, as AIPS TECOR's
+            # equivalent) carry a sign convention that has been seen to double the
+            # ionospheric delay instead of removing it — see vlbipy.solvers.tec.
+            # Do not produce one here; the dask-ms backend computes it natively.
+            warnings.warn(f"{project_code}: the ionosphere matters at this frequency, but CASA's "
+                          "TEC corrections are not reliable (their sign convention can double the "
+                          "dispersive delays rather than remove them); skipping the TEC correction. "
+                          "The dask-ms backend applies it from IONEX maps")
         return tables
 
     def _run_gencal_task(self, params: dict) -> None:
@@ -2123,7 +2133,8 @@ class CasaCalibrationOps(CalibrationOps):
             # corrdepflags: a station with one dead polarization has that autocorrelation flagged
             # (DiFX gives it zero weight). Without this, accor drops the whole row and the working
             # polarization gets no solution either, which then flags the antenna altogether.
-            self.backend.tasks.accor(vis=str(ms), caltable=str(raw), solint=str(solint), corrdepflags=True)
+            self._run_accor_task({"vis": str(ms), "caltable": str(raw), "solint": str(solint),
+                                  "corrdepflags": True})
         except RuntimeError as exc:
             warnings.anomaly(f"{project_code}: accor failed ({exc}); the correlator amplitude correction is "
                              "not applied")
@@ -2137,12 +2148,100 @@ class CasaCalibrationOps(CalibrationOps):
             logger.info("smoothcal smoothtype='{}' smoothtime={:g} s -> {}", smoothtype, float(smoothtime),
                         smoothed.name)
             try:
-                self.backend.tasks.smoothcal(vis=str(ms), tablein=str(raw), caltable=str(smoothed),
-                                             smoothtype=str(smoothtype), smoothtime=float(smoothtime))
+                self._run_smoothcal_task({"vis": str(ms), "tablein": str(raw), "caltable": str(smoothed),
+                                          "smoothtype": str(smoothtype), "smoothtime": float(smoothtime)})
                 applied = smoothed
             except RuntimeError as exc:
                 warnings.warn(f"{project_code}: smoothcal of the accor table failed ({exc}); applying it unsmoothed")
         return CalTable(cal_type="accor", path=str(applied), field=field, interp=APRIORI_TABLE_SPECS["accor"][1])
+
+    def _set_model_column(self, ms: Path, field: str, model: str) -> None:
+        """Fill MODEL_DATA of ``field`` from the model image (engine hook: native under dask-ms)."""
+        self.backend.tasks.setjy(vis=str(ms), field=field, model=str(model), scalebychan=True)
+
+    def emerlin_scale(self, project_code: str, field: str, antennas: list[str], fixed: str, *,
+                      model: str, flux_total: Optional[float] = None,
+                      gaintable: Optional[list] = None, callib: bool = False, **kwargs) -> Optional[CalTable]:
+        """Amplitude gains of the e-MERLIN outstations from a modelled flux calibrator (3C286).
+
+        The e-MERLIN outstations lack reliable Tsys, so their subband amplitudes
+        are rescaled against the known source: the model is written into
+        MODEL_DATA, amplitude gains are solved for ``antennas`` on the baselines
+        among them and ``fixed`` (``calmode='a'``, ``solint='inf'``), the
+        solutions are renormalised so that ``fixed`` keeps gain 1, and every
+        other antenna gets unit gain — the table can then sit in the apply chain
+        and correct only the e-MERLIN data.
+
+        Returns the CalTable (cal_type ``emgain``), or None when the solve produced nothing.
+        """
+        ms = self.backend.ms_path(project_code)
+        table_path = self.backend.caldir() / f"{project_code}.emgain"
+        if table_path.exists():
+            shutil.rmtree(table_path)
+        self._set_model_column(ms, field, model)
+        # Both groups: baselines outstation-outstation and outstation-Jb.
+        selection = "&".join([",".join(antennas), ",".join([*antennas, fixed])])
+        params = {"vis": str(ms), "caltable": str(table_path), "field": field, "calmode": "a",
+                  "solint": "inf", "antenna": selection, "minsnr": 1.0, "parang": True}
+        params.update(self._prior_callib(project_code, gaintable, table_path, field=field, callib=callib))
+        try:
+            self._run_gaincal_task(params)
+        except RuntimeError as exc:
+            warnings.warn(f"{project_code}: e-MERLIN flux-scale gaincal failed ({exc}); "
+                          "the outstations keep their a-priori amplitudes")
+            return None
+        if not table_path.is_dir():
+            warnings.warn(f"{project_code}: e-MERLIN flux-scale produced no table")
+            return None
+        self._normalise_emerlin_table(table_path, antennas, fixed)
+        return CalTable(cal_type="emgain", path=str(table_path), field=field, gainfield=field,
+                        interp="nearest")
+
+    def _normalise_emerlin_table(self, table_path: Path, antennas: list[str], fixed: str) -> None:
+        """Divide every solution by the ``fixed`` antenna's gain and set unit gain for the rest."""
+        names = {n.lower() for n in antennas} | {fixed.lower()}
+        handle = self.backend.tools.table()
+        handle.open(str(table_path), nomodify=False)
+        try:
+            ant_ids = np.asarray(handle.getcol("ANTENNA1"))
+            gparam = np.asarray(handle.getcol("CPARAM"))           # (nparam, nchan, nrow)
+            flags = np.asarray(handle.getcol("FLAG"))
+            ant_names = self._table_antenna_names(table_path)
+            fixed_rows = {i for i, a in enumerate(ant_ids) if ant_names[a].lower() == fixed.lower()}
+            solved_rows = {i for i, a in enumerate(ant_ids) if ant_names[a].lower() in names}
+            if not fixed_rows:
+                warnings.warn(f"emgain: {fixed} has no solution; gains normalised to the mean")
+            # Per (time, spw) group, divide by the fixed antenna's gain.
+            spw_ids = np.asarray(handle.getcol("SPECTRAL_WINDOW_ID"))
+            times = np.asarray(handle.getcol("TIME"))
+            for key in set(zip(times.tolist(), spw_ids.tolist())):
+                rows = np.flatnonzero((times == key[0]) & (spw_ids == key[1]))
+                ref = [r for r in rows if r in fixed_rows]
+                ref_gain = gparam[:, :, ref[0]].copy() if ref else np.ones(gparam.shape[:2])
+                ref_gain = np.where(ref_gain == 0, 1.0, ref_gain)
+                for r in rows:
+                    name = ant_names[ant_ids[r]].lower()
+                    if r in solved_rows and name != fixed.lower():
+                        gparam[:, :, r] = gparam[:, :, r] / ref_gain
+                        flags[:, :, r] = flags[:, :, r] | ~np.isfinite(gparam[:, :, r])
+                    else:
+                        gparam[:, :, r] = 1.0 + 0.0j
+                        flags[:, :, r] = False
+            handle.putcol("CPARAM", gparam)
+            handle.putcol("FLAG", flags)
+            handle.flush()
+        finally:
+            handle.close()
+        logger.info("emgain: e-MERLIN gains of {} normalised to {}=1; all other antennas set to 1",
+                    table_path.name, fixed)
+
+    def _run_accor_task(self, params: dict) -> None:
+        """Run ``accor`` with ``params`` (engine hook: the dask-ms backend solves it natively)."""
+        self.backend.tasks.accor(**params)
+
+    def _run_smoothcal_task(self, params: dict) -> None:
+        """Run ``smoothcal`` with ``params`` (engine hook: the dask-ms backend smooths natively)."""
+        self.backend.tasks.smoothcal(**params)
 
     def _all_flagged(self, table_path: Path) -> bool:
         """True when a calibration table has no row, or no unflagged solution."""
@@ -2888,6 +2987,10 @@ class CasaCalibrationOps(CalibrationOps):
         callib : bool
             Use a CASA cal-library file for the on-the-fly priors instead of
             explicit parallel lists.
+        delaywindow, ratewindow : list, optional
+            Search-window limits of the fringe fit ([-w, +w] ns and mHz,
+            ``[calibration.mbd]``). Restricting them cuts false detections
+            on weak calibrators; unset keeps the whole window.
 
         Returns
         -------
@@ -2903,6 +3006,9 @@ class CasaCalibrationOps(CalibrationOps):
         params = {"caltable": str(table_path), "field": field, "spw": spw, "solint": solint,
                   "combine": combine, "zerorates": zerorates, "corrdepflags": True,
                   "refant": self.refant_chain(meta, refant), "minsnr": minsnr, "parang": True}
+        for window in ("delaywindow", "ratewindow"):
+            if kwargs.get(window) is not None:
+                params[window] = kwargs[window]
         if dispersive:
             # paramactive = [delay, rate, dispersive delay]; zerorates is separate,
             # it zeroes the fitted rates in the output rather than not fitting them.
@@ -5274,6 +5380,25 @@ class CasaFlagOps(FlagOps):
 
 class CasaExportOps(ExportOps):
     """Split calibrated data per source and export it."""
+
+    def split_band(self, project_code: str, spws: list[int], target: str) -> str:
+        """Split the subbands ``spws`` (all fields, DATA column) into the measurement set ``target``.
+
+        Used to separate the bands of a multi-band observation (e.g. S/X), each of
+        which is calibrated independently afterwards.
+        """
+        ms = self.backend.ms_path(project_code)
+        target = Path(target)
+        if target.exists():
+            shutil.rmtree(target)
+        params = {"vis": str(ms), "outputvis": str(target), "datacolumn": "data",
+                  "spw": ",".join(str(s) for s in spws), "keepflags": True}
+        logger.info("mstransform: {} spw={} -> {}", ms.name, params["spw"], target.name)
+        try:
+            self.backend.tasks.mstransform(**params)
+        except RuntimeError as exc:
+            raise BackendError(f"{project_code}: mstransform band split failed: {exc}") from exc
+        return str(target)
 
     def ms(self, project_code: str, source: str, *, datacolumn: str = "corrected",
            chanbin: int = -1, timebin: str = "", keepflags: bool = True,

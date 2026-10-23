@@ -1,4 +1,4 @@
-"""Native concat (solvers/concat_task.py): a synthetic two-epoch case and a comparison with casatasks.concat."""
+"""Native concat (solvers/concat.py): a synthetic two-epoch case and a comparison with casatasks.concat."""
 import filecmp
 import shutil
 import subprocess
@@ -10,7 +10,7 @@ import pytest
 from vlbipy.casacore_format.aipsio import TableRef
 from vlbipy.casacore_format.table import Table
 from vlbipy.casacore_format.writer import array_column, create_table, scalar_column
-from vlbipy.solvers.concat_task import concat_ms
+from vlbipy.solvers.concat import concat
 
 RSM07_MMS = Path(__file__).resolve().parent.parent / "test" / "RSM07_import_ref" / "RSM07.mms"
 NCHAN, NCORR = 4, 4
@@ -115,7 +115,7 @@ def test_synthetic_two_epochs(tmp_path, monkeypatch):
     # Epoch 2 lists CC first (its baselines to AA/BB come out swapped) and BB moved by 0.5 m (still matched).
     second = _write_ms(tmp_path / "e2.ms", [("CC", 3e6), ("AA", 1e6), ("BB", 2e6 + 0.5)], t0 + 30 * DAY, seed=2)
     # Given in reverse time order: concat processes them by their first TIME.
-    report = concat_ms([tmp_path / "e2.ms", tmp_path / "e1.ms"], tmp_path / "out.ms", scales=[2.0, 1.0])
+    report = concat([tmp_path / "e2.ms", tmp_path / "e1.ms"], tmp_path / "out.ms", scales=[2.0, 1.0])
     assert report["rows"] == 2 * len(first["TIME"]) and report["antennas"] == 3 and report["observations"] == 2
     assert report["spectral_windows"] == 2 and report["fields"] == 1
     out = _read(tmp_path / "out.ms", ["ANTENNA1", "ANTENNA2", "SCAN_NUMBER", "OBSERVATION_ID", "UVW", "DATA",
@@ -146,7 +146,7 @@ def test_synthetic_two_epochs(tmp_path, monkeypatch):
 def test_multi_ms_is_left_to_casa(tmp_path):
     (tmp_path / "x.ms" / "SUBMSS").mkdir(parents=True)
     with pytest.raises(NotImplementedError):
-        concat_ms([tmp_path / "x.ms", tmp_path / "x.ms"], tmp_path / "out.ms")
+        concat([tmp_path / "x.ms", tmp_path / "x.ms"], tmp_path / "out.ms")
 
 
 def _shift_epoch(source: Path, dest: Path, seconds: float) -> None:
@@ -167,13 +167,13 @@ def test_rsm07_concat_matches_casa(tmp_path, monkeypatch):
     monkeypatch.setenv("VLBIPY_TABLE_ENGINE", "native")
     from casatasks import concat
 
-    from vlbipy.solvers.split_task import split_field
-    from vlbipy.solvers.uvfits_task import export_uvfits
-    split_field(RSM07_MMS, tmp_path / "e1.ms", "3C345", column="DATA", chanbin=4, timebin=8.0, workers=4)
+    from vlbipy.solvers.split import split
+    from vlbipy.solvers.uvfits import exportuvfits
+    split(RSM07_MMS, tmp_path / "e1.ms", "3C345", column="DATA", chanbin=4, timebin=8.0, workers=4)
     _shift_epoch(tmp_path / "e1.ms", tmp_path / "e2.ms", 30 * DAY)
     inputs = [str(tmp_path / "e1.ms"), str(tmp_path / "e2.ms")]
     concat(vis=inputs, concatvis=str(tmp_path / "casa.ms"), respectname=True, copypointing=False)
-    concat_ms(inputs, tmp_path / "native.ms")
+    concat(inputs, tmp_path / "native.ms")
     names = ["TIME", "ANTENNA1", "ANTENNA2", "SCAN_NUMBER", "OBSERVATION_ID", "DATA_DESC_ID", "FIELD_ID", "UVW",
              "DATA", "FLAG", "WEIGHT", "SIGMA", "WEIGHT_SPECTRUM", "SIGMA_SPECTRUM", "EXPOSURE", "TIME_CENTROID"]
     casa, native = _read(tmp_path / "casa.ms", names), _read(tmp_path / "native.ms", names)
@@ -182,7 +182,7 @@ def test_rsm07_concat_matches_casa(tmp_path, monkeypatch):
     for sub in ("ANTENNA", "FEED", "OBSERVATION", "SPECTRAL_WINDOW", "EARTH_ORIENTATION", "GAIN_CURVE", "SYSCAL"):
         with Table(tmp_path / "casa.ms" / sub) as a, Table(tmp_path / "native.ms" / sub) as b:
             assert a.nrows() == b.nrows(), sub
-    export_uvfits(tmp_path / "casa.ms", tmp_path / "casa.uvfits")
-    export_uvfits(tmp_path / "native.ms", tmp_path / "native.uvfits")
+    exportuvfits(tmp_path / "casa.ms", tmp_path / "casa.uvfits")
+    exportuvfits(tmp_path / "native.ms", tmp_path / "native.uvfits")
     assert filecmp.cmp(tmp_path / "casa.uvfits", tmp_path / "native.uvfits", shallow=False)
     shutil.rmtree(tmp_path / "casa.ms")

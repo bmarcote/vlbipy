@@ -1,6 +1,6 @@
 """Apply calibration tables to a measurement set (the dask-ms backend's ``applycal``).
 
-:func:`apply_to_ms` writes what ``casatasks.applycal`` writes — CORRECTED_DATA,
+:func:`applycal` writes what ``casatasks.applycal`` writes — CORRECTED_DATA,
 the calibration flags and the calibrated weights — into the measurement set
 itself, so CASA flagging, imaging and export downstream are unaffected.
 
@@ -460,7 +460,7 @@ def apply_to_ms(ms, entries_by_field: dict, *, parang: bool = True, applymode: s
     jobs = _part_jobs(layout, resolved, ddids=ddids, scans=scans, entries_by_field=resolved, setup=setup,
                       engine=engine, columns=layout["columns"], parang=bool(parang), write_flags=mode != "calonly",
                       chunk_rows=int(chunk_rows), source=source, write_weights=bool(write_weights))
-    results = run_jobs("vlbipy.solvers.apply_task:apply_part_job", jobs, workers)
+    results = run_jobs("vlbipy.solvers.applycal:apply_part_job", jobs, workers)
     if record:
         if source == "DATA" and not partial:
             corrected.record_written(ms, entries_by_field, parang=bool(parang), write_flags=mode != "calonly")
@@ -483,7 +483,7 @@ def defer_to_ms(ms, entries_by_field: dict, *, parang: bool = True, applymode: s
 
     The calibration flags are written (unless ``applymode='calonly'``), so every later step sees the flags
     an applycal would have left; the corrected visibilities and weights are computed by whoever reads them
-    (see :mod:`vlbipy.solvers.corrected`). Same arguments and statistics as :func:`apply_to_ms`, plus
+    (see :mod:`vlbipy.solvers.corrected`). Same arguments and statistics as :func:`applycal`, plus
     ``pending``, the fields whose CORRECTED_DATA is now out of date.
     """
     from . import corrected
@@ -499,7 +499,7 @@ def defer_to_ms(ms, entries_by_field: dict, *, parang: bool = True, applymode: s
     if mode != "calonly":
         jobs = _part_jobs(layout, resolved, entries_by_field=resolved, setup=setup, engine=engine,
                           chunk_rows=int(chunk_rows))
-        results = run_jobs("vlbipy.solvers.apply_task:flag_part_job", jobs, workers)
+        results = run_jobs("vlbipy.solvers.applycal:flag_part_job", jobs, workers)
     stale = corrected.record_deferred(ms, entries_by_field, parang=bool(parang), write_flags=mode != "calonly")
     total = {name: sum(result[name] for result in results)
              for name in ("rows", "samples", "flagged_before", "flagged_after")}
@@ -663,7 +663,7 @@ def applycal(ms, caltables: list[str], *, field: str = "", spw: str = "", scan: 
     Returns
     -------
     dict
-        The statistics of :func:`apply_to_ms` plus ``source``, ``parang`` and ``fields``.
+        The statistics of :func:`applycal` plus ``source``, ``parang`` and ``fields``.
     """
     from . import corrected
     from .apply import adapt_table, load_caltable

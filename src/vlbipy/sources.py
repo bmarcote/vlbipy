@@ -128,7 +128,12 @@ class SourceSet:
                     continue
                 seen.add(name)
                 sources.append(Source(name=name, source_type=stype))
-        phaseref = {str(t): _as_list(c) for t, c in (phaseref_cfg or {}).items()}
+        # Settings of the section (strategy, order, ...) are not target->calibrator entries.
+        import dataclasses
+        from .phaseref import PhaseRefSettings
+        settings_keys = {f.name for f in dataclasses.fields(PhaseRefSettings)}
+        phaseref = {str(t): _as_list(c) for t, c in (phaseref_cfg or {}).items()
+                    if str(t).strip().lower() not in settings_keys}
         return cls(sources, phase_referencing=phaseref)
 
     # -- role accessors --

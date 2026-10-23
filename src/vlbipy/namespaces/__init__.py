@@ -351,10 +351,15 @@ class CalibrateNamespace(Namespace):
         antab = handler.get_antab_file(self._code, obs.work_dir)
         accor_cfg = dict(cal_cfg.get("accor", {}))
         needs_accor = bool(handler.needs_accor and accor_cfg.pop("enabled", True))
+        freq_ghz = obs.metadata.freq_setup.freq_ghz if obs.metadata and obs.metadata.freq_setup else 0.0
+        # The ionosphere matters below ~8 GHz for every array; the table is only
+        # produced by the native solver (CASA's TECOR sign is buggy).
+        needs_tec = bool(cal_cfg.get("ionos", True) and freq_ghz and
+                         freq_ghz < float(cal_cfg.get("ionos_max_ghz", 8.0)))
         tables = self._backend.calibrate.a_priori(
             self._code, obs.calibrator_field, needs_eop=handler.needs_eop,
             eop_file=cal_cfg.get("eop_file") or None, antab=antab,
-            needs_accor=needs_accor, accor=accor_cfg)
+            needs_accor=needs_accor, accor=accor_cfg, needs_tec=needs_tec)
         if needs_accor and obs._state.status("flag_autocorr") != "done":
             # flag.apriori left the autocorrelations for accor; it has used them now.
             obs.flag.autocorr(force=force)
@@ -923,7 +928,7 @@ class CalibrateNamespace(Namespace):
         # Everything the a-priori step made stays (Tsys, gain curve, and for DiFX data ACCOR and
         # EOP); the types are named as well for chains recorded before tables carried their step.
         apriori = [t for t in obs.gaintables
-                   if t.step == "a_priori" or t.cal_type in ("accor", "tsys", "gc", "eop")]
+                   if t.step == "a_priori" or t.cal_type in ("accor", "tsys", "gc", "eop", "tec")]
         dropped = [t.cal_type for t in obs.gaintables if t not in apriori]
         obs.set_gaintables(apriori)
         logger.info("{}: re-deriving {} from the a-priori tables on the flagged data",
@@ -995,6 +1000,74 @@ class CalibrateNamespace(Namespace):
             obs.plot.caltable(table)
         obs._state.mark_complete("scalar_bandpass", outputs=["scalar_bp"])
         return table
+
+    #: e-MERLIN outstations (antenna names as they appear in the data); Jb is the trusted reference.
+    EMERLIN_OUTSTATIONS = ("Cm", "Da", "De", "Kn", "Pi")
+    EMERLIN_REFERENCE = "Jb"
+
+    def emerlin_scale(self, *, force: bool = False, field: str = "3C286") -> Optional[CalTable]:
+        """Fix the e-MERLIN outstation amplitudes against a modelled flux calibrator.
+
+        When the array contains e-MERLIN outstations (any of ``EMERLIN_OUTSTATIONS``,
+        Jb excluded — its Tsys is trustworthy) and the flux calibrator ``field``
+        was observed, their gains are solved against the source model
+        (``[calibration.emerlin]``, models exist for the L and C bands only) on the
+        outstation–outstation and outstation–Jb baselines, Jb's gain held at 1.
+        The ``emgain`` table enters the apply chain and corrects only those
+        antennas; the same antennas are then held fixed in difmapy self-calibration.
+        """
+        obs = self._obs
+        if not obs._state.should_run("emerlin_scale", force=force):
+            return None
+        cfg = obs.config.get("calibration", {}).get("emerlin", {})
+        if not cfg.get("enabled", True):
+            return None
+        if not self._backend.supports("calibrate", "emerlin_scale"):
+            obs._state.mark_complete("emerlin_scale", outputs=[])
+            return None
+        present = {n.lower(): n for n in (obs.metadata.antennas if obs.metadata else {})}
+        antennas = [present[n] for n in present if n in {s.lower() for s in self.EMERLIN_OUTSTATIONS}]
+        jb = next((present[n] for n in present if n.startswith(self.EMERLIN_REFERENCE.lower())), "")
+        if not antennas or not jb:
+            obs._state.mark_complete("emerlin_scale", outputs=["no e-MERLIN array"])
+            return None
+        observed = set(obs.metadata.source_names or []) if obs.metadata else set()
+        if field not in observed:
+            obs._state.mark_complete("emerlin_scale", outputs=[f"{field} not observed"])
+            return None
+        freq_ghz = obs.metadata.freq_setup.freq_ghz if obs.metadata.freq_setup else 0.0
+        model = self._emerlin_model(freq_ghz, cfg)
+        if not model:
+            warnings.warn(f"{self._code}: no 3C286 model image for {freq_ghz:.2f} GHz (models cover L and C "
+                          "band); set [calibration.emerlin].model or copy the FITS into the package data "
+                          "directory (src/vlbipy/data/). The e-MERLIN amplitudes keep their a-priori values")
+            obs._state.mark_complete("emerlin_scale", outputs=["no model"])
+            return None
+        table = self._backend.calibrate.emerlin_scale(
+            self._code, field, antennas, jb, model=model, gaintable=list(obs.gaintables),
+            callib=obs.config.get("calibration", {}).get("callib", False), **cfg)
+        if table is None:
+            obs._state.mark_complete("emerlin_scale", outputs=["failed"])
+            return None
+        obs.add_gaintable(table, "emerlin_scale")
+        obs._state.mark_complete("emerlin_scale", outputs=["emgain"])
+        return table
+
+    def _emerlin_model(self, freq_ghz: float, cfg: dict) -> Optional[str]:
+        """Path of the 3C286 model image for this band (config, then package data)."""
+        band = "L" if freq_ghz < 3.0 else ("C" if freq_ghz < 8.5 else "")
+        candidates = [cfg.get("model"), cfg.get(f"model_{band.lower()}")] if band else [cfg.get("model")]
+        candidates = [c for c in candidates if c]
+        if band:
+            try:
+                from importlib.resources import files
+                candidates.append(str(files("vlbipy") / "data" / f"3C286_{band}.fits"))
+            except Exception:  # noqa: BLE001 - fall through to "no model"
+                pass
+        for candidate in candidates:
+            if candidate and Path(str(candidate)).is_file():
+                return str(candidate)
+        return None
 
     def verify_solutions(self, table: CalTable, antennas: list[str]) -> dict[str, set[int]]:
         """Warn about antennas missing solutions in subbands they actually recorded.
@@ -2421,6 +2494,11 @@ class SelfcalNamespace(Namespace):
         image_dir = Path(obs.work_dir) / "images"
         image_dir.mkdir(parents=True, exist_ok=True)
         solints = cfg.get("solints") or None
+        emgain = any(t.cal_type == "emgain" for t in obs.gaintables)
+        fixed = [s for s in CalibrateNamespace.EMERLIN_OUTSTATIONS if emgain]
+        defer_cfg = cfg.get("defer_antennas", {})
+        deferred = defer_cfg.get(obs.observatory, defer_cfg.get("default", [])) if isinstance(defer_cfg, dict) \
+            else (defer_cfg or [])
         logger.info("selfcal[{}]: difmapy on {} ({}; phases {})", src, Path(split).name,
                     "fringe finder" if is_finder else "phase calibrator", "transferred" if transfer else "kept local")
         report = difmap.calibrate_source(
@@ -2433,9 +2511,30 @@ class SelfcalNamespace(Namespace):
             prior_sigma=float(cfg.get("prior_sigma", 0.1)), workers=cfg.get("workers") or None,
             imagename=str(image_dir / f"{self._code}_{src}"), niter=int(img_cfg.get("niter", 4000)),
             gain=float(img_cfg.get("clean_gain", 0.05)), threshold_sigma=float(img_cfg.get("threshold_sigma", 3.0)),
+            fixed_antennas=tuple(fixed), deferred_antennas=tuple(deferred),
+            fix_stage1=bool(cfg.get("fix_stage1", True)),
             **{**_search_settings(img_cfg), **kwargs})
         _write_search_report(image_dir / f"{self._code}_{src}.search.json", report)
         apply_to = self._apply_to(src)
+        accumulated = report.get("accumulated_table") or ""
+        if accumulated and Path(accumulated).is_dir():
+            # Single table carrying phase + amplitude corrections accumulated by the difmapy session.
+            obs.add_gaintable(CalTable(cal_type=f"selfcal_{src}", path=accumulated, field=src, gainfield=src,
+                                       interp="linear", apply_to=apply_to, snr=0.0), step)
+            _write_search_report(image_dir / f"{self._code}_{src}.search.json", report)
+            images = [_image_from_difmap(src, info) for info in report["images"].values()]
+            rounds = [dict(r, mode="phase") for r in report["rounds"]]
+            result = SelfcalResult(src, rounds, any(r["accepted"] for r in rounds), images[0] if images else None)
+            result.images = images
+            result.report = report
+            obs._selfcal_results[src] = result
+            self._preview(src, images)
+            obs._state.mark_complete(step, outputs=[t.path for t in obs.gaintables if t.step == step])
+            if not result.converged:
+                warnings.warn(f"{self._code}: no phase self-cal step improved the fit on {src}")
+            logger.info("selfcal[{}]: {} accepted round(s); chain is now {}", src,
+                        sum(r["accepted"] for r in rounds), " -> ".join(t.cal_type for t in obs.gaintables))
+            return result
         amp_path = report["amplitude"].get("caltable", "")
         if amp_path and Path(amp_path).is_dir():
             obs.add_gaintable(CalTable(cal_type=f"selfamp_{src}", path=amp_path, field=src, gainfield=src,

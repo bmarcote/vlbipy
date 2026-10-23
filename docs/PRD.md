@@ -331,7 +331,7 @@ obs.map(fn)            # advanced: apply a callable to each Observation
 
 - A single cohesive **`Backend`** interface defines every low-level operation the namespaces
   need (import, metadata read, a-priori cal, fringefit, bandpass, gaincal, applycal, flag
-  operations, clean/wsclean/tclean, split, export_uvfits). Real backends may internally
+  operations, clean/wsclean/tclean, split, exportuvfits). Real backends may internally
   compose sub-handlers, but the API layer sees one `Backend`.
 - `VLBIObs`/`Observation` hold a `Backend` instance chosen by the `backend=` argument;
   **users never touch it.** This is the deliberate departure from the previous design, where

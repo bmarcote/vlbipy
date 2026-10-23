@@ -1,6 +1,6 @@
 """Bandpass and gain solvers for the dask-ms backend, writing CASA B/G Jones tables.
 
-:func:`run_bandpass` and :func:`run_gaincal` take the keyword sets of
+:func:`bandpass` and :func:`gaincal` take the keyword sets of
 ``casatasks.bandpass`` / ``casatasks.gaincal``. Like CASA they solve on
 *averages*: within a solution interval the calibrated visibilities of each
 baseline are vector-averaged in time (and, for a gain, over the channels), and
@@ -28,7 +28,7 @@ import numpy as np
 
 from ..logging_utils import get_logger
 from .caltable import write_jones_table
-from .fringefit_task import (_prior_entries, parse_antennas, parse_names, parse_scans, parse_solint, parse_spw,
+from .fringefit import (_prior_entries, parse_antennas, parse_names, parse_scans, parse_solint, parse_spw,
                             parse_timerange)
 from .msio import read_layout, read_setup, run_specs, select_runs, split_rows, table_engine
 from .workers import run_jobs
@@ -367,7 +367,7 @@ def _solve(vis, caltable, *, bandpass: bool, field="", spw="", scan="", timerang
            combine="", refant="", minsnr=3.0, minblperant=4, solnorm=False, fillgaps=0, calmode="ap", parang=False,
            gaintable=None, gainfield=None, interp=None, spwmap=None, docallib=False, workers: Optional[int] = None,
            data_column: str = "DATA", divide_continuum: bool = False, **ignored) -> Path:
-    """Shared driver of :func:`run_bandpass` and :func:`run_gaincal` (see those for the parameters)."""
+    """Shared driver of :func:`bandpass` and :func:`gaincal` (see those for the parameters)."""
     if docallib:
         raise NotImplementedError("cal-library files are not supported by the dask-ms solvers; pass gaintable lists")
     combine_parts = {part.strip() for part in str(combine or "").split(",") if part.strip()}
@@ -412,7 +412,7 @@ def _solve(vis, caltable, *, bandpass: bool, field="", spw="", scan="", timerang
     if not jobs:
         raise RuntimeError(f"no data selected for the {'bandpass' if bandpass else 'gain'} solve on {Path(vis).name}")
     order = np.argsort([-sum(spec["nrow"] for spec in job["specs"]) for job in jobs], kind="stable")
-    results = run_jobs("vlbipy.solvers.gain_task:accumulate_job", [jobs[i] for i in order], workers)
+    results = run_jobs("vlbipy.solvers.gain:accumulate_job", [jobs[i] for i in order], workers)
 
     sums: dict[tuple, dict] = {}
     for part in (item for group in results for item in group):
@@ -496,7 +496,7 @@ def _solve(vis, caltable, *, bandpass: bool, field="", spw="", scan="", timerang
     return caltable
 
 
-def run_bandpass(vis: str, caltable: str, *, bandtype="B", divide_continuum: bool = True, **params) -> Path:
+def bandpass(vis: str, caltable: str, *, bandtype="B", divide_continuum: bool = True, **params) -> Path:
     """Solve a per-channel bandpass into a CASA "B Jones" table (``casatasks.bandpass`` keyword set).
 
     Honoured: ``field``, ``spw``, ``scan``, ``timerange``, ``antenna``, ``solint``, ``combine``
@@ -518,7 +518,7 @@ def run_bandpass(vis: str, caltable: str, *, bandtype="B", divide_continuum: boo
     return _solve(vis, caltable, bandpass=True, divide_continuum=bool(divide_continuum), **params)
 
 
-def run_gaincal(vis: str, caltable: str, *, gaintype="G", calmode="ap", **params) -> Path:
+def gaincal(vis: str, caltable: str, *, gaintype="G", calmode="ap", **params) -> Path:
     """Solve channel-averaged antenna gains into a CASA "G Jones" table (``casatasks.gaincal`` keyword set).
 
     Honoured: the selections, ``solint`` (``'inf'``, ``'int'``, seconds), ``combine`` (``scan``/``field``),

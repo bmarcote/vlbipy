@@ -1,4 +1,4 @@
-"""The native accor + smoothcal (``vlbipy.solvers.accor_task``): a synthetic measurement set with known
+"""The native accor + smoothcal (``vlbipy.solvers.accor``): a synthetic measurement set with known
 autocorrelation scales (no CASA needed), the smoothing filter on known series, and CASA's tables for RSM07."""
 from __future__ import annotations
 
@@ -12,10 +12,10 @@ import pytest
 from vlbipy.casacore_format.aipsio import TableRef
 from vlbipy.casacore_format.table import Table
 from vlbipy.casacore_format.writer import array_column, create_table, scalar_column
-from vlbipy.solvers.accor_task import (MEDIAN_EVEN_MEAN_MAX, parse_solint, run_accor, smooth_caltable,
+from vlbipy.solvers.accor import (MEDIAN_EVEN_MEAN_MAX, parse_solint, accor, smoothcal,
                                        smooth_series)
 from vlbipy.solvers.caltable import _columns
-from vlbipy.solvers.gaincurve_task import SUBTABLE_DESCS
+from vlbipy.solvers.gaincurve import SUBTABLE_DESCS
 
 RSM07_MMS = Path(__file__).resolve().parents[1] / "test" / "RSM07_import_ref" / "RSM07.mms"
 NANT, NSPW, NCHAN, NCORR, NTIME, DT = 4, 2, 8, 4, 10, 2.0          # antenna 3 has no data at all
@@ -131,7 +131,7 @@ def native_engine(monkeypatch):
 def test_accor_recovers_the_autocorrelation_scale_of_every_antenna_subband_and_polarization(tmp_path, native_engine,
                                                                                             corrdepflags):
     ms = make_ms(tmp_path / "sim.ms")
-    report = run_accor(ms, tmp_path / "sim.accor", solint="10s", corrdepflags=corrdepflags, workers=1)
+    report = accor(ms, tmp_path / "sim.accor", solint="10s", corrdepflags=corrdepflags, workers=1)
     table = read_table(tmp_path / "sim.accor")
     # 2 scans x 2 bins of 10 s x 2 subbands, one row per antenna of the ANTENNA table each
     assert report["rows"] == 2 * 2 * NSPW * NANT == table["TIME"].size and report["solved"] == 8
@@ -162,7 +162,7 @@ def test_accor_recovers_the_autocorrelation_scale_of_every_antenna_subband_and_p
 
 def test_accor_with_an_infinite_interval_solves_each_scan_and_subband_once(tmp_path, native_engine):
     ms = make_ms(tmp_path / "sim.ms", flag_ll_antenna1_scan1=False)
-    report = run_accor(ms, tmp_path / "sim.accor", solint="inf", workers=1)
+    report = accor(ms, tmp_path / "sim.accor", solint="inf", workers=1)
     table = read_table(tmp_path / "sim.accor")
     assert report["solved"] == 2 * NSPW and table["TIME"].size == 2 * NSPW * NANT
     assert np.isclose(np.unique(table["TIME"])[0], T0 + DT * (NTIME - 1) / 2, atol=1e-5)
@@ -170,26 +170,26 @@ def test_accor_with_an_infinite_interval_solves_each_scan_and_subband_once(tmp_p
 
 def test_accor_without_usable_autocorrelations_writes_no_table(tmp_path, native_engine):
     ms = make_ms(tmp_path / "sim.ms", flag_everything=True)
-    report = run_accor(ms, tmp_path / "sim.accor", solint="30s", workers=1)
+    report = accor(ms, tmp_path / "sim.accor", solint="30s", workers=1)
     assert report["rows"] == 0 and not (tmp_path / "sim.accor").exists()
 
 
 def test_requests_that_casa_answers_differently_are_refused(tmp_path, native_engine):
     ms = make_ms(tmp_path / "sim.ms")
     with pytest.raises(NotImplementedError):
-        run_accor(ms, tmp_path / "x.accor", solint="30s", combine="scan", workers=1)
+        accor(ms, tmp_path / "x.accor", solint="30s", combine="scan", workers=1)
     with pytest.raises(NotImplementedError):
-        run_accor(ms, tmp_path / "x.accor", solint="30s", field="CAL", workers=1)
+        accor(ms, tmp_path / "x.accor", solint="30s", field="CAL", workers=1)
     for solint in ("int", "30s,4ch", "3 parsecs"):
         with pytest.raises(NotImplementedError):
             parse_solint(solint)
     assert parse_solint("1min") == 60.0 and parse_solint(2.5) == 2.5 and parse_solint("") == float("inf")
     assert parse_solint("0.1") == float(np.float32(0.1))                 # CASA iterates with a float32 interval
-    run_accor(ms, tmp_path / "sim.accor", solint="30s", workers=1)
+    accor(ms, tmp_path / "sim.accor", solint="30s", workers=1)
     with pytest.raises(NotImplementedError):
-        smooth_caltable(ms, tmp_path / "sim.accor", tmp_path / "s", smoothtype="median", smoothtime=60, field="CAL")
+        smoothcal(ms, tmp_path / "sim.accor", tmp_path / "s", smoothtype="median", smoothtime=60, field="CAL")
     with pytest.raises(RuntimeError):
-        smooth_caltable(ms, tmp_path / "sim.accor", tmp_path / "s", smoothtype="boxcar", smoothtime=60)
+        smoothcal(ms, tmp_path / "sim.accor", tmp_path / "s", smoothtype="boxcar", smoothtime=60)
 
 
 def test_smooth_series_takes_the_median_or_mean_of_the_window_and_unflags_like_casa():
@@ -224,8 +224,8 @@ def test_median_of_an_even_window_depends_on_the_length_of_the_whole_series(size
 
 def test_smoothcal_of_a_synthetic_table_unflags_the_dead_polarization_from_its_neighbours(tmp_path, native_engine):
     ms = make_ms(tmp_path / "sim.ms")
-    run_accor(ms, tmp_path / "sim.accor", solint="10s", workers=1)
-    report = smooth_caltable(ms, tmp_path / "sim.accor", tmp_path / "sim.smooth", smoothtype="median",
+    accor(ms, tmp_path / "sim.accor", solint="10s", workers=1)
+    report = smoothcal(ms, tmp_path / "sim.accor", tmp_path / "sim.smooth", smoothtype="median",
                              smoothtime=1000.0)
     raw, smooth = read_table(tmp_path / "sim.accor"), read_table(tmp_path / "sim.smooth")
     # antenna 1's LL in the 2 bins of scan 1 and antenna 0's two hands in the 2 bins of scan 2, per subband
@@ -277,8 +277,8 @@ def test_rsm07_accor_and_smoothcal_tables_are_identical_to_casa(tmp_path, monkey
     casatasks.accor(vis=str(vis), caltable=str(tmp_path / "casa.accor"), solint="30s", corrdepflags=True)
     casatasks.smoothcal(vis=str(vis), tablein=str(tmp_path / "casa.accor"), caltable=str(tmp_path / "casa.smooth"),
                         smoothtype="median", smoothtime=1800.0)
-    report = run_accor(vis, tmp_path / "native.accor", solint="30s", corrdepflags=True)
-    smooth_caltable(vis, tmp_path / "native.accor", tmp_path / "native.smooth", smoothtype="median",
+    report = accor(vis, tmp_path / "native.accor", solint="30s", corrdepflags=True)
+    smoothcal(vis, tmp_path / "native.accor", tmp_path / "native.smooth", smoothtype="median",
                     smoothtime=1800.0)
     assert report["rows"] == 17304 and report["solved"] == 1236
     _assert_tables_identical(tmp_path / "native.accor", tmp_path / "casa.accor")

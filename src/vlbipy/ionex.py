@@ -19,7 +19,7 @@ What AIPS does (TECOR, the VLBATECR procedure of VLBAUTIL, 31DEC26) and this mod
   10**EXPONENT`` TECU, 9999 marks a missing value.
 
 Deviations: a latitude beyond the grid (the polar caps of a global map) takes the edge row instead of failing,
-and a time equal to the last map is accepted. Nothing here reads a measurement set; :mod:`vlbipy.solvers.tec_task`
+and a time equal to the last map is accepted. Nothing here reads a measurement set; :mod:`vlbipy.solvers.tec`
 does the geometry.
 """
 from __future__ import annotations

@@ -114,6 +114,47 @@ def _dminfo(columns):
                    "TYPE": "StandardStMan"}}
 
 
+def _columns(desc: dict) -> list:
+    """casacore dict column descriptions -> :class:`vlbipy.casacore_format.tabledat.ColumnDesc` list (same order)."""
+    from ..casacore_format.tabledat import ColumnDesc
+    from ..casacore_format.writer import VALUE_TYPES
+    columns = []
+    for name, item in desc.items():
+        is_array = "ndim" in item
+        shape = item.get("shape")
+        columns.append(ColumnDesc(name=name, dtype=VALUE_TYPES[item["valueType"]], is_array=is_array,
+                                  comment=item.get("comment", ""), option=int(item.get("option", 0)),
+                                  ndim=int(item.get("ndim", 0)),
+                                  shape=tuple(int(n) for n in shape) if shape is not None else None,
+                                  maxlen=int(item.get("maxlen", 0)), keywords=_keywords(item.get("keywords", {}))))
+    return columns
+
+
+def _keywords(keywords: dict) -> dict:
+    """Keyword values in the types the native writer stores (numpy string arrays -> lists of str)."""
+    out = {}
+    for key, value in keywords.items():
+        if isinstance(value, dict):
+            out[key] = _keywords(value)
+        elif isinstance(value, np.ndarray) and value.dtype.kind in "US":
+            out[key] = [str(v) for v in value]
+        else:
+            out[key] = value
+    return out
+
+
+def _create(path, desc: dict, nrow: int, values: dict, *, keywords=None, info=("", "")) -> Path:
+    """Create a table of ``desc`` columns (one StandardStMan, MSMTAB, like CASA) holding ``values``."""
+    from ..casacore_format.writer import create_table
+    return create_table(path, _columns(desc), nrow, values, keywords=keywords, info=info, manager_name="MSMTAB")
+
+
+def _link_subtables(path, names) -> dict:
+    """Table keywords linking subtables ``names`` of the table at ``path`` (relative, as CASA writes them)."""
+    from ..casacore_format.aipsio import TableRef
+    return {name: TableRef(f"././{name}") for name in names}
+
+
 def _copy_subtable(ms_path, name, dest_dir):
     """Deep-copy MS subtable `name` into `dest_dir`/`name` and return its absolute path.
 
