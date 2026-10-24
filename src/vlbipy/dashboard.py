@@ -1874,7 +1874,7 @@ def _detected_sources(ctx: dict) -> set[str]:
 
 
 #: Source roles that are calibrators: their plots show even without a fringe detection on them.
-_CALIBRATOR_ROLES = {"phase_calibrator", "fringe_finder", "calibrator", "fringe calibrator"}
+_CALIBRATOR_ROLES = {"phasecal", "fringefinder", "calibrator", "phase_calibrator", "fringe_finder"}
 
 
 def render_final_data(ctx: dict, html_dir: Path, plot_root: Path, image_root: Path) -> str:
@@ -1890,9 +1890,14 @@ def render_final_data(ctx: dict, html_dir: Path, plot_root: Path, image_root: Pa
     # A target that does not get fringes draws only noise on a light curve: keep the
     # calibrators' plots and drop its own from the time-series groups.
     gated = {"Light curve per baseline", "Total-amplitude light curve"}
+    has_calibrator = any(role in _CALIBRATOR_ROLES for role in roles.values())
 
     def keep(source: Optional[str], title: str) -> bool:
-        return (title not in gated or source in detected or roles.get(source or "", "") in _CALIBRATOR_ROLES)
+        if title not in gated:
+            return True
+        if source is None:      # all-sources panel: it shows the calibrators too
+            return bool(detected) or has_calibrator
+        return source in detected or roles.get(source, "") in _CALIBRATOR_ROLES
 
     grouped: list[tuple[str, str, dict[Optional[str], list[Path]]]] = []
     for title, blurb, patterns, fallback in FINAL_GROUPS:

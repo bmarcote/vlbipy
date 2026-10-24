@@ -2537,11 +2537,27 @@ def _search_settings(img_cfg: dict) -> dict:
             "recentre_min_beams": float(img_cfg.get("recentre_min_beams", 10.0))}
 
 
-def _write_search_report(path: Path, report: dict) -> None:
-    """Save the source search of a difmapy report (peak, significance, offset, shift) as JSON, when there is one."""
-    if report.get("search"):
-        Path(path).write_text(json.dumps({"search": report["search"], "shift_mas": report.get("shift_mas", [0, 0])},
-                                         indent=2), encoding="utf-8")
+def _write_image_report(path: Path, report: dict, settings: Optional[dict] = None) -> None:
+    """Save what imaging a source with difmapy found, as JSON (``images/<code>_<source>.search.json``).
+
+    The source search (peak, significance, offset) and the shift applied, the statistics of every image
+    (the dashboard shows these: they are the latest images, also when a campaign re-imaged the epoch
+    after its self-calibration), the model the images are made of, and the imaging ``settings`` (the
+    keywords that matter for the method), by which a campaign tells whether images on disk were made
+    the way it would make them.
+    """
+    from ..backends.difmap import method_keywords
+    images = {str(robust): {key: value for key, value in info.items() if key != "fits"}
+              for robust, info in (report.get("images") or {}).items()}
+    model = report.get("model") if isinstance(report.get("model"), dict) else report.get("image_model") or {}
+    Path(path).write_text(json.dumps({"search": report.get("search") or {},
+                                      "shift_mas": report.get("shift_mas", [0, 0]),
+                                      "images": images, "model": model,
+                                      "imaging": method_keywords(settings) if settings else {}},
+                                     indent=2, default=str), encoding="utf-8")
+
+
+_write_search_report = _write_image_report
 
 
 def _image_from_difmap(source: str, info: dict, weighting: str = "briggs") -> Image:

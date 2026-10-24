@@ -742,7 +742,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     parser = build_parser()
     args = _relocate_selectors(parser.parse_args(argv))
-    args.force = args.force or args.scratch    # --scratch resets and re-runs: the former --force
+    # --scratch resets and re-runs: the former --force flag aliases it (not every subcommand has it)
+    args.force = getattr(args, "force", False) or getattr(args, "scratch", False)
     _validate_args(parser, args)
     configure_logging("DEBUG" if args.verbose else "INFO")
 

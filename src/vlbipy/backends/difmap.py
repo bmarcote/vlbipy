@@ -668,3 +668,88 @@ def image_source(split_ms: str, imagename: str, *, robust_values=(-2.0, 0.0, 2.0
             _record_shift(info["fits"], shift[0], shift[1])
     return {"source": obs.source, "split_ms": str(split_ms), "images": images, "search": search,
             "shift_mas": list(shift)}
+
+
+#: Revision tag recorded in the image report with the modelfit settings (bump when the defaults change).
+MODELFIT_REVISION = 2
+#: Peak memory of one imaging job per map pixel: 3.5 GB measured for an 8192-pixel map (the map, its beam and
+#: the FFT grid, plus the double-precision copies the noise statistics make).
+IMAGE_BYTES_PER_PIXEL = 52
+#: Share of the free memory the imaging jobs running together may take.
+IMAGE_MEMORY_FRACTION = 0.6
+#: The worker job of :func:`run_image_jobs`, as :mod:`vlbipy.solvers.workers` addresses it.
+IMAGE_JOB = "vlbipy.backends.difmap:image_in_worker"
+
+
+def imaging_settings(img_cfg: dict) -> dict:
+    """The difmapy imaging keywords of an ``[imaging]`` table: the ``method`` and its limits."""
+    return {"method": str(img_cfg.get("method", "modelfit")).strip().lower(),
+            "niter": int(img_cfg.get("niter", 4000)), "gain": float(img_cfg.get("clean_gain", 0.05)),
+            "threshold_sigma": float(img_cfg.get("threshold_sigma", 3.0)),
+            "max_components": int(img_cfg.get("max_components", 10)),
+            "component_sigma": float(img_cfg.get("component_sigma", 5.0)),
+            "component_improvement": float(img_cfg.get("component_improvement", 0.01)),
+            "clean_sigma": float(img_cfg.get("clean_residual_sigma", 5.0))}
+
+
+def method_keywords(settings: dict) -> dict:
+    """What makes images with ``settings`` what they are: the keywords of :func:`imaging_settings` its method
+    takes (all of them for modelfit, with :data:`MODELFIT_REVISION`)."""
+    if settings.get("method", "modelfit") == "clean":
+        return {key: settings[key] for key in ("method", "niter", "gain", "threshold_sigma") if key in settings}
+    return {**settings, "revision": MODELFIT_REVISION}
+
+
+def image_in_worker(*, log: dict, **kwargs) -> dict:
+    """Worker job of :func:`run_image_jobs`: :func:`image_source`, logging to the parent's run log."""
+    from ..logging_utils import attach_logging
+    attach_logging(log)
+    return image_source(**kwargs)
+
+
+def run_image_jobs(jobs: list[dict], *, max_workers: Optional[int] = None) -> list:
+    """Run :func:`image_source` for every job (its keyword arguments), several at once in worker processes.
+
+    difmapy works on one core, and an epoch has several sources to image, so they are imaged side by
+    side in the processes of :mod:`vlbipy.solvers.workers`: as many at a time as there are CPUs and as
+    fit together in :data:`IMAGE_MEMORY_FRACTION` of the free memory (:data:`IMAGE_BYTES_PER_PIXEL`
+    per map pixel), at most ``max_workers``. One job, or room for only one, runs here.
+
+    Returns
+    -------
+    list
+        One entry per job, in order: its report, or the exception it raised (a failed image must not
+        lose the others).
+    """
+    from ..logging_utils import logging_setup
+    from ..resources import available_memory, usable_cpus
+    from ..solvers.workers import submit_jobs
+    if not jobs:
+        return []
+    per_job = IMAGE_BYTES_PER_PIXEL * max(int(job.get("mapsize", IMAGE_PIXELS)) for job in jobs) ** 2
+    free = available_memory()
+    fit = max(1, int(free * IMAGE_MEMORY_FRACTION // per_job)) if free is not None else len(jobs)
+    workers = max(1, min(len(jobs), usable_cpus(), fit, int(max_workers) if max_workers else len(jobs)))
+    if workers > 1:
+        logger.info("difmapy: imaging {} source(s), {} at a time ({:.1f} GB each, {} free)", len(jobs), workers,
+                    per_job / 1e9, f"{free / 1e9:.1f} GB" if free is not None else "unknown")
+        log = logging_setup()
+        try:
+            futures = submit_jobs(IMAGE_JOB, [dict(job, log=log) for job in jobs], workers)
+        except Exception as exc:  # noqa: BLE001 - the images can still be made here, one at a time
+            logger.warning("difmapy: the worker processes could not start ({}); imaging one source at a time", exc)
+        else:
+            results = []
+            for future in futures:
+                try:
+                    results.append(future.result())
+                except Exception as exc:  # noqa: BLE001 - WorkerError: reported per source by the caller
+                    results.append(exc)
+            return results
+    results = []
+    for job in jobs:
+        try:
+            results.append(image_source(**job))
+        except Exception as exc:  # noqa: BLE001 - reported per source by the caller
+            results.append(exc)
+    return results

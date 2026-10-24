@@ -3396,8 +3396,12 @@ class CasaCalibrationOps(CalibrationOps):
             flags = np.asarray(handle.getcol("FLAG")).astype(bool)
             antennas = np.asarray(handle.getcol("ANTENNA1"))
             spws = np.asarray(handle.getcol("SPECTRAL_WINDOW_ID"))
-            fields = np.asarray(handle.getcol("FIELD_ID"))
-            snr = np.asarray(handle.getcol("SNR")).astype(float)
+            try:
+                fields = np.asarray(handle.getcol("FIELD_ID"))
+                snr = np.asarray(handle.getcol("SNR")).astype(float)
+            except Exception:  # noqa: BLE001 - tables written without them merge as one field
+                fields = np.zeros(gains.shape[2], dtype=int)
+                snr = np.ones(gains.shape)
             names = self._table_antenna_names(table_path)
             dropped: set[str] = set()
             filled: set[str] = set()
