@@ -17,7 +17,9 @@ _CONFIGURED = False
 _CONSOLE_LEVEL = "INFO"
 #: The :func:`logging_setup` this (worker) process was last attached to, so re-attaching is free.
 _ATTACHED: dict = {}
-_FORMAT = "<level>{message}</level>"
+_FORMAT = "<level>{message}</level>\n{exception}"
+#: Step headlines (:func:`headline`) render in bold.
+_HEADLINE_FORMAT = "<bold>{message}</bold>\n{exception}"
 #: File sink format: timestamped and level-tagged, so a run can be audited afterwards.
 _FILE_FORMAT = "{time:YYYY-MM-DD HH:mm:ss} | {level: <7} | {message}"
 #: Log files already attached, keyed by directory, so re-entry does not duplicate sinks.
@@ -39,9 +41,40 @@ def configure_logging(level: str = "INFO") -> None:
     _logger.remove()
     _logger.level("WARNING", color="<yellow>")
     _logger.level("ERROR", color="<red><bold>")
-    _logger.add(sys.stderr, level=level, format=_FORMAT, colorize=True)
+    _logger.level("INFO", color="<normal>")
+    _logger.add(sys.stderr, level=level, format=_console_format, colorize=True,
+                filter=_steps_only if str(level).upper() == "INFO" else None)
     _CONFIGURED = True
     _CONSOLE_LEVEL = level
+
+
+def _console_format(record) -> str:
+    """Bold for a step headline, the level's colour otherwise."""
+    return _HEADLINE_FORMAT if record["extra"].get("headline") else _FORMAT
+
+
+def _steps_only(record) -> bool:
+    """The console filter of the default level: headlines, anomalies and errors (the rest is in the run log)."""
+    extra = record["extra"]
+    return bool(extra.get("headline") or extra.get("anomaly")) or record["level"].no >= _logger.level("ERROR").no
+
+
+def headline(message: str, *args) -> None:
+    """Log the main line of a step: shown in bold on the console at the default level (and in the run log).
+
+    Parameters
+    ----------
+    message : str
+        loguru format string.
+    *args
+        Its arguments.
+    """
+    get_logger().opt(depth=1).bind(headline=True).info(message, *args)
+
+
+def run_logs() -> list[Path]:
+    """The run log files this process writes (see :func:`add_file_log`)."""
+    return sorted(sink["path"] for sink in _FILE_SINKS.values())
 
 
 def add_file_log(log_dir, project_code: str = "", level: str = "DEBUG"):
@@ -82,7 +115,7 @@ def add_file_log(log_dir, project_code: str = "", level: str = "DEBUG"):
     sink_id = _logger.add(str(path), level=level, format=_FILE_FORMAT, colorize=False,
                           enqueue=False, backtrace=True, diagnose=False)
     _FILE_SINKS[str(directory.resolve())] = {"path": path, "id": sink_id}
-    _logger.info("logging this run to {}", path)
+    _logger.bind(headline=True).info("logging this run to {}", path)
     return path
 
 
@@ -146,8 +179,8 @@ class WarningCollector:
         self._items.append(message)
 
     def anomaly(self, message: str) -> None:
-        """Log a prominent anomaly and record it for the summary."""
-        get_logger().warning("ANOMALY: {}", message)
+        """Log a prominent anomaly (shown on the console at every level) and record it for the summary."""
+        get_logger().bind(anomaly=True).warning("ANOMALY: {}", message)
         self._items.append("ANOMALY: " + message)
 
     def summary(self) -> list[str]:

@@ -20,7 +20,7 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from .logging_utils import get_logger
+from .logging_utils import get_logger, headline
 
 logger = get_logger()
 
@@ -65,8 +65,8 @@ class StepState:
                            self.project_code, path, exc)
             return
         done = [name for name, entry in self._steps.items() if entry.get("status") == "done"]
-        logger.info("[{}] resuming: {} step(s) already complete ({})", self.project_code,
-                    len(done), ", ".join(done) or "none")
+        headline("[{}] resuming: {} step(s) already complete", self.project_code, len(done))
+        logger.info("[{}] steps already complete: {}", self.project_code, ", ".join(done) or "none")
 
     def save(self) -> None:
         """Write the state file (no-op for in-memory state)."""
@@ -100,8 +100,7 @@ class StepState:
         if done and not force:
             logger.info("[{}] skipping: {} (already done)", self.project_code, step)
             return False
-        logger.info("[{}] running: {}{}", self.project_code, step,
-                    " (forced)" if force and done else "")
+        headline("[{}] {}{}", self.project_code, step, " (forced)" if force and done else "")
         return True
 
     def mark_complete(self, step: str, outputs=None, inputs=None) -> None:
