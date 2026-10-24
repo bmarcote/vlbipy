@@ -1,6 +1,6 @@
 """Flag versions (CASA ``flagmanager``) without CASA: save, restore, delete, rename and list.
 
-The files are CASA's, so either implementation reads what the other wrote: ``<vis>.flagmanager/`` holds one
+The files are CASA's, so either implementation reads what the other wrote: ``<vis>.flagversions/`` holds one
 table ``flags.<name>`` per version — FLAG (TiledShapeStMan) and FLAG_ROW, one row per main-table row, the parts of a
 Multi-MS concatenated in order — and ``FLAG_VERSION_LIST``, one ``"<name> : <comment>"`` line per version.
 Saving over an existing name first renames it to ``<name>.old.<unix time>``, as the CASA task does.
@@ -24,9 +24,9 @@ LIST_NAME = "FLAG_VERSION_LIST"
 
 
 def versions_dir(vis) -> Path:
-    """``<vis>.flagmanager``."""
+    """``<vis>.flagversions`` (the directory CASA's flagmanager reads, for interop)."""
     vis = Path(vis)
-    return vis.parent / f"{vis.name}.flagmanager"
+    return vis.parent / f"{vis.name}.flagversions"
 
 
 def _parts(vis) -> list[Path]:

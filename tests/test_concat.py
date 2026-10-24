@@ -165,14 +165,14 @@ def test_rsm07_concat_matches_casa(tmp_path, monkeypatch):
         pytest.skip("RSM07 reference data not available")
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("VLBIPY_TABLE_ENGINE", "native")
-    from casatasks import concat
+    from casatasks import concat as casa_concat
 
     from vlbipy.solvers.split import split
     from vlbipy.solvers.uvfits import exportuvfits
     split(RSM07_MMS, tmp_path / "e1.ms", "3C345", column="DATA", chanbin=4, timebin=8.0, workers=4)
     _shift_epoch(tmp_path / "e1.ms", tmp_path / "e2.ms", 30 * DAY)
     inputs = [str(tmp_path / "e1.ms"), str(tmp_path / "e2.ms")]
-    concat(vis=inputs, concatvis=str(tmp_path / "casa.ms"), respectname=True, copypointing=False)
+    casa_concat(vis=inputs, concatvis=str(tmp_path / "casa.ms"), respectname=True, copypointing=False)
     concat(inputs, tmp_path / "native.ms")
     names = ["TIME", "ANTENNA1", "ANTENNA2", "SCAN_NUMBER", "OBSERVATION_ID", "DATA_DESC_ID", "FIELD_ID", "UVW",
              "DATA", "FLAG", "WEIGHT", "SIGMA", "WEIGHT_SPECTRUM", "SIGMA_SPECTRUM", "EXPOSURE", "TIME_CENTROID"]

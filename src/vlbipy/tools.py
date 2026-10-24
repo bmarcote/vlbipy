@@ -62,22 +62,15 @@ def space_available_gb(path: Union[str, Path]) -> float:
 
 
 def available_memory() -> Optional[int]:
-    """Bytes of memory new work can take without swapping (Linux ``MemAvailable``), or None when unknown."""
-    try:
-        for line in Path("/proc/meminfo").read_text().splitlines():
-            if line.startswith("MemAvailable:"):
-                return int(line.split()[1]) * 1024
-    except (OSError, ValueError, IndexError) as exc:
-        logger.debug("available memory unknown: {}", exc)
-    return None
+    """Bytes of memory new work can take, cgroup-aware (:func:`vlbipy.resources.available_memory`)."""
+    from .resources import available_memory as _available
+    return _available()
 
 
 def usable_cpus() -> int:
-    """Number of CPUs this process may run on (its affinity mask where the platform has one)."""
-    try:
-        return len(os.sched_getaffinity(0))
-    except AttributeError:            # macOS: no affinity masks
-        return os.cpu_count() or 1
+    """CPUs this process may keep busy, cgroup/affinity-aware (:func:`vlbipy.resources.usable_cpus`)."""
+    from .resources import usable_cpus as _usable
+    return _usable()
 
 
 def collect_casa_logs(log_dir: Union[str, Path], search_dirs=None) -> list[Path]:

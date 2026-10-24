@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .logging_utils import attach_logging, get_logger, logging_setup, warnings
-from .tools import available_memory, usable_cpus
+from .resources import available_memory, usable_cpus
 
 logger = get_logger()
 

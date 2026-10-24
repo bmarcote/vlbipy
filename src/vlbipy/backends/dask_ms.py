@@ -853,7 +853,7 @@ class DaskMsCalibrationOps(CasaCalibrationOps):
         logger.info("statwt[dask-ms]: datacolumn={!r} minsamp={} flagbackup={}", column, minsamp, flagbackup)
         if flagbackup:
             # CASA's statwt names its backups statwt_1, statwt_2, ...
-            listing = Path(f"{ms}.flagmanager") / "FLAG_VERSION_LIST"
+            listing = Path(f"{ms}.flagversions") / "FLAG_VERSION_LIST"
             names = [line.split(":")[0].strip() for line in listing.read_text().splitlines()] if listing.is_file() else []
             number = 1 + max([int(n.split("_")[1]) for n in names if n.startswith("statwt_") and n[7:].isdigit()],
                              default=0)
@@ -953,9 +953,6 @@ class NativeFlagTasks:
         task = getattr(self._tasks, name)
         if not callable(task) or name.startswith("_"):
             return task
-        if name == "flagmanager":
-            from ..solvers.flagmanager import flagmanager
-            return flagmanager
 
         def guarded(*args, **kwargs):
             from ..solvers import corrected

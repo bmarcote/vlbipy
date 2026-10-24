@@ -658,7 +658,7 @@ class CasaDataOps(DataOps):
         except RuntimeError as exc:
             raise BackendError(f"{project_code}: clearcal failed: {exc}") from exc
         if unflag:
-            imported = ms.with_name(f"{ms.name}.flagmanager") / f"flags.{IMPORT_FLAG_VERSION}"
+            imported = ms.with_name(f"{ms.name}.flagversions") / f"flags.{IMPORT_FLAG_VERSION}"
             try:
                 if imported.exists():
                     # Back to the flags of the import (zero-weight data), not to no flags at all.
