@@ -281,3 +281,27 @@ def test_obsdate_is_a_common_option():
     """--obsdate matters wherever a download can happen, so every pipeline subcommand takes it."""
     for command in ("pipeline", "import", "calibrate", "summary"):
         assert parse([command, "-p", "EG078B", "--obsdate", "231015"]).obsdate == "231015"
+
+
+def test_import_options_are_common_options():
+    """--files and --replace-tsys act wherever the data get imported, the pipeline included."""
+    for command in ("pipeline", "import", "calibrate", "flag", "summary"):
+        args = parse([command, "-p", "EG078B", "--replace-tsys", "--files", "a.idi", "b.idi"])
+        assert args.replace_tsys and args.files == ["a.idi", "b.idi"]
+
+
+def test_import_options_reach_the_import_config(tmp_path):
+    """The CLI import options become [import] overrides; a single --files value stays a glob string."""
+    from vlbipy.cli import _build_obs
+    args = parse(["pipeline", "-p", "TS01", "--backend", "dummy", "-t", "SRC", "--replace-tsys",
+                  "--files", "*.IDI*", "--config", _dummy_config(tmp_path)])
+    imp = _build_obs(args).config["import"]
+    assert imp["replace_tsys"] is True and imp["files"] == "*.IDI*"
+    args = parse(["pipeline", "-p", "TS01", "--backend", "dummy", "-t", "SRC", "--config", _dummy_config(tmp_path)])
+    assert not _build_obs(args).config["import"].get("replace_tsys")
+
+
+def test_files_before_a_selector_do_not_swallow_it():
+    """`calibrate --files X bandpass`: the step name is moved out of the greedy --files."""
+    args = parse(["calibrate", "-p", "TS01", "--files", "a.idi", "bandpass"])
+    assert args.files == ["a.idi"] and args.steps == ["bandpass"]
