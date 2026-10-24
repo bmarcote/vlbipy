@@ -1166,15 +1166,17 @@ def plot_subband_phase_jumps(data: dict, plot_dir: Union[str, Path], project_cod
     return str(outfile)
 
 
-#: Half-width of the image preview in synthesised beams (when the FITS header carries BMAJ).
-IMAGE_ZOOM_BEAMS = 40.0
+#: Half-width of the image preview in synthesised beams: the panel spans 7 times the
+#: restoring beam's major axis when the FITS header carries BMAJ.
+IMAGE_ZOOM_BEAMS = 3.5
 
 
 def _read_image_plane(fits_path: Union[str, Path]) -> tuple[np.ndarray, float]:
     """Return the first 2D plane of a FITS image (in mJy/beam) and its pixel size in mas.
 
-    When the header has a restoring beam the plane is cut to +-IMAGE_ZOOM_BEAMS
-    beams around the peak, so a VLBI source is visible in a wide field.
+    When the header has a restoring beam the plane is cut to a square of
+    7 * BMAJ (+-IMAGE_ZOOM_BEAMS half-width) around the peak, so a VLBI source
+    is visible in a wide field.
     """
     from astropy.io import fits
     with fits.open(str(fits_path)) as hdul:
@@ -1238,6 +1240,12 @@ def plot_image_grid(images: dict, plot_dir: Union[str, Path], project_code: str 
                                 vmin=-3 * rms, vmax=peak if peak > -3 * rms else -3 * rms + 1e-9,
                                 interpolation="nearest")
             figure.colorbar(image, ax=axis, fraction=0.046, pad=0.02).set_label("mJy/beam", fontsize=8)
+            # Contours at 5 sigma, up by sqrt(2): the lowest meaningful signal upward.
+            if rms > 0 and peak > 5 * rms:
+                n_levels = int(np.log(peak / (5 * rms)) / np.log(np.sqrt(2))) + 1
+                levels = 5 * rms * np.sqrt(2) ** np.arange(n_levels)
+                axis.contour(plane, levels=levels, extent=extent, colors="w",
+                             linewidths=0.7, alpha=0.85)
             axis.set_title(f"robust {robust:g}  peak {peak:.2f} mJy/beam  rms {rms:.3f} mJy/beam",
                            fontsize=8)
             axis.set_xlabel("relative RA (mas)", fontsize=8)

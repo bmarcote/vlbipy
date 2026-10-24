@@ -93,9 +93,9 @@ vlbipy applycal sbd.K bpass.B target.ms --interp linear nearest,linear --gainfie
 Steps already recorded as complete are skipped:
 
 ```bash
---force                # re-run this step even if it is done
+--scratch              # re-run: forget all progress, reset the data and run again
 --from-step bandpass   # invalidate that step and everything after it
---scratch              # forget all progress and reset the data
+--force                # kept for compatibility: same as --scratch
 ```
 
 ## The ionosphere

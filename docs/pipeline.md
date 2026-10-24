@@ -24,7 +24,7 @@ Raw data → Import → Metadata → A-priori cal → A-priori flags
 ```
 
 Progress is recorded per step in `<work_dir>/.pipeline_state.json`; a step is
-skipped on a repeated run unless `force=True` (`--force` on the CLI) or a
+skipped on a repeated run unless `force=True` (`--scratch` on the CLI) or a
 step later in the chain invalidates it. The calibration chain itself is
 persisted in `<work_dir>/.caltables.json`, so a resumed process solves on top
 of the tables earlier steps produced rather than starting from raw data.

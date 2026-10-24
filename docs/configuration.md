@@ -340,5 +340,4 @@ CLI arguments override the corresponding TOML parameters:
 | `--username` | `[import] username` (every subcommand) |
 | `--password` | `[import] password` (every subcommand; never saved to `.project.json`) |
 | `--from-step` | *(run control, no TOML equivalent)* |
-| `--scratch` | *(run control, no TOML equivalent)* |
-| `--force` | *(run control, no TOML equivalent)* |
+| `--scratch` | *(run control, no TOML equivalent; `--force` is an alias)* |

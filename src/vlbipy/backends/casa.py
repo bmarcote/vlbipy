@@ -567,9 +567,10 @@ class CasaDataOps(DataOps):
 
         if mms:
             # Flag versions of a previous (deleted) MMS make partition refuse to write.
-            stale_flags = target.with_name(f"{target.name}.flagmanager")
-            if stale_flags.exists():
-                shutil.rmtree(stale_flags)
+            for suffix in ("flagversions", "flagmanager"):
+                stale_flags = target.with_name(f"{target.name}.{suffix}")
+                if stale_flags.exists():
+                    shutil.rmtree(stale_flags)
             logger.info("partition: {} -> {} (Multi-MS for parallel I/O)", plain_ms.name, target.name)
             self.backend.tasks.partition(vis=str(plain_ms), outputvis=str(target), createmms=True,
                                          separationaxis="auto", numsubms="auto", flagbackup=False,

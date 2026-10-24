@@ -12,3 +12,4 @@ build
 .gitignore
 *.nbi
 *.nbc
+casa-*.log

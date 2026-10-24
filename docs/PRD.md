@@ -369,7 +369,7 @@ instructions). The `DummyBackend` synthesizes "found" files so `import_data` com
 ### 6.12 CLI and dashboard (thin wrappers — specified, implemented later)
 
 - **CLI:** `vlbipy` maps flags to `VLBIObs` construction and calls `.run()` (or a
-  `--summary-only`, `--dashboard`, `--from-step/--to-step/--step`, `--force`, `--clean`,
+  `--summary-only`, `--dashboard`, `--from-step/--to-step/--step`, `--scratch`, `--clean`,
   `--no-smart` mode). It adds **no** logic beyond argument translation.
 - **Dashboard:** launched via `vlbipy --dashboard -p PROJECT`; reads the same `VLBIObs`
   state/products. Interactivity (interactive flagging, live re-runs, CARTA) is a later phase.

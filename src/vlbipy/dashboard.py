@@ -112,6 +112,20 @@ def mjd_seconds_to_utc(seconds: float) -> str:
     return Time(seconds / 86400.0, format="mjd").strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _time_of_day_utc(seconds: float, start_seconds: float | None = None) -> str:
+    """Format an MJD-in-seconds as ``HH:MM``, suffixed ``(+N d)`` when it falls N days
+    after the day of ``start_seconds`` (i.e. an end time past midnight)."""
+    if not seconds or seconds / 86400.0 < 40587:
+        return ""
+    time = Time(seconds / 86400.0, format="mjd")
+    label = time.strftime("%H:%M")
+    if start_seconds and start_seconds / 86400.0 >= 40587:
+        days = int(seconds // 86400.0 - start_seconds // 86400.0)
+        if days > 0:
+            label += f" (+{days} d)"
+    return label
+
+
 def snr_class(snr: Optional[float]) -> str:
     """CSS class of an antenna chip for a fringe SNR (``snr-none`` when unknown)."""
     if snr is None or (isinstance(snr, float) and math.isnan(snr)):
@@ -902,7 +916,7 @@ def collect(obs, *, flag_statistics: Optional[dict] = None) -> dict:
         "generated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "observation": {
             "date": format_obs_date(metadata.obs_date) if metadata else "",
-            "start_utc": mjd_seconds_to_utc(start), "end_utc": mjd_seconds_to_utc(end),
+            "start_utc": _time_of_day_utc(start), "end_utc": _time_of_day_utc(end, start),
             "duration_hours": round((end - start) / 3600.0, 2) if end > start else 0.0,
             "ref_freq_ghz": round(freq.freq_ghz, 4) if freq else None,
             "bandwidth_mhz": round(freq.bandwidth_mhz, 2) if freq else None,
@@ -1688,6 +1702,20 @@ def _final_source_panel(ctx: dict, html_dir: Path, slug: str, entries: list[dict
     return "".join(parts)
 
 
+def _detected_sources(ctx: dict) -> set[str]:
+    """Sources that get fringes: at least one surveyed antenna at >= ``FRINGE_DETECTION_SNR``."""
+    detected: set[str] = set()
+    for scan in ctx.get("scans") or []:
+        if any(v is not None and v >= FRINGE_DETECTION_SNR for v in (scan.get("antenna_snrs") or {}).values()):
+            detected.add(scan.get("source") or "")
+    detected.discard("")
+    return detected
+
+
+#: Source roles that are calibrators: their plots show even without a fringe detection on them.
+_CALIBRATOR_ROLES = {"phase_calibrator", "fringe_finder", "calibrator", "fringe calibrator"}
+
+
 def render_final_data(ctx: dict, html_dir: Path, plot_root: Path, image_root: Path) -> str:
     """Final-results tab: one sub-tab per source with its plots, images and downloads.
 
@@ -1696,11 +1724,22 @@ def render_final_data(ctx: dict, html_dir: Path, plot_root: Path, image_root: Pa
     neither plots nor downloads is skipped.
     """
     names = sorted((s["name"] for s in ctx["sources"]), key=len, reverse=True)
+    roles = {s["name"]: s.get("type", "") for s in ctx["sources"]}
+    detected = _detected_sources(ctx)
+    # A target that does not get fringes draws only noise on a light curve: keep the
+    # calibrators' plots and drop its own from the time-series groups.
+    gated = {"Light curve per baseline", "Total-amplitude light curve"}
+
+    def keep(source: Optional[str], title: str) -> bool:
+        return (title not in gated or source in detected or roles.get(source or "", "") in _CALIBRATOR_ROLES)
+
     grouped: list[tuple[str, str, dict[Optional[str], list[Path]]]] = []
     for title, blurb, patterns, fallback in FINAL_GROUPS:
         by_source: dict[Optional[str], list[Path]] = {}
         for path in find_plots(plot_root, patterns) or find_plots(plot_root, fallback):
-            by_source.setdefault(plot_source(path, names), []).append(path)
+            source = plot_source(path, names)
+            if keep(source, title):
+                by_source.setdefault(source, []).append(path)
         grouped.append((title, blurb, by_source))
     images = find_plots(image_root, ["*.images.*.png"]) if image_root.is_dir() else []
     if not images and image_root.is_dir():

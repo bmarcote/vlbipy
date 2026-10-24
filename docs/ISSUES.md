@@ -194,7 +194,7 @@ Deliver the non-Python surfaces as thin wrappers over `VLBIObs`.
 
 **Scope**
 - CLI (`vlbipy`): flags → `VLBIObs` construction → `.run()`; modes `--summary-only`,
-  `--dashboard`, `--from-step/--to-step/--step`, `--force`, `--clean`, `--no-smart`,
+  `--dashboard`, `--from-step/--to-step/--step`, `--scratch`, `--clean`, `--no-smart`,
   `--verbose`. No logic beyond argument translation.
 - Dashboard (`vlbipy --dashboard -p PROJECT`): reads the same `VLBIObs` state/products;
   interactive flagging + live smart re-runs; calibrated-data and results tabs.

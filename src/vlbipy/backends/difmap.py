@@ -379,7 +379,7 @@ def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_value
     # Stage 1 ignores the longest-baseline antennas: they see a resolved source and would bias the
     # model while it is still coarse. They join for stage 2, when the model is good enough to hold them.
     if deferred and len(deferred) < len(obs.antennas):
-        obs.ignore(deferred)
+        obs.ignore(*deferred)
         logger.info("difmapy: stage 1 ignores the longest-baseline antenna(s): {}", ", ".join(deferred))
     model = fit_starting_model(obs)
     ladder = solints or selfcal_ladder(scan_lengths(obs))
@@ -388,7 +388,7 @@ def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_value
     obs, stage1 = phase_selfcal(obs, ladder, min_improvement=min_improvement, max_bad_fraction=max_bad_fraction)
     rounds += stage1
     if deferred and len(deferred) < len(obs.antennas):
-        obs.unignore(deferred)
+        obs.unignore(*deferred)
         obs.modelfit(quiet=True)               # the model now has to describe the long baselines too
         if fix_stage1:
             stage1_names = [a for a in obs.antennas if a not in deferred]

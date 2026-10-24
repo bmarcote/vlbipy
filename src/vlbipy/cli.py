@@ -88,7 +88,7 @@ def _common_parser(*, project_required: bool = True) -> argparse.ArgumentParser:
     p.add_argument("--check-source", nargs="+", dest="check_source", help="Check source name(s)")
     p.add_argument("--refant", help="Preferred reference antenna(s), comma-separated")
     p.add_argument("--config", help="Path to a TOML config file")
-    p.add_argument("--force", action="store_true", help="Re-run steps even if already completed")
+    p.add_argument("--force", action="store_true", help=argparse.SUPPRESS)  # alias of --scratch (merged)
     p.add_argument("--no-ionos", dest="ionos", action="store_false", default=None,
                    help="Do not solve the dispersive (ionospheric) delay in the fringe fit. "
                         "By default it is solved below 6 GHz, where the ionosphere matters.")
@@ -96,8 +96,9 @@ def _common_parser(*, project_required: bool = True) -> argparse.ArgumentParser:
                    help="Use CASA cal-library files instead of explicit parallel "
                         "gaintable/gainfield/interp/spwmap/calwt parameters.")
     p.add_argument("--scratch", action="store_true",
-                   help="Start over: forget all recorded progress and reset the data "
-                        "(clearcal + unflag). Without it the run resumes where it stopped.")
+                   help="Start over: forget all recorded progress, reset the data "
+                        "(clearcal + unflag) and re-run the steps. Without it the run "
+                        "resumes where it stopped.")
     p.add_argument("--from-step", dest="from_step", metavar="STEP",
                    help="Re-run from this step onward, invalidating it and everything after")
     # Any subcommand may have to download (the pipeline imports when no data is on disk), so the
@@ -730,6 +731,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     parser = build_parser()
     args = _relocate_selectors(parser.parse_args(argv))
+    args.force = args.force or args.scratch    # --scratch resets and re-runs: the former --force
     _validate_args(parser, args)
     configure_logging("DEBUG" if args.verbose else "INFO")
 

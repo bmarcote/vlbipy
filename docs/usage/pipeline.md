@@ -86,7 +86,7 @@ obs.run()            # every epoch, then obs.combine()
 
 ```bash
 vlbipy pipeline --config v589.toml -p V589A V589B V589C V589D
-vlbipy combine  --config v589.toml -p V589A V589B V589C V589D --force   # only the multi-epoch stage
+vlbipy combine  --config v589.toml -p V589A V589B V589C V589D --scratch # only the multi-epoch stage
 ```
 
 The combination writes to `<cwd>/combined`:
