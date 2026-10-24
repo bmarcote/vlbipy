@@ -472,3 +472,208 @@ def read_timeseries(ms, *, fields: Optional[list[str]], scans: Optional[list[int
         with np.errstate(invalid="ignore", divide="ignore"):
             baselines[other] = np.where(counts[other] > 0, total / np.maximum(counts[other], 1), np.nan)
     return {"baselines": baselines, "seconds": _time.perf_counter() - started}
+
+
+# ---------------------------------------------------------------------------
+# Time-averaged spectra: cross-correlations to a reference antenna, autocorrelations; subband phases per scan
+# ---------------------------------------------------------------------------
+def spectrum_job(*, specs: list[dict], column: str, corrs: Optional[list[int]], ncorr: int, engine: str,
+                 refant: int, nant: int, nddid: int, view: Optional[dict] = None) -> dict:
+    """Worker job: per (other antenna, subband), the sum and count over rows of the unflagged samples of
+    ``refant``'s cross-correlations, per channel and hand."""
+    block = read_view_runs(specs, [column, "FLAG", "ANTENNA1", "ANTENNA2"], engine=engine, view=view,
+                           corrs=None if corrs is None else np.asarray(corrs), ncorr=ncorr)
+    if not block:
+        return {}
+    ant1 = np.asarray(block["ANTENNA1"], dtype=np.int64)
+    ant2 = np.asarray(block["ANTENNA2"], dtype=np.int64)
+    other = np.where(ant1 == refant, ant2, ant1)
+    keep = ((ant1 == refant) | (ant2 == refant)) & (ant1 != ant2) & (other < nant)
+    if not keep.any():
+        return {}
+    values = np.where(np.asarray(block["FLAG"], dtype=bool)[keep], np.nan, block[column][keep])
+    keys = other[keep] * nddid + np.asarray(block["DATA_DESC_ID"], dtype=np.int64)[keep]
+    unique, sums, counts = _reduce(keys, values.astype(np.complex128))
+    return {"keys": unique, "sums": sums, "counts": counts}
+
+
+def autocorr_job(*, specs: list[dict], column: str, corrs: Optional[list[int]], ncorr: int, engine: str,
+                 nant: int, nddid: int, view: Optional[dict] = None) -> dict:
+    """Worker job: per (antenna, subband), the sum and count over rows of the autocorrelation amplitudes per
+    channel and hand. The flags are ignored (the autocorrelations are all flagged by then); exact zeros (a
+    subband the station never recorded) are left out."""
+    block = read_view_runs(specs, [column, "ANTENNA1", "ANTENNA2"], engine=engine, view=view,
+                           corrs=None if corrs is None else np.asarray(corrs), ncorr=ncorr)
+    if not block:
+        return {}
+    ant1 = np.asarray(block["ANTENNA1"], dtype=np.int64)
+    keep = (ant1 == np.asarray(block["ANTENNA2"], dtype=np.int64)) & (ant1 < nant)
+    if not keep.any():
+        return {}
+    amplitude = np.abs(block[column][keep]).astype(np.float64)
+    amplitude = np.where(amplitude == 0, np.nan, amplitude)
+    keys = ant1[keep] * nddid + np.asarray(block["DATA_DESC_ID"], dtype=np.int64)[keep]
+    unique, sums, counts = _reduce(keys, amplitude)
+    return {"keys": unique, "sums": sums, "counts": counts}
+
+
+def subband_phase_job(*, specs: list[dict], column: str, corrs: Optional[list[int]], ncorr: int, engine: str,
+                      refant: int, nant: int, nddid: int, first: int, last: int, view: Optional[dict] = None) -> dict:
+    """Worker job: per (other antenna, scan, subband), the sum and count of the unflagged samples of channels
+    ``first..last`` of ``refant``'s cross-correlations over rows and channels, per hand."""
+    block = read_view_runs(specs, [column, "FLAG", "ANTENNA1", "ANTENNA2"], engine=engine, view=view,
+                           corrs=None if corrs is None else np.asarray(corrs), ncorr=ncorr)
+    if not block:
+        return {}
+    ant1 = np.asarray(block["ANTENNA1"], dtype=np.int64)
+    ant2 = np.asarray(block["ANTENNA2"], dtype=np.int64)
+    other = np.where(ant1 == refant, ant2, ant1)
+    keep = ((ant1 == refant) | (ant2 == refant)) & (ant1 != ant2) & (other < nant)
+    if not keep.any():
+        return {}
+    values = np.where(np.asarray(block["FLAG"], dtype=bool)[keep], np.nan, block[column][keep])[:, first:last]
+    finite = np.isfinite(values)
+    row_sums = np.where(finite, values, 0).sum(axis=1, dtype=np.complex128)        # (nrow, npol)
+    row_counts = finite.sum(axis=1)
+    scans = np.asarray(block["SCAN_NUMBER"], dtype=np.int64)[keep]
+    keys = (other[keep] * 1_000_000 + scans) * nddid + np.asarray(block["DATA_DESC_ID"], dtype=np.int64)[keep]
+    order = np.argsort(keys, kind="stable")
+    unique, starts = np.unique(keys[order], return_index=True)
+    return {"keys": unique, "sums": np.add.reduceat(row_sums[order], starts, axis=0),
+            "counts": np.add.reduceat(row_counts[order], starts, axis=0)}
+
+
+def _run_keyed(ms, function: str, *, fields: Optional[list[str]], scans: Optional[list[int]], column: str,
+               corrs: Optional[list[int]], workers: Optional[int], **extra) -> tuple[dict, list[dict]]:
+    """Run a keyed-sum job over the rows of ``fields``/``scans``; returns the setup and the job results."""
+    engine = table_engine()
+    setup = read_setup(ms, engine=engine)
+    layout = read_layout(ms, engine=engine)
+    field_ids = None
+    if fields:
+        field_ids = {setup["field_names"].index(name) for name in fields if name in setup["field_names"]}
+    selected = select_runs(layout, fields=field_ids, scans=None if not scans else set(int(s) for s in scans))
+    view = _view(ms, column, field_ids, setup, layout)
+    jobs = [dict(extra, specs=chunk, column=column, corrs=corrs, ncorr=int(setup["ncorr"]), engine=engine,
+                 nant=len(setup["antenna_names"]), nddid=len(setup["ddid_to_spw"]), view=view)
+            for chunk in split_rows(run_specs(layout, selected), PLOT_ROWS)]
+    return setup, [part for part in run_jobs(f"vlbipy.solvers.plot_read:{function}", jobs, workers) if part]
+
+
+def _per_key(parts: list[dict]) -> tuple[dict, dict]:
+    """Sums and counts of the job results added up per key."""
+    sums, counts = {}, {}
+    for part in parts:
+        for key, total, count in zip(part["keys"], part["sums"], part["counts"]):
+            key = int(key)
+            sums[key] = sums.get(key, 0) + total
+            counts[key] = counts.get(key, 0) + count
+    return sums, counts
+
+
+def read_spectrum(ms, *, fields: Optional[list[str]], scans: Optional[list[int]], column: str,
+                  corrs: Optional[list[int]], refant: int, workers: Optional[int] = None) -> dict:
+    """Time-averaged (vector) spectra of the baselines to ``refant``: ``{other antenna: complex (nspw, nchan,
+    npol)}`` (``nan`` where no unflagged sample) under ``spectra``; ``seconds``."""
+    started = _time.perf_counter()
+    setup, parts = _run_keyed(ms, "spectrum_job", fields=fields, scans=scans, column=column, corrs=corrs,
+                              workers=workers, refant=int(refant))
+    nddid = len(setup["ddid_to_spw"])
+    nspw = int(np.max(setup["ddid_to_spw"])) + 1 if nddid else 0
+    sums, counts = _per_key(parts)
+    spectra: dict[int, np.ndarray] = {}
+    for key, total in sums.items():
+        other, ddid = divmod(key, nddid)
+        if other not in spectra:
+            spectra[other] = np.full((nspw,) + total.shape, np.nan + 0j)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            spectra[other][int(setup["ddid_to_spw"][ddid])] = np.where(counts[key] > 0, total / counts[key], np.nan)
+    return {"spectra": spectra, "seconds": _time.perf_counter() - started}
+
+
+def read_autocorr_spectrum(ms, *, fields: Optional[list[str]], scans: Optional[list[int]], column: str,
+                           corrs: Optional[list[int]], workers: Optional[int] = None) -> dict:
+    """Time-averaged autocorrelation amplitude spectra: ``{antenna: (nspw, nchan, npol)}`` under ``spectra``."""
+    started = _time.perf_counter()
+    setup, parts = _run_keyed(ms, "autocorr_job", fields=fields, scans=scans, column=column, corrs=corrs,
+                              workers=workers)
+    nddid = len(setup["ddid_to_spw"])
+    nspw = int(np.max(setup["ddid_to_spw"])) + 1 if nddid else 0
+    sums, counts = _per_key(parts)
+    spectra: dict[int, np.ndarray] = {}
+    for key, total in sums.items():
+        antenna, ddid = divmod(key, nddid)
+        if antenna not in spectra:
+            spectra[antenna] = np.full((nspw,) + total.shape, np.nan)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            spectra[antenna][int(setup["ddid_to_spw"][ddid])] = np.where(counts[key] > 0, total / counts[key], np.nan)
+    return {"spectra": spectra, "seconds": _time.perf_counter() - started}
+
+
+def read_subband_phases(ms, *, fields: list[str], scans: list[int], column: str, corrs: Optional[list[int]],
+                        refant: int, first: int, last: int, workers: Optional[int] = None) -> dict:
+    """Mean phase [deg] of channels ``first..last`` per (other antenna, scan, subband) of the baselines to
+    ``refant``: ``{other antenna: {scan: (nspw, npol)}}`` under ``phases``."""
+    started = _time.perf_counter()
+    setup, parts = _run_keyed(ms, "subband_phase_job", fields=fields, scans=scans, column=column, corrs=corrs,
+                              workers=workers, refant=int(refant), first=int(first), last=int(last))
+    nddid = len(setup["ddid_to_spw"])
+    nspw = int(np.max(setup["ddid_to_spw"])) + 1 if nddid else 0
+    sums, counts = _per_key(parts)
+    phases: dict[int, dict] = {}
+    for key, total in sums.items():
+        rest, ddid = divmod(key, nddid)
+        other, scan = divmod(rest, 1_000_000)
+        per_scan = phases.setdefault(other, {})
+        if scan not in per_scan:
+            per_scan[scan] = np.full((nspw, total.shape[0]), np.nan)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            mean = np.where(counts[key] > 0, total / counts[key], np.nan)
+        per_scan[scan][int(setup["ddid_to_spw"][ddid])] = np.degrees(np.angle(mean))
+    return {"phases": phases, "seconds": _time.perf_counter() - started}
+
+
+# ---------------------------------------------------------------------------
+# uv coverage
+# ---------------------------------------------------------------------------
+def uv_coverage_job(*, specs: list[dict], engine: str, ncorr: int, view: Optional[dict] = None) -> dict:
+    """Worker job: FIELD_ID, U and V [m] of the cross-correlation rows that are not entirely flagged, in row
+    order."""
+    block = read_runs(specs, ["UVW", "FLAG", "FLAG_ROW", "ANTENNA1", "ANTENNA2"], engine=engine)
+    if not block:
+        return {}
+    flagged = np.asarray(block["FLAG_ROW"], dtype=bool) | np.asarray(block["FLAG"], dtype=bool).all(axis=(1, 2))
+    keep = (np.asarray(block["ANTENNA1"]) != np.asarray(block["ANTENNA2"])) & ~flagged
+    uvw = np.asarray(block["UVW"], dtype=np.float64)[keep]
+    return {"field": np.asarray(block["FIELD_ID"], dtype=np.int64)[keep], "u": uvw[:, 0], "v": uvw[:, 1]}
+
+
+def read_uv_coverage(ms, *, fields: Optional[list[str]], max_points: int, workers: Optional[int] = None) -> dict:
+    """The sampled (u, v) [m] of the first data description per field, as the CASA reader selects them: the
+    cross-correlations not entirely flagged, every k-th row of a field with more than ``max_points``.
+
+    Returns
+    -------
+    dict
+        ``fields`` (``{field id: (u, v)}`` arrays in metres) and ``seconds``.
+    """
+    started = _time.perf_counter()
+    engine = table_engine()
+    setup = read_setup(ms, engine=engine)
+    layout = read_layout(ms, engine=engine)
+    field_ids = None
+    if fields:
+        field_ids = {setup["field_names"].index(name) for name in fields if name in setup["field_names"]}
+    selected = select_runs(layout, fields=field_ids, ddids={0})
+    jobs = [{"specs": chunk, "engine": engine, "ncorr": int(setup["ncorr"])}
+            for chunk in split_rows(run_specs(layout, selected), PLOT_ROWS)]
+    parts = [part for part in run_jobs("vlbipy.solvers.plot_read:uv_coverage_job", jobs, workers) if part]
+    coverage: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    if parts:
+        field = np.concatenate([part["field"] for part in parts])
+        u, v = np.concatenate([part["u"] for part in parts]), np.concatenate([part["v"] for part in parts])
+        for fid in np.unique(field):
+            rows = np.flatnonzero(field == fid)
+            rows = rows[::max(1, int(np.ceil(rows.size / max_points)))]
+            coverage[int(fid)] = (u[rows], v[rows])
+    return {"fields": coverage, "seconds": _time.perf_counter() - started}

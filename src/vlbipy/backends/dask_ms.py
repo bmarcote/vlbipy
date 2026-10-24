@@ -482,17 +482,124 @@ class DaskMsPlotReads:
         if column == "corrected":
             self.backend.calibrate.ensure_corrected(project_code)
 
-    def read_spectrum(self, project_code: str, **kwargs) -> dict:
-        self._corrected_written(project_code, kwargs.get("column", "corrected"))
-        return super().read_spectrum(project_code, **kwargs)
+    def _selected_scans(self, meta: ObsMetadata, field: str, scans: Optional[list]) -> tuple[list, list]:
+        """The field names and scan numbers a ``field``/``scans`` selection of the CASA readers covers."""
+        wanted = [f for f in field.split(",") if f]
+        numbers = sorted(int(s) for s in (scans or []))
+        return wanted, numbers
 
-    def read_subband_phases(self, project_code: str, **kwargs) -> dict:
-        self._corrected_written(project_code, kwargs.get("column", "corrected"))
-        return super().read_subband_phases(project_code, **kwargs)
+    def read_spectrum(self, project_code: str, *, field: str = "", scans: Optional[list] = None,
+                      refant: str = "", column: str = "corrected", all_pols: bool = False,
+                      metadata: Optional[ObsMetadata] = None) -> dict:
+        """Time-averaged spectra of the baselines to ``refant``, read in parallel (same output as
+        :meth:`CasaDataOps.read_spectrum`, which reads through the ``ms`` tool)."""
+        self._corrected_written(project_code, column)
+        from ..solvers.plot_read import read_spectrum
+        from .casa import parallel_hand_indices
+        meta = metadata or self.get_metadata(project_code, [], "")
+        refant = refant or self.backend.calibrate.refant_chain(meta, "").split(",")[0]
+        antenna_names = list(meta.antennas)
+        if refant not in antenna_names:
+            raise BackendError(f"{project_code}: reference antenna {refant!r} is not in the array")
+        n_spw, n_chan = meta.freq_setup.n_subbands, meta.freq_setup.n_channels
+        if all_pols:
+            pol_indices = list(range(len(meta.freq_setup.polarizations)))
+            pol_labels = [p.name for p in meta.freq_setup.polarizations]
+        else:
+            pol_indices, pol_labels = parallel_hand_indices(meta)
+        wanted, numbers = self._selected_scans(meta, field, scans)
+        result = read_spectrum(self.backend.ms_path(project_code), fields=wanted or None,
+                               scans=numbers or None,
+                               column={"corrected": "CORRECTED_DATA", "data": "DATA",
+                                       "model": "MODEL_DATA"}[column],
+                               corrs=list(pol_indices), refant=antenna_names.index(refant))
+        spectra = {antenna_names[k]: v for k, v in result["spectra"].items() if k < len(antenna_names)}
+        logger.info("read_spectrum[dask-ms]: {} baseline(s) to {} from the {} column ({} x {} channels) in {:.1f}s",
+                    len(spectra), refant, column, n_spw, n_chan, result["seconds"])
+        return {"antennas": sorted(spectra), "spectra": spectra, "refant": refant,
+                "n_spw": n_spw, "n_channels": n_chan, "polarizations": pol_labels,
+                "frequencies_ghz": [meta.freq_setup.frequencies_ghz(s) for s in range(n_spw)],
+                "column": column, "field": field, "scans": list(scans or [])}
 
-    def read_autocorr_spectrum(self, project_code: str, **kwargs) -> dict:
-        self._corrected_written(project_code, kwargs.get("column", "data"))
-        return super().read_autocorr_spectrum(project_code, **kwargs)
+    def read_autocorr_spectrum(self, project_code: str, *, field: str = "", scans: Optional[list] = None,
+                               column: str = "data", metadata: Optional[ObsMetadata] = None) -> dict:
+        """Time-averaged autocorrelation amplitude spectra, read in parallel (same output as
+        :meth:`CasaDataOps.read_autocorr_spectrum`)."""
+        self._corrected_written(project_code, column)
+        from ..solvers.plot_read import read_autocorr_spectrum
+        from .casa import parallel_hand_indices
+        meta = metadata or self.get_metadata(project_code, [], "")
+        antenna_names = list(meta.antennas)
+        n_spw, n_chan = meta.freq_setup.n_subbands, meta.freq_setup.n_channels
+        pol_indices, pol_labels = parallel_hand_indices(meta)
+        wanted, numbers = self._selected_scans(meta, field, scans)
+        result = read_autocorr_spectrum(self.backend.ms_path(project_code), fields=wanted or None,
+                                        scans=numbers or None,
+                                        column={"corrected": "CORRECTED_DATA", "data": "DATA"}[column],
+                                        corrs=list(pol_indices))
+        spectra = {antenna_names[k]: v for k, v in result["spectra"].items() if k < len(antenna_names)}
+        logger.info("read_autocorr_spectrum[dask-ms]: {} antenna(s) on {} scan(s) of {} from the {} column in "
+                    "{:.1f}s", len(spectra), len(scans or []) or "all", field or "all fields", column,
+                    result["seconds"])
+        return {"antennas": sorted(spectra, key=antenna_names.index), "spectra": spectra,
+                "n_spw": n_spw, "n_channels": n_chan, "polarizations": pol_labels,
+                "frequencies_ghz": [meta.freq_setup.frequencies_ghz(s) for s in range(n_spw)],
+                "scans": list(scans or []), "field": field, "column": column}
+
+    def read_subband_phases(self, project_code: str, *, fields: list[str], refant: str,
+                            column: str = "corrected", channel_fraction: float = 0.8,
+                            metadata: Optional[ObsMetadata] = None) -> dict:
+        """Per scan and baseline to ``refant`` the mean phase of every subband, read in parallel (same output as
+        :meth:`CasaDataOps.read_subband_phases`)."""
+        self._corrected_written(project_code, column)
+        from ..solvers.plot_read import read_subband_phases
+        from .casa import parallel_hand_indices
+        meta = metadata or self.get_metadata(project_code, [], "")
+        antenna_names = list(meta.antennas)
+        if refant not in antenna_names:
+            raise BackendError(f"{project_code}: reference antenna {refant!r} not in the data")
+        n_spw, n_chan = meta.freq_setup.n_subbands, meta.freq_setup.n_channels
+        pol_indices, pol_labels = parallel_hand_indices(meta)
+        scans = [s for s in meta.scans if s.source in set(fields)]
+        margin = int(round(n_chan * (1.0 - channel_fraction) / 2.0))
+        result = read_subband_phases(self.backend.ms_path(project_code), fields=list(fields),
+                                     scans=[s.scan_number for s in scans],
+                                     column={"corrected": "CORRECTED_DATA", "data": "DATA"}[column],
+                                     corrs=list(pol_indices), refant=antenna_names.index(refant), first=margin,
+                                     last=max(margin + 1, n_chan - margin))
+        named = {}
+        for other, per_scan in result["phases"].items():
+            if other >= len(antenna_names):
+                continue
+            grid = np.full((len(scans), n_spw, len(pol_indices)), np.nan)
+            for row, scan in enumerate(scans):
+                if scan.scan_number in per_scan:
+                    grid[row] = per_scan[scan.scan_number]
+            named[antenna_names[other]] = grid
+        logger.info("read_subband_phases[dask-ms]: {} baseline(s) to {} over {} scan(s) of {} ({} column) in {:.1f}s",
+                    len(named), refant, len(scans), ",".join(fields), column, result["seconds"])
+        return {"antennas": sorted(named, key=antenna_names.index), "phases": named, "refant": refant,
+                "scans": [{"scan": s.scan_number, "source": s.source,
+                           "time": 0.5 * (s.time_start + s.time_end)} for s in scans],
+                "polarizations": pol_labels, "n_spw": n_spw, "column": column, "fields": list(fields)}
+
+    def read_uv_coverage(self, project_code: str, *, field: str = "", max_points: int = 200_000,
+                         metadata: Optional[ObsMetadata] = None) -> dict:
+        """The sampled (u, v) points per source in Mlambda, read in parallel (same output as
+        :meth:`CasaDataOps.read_uv_coverage`)."""
+        from ..solvers.plot_read import read_uv_coverage
+        meta = metadata or self.get_metadata(project_code, [], "")
+        names = {fid: name for name, fid in meta.source_ids.items()}
+        frequency = float(meta.freq_setup.ref_freq)
+        to_mlambda = frequency / 299792458.0 / 1e6
+        result = read_uv_coverage(self.backend.ms_path(project_code),
+                                  fields=[f for f in field.split(",") if f] or None,
+                                  max_points=int(max_points))
+        fields = {names.get(fid, f"field{fid}"): {"u": (u * to_mlambda).tolist(), "v": (v * to_mlambda).tolist()}
+                  for fid, (u, v) in result["fields"].items()}
+        logger.info("read_uv_coverage[dask-ms]: {} field(s), {} point(s) on {} in {:.1f}s", len(fields),
+                    sum(len(f["u"]) for f in fields.values()), field or "all fields", result["seconds"])
+        return {"fields": fields, "unit": "Mlambda", "freq_ghz": frequency / 1e9}
 
 
 class DaskMsDataOps(DaskMsPlotReads, CasaDataOps):
