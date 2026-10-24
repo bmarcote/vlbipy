@@ -21,10 +21,14 @@ from .models import CalTable, ObsMetadata
 from .namespaces import (CalibrateNamespace, CleanNamespace, ExportNamespace, FlagNamespace,
                          ImportDataNamespace, PlotNamespace, SelfcalNamespace)
 from .observatories import get_observatory_handler
+from .phaseref import PhaseRefPlan, PhaseRefSettings, median_sampling, resolve_plan
 from .sources import SourceSet
 from .state import StepState
 
 logger = get_logger()
+
+#: Name of the phase-referencing decision file kept next to the measurement set.
+PHASEREF_FILENAME = ".phaseref.json"
 
 #: File holding the calibration chain, so a resumed process can rebuild it.
 CALTABLES_FILENAME = ".caltables.json"
@@ -281,6 +285,79 @@ class Observation:
             self.gaintables[:] = [t for t in self.gaintables if t.step not in steps]
             self._save_gaintables()
         return dropped
+
+    # -- phase referencing --
+    @property
+    def phaseref_settings(self) -> PhaseRefSettings:
+        """The ``[phase_referencing]`` settings (:class:`vlbipy.phaseref.PhaseRefSettings`)."""
+        return PhaseRefSettings.from_config(self.config.get("phase_referencing"))
+
+    def phaseref_plan(self, *, refresh: bool = False) -> PhaseRefPlan:
+        """Which sources the phases are solved on, in which order, and how they reach the others.
+
+        Decided once (:func:`vlbipy.phaseref.resolve_plan`, with the fringe SNR of the reference sources as
+        their brightness when the decision needs it) and kept in :data:`PHASEREF_FILENAME`: the
+        self-calibration and every application of a resumed run follow the decision the fringe fit took, as
+        long as the settings and the sources are the same. ``refresh`` decides again.
+        """
+        settings = self.phaseref_settings
+        meta = self.metadata
+        observed = list(meta.source_names) if meta is not None and meta.source_names else list(self.sources.names)
+        finders = {s.name for s in self.sources.fringe_finders}
+        role = self.sources.targets if settings.inverse else self.sources.phase_calibrators
+        references = [s.name for s in role if s.name in observed and s.name not in finders]
+        receivers = [name for name in observed if name not in finders and name not in references]
+        key = {"settings": settings.to_dict(), "references": sorted(references), "receivers": receivers}
+        path = Path(self.work_dir) / PHASEREF_FILENAME if self._backend.requires_data_files else None
+        cached = getattr(self, "_phaseref", None)
+        if not refresh:
+            if cached is not None and cached[0] == key:
+                return cached[1]
+            if path is not None and path.is_file():
+                stored = json.loads(path.read_text())
+                if stored.get("key") == key:
+                    plan = PhaseRefPlan.from_dict(stored["plan"])
+                    self._phaseref = (key, plan)
+                    return plan
+        needs_brightness = len(references) > 1 and (
+            settings.strategy == "auto" or (settings.strategy == "sequential"
+                                            and not set(references) <= set(settings.order)))
+        sampling = None
+        if len(references) > 1 and settings.strategy == "auto" and meta is not None:
+            sampling = median_sampling(meta.scans, references, receivers, dict(meta.source_coords or {}))
+        plan = resolve_plan(settings, references, receivers,
+                            self._reference_brightness(references) if needs_brightness else {},
+                            sampling=sampling)
+        logger.info("phase referencing: {}{} -> {} ({}){}", "inverse; " if plan.inverse else "",
+                    ", ".join(plan.references) or "no reference source", plan.strategy, plan.reason,
+                    f"; transferred to {', '.join(plan.receivers)}" if plan.receivers else "")
+        self._phaseref = (key, plan)
+        if path is not None:
+            path.write_text(json.dumps({"key": key, "plan": plan.to_dict()}, indent=1))
+        return plan
+
+    def clear_phaseref(self) -> None:
+        """Forget the phase-referencing decision; the next :meth:`phaseref_plan` takes it again."""
+        self._phaseref = None
+        if self._backend.requires_data_files:
+            (Path(self.work_dir) / PHASEREF_FILENAME).unlink(missing_ok=True)
+
+    def _reference_brightness(self, references: list[str]) -> dict[str, float]:
+        """Array fringe SNR of each reference source (empty when the survey cannot be had)."""
+        survey = self.metadata.snr_survey if self.metadata is not None else None
+        ranked = {name: snr for name, snr, _ in survey.rank_sources()} if survey is not None else {}
+        # The calibrator survey first (a resumed run reads it back from disk), the references alone if it
+        # does not cover them.
+        for selection in ("", ",".join(references)):
+            if set(references) <= set(ranked):
+                break
+            try:
+                survey = self.calibrate.scan_snr(field=selection)
+                ranked.update({name: snr for name, snr, _ in survey.rank_sources()})
+            except Exception as exc:  # noqa: BLE001 - the plan falls back to its brightness-free choice
+                logger.warning("phase referencing: no fringe SNR survey of {} ({}); brightness unknown",
+                               selection or "the calibrators", exc)
+        return {name: ranked[name] for name in references if name in ranked}
 
     # -- read-only accessors --
     @property

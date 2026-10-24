@@ -124,6 +124,9 @@ class VLBIObs:
             phasecal=_string_list(phasecal) or None,
             fringe_finder=_string_list(fringe_finder) or None,
             check_source=_string_list(check_source) or None,
+            phaseref_strategy=overrides.pop("phaseref_strategy", None),
+            inverse_phaseref=overrides.pop("inverse_phaseref", None),
+            phaseref_order=overrides.pop("phaseref_order", None),
         )
         merged_overrides = _deep_merge(kw_over, overrides) if overrides else kw_over
         self.config = load_config(config, overrides=merged_overrides)
@@ -428,6 +431,8 @@ class VLBIObs:
         # Every application before the last one is deferred where the backend can (dask-ms): the
         # steps in between read the corrected data through readers that calibrate DATA as they
         # read it, and CORRECTED_DATA is written once, with the final chain (write_corrected).
+        # A receptor much weaker than its pair goes first, so no solve averages it in.
+        self.flag.weak_polarizations(force=force)
         self.calibrate.instrumental(force=force)
         self.flag.edges(force=force)
         self.calibrate.apply(force=True, defer=True)

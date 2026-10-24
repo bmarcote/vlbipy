@@ -26,6 +26,12 @@ polarization_calibrators = []
 #   "3C286"     = "J1048+7143"
 #   "R20181030" = ["J1027+7428", "J1048+7143"]
 [phase_referencing]
+inverse = false             # true: solve the phases on the targets, transfer to the calibrators
+strategy = "auto"           # auto|single|sequential|interpolate|time (how reference phases reach receivers)
+order = []                  # sequential: reference-source preference order
+brightness_ratio = 3.0      # auto: sequential only when a reference is this much brighter than the next
+max_extrapolation = 1.0     # interpolate: fraction of a calibrator separation a receiver may extrapolate
+max_gap = 600.0             # seconds; a larger reference gap around a scan counts as unobserved
 
 [import]
 scan_gap = 15                # seconds; gap defining a new scan boundary

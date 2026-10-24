@@ -93,6 +93,15 @@ def job_cost(job: PlotJob) -> float:
                      if (not fields or scan.source in fields) and (not scans or scan.scan_number in scans)))
 
 
+def plot_workers(setting) -> int:
+    """Most plots drawn at once for a ``[plotting].workers`` setting: ``"auto"`` (or 0) = every CPU this
+    process may use (:func:`vlbipy.tools.usable_cpus`), a number = at most that many. The memory
+    estimate of each plot set then lowers it where they would not fit (:func:`plan_workers`)."""
+    if setting is None or str(setting).strip().lower() in ("auto", "", "0"):
+        return usable_cpus()
+    return max(1, int(setting))
+
+
 def plan_workers(peaks: list, *, max_workers: int, available: Optional[int]) -> int:
     """Number of plots to draw at once.
 

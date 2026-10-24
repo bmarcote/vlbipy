@@ -124,9 +124,20 @@ def kwargs_to_overrides(**kwargs) -> dict:
         if value is not None:
             sources[cfg_key] = [value] if isinstance(value, str) else list(value)
 
+    phaseref: dict = {}
+    if kwargs.get("phaseref_strategy") is not None:
+        phaseref["strategy"] = kwargs["phaseref_strategy"]
+    if kwargs.get("inverse_phaseref") is not None:
+        phaseref["inverse"] = bool(kwargs["inverse_phaseref"])
+    if kwargs.get("phaseref_order") is not None:
+        order = kwargs["phaseref_order"]
+        phaseref["order"] = [order] if isinstance(order, str) else list(order)
+
     out: dict = {}
     if glob:
         out["global"] = glob
     if sources:
         out["sources"] = sources
+    if phaseref:
+        out["phase_referencing"] = phaseref
     return out

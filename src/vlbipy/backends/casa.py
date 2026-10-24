@@ -3349,6 +3349,9 @@ class CasaCalibrationOps(CalibrationOps):
             shutil.rmtree(table_path)
         new_path.rename(table_path)
         spread = self._subband_gain_spread(table_path)
+        # The normalisation removes each hand's level: compare the two hands first.
+        (self.backend.caldir() / f"{project_code}.scalar_bp.hands.json").write_text(
+            json.dumps(self._hand_levels(table_path), indent=1))
         dropped, filled = self._normalise_per_antenna(table_path, max_factor=max_factor,
                                                       fill_unsolved=fill_unsolved)
         if filled:
@@ -3365,13 +3368,25 @@ class CasaCalibrationOps(CalibrationOps):
 
     def _normalise_per_antenna(self, table_path: Path, *, max_factor: float = 2.0,
                                fill_unsolved: bool = False) -> tuple[list[str], list[str]]:
-        """Scale a gain table so each antenna/polarization has median amplitude 1 across its subbands.
+        """Level each antenna/polarization across its subbands and merge the calibrators into one solution.
 
-        Solutions more than a factor ``max_factor`` above or below that median are
-        flagged. Solutions the solver flagged are left flagged, or with
-        ``fill_unsolved`` set to gain 1 and unflagged. Returns the labels
-        (``"<antenna> spw <n> pol <index>"``) of the newly flagged and of the
-        filled solutions.
+        gaincal solves every calibrator field on its own (``combine`` has no
+        ``field``) against a 1 Jy point model, so the solutions of each field
+        carry that source's flux density and structure on top of the subband
+        steps. Each (antenna, polarization, field) set is therefore scaled to
+        median amplitude 1 across its subbands on its own; only then are the
+        fields comparable. Their SNR-weighted geometric mean is written to every
+        row of that antenna/subband/polarization, so the table holds a single
+        time-independent level per antenna, subband and polarization and every
+        time and field gets the same correction, whatever the interpolation.
+
+        A solution more than a factor ``max_factor`` above or below its field's
+        level is not merged; when no field has a usable solution for that
+        antenna/subband/polarization it is flagged. Solutions the solver could
+        not find in any field are left flagged, or with ``fill_unsolved`` set to
+        gain 1 and unflagged. Returns the labels
+        (``"<antenna> spw <n> pol <index>"``) of the flagged and of the filled
+        solutions.
         """
         handle = self.backend.tools.table()
         if not handle.open(str(table_path), nomodify=False):
@@ -3381,6 +3396,8 @@ class CasaCalibrationOps(CalibrationOps):
             flags = np.asarray(handle.getcol("FLAG")).astype(bool)
             antennas = np.asarray(handle.getcol("ANTENNA1"))
             spws = np.asarray(handle.getcol("SPECTRAL_WINDOW_ID"))
+            fields = np.asarray(handle.getcol("FIELD_ID"))
+            snr = np.asarray(handle.getcol("SNR")).astype(float)
             names = self._table_antenna_names(table_path)
             dropped: set[str] = set()
             filled: set[str] = set()
@@ -3389,25 +3406,76 @@ class CasaCalibrationOps(CalibrationOps):
                 name = names[int(antenna)] if int(antenna) < len(names) else f"#{int(antenna)}"
                 for pol in range(gains.shape[0]):
                     amplitude = np.abs(gains[pol, 0, rows])
-                    good = ~flags[pol, 0, rows] & np.isfinite(amplitude) & (amplitude > 0)
-                    if fill_unsolved and not good.all():
-                        gains[pol, 0, rows[~good]] = 1.0
-                        flags[pol, 0, rows[~good]] = False
-                        filled.update(f"{name} spw {int(s)} pol {pol}" for s in spws[rows[~good]])
-                    if not good.any():
-                        continue
-                    level = float(np.median(amplitude[good]))
-                    gains[pol, 0, rows[good]] = gains[pol, 0, rows[good]] / level
-                    ratio = amplitude / level
-                    off = good & ((ratio > max_factor) | (ratio < 1.0 / max_factor))
-                    flags[pol, 0, rows[off]] = True
-                    dropped.update(f"{name} spw {int(s)} pol {pol}" for s in spws[rows[off]])
+                    solved = ~flags[pol, 0, rows] & np.isfinite(amplitude) & (amplitude > 0)
+                    usable = solved.copy()
+                    relative = np.full(rows.size, np.nan)
+                    for field in np.unique(fields[rows]):
+                        in_field = solved & (fields[rows] == field)
+                        if not in_field.any():
+                            continue
+                        relative[in_field] = amplitude[in_field] / float(np.median(amplitude[in_field]))
+                        usable[in_field] = (relative[in_field] <= max_factor) & \
+                                           (relative[in_field] >= 1.0 / max_factor)
+                    for spw in np.unique(spws[rows]):
+                        same = spws[rows] == spw
+                        label = f"{name} spw {int(spw)} pol {pol}"
+                        merge = same & usable
+                        if merge.any():
+                            weight = np.where(snr[pol, 0, rows[merge]] > 0, snr[pol, 0, rows[merge]], 1.0)
+                            level = float(np.exp(np.sum(weight * np.log(relative[merge])) / np.sum(weight)))
+                            gains[pol, 0, rows[same]] = level
+                            flags[pol, 0, rows[same]] = False
+                        elif (same & solved).any():
+                            flags[pol, 0, rows[same]] = True
+                            dropped.add(label)
+                        elif fill_unsolved:
+                            gains[pol, 0, rows[same]] = 1.0
+                            flags[pol, 0, rows[same]] = False
+                            filled.add(label)
             handle.putcol("CPARAM", gains)
             handle.putcol("FLAG", flags)
         finally:
             handle.close()
         order = lambda label: (label.split()[0], int(label.split()[2]), label.split()[-1])  # noqa: E731
         return sorted(dropped, key=order), sorted(filled, key=order)
+
+    def _hand_levels(self, table_path: Path) -> dict:
+        """How the two hands of every antenna compare in the scalar-bandpass solutions, before normalising.
+
+        Each solution is the amplitude of one hand of one antenna in one subband against the 1 Jy model of
+        one calibrator, so the ratio of the two hands' solutions of the same subband and calibrator is the
+        ratio of their amplitudes, whatever the calibrator's flux density or structure.
+
+        Returns
+        -------
+        dict
+            ``{antenna: {"ratio": median |g_RR| / |g_LL| over the (field, subband) solutions both hands have
+            (None without any), "pairs": their number, "solved": {"RR": n, "LL": n}}}``.
+        """
+        handle = self.backend.tools.table()
+        if not handle.open(str(table_path)):
+            return {}
+        try:
+            gains = np.abs(np.asarray(handle.getcol("CPARAM")))[:, 0]   # (npol, nrow)
+            flags = np.asarray(handle.getcol("FLAG")).astype(bool)[:, 0]
+            antennas = np.asarray(handle.getcol("ANTENNA1"))
+        finally:
+            handle.close()
+        names = self._table_antenna_names(table_path)
+        if gains.shape[0] < 2:
+            return {}
+        solved = ~flags & np.isfinite(gains) & (gains > 0)
+        levels = {}
+        for antenna in np.unique(antennas):
+            rows = antennas == antenna
+            both = rows & solved[0] & solved[1]
+            ratios = gains[0, both] / gains[1, both]
+            name = names[int(antenna)] if int(antenna) < len(names) else f"#{int(antenna)}"
+            levels[name] = {"ratio": float(np.median(ratios)) if ratios.size else None,
+                            "pairs": int(both.sum()),
+                            "solved": {"RR": int((rows & solved[0]).sum()),
+                                       "LL": int((rows & solved[1]).sum())}}
+        return levels
 
     @staticmethod
     def _summarise_labels(labels: list[str], limit: int = 6) -> str:

@@ -49,10 +49,20 @@ from typing import Optional
 
 import numpy as np
 
+from ..resources import available_memory, parse_size, usable_cpus
+
 #: Environment variable overriding the number of worker processes.
 WORKERS_ENV = "VLBIPY_WORKERS"
 #: Upper bound on the default pool size (the Multi-MS parts and scans rarely feed more).
 MAX_DEFAULT_WORKERS = 16
+#: Memory planned per worker process when sizing the pool. Measured on LBA data (32 channels, 4
+#: correlations): 0.13 GB idle, 0.45 GB for a split job, up to 0.9 GB with the calibration tables it keeps.
+WORKER_MEMORY = 1 << 30
+#: Environment variable overriding :data:`WORKER_MEMORY` (e.g. ``2G`` for data with many more channels).
+WORKER_MEMORY_ENV = "VLBIPY_WORKER_MEMORY"
+#: Share of the available memory the pool is sized to fill; the rest is for the main process (CASA, the
+#: concatenated results of a task, plots) and whatever else runs on the machine.
+POOL_MEMORY_FRACTION = 0.75
 #: Seconds to wait for the worker processes to start and connect back.
 START_TIMEOUT = 120.0
 #: Shared objects (calibration tables) a worker keeps; the least recently used one is dropped beyond that.
@@ -69,12 +79,38 @@ _EXECUTOR_LOCK = threading.Lock()
 _IN_THREAD = threading.local()
 
 
+_CPUS: Optional[int] = None
+
+
+def _cpus() -> int:
+    """CPUs this process may use (:func:`vlbipy.resources.usable_cpus`, read once per process)."""
+    global _CPUS
+    if _CPUS is None:
+        _CPUS = usable_cpus()
+    return _CPUS
+
+
+def worker_memory() -> int:
+    """Bytes planned per worker process: ``$VLBIPY_WORKER_MEMORY`` or :data:`WORKER_MEMORY`."""
+    configured = os.environ.get(WORKER_MEMORY_ENV, "").strip()
+    return max(1, parse_size(configured)) if configured else WORKER_MEMORY
+
+
 def default_workers() -> int:
-    """Number of worker processes to use: ``$VLBIPY_WORKERS`` or the CPU count capped at 16."""
+    """Number of worker processes to use: ``$VLBIPY_WORKERS``, else as many as the machine can run.
+
+    That is the CPUs this process may use (its affinity and any cgroup CPU quota), at most 16, and no more
+    than fit in :data:`POOL_MEMORY_FRACTION` of the available memory (the system's, or what a container,
+    batch job or ``systemd-run -p MemoryMax=`` unit leaves) at :func:`worker_memory` each.
+    """
     configured = os.environ.get(WORKERS_ENV, "").strip()
     if configured:
         return max(1, int(configured))
-    return max(1, min(os.cpu_count() or 1, MAX_DEFAULT_WORKERS))
+    by_cpu = min(_cpus(), MAX_DEFAULT_WORKERS)
+    free = available_memory()
+    if free is None:
+        return max(1, by_cpu)
+    return max(1, min(by_cpu, int(free * POOL_MEMORY_FRACTION // worker_memory())))
 
 
 def job_threads() -> int:

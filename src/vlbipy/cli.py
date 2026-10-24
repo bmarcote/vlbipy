@@ -92,6 +92,12 @@ def _common_parser(*, project_required: bool = True) -> argparse.ArgumentParser:
     p.add_argument("--no-ionos", dest="ionos", action="store_false", default=None,
                    help="Do not solve the dispersive (ionospheric) delay in the fringe fit. "
                         "By default it is solved below 6 GHz, where the ionosphere matters.")
+    p.add_argument("--phaseref-strategy", dest="phaseref_strategy",
+                   choices=("auto", "single", "sequential", "interpolate", "time"),
+                   help="Phase-referencing strategy of [phase_referencing].strategy")
+    p.add_argument("--inverse-phaseref", action="store_true", default=None, dest="inverse_phaseref",
+                   help="Inverse phase referencing: solve the phases on the targets, "
+                        "transfer them to the calibrators")
     p.add_argument("--callib", action="store_true", default=None,
                    help="Use CASA cal-library files instead of explicit parallel "
                         "gaintable/gainfield/interp/spwmap/calwt parameters.")
@@ -381,6 +387,8 @@ def _build_obs(args: argparse.Namespace) -> VLBIObs:
     return VLBIObs(args.project, network=args.network, backend=args.backend, target=args.target,
                    phasecal=args.phasecal, fringe_finder=args.fringe_finder,
                    check_source=getattr(args, "check_source", None), refant=refant,
+                   phaseref_strategy=getattr(args, "phaseref_strategy", None),
+                   inverse_phaseref=getattr(args, "inverse_phaseref", None),
                    config=args.config, **overrides)
 
 
