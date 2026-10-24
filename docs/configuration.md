@@ -129,6 +129,8 @@ Source names must exactly match those in the data file. Both the new-style keys 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | `scan_gap` | int | `15` | Time gap in seconds that defines a new scan boundary during import |
+| `files` | string or list[str] | *(unset)* | Explicit FITS-IDI file(s) or a glob pattern; skips the search on disk and the download |
+| `replace_tsys` | bool | `false` | Overwrite the Tsys/GC tables already present in the FITS-IDI files with the ANTAB ones (acts only when the data are imported) |
 
 ### `[flagging]`
 
@@ -339,5 +341,7 @@ CLI arguments override the corresponding TOML parameters:
 | `--obsdate` | `[import] obsdate` (every subcommand) |
 | `--username` | `[import] username` (every subcommand) |
 | `--password` | `[import] password` (every subcommand; never saved to `.project.json`) |
+| `--files` | `[import] files` (every subcommand) |
+| `--replace-tsys` | `[import] replace_tsys = true` (every subcommand) |
 | `--from-step` | *(run control, no TOML equivalent)* |
 | `--scratch` | *(run control, no TOML equivalent; `--force` is an alias)* |

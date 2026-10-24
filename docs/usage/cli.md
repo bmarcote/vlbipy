@@ -34,6 +34,16 @@ vlbipy run -p eg078b -t J1234+5678 --username eg078b --password '...'
 They can also go in the configuration (`[import] username`, `password`,
 `obsdate`). The password is never written to `<work_dir>/.project.json`.
 
+The import options `--files` (explicit FITS-IDI files or a glob pattern) and
+`--replace-tsys` (overwrite the Tsys/GC tables already in the FITS-IDI files)
+are common to every subcommand too, as `[import] files` and `replace_tsys`.
+They act only when the data are imported: on a project already imported, add
+`--force` or `--from-step import_data`.
+
+```bash
+vlbipy pipeline -p eg078b --replace-tsys --from-step import_data
+```
+
 ## A worked reduction
 
 ```bash

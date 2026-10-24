@@ -67,7 +67,7 @@ def _relocate_selectors(args: argparse.Namespace) -> argparse.Namespace:
         return args
     attr, valid = selector
     moved: list[str] = []
-    for source_attr in ("project", "target"):
+    for source_attr in ("project", "target", "files"):
         values = getattr(args, source_attr, None) or []
         while len(values) > 1 and values[-1] in valid:
             moved.insert(0, values.pop())
@@ -107,6 +107,13 @@ def _common_parser(*, project_required: bool = True) -> argparse.ArgumentParser:
                                      "auto-resolved from the data or the EVN archive if omitted")
     p.add_argument("--username", help="Archive username for proprietary data")
     p.add_argument("--password", help="Archive password for proprietary data")
+    # Likewise the import options: whichever subcommand ends up importing the data uses them.
+    p.add_argument("--files", nargs="+", metavar="FILE",
+                   help="Explicit FITS-IDI file(s) or a glob pattern; skips search/download")
+    p.add_argument("--replace-tsys", action="store_true", default=None, dest="replace_tsys",
+                   help="Overwrite the Tsys/GC tables in the FITS-IDI files even if already present "
+                        "(only takes effect when the data are (re-)imported: add --force or "
+                        "--from-step import_data if they already are)")
     p.add_argument("-v", "--verbose", action="store_true", help="Verbose (DEBUG) logging")
     return p
 
@@ -180,14 +187,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="List the pipeline steps in order (all valid for --from-step) and exit; "
                              "with -p it also shows which ones are already done")
 
-    p_imp = sub.add_parser(
+    sub.add_parser(
         "import", parents=[common], formatter_class=RichHelpFormatter,
         help="Download the raw data (if not on disk) and import it into a measurement set"
     )
-    p_imp.add_argument("--files", nargs="+", metavar="FILE",
-                       help="Explicit FITS-IDI file(s) or a glob pattern; skips search/download")
-    p_imp.add_argument("--replace-tsys", action="store_true", dest="replace_tsys",
-                       help="Overwrite Tsys/GC tables in the FITS-IDI files even if already present")
 
     p_cal = sub.add_parser(
         "calibrate", parents=[common], formatter_class=RichHelpFormatter,
@@ -365,6 +368,9 @@ def _build_obs(args: argparse.Namespace) -> VLBIObs:
     refant = [a.strip() for a in args.refant.split(",")] if args.refant else None
     import_cfg = {key: getattr(args, key) for key in ("obsdate", "username", "password", "replace_tsys")
                   if getattr(args, key, None)}
+    if getattr(args, "files", None):
+        # A single argument may be a glob pattern; the import namespace expands it.
+        import_cfg["files"] = args.files[0] if len(args.files) == 1 else list(args.files)
     overrides = {"import": import_cfg} if import_cfg else {}
     if args.ionos is False:
         # --no-ionos: never solve the dispersive delay, whatever the frequency.
@@ -433,10 +439,7 @@ def _cmd_pipeline(obs: VLBIObs, args: argparse.Namespace) -> int:
 
 def _cmd_import(obs: VLBIObs, args: argparse.Namespace) -> int:
     """Import: download the raw data if missing, import to MS if missing, print the summary."""
-    files = args.files
-    if files and len(files) == 1:
-        files = files[0]  # single argument may be a glob pattern; let the namespace expand it
-    obs.import_data(force=args.force, files=files)
+    obs.import_data(force=args.force)
     print(obs.summary())
     return 0
 

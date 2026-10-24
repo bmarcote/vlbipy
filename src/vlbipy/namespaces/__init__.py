@@ -88,21 +88,25 @@ class ImportDataNamespace(Namespace):
             Re-run even if already imported (overwrites an existing MS).
         files : str or list, optional
             Explicit FITS-IDI file(s) or a glob pattern; skips find/download.
+            Default: ``[import].files``.
         """
         obs = self._obs
+        imp_cfg = obs.config.get("import", {})
+        files = files or imp_cfg.get("files") or None
         if not obs._state.should_run("import_data", force=force):
+            self._warn_ignored_import_options(imp_cfg, files)
             # Skipping the import must not skip *knowing* about the data: a resumed run
             # in a fresh process has no metadata yet, and every later step needs it.
             if obs._metadata is None:
                 obs._metadata = obs._load_metadata_cache() or self._load_metadata()
             obs.restrict_sources_to_data()
             return obs.metadata
-        imp_cfg = obs.config.get("import", {})
         scan_gap = imp_cfg.get("scan_gap", 15)
         inputs: list[str] = []
         if self._backend.requires_data_files and self._backend.data.is_imported(self._code) and not force:
             # Fresh process, product already on disk: skip file search/download entirely.
             logger.info("import_data: {} already imported; reading metadata", self._code)
+            self._warn_ignored_import_options(imp_cfg, files)
             self._reset_existing_data(imp_cfg)
         elif self._backend.requires_data_files:
             file_list = self._locate_files(files, imp_cfg)
@@ -124,6 +128,15 @@ class ImportDataNamespace(Namespace):
         obs.restrict_sources_to_data()
         obs._state.mark_complete("import_data", outputs=[f"{self._code}.ms"], inputs=inputs)
         return obs._metadata
+
+    def _warn_ignored_import_options(self, imp_cfg: dict, files) -> None:
+        """Say so when options that only act on a fresh import are given but the data are already in."""
+        ignored = [name for name, value in (("--files", files),
+                                            ("--replace-tsys", imp_cfg.get("replace_tsys"))) if value]
+        if ignored:
+            logger.warning("import_data: {} already imported, so {} has no effect; add --force "
+                           "(or --from-step import_data) to import the data again",
+                           self._code, " and ".join(ignored))
 
     def _reset_existing_data(self, imp_cfg: dict) -> None:
         """Clear a previous attempt's flags and corrected data from an existing dataset.
