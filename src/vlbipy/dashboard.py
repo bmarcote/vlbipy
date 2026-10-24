@@ -284,6 +284,8 @@ def _source_rows(observation, metadata) -> list[dict]:
                      "id": metadata.source_ids.get(name, "") if metadata else "",
                      "ra": coords.ra.to_string(unit=u.hourangle, sep=":", precision=4, pad=True) if coords else "",
                      "dec": coords.dec.to_string(unit=u.deg, sep=":", precision=3, alwayssign=True, pad=True) if coords else "",
+                     "ra_deg": float(coords.ra.deg) if coords else None,
+                     "dec_deg": float(coords.dec.deg) if coords else None,
                      "n_scans": sum(1 for s in metadata.scans if s.source == name) if metadata else 0})
     return rows
 
@@ -986,6 +988,17 @@ h3{font-size:15px;margin:22px 0 4px}
 .sub{color:var(--muted);margin:0 0 18px;max-width:80ch}
 section{scroll-margin-top:18px;padding:26px 0 8px;border-top:1px solid var(--border)}
 section:first-of-type{border-top:0;padding-top:8px}
+.skymap{max-width:460px;margin-top:8px;margin-bottom:14px}
+.skymap svg{display:block;width:100%;height:auto}
+.skymap .axis,.skymap .ring{fill:none;stroke:var(--border);stroke-width:1}
+.skymap .ringlabel,.skymap .seplabel{fill:var(--muted);font-size:10.5px;font-family:ui-monospace,Menlo,monospace}
+.skymap .compass{fill:var(--muted);font-weight:700;font-size:12px}
+.skymap .pair{stroke:var(--muted);stroke-width:1.2;stroke-dasharray:4 3}
+.skymap .leader{stroke:var(--border);stroke-width:1}
+.skymap .srclabel{fill:var(--ink);font-size:11.5px;font-weight:600}
+.skymap text{paint-order:stroke;stroke:var(--panel);stroke-width:3px;stroke-linejoin:round}
+.skymap .src{fill:var(--muted);stroke:var(--panel);stroke-width:1.5}
+.skymap .src.fringefinder{fill:var(--role-ff)} .skymap .src.phasecal{fill:var(--role-pc)} .skymap .src.target{fill:var(--role-tg)}
 .facts{display:flex;flex-wrap:wrap;gap:10px;margin:16px 0 8px}
 .fact{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px 14px;min-width:120px;
   box-shadow:var(--shadow)}
@@ -1288,6 +1301,153 @@ def _comments_section(ctx: dict) -> str:
     return "".join(parts)
 
 
+SKY_MAP_MAX_RINGS = 4
+
+
+def _unit_vector(ra_deg: float, dec_deg: float) -> tuple[float, float, float]:
+    """Cartesian unit vector of a sky position given in degrees."""
+    ra, dec = math.radians(ra_deg), math.radians(dec_deg)
+    return math.cos(dec) * math.cos(ra), math.cos(dec) * math.sin(ra), math.sin(dec)
+
+
+def angular_offset(ra0: float, dec0: float, ra: float, dec: float) -> tuple[float, float]:
+    """Great-circle distance and position angle (east of north) of ``(ra, dec)`` seen from ``(ra0, dec0)``.
+
+    All inputs and both outputs are in degrees; the position angle lies in ``[0, 360)``.
+    """
+    a0, d0, a, d = (math.radians(v) for v in (ra0, dec0, ra, dec))
+    dra = a - a0
+    north = math.cos(d0) * math.sin(d) - math.sin(d0) * math.cos(d) * math.cos(dra)
+    east = math.cos(d) * math.sin(dra)
+    rho = math.atan2(math.hypot(east, north), math.sin(d0) * math.sin(d) + math.cos(d0) * math.cos(d) * math.cos(dra))
+    return math.degrees(rho), math.degrees(math.atan2(east, north)) % 360.0
+
+
+def _format_separation(deg: float) -> str:
+    """Angular separation as text: arcminutes below one degree, degrees above."""
+    if deg < 1:
+        return f"{deg * 60:.1f}\u2032"
+    return f"{deg:.2f}\u00b0" if deg < 10 else f"{deg:.1f}\u00b0"
+
+
+def _format_ring(deg: float) -> str:
+    """Ring radius of the sky map as a round number: arcminutes below one degree, degrees above."""
+    return f"{round(deg * 60, 3):g}\u2032" if deg < 1 else f"{deg:g}\u00b0"
+
+
+def _sky_map_labels(names: list[str], points: list[tuple[float, float]], flip_x: float) -> list[tuple[float, float, str]]:
+    """Place the source labels of the sky map so that they do not overlap.
+
+    Parameters
+    ----------
+    names : list of str
+        Label texts, one per point.
+    points : list of (float, float)
+        SVG positions of the sources.
+    flip_x : float
+        Points to the right of this x get their label on their left (``text-anchor="end"``).
+
+    Returns
+    -------
+    list of (float, float, str)
+        ``(x, y, text-anchor)`` per point, in input order. Labels are placed top to bottom and a label that would
+        overlap one already placed moves down (then up) in steps of one line; the width is estimated from the
+        number of characters.
+    """
+    placed_boxes, result = [], [None] * len(names)
+    for i in sorted(range(len(names)), key=lambda k: points[k][1]):
+        x, y = points[i]
+        anchor = "end" if x > flip_x else "start"
+        lx = x - 9 if anchor == "end" else x + 9
+        width = 7.0 * len(names[i])
+        x0, x1 = (lx - width, lx) if anchor == "end" else (lx, lx + width)
+        ly = y + 4
+        for shift in (0, 13, -13, 26, -26, 39, -39, 52):
+            top = y + 4 + shift - 11
+            if not any(x0 < bx1 and bx0 < x1 and top < by1 and by0 < top + 14 for bx0, bx1, by0, by1 in placed_boxes):
+                ly = y + 4 + shift
+                break
+        placed_boxes.append((x0, x1, ly - 11, ly + 3))
+        result[i] = (lx, ly, anchor)
+    return result
+
+
+def _sky_map(sources: list[dict]) -> str:
+    """Inline SVG of the source positions relative to each other.
+
+    Parameters
+    ----------
+    sources : list of dict
+        Source rows from :func:`_source_rows`; rows without ``ra_deg``/``dec_deg`` (older ``dashboard.json``
+        snapshots, unknown coordinates) are skipped.
+
+    Returns
+    -------
+    str
+        A ``<figure class="skymap">`` with an azimuthal equidistant projection about the mean direction of the
+        sources (north up, east left), so the distance from the centre and the direction to every source are
+        true. Rings mark angular distance from the centre and every target is joined to its nearest phase
+        calibrator with the separation written along the line. Empty when fewer than two sources have
+        coordinates.
+    """
+    placed = [s for s in sources if s.get("ra_deg") is not None and s.get("dec_deg") is not None]
+    if len(placed) < 2:
+        return ""
+    vectors = [_unit_vector(s["ra_deg"], s["dec_deg"]) for s in placed]
+    mx, my, mz = (sum(v[i] for v in vectors) for i in range(3))
+    norm = math.sqrt(mx * mx + my * my + mz * mz)
+    if norm < 1e-9:
+        ra0, dec0 = placed[0]["ra_deg"], placed[0]["dec_deg"]
+    else:
+        ra0, dec0 = math.degrees(math.atan2(my, mx)) % 360.0, math.degrees(math.asin(mz / norm))
+    offsets = [angular_offset(ra0, dec0, s["ra_deg"], s["dec_deg"]) for s in placed]
+    max_rho = max(rho for rho, _ in offsets)
+    step = next((st for st in SKY_MAP_RING_STEPS_DEG if math.ceil(max_rho / st) <= SKY_MAP_MAX_RINGS), 90)
+    n_rings = max(1, math.ceil(max_rho / step - 1e-9))
+    width, height, radius = 440, 360, 140
+    cx, cy = width / 2, height / 2
+    scale = radius / (n_rings * step)
+    points = [(cx - rho * scale * math.sin(math.radians(pa)), cy - rho * scale * math.cos(math.radians(pa)))
+              for rho, pa in offsets]
+
+    parts = [f'<line class="axis" x1="{cx - radius}" y1="{cy}" x2="{cx + radius}" y2="{cy}"/>',
+             f'<line class="axis" x1="{cx}" y1="{cy - radius}" x2="{cx}" y2="{cy + radius}"/>']
+    for k in range(1, n_rings + 1):
+        r = k * radius / n_rings
+        parts.append(f'<circle class="ring" cx="{cx}" cy="{cy}" r="{r:.1f}"/>')
+        parts.append(f'<text class="ringlabel" x="{cx + r * 0.707 + 3:.1f}" y="{cy - r * 0.707 - 3:.1f}">'
+                     f'{escape(_format_ring(k * step))}</text>')
+    parts.append(f'<text class="compass" x="{cx}" y="{cy - radius - 8}" text-anchor="middle">N</text>')
+    parts.append(f'<text class="compass" x="{cx - radius - 8}" y="{cy + 4}" text-anchor="end">E</text>')
+
+    calibrators = [i for i, s in enumerate(placed) if s.get("type") == "phasecal"]
+    for i, source in enumerate(placed):
+        if source.get("type") != "target" or not calibrators:
+            continue
+        sep, j = min((angular_offset(source["ra_deg"], source["dec_deg"], placed[j]["ra_deg"], placed[j]["dec_deg"])[0], j)
+                     for j in calibrators)
+        (x1, y1), (x2, y2) = points[i], points[j]
+        parts.append(f'<line class="pair" x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}"/>')
+        parts.append(f'<text class="seplabel" x="{(x1 + x2) / 2:.1f}" y="{(y1 + y2) / 2 - 4:.1f}" '
+                     f'text-anchor="middle">{escape(_format_separation(sep))}</text>')
+    labels = _sky_map_labels([s["name"] for s in placed], points, cx + radius * 0.4)
+    for source, (x, y), (lx, ly, anchor) in zip(placed, points, labels):
+        role = escape(str(source.get("type") or "other"), quote=True)
+        tip = f'{source["name"]} ({source.get("ra", "")}, {source.get("dec", "")})'
+        if abs(ly - (y + 4)) > 1:
+            parts.append(f'<line class="leader" x1="{x:.1f}" y1="{y:.1f}" x2="{lx + (2 if anchor == "end" else -2):.1f}" '
+                         f'y2="{ly - 4:.1f}"/>')
+        parts.append(f'<circle class="src {role}" cx="{x:.1f}" cy="{y:.1f}" r="5"><title>{escape(tip)}</title></circle>')
+        parts.append(f'<text class="srclabel" x="{lx:.1f}" y="{ly:.1f}" text-anchor="{anchor}">'
+                     f'{escape(source["name"])}</text>')
+    caption = (f"Source positions about their mean direction (RA {ra0 / 15:.2f} h, Dec {dec0:+.1f}\u00b0) in an "
+               "azimuthal equidistant projection: distances from the centre and directions are true. North up, east "
+               "left; dashed lines join each target to its nearest phase calibrator.")
+    return (f'<figure class="skymap"><svg viewBox="0 0 {width} {height}" role="img" '
+            f'aria-label="Sky positions of the observed sources">{"".join(parts)}</svg>'
+            f'<figcaption><div class="d">{escape(caption)}</div></figcaption></figure>')
+
+
 def render_overview(ctx: dict, html_dir: Path) -> str:
     """Overview tab: observation facts, general comments, antennas, sources and scan table."""
     obs = ctx["observation"]
@@ -1392,7 +1552,8 @@ def render_overview(ctx: dict, html_dir: Path) -> str:
                        "Issues, decisions and results of this reduction, derived from the calibration products "
                        "on disk. The same list opens summary.md.", count=_comment_count(ctx.get("comments")))
             + _section("antennas", "Antennas", antenna_table, summary)
-            + _section("sources", "Sources", source_table, count=f'{len(ctx["sources"])}')
+            + _section("sources", "Sources", _sky_map(ctx["sources"]) + source_table,
+                       count=f'{len(ctx["sources"])}')
             + _section("scans", "Scans", scan_table, count=f'{len(ctx["scans"])}'))
     sections = [("observation", "Observation"), ("comments", "General comments"), ("antennas", "Antennas"),
                 ("sources", "Sources"), ("scans", "Scans")]
