@@ -972,6 +972,9 @@ class CalibrateNamespace(Namespace):
         cfg = dict(obs.config.get("calibration", {}).get("reweight", {}))
         cfg.pop("enabled", None)
         cfg.update(kwargs)
+        # statwt reads the corrected column; materialize it once instead of recomputing the
+        # deferred calibration on every read.
+        obs.calibrate.write_corrected()
         report = self._backend.calibrate.reweight(self._code, **cfg)
         obs._state.mark_complete("reweight", outputs=[f"mean={report.get('mean')}"])
         return report
@@ -1631,6 +1634,9 @@ class FlagNamespace(Namespace):
         # but one antenna pulling all of its baselines down. Found once, on the first pass: the typical
         # times given to the faint fields count from each antenna's first unflagged sample, so a second
         # application would move that sample and flag again.
+        # The outlier passes below read the corrected column per baseline: materialize it once
+        # rather than let every read recompute the whole deferred calibration chain.
+        obs.calibrate.write_corrected()
         if step == "flag_outliers" and not field and cfg.get("flag_off_source", True):
             self.off_source(dry_run=dry_run)
         report = self._backend.flag.outliers(

@@ -1354,10 +1354,11 @@ def apply_point_grid(vis, flag, weight, grid, point1, point2, chans=None, *, rot
             vis[bad] = 0
             flag |= bad
     if rotation is not None and rotate is not None and rotate.any():
-        if rotate.all():
-            vis *= rotation[:, None, :]
-        else:
-            vis[rotate] *= rotation[rotate][:, None, :]
+        with np.errstate(invalid="ignore"):    # NaN visibilities of flagged rows are expected
+            if rotate.all():
+                vis *= rotation[:, None, :]
+            else:
+                vis[rotate] *= rotation[rotate][:, None, :]
     gain = grid["gain"]
     g1, g2 = gain[point1], np.conj(gain[point2])                                  # (nrow, nchan, 2)
     if chans is not None:

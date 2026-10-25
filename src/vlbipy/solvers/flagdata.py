@@ -38,6 +38,7 @@ DATA does not change after import.
 from __future__ import annotations
 
 import datetime as _dt
+import os
 import re
 import time as _time
 import warnings
@@ -696,14 +697,27 @@ PER_PART_MODES = {"tfcrop", "rflag", "clip", "manual", "list", "quack", "unflag"
 
 
 def casa_flagdata_job(*, kwargs: dict, logfile: str = "") -> str:
-    """Worker job: run ``casatasks.flagdata(**kwargs)`` on one part; returns "" or the error text."""
-    import casatasks
-    if logfile:
-        casatasks.casalog.setlogfile(logfile)
+    """Worker job: run ``casatasks.flagdata(**kwargs)`` on one part; returns "" or the error text.
+
+    The task runs in a clean subprocess: a worker that already imported python-casacore (the default
+    table engine) cannot import casatools afterwards — the shared TaQL engine registers its functions
+    twice (``User defined TaQL function derivedmscal.help already exists``).
+    """
+    import pickle
+    import subprocess
+    import sys
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("wb", suffix=".pickle", delete=False) as handle:
+        pickle.dump({"kwargs": kwargs, "logfile": logfile}, handle)
+        spec = handle.name
     try:
-        casatasks.flagdata(**kwargs)
-    except Exception as exc:  # noqa: BLE001 - reported back to the caller, which raises
-        return f"{type(exc).__name__}: {exc}"
+        proc = subprocess.run([sys.executable, "-m", "vlbipy.solvers.flagdata", spec],
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            return (proc.stderr or f"exit status {proc.returncode}").strip().splitlines()[-1]
+    finally:
+        os.unlink(spec)
     return ""
 
 
@@ -733,3 +747,21 @@ def parallel_casa_flagdata(kwargs: dict, *, logfile: str = "", workers: Optional
     if errors:
         raise RuntimeError(f"flagdata failed on {len(errors)} of {len(parts)} part(s): {errors[0]}")
     return {"parts": len(parts), "seconds": _time.perf_counter() - started}
+
+
+if __name__ == "__main__":
+    # The one-part casatasks.flagdata runner of :func:`casa_flagdata_job` — a clean process, so
+    # casatools never meets a python-casacore already loaded here.
+    import pickle
+    import sys
+
+    import casatasks
+
+    spec = pickle.load(open(sys.argv[1], "rb"))
+    if spec["logfile"]:
+        casatasks.casalog.setlogfile(spec["logfile"])
+    try:
+        casatasks.flagdata(**spec["kwargs"])
+    except Exception as exc:  # noqa: BLE001 - the caller reports the text
+        sys.stderr.write(f"{type(exc).__name__}: {exc}")
+        sys.exit(3)

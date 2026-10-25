@@ -1960,11 +1960,29 @@ class CasaDataOps(DataOps):
         report = {"has_tsys": bool(with_tsys), "has_gc": n_gc > 0,
                   "antennas_with_tsys": with_tsys,
                   "antennas_without_tsys": [n for n in antenna_names if n not in with_tsys],
+                  "antennas_with_data": self._antennas_with_data(ms, antenna_names),
                   "gc_is_trivial": gc_trivial, "n_syscal_rows": n_syscal, "n_gc_rows": n_gc}
         logger.info("a-priori data in {}: SYSCAL {} rows ({}/{} antennas with valid Tsys), "
                     "GAIN_CURVE {} rows{}", ms.name, n_syscal, len(with_tsys), len(antenna_names),
                     n_gc, " (all coefficients 1.0 — placeholder)" if gc_trivial else "")
         return report
+
+    def _antennas_with_data(self, ms: Path, antenna_names: list[str]) -> set[str]:
+        """Names of the antennas that appear on at least one main-table row (empty on read failure).
+
+        Used to warn only for antennas missing Tsys *while they observed*: a station absent from
+        the data or present only on subbands the antenna has no Tsys for is expected, not a defect.
+        """
+        table = self.backend.tools.table()
+        try:
+            table.open(str(ms))
+            used = np.unique(np.concatenate([np.asarray(table.getcol(c), dtype=np.int32)
+                                             for c in ("ANTENNA1", "ANTENNA2")]))
+        except Exception:  # noqa: BLE001 - an empty set warns for everyone, the safe side
+            return set(antenna_names)
+        finally:
+            table.close()
+        return {antenna_names[i] for i in used if i < len(antenna_names)}
 
     # -- inspection --
     def listobs(self, project_code: str, listfile: Optional[str] = None) -> dict:
@@ -3927,7 +3945,7 @@ class CasaCalibrationOps(CalibrationOps):
         if report["gc_is_trivial"]:
             warnings.warn(f"{project_code}: every gain-curve coefficient is 1.0 — the elevation "
                           "dependence of the antenna gain will not be corrected")
-        missing = report["antennas_without_tsys"]
+        missing = [n for n in report["antennas_without_tsys"] if n in report["antennas_with_data"]]
         if missing:
             warnings.warn(f"{project_code}: no valid Tsys for {', '.join(missing)}; their "
                           "amplitude scale stays uncalibrated")

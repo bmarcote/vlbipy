@@ -664,10 +664,13 @@ class DaskMsDataOps(DaskMsPlotReads, CasaDataOps):
         kwargs.pop("keep_ms", None)  # legacy option: the measurement set is always kept now
         target = self.work_dir / f"{project_code}.mms"
         plain_ms = self.work_dir / f"{project_code}.ms"
-        if mms and files and not plain_ms.is_dir() and (delete or not target.exists()):
-            if target.exists():
-                logger.warning("removing existing {}", target)
-                shutil.rmtree(target)
+        if mms and files and (delete or not (target.exists() or plain_ms.is_dir())):
+            for stale in (target, plain_ms):
+                if stale.exists():
+                    # A leftover plain MS must not divert a fresh import to the CASA partition path
+                    # (it may be an interrupted import's corrupt remain); re-import from the files.
+                    logger.warning("removing existing {}", stale)
+                    shutil.rmtree(stale)
             try:
                 self._import_fitsidi_native(project_code, files, target, float(scan_gap), workers)
             except NotImplementedError as exc:
@@ -1196,6 +1199,23 @@ def _count_commands(kwargs: dict) -> int:
 class DaskMsFlagOps(CasaFlagOps):
     """CASA flag operations with native flag statistics and data reads; the flagdata calls themselves go
     through :class:`NativeFlagTasks`."""
+
+    def _run_flagdata(self, project_code: str, kind: str, *, field: str = "", **kwargs) -> None:
+        """``tfcrop`` runs natively (:func:`vlbipy.solvers.tfcrop.tfcrop`); a call it does not cover
+        falls back to CASA's flagdata, like :meth:`DaskMsCalibrationOps._run_fast`."""
+        if kind != "tfcrop":
+            return super()._run_flagdata(project_code, kind, field=field, **kwargs)
+        params = {"datacolumn": "data", "timecutoff": 4.0, "freqcutoff": 3.0, "extendflags": False}
+        params.update({k: v for k, v in kwargs.items() if v not in (None, "")})
+        if field:
+            params["field"] = field
+        try:
+            from ..solvers.tfcrop import tfcrop
+            tfcrop(str(self.backend.ms_path(project_code)), **params)
+        except NotImplementedError as exc:
+            warnings.warn(f"{project_code}: {exc}; running the CASA task instead")
+            return super()._run_flagdata(project_code, kind, field=field, **kwargs)
+        logger.info("tfcrop[native]: {} done", self.backend.ms_path(project_code).name)
 
     def _quack_series(self, project_code: str, meta: ObsMetadata, scans: list, wanted: list[str],
                       column_name: str, pol_indices: list[int]) -> dict:

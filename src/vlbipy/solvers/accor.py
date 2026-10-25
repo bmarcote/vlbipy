@@ -361,11 +361,14 @@ def channel_average(data: np.ndarray, flag: np.ndarray, weight: np.ndarray, *,
     acc_real = np.zeros((nrow, ncorr), dtype=np.float32)
     acc_imag = np.zeros((nrow, ncorr), dtype=np.float32)
     norm = np.zeros((nrow, ncorr), dtype=np.float32)
-    for chan in range(nchan):
-        used, w = use[:, chan], weight[:, chan]
-        acc_real = np.where(used, acc_real + (data[:, chan].real * w).astype(np.float32), acc_real)
-        acc_imag = np.where(used, acc_imag + (data[:, chan].imag * w).astype(np.float32), acc_imag)
-        norm = np.where(used, norm + w, norm).astype(np.float32)
+    # Flagged samples may carry NaN/inf data (e.g. zero-weight rows of an import): np.where skips them,
+    # but still evaluates the multiply on every element — silence the expected warnings.
+    with np.errstate(invalid="ignore"):
+        for chan in range(nchan):
+            used, w = use[:, chan], weight[:, chan]
+            acc_real = np.where(used, acc_real + (data[:, chan].real * w).astype(np.float32), acc_real)
+            acc_imag = np.where(used, acc_imag + (data[:, chan].imag * w).astype(np.float32), acc_imag)
+            norm = np.where(used, norm + w, norm).astype(np.float32)
     positive = norm > 0
     value = np.zeros((nrow, ncorr), dtype=np.complex64)
     if positive.any():

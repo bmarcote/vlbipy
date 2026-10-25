@@ -19,8 +19,12 @@ SIGMA):
   FLAG_ROW = every sample flagged;
 * SCAN_NUMBER restarts whenever a field's integrations are more than ``scan_gap`` seconds apart.
 
-Files written by correlators whose data need van Vleck / weight corrections in the filler (DIFX, VLBA,
-``WEIGHTYP = CORRELAT``) raise NotImplementedError, and the caller uses CASA instead.
+DiFX and VLBA correlator output (``WEIGHTYP = CORRELAT``) gets the filler's digital corrections
+(:func:`convert_block`): the van-Vleck correction of the autocorrelation spectra (``rho_2``/``rho_4``
+per the antennas' NO_LEVELS, skipped when the primary HDU sets VANVLECK), the amplitude factor
+``bfactc`` on every other visibility, and the ``vis / (VIS_SCAL x weight)`` rescaling that turns the
+DiFX correlation coefficients into flux densities. DiFX writes the weights in the WEIGHT random
+parameter (one value per band and correlation, no channel axis) instead of a third COMPLEX element.
 """
 from __future__ import annotations
 
@@ -67,6 +71,8 @@ def _uv_dtype(header) -> tuple[np.dtype, dict]:
         dims = header.get(f"TDIM{k}")
         if dims:
             shape = tuple(int(n) for n in str(dims).strip("() ").split(","))[::-1]
+        elif count == 0:
+            shape = (0,)                                # a zero-count column (e.g. DiFX's GATEID) is 0 bytes
         else:
             shape = (count,) if count > 1 else ()
         if kind == "S1":
@@ -271,8 +277,104 @@ def _main_columns(ncorr: int, nchan: int) -> list:
     return columns
 
 
+def _rho_4(r: np.ndarray) -> np.ndarray:
+    """Van Vleck relation for 4-level (2-bit) sampling: Fred Schwab's rational approximation
+    (VLBA Correlator Memo 75), as casacore's ``rho_4``."""
+    rr = r * r
+    num = 1.1329552 - 3.1056902 * rr + 2.9296994 * rr * rr - 0.90122460 * rr * rr * rr
+    den = 1 - 2.7056559 * rr + 2.5012473 * rr * rr - 0.73985978 * rr * rr * rr
+    return (num / den) * r
+
+
+def _redft00(n: int) -> np.ndarray:
+    """The REDFT00 (unshifted DCT-I) transform matrix for an ``n``-point series: the forward matrix F of
+    FFTW's ``plan_redft00``, ``y[k] = x[0] + (-1)^k x[n-1] + 2 sum_j x[j] cos(pi j k / (n-1))``.
+    The same matrix applied to the output inverts it up to a scale of ``2 (n-1)``."""
+    k, j = np.meshgrid(np.arange(n), np.arange(n), indexing="ij")
+    t = 2.0 * np.cos(np.pi * j * k / (n - 1))
+    t[:, 0] = 1.0
+    t[:, n - 1] = (-1.0) ** np.arange(n)
+    return t
+
+
+def _digital_correction(data: np.ndarray, wmag: np.ndarray, ant1: np.ndarray, ant2: np.ndarray,
+                        cross: np.ndarray, setup: dict) -> np.ndarray:
+    """The DiFX/VLBA digital corrections of casacore's filler, applied in place to ``data``.
+
+    Cross-correlations (and every row of an antenna pair without a rho model, and everything when the
+    file's VANVLECK keyword is set) are scaled by ``bfactc = gamma^2 / (A Rm alfa H)`` with the
+    constants of the baseline's 2-bit/4-bit combination (VLBA Scientific Memo 12). Autocorrelation
+    spectra in the parallel hands get the van Vleck correction instead: cosine transform to the lag
+    domain, ``rho`` of the measured lag correlation, transform back (real-valued, as the filler writes
+    it). ``wmag`` is the magnitude of the raw FITS weight per (row, chan, corr) — for VLBA it enters
+    the saturation factor.
+    """
+    nchan, ncorr = data.shape[1], data.shape[2]
+    digi = setup.get("digi_levels") or {}
+    lev1 = np.fromiter((digi.get(int(a), 0) for a in ant1), np.int64, count=ant1.size)
+    lev2 = np.fromiter((digi.get(int(a), 0) for a in ant2), np.int64, count=ant2.size)
+    cat44 = (lev1 == 4) & (lev2 == 4)
+    cat22 = (lev1 == 2) & (lev2 == 2)
+    cat24 = ((lev1 == 2) & (lev2 == 4)) | ((lev1 == 4) & (lev2 == 2))
+    a_coef, h_coef = 5.36, 0.87890625
+    gm = 3.335875 * 64.0 / 63.0
+    rm = np.select([cat44, cat22, cat24], [4.3048, 1.0, 5.8784], default=1.0 / (a_coef * h_coef))
+    alfa = np.select([cat44, cat22, cat24], [0.882518, 2.0 / np.pi, 0.882518], default=1.0)
+    gamma = np.select([cat44, cat22, cat24], [gm, 64.0 / 63.0, gm], default=1.0)
+    has_rho = cat22 | cat44
+    if float(setup.get("vanvleck", 0.0)) != 0.0:
+        alfa = np.ones_like(alfa)
+        has_rho = np.zeros_like(cat44)
+    bfactc = (gamma * gamma) / (a_coef * rm * alfa * h_coef)
+    bfacta = (gamma * gamma) / (a_coef * rm * h_coef)
+    scalar = cross | ~has_rho                          # cross rows, and autos without a rho model
+    data[scalar] *= bfactc[scalar, None, None]
+    usable = np.flatnonzero(~cross & has_rho)          # autos that get the van Vleck correction
+    if not usable.size:
+        return data
+    same_pol = np.array([product[0] == product[1] for product in setup["corr_product"]])
+    for pol in np.flatnonzero(~same_pol):              # cross hands of an auto: the scalar factor
+        data[usable, :, pol] *= bfactc[usable, None]
+    # The filler cosine-transforms each parallel-hand autocorrelation spectrum to the lag domain,
+    # corrects the measured correlation by rho(r), and transforms back (FFTW REDFT00 twice, output
+    # divided by 2 nchan). The dropped last spectral point is extrapolated first.
+    transform = _redft00(nchan + 1)
+    interior = np.arange(1, nchan)
+    wt = (1.0 - interior / nchan)[None, :]             # 1 - chan / nchan
+    correlator = str(setup["correlator"]).upper()
+    for pol in np.flatnonzero(same_pol):
+        spectrum = np.empty((usable.size, nchan + 1), dtype=np.float64)
+        spectrum[:, :nchan] = bfacta[usable, None] * data.real[usable, :, pol]
+        spectrum[:, nchan] = (2.0 * spectrum[:, nchan - 1] - spectrum[:, nchan - 2]) if nchan > 1 \
+            else spectrum[:, nchan - 1]
+        good = np.abs(spectrum[:, 0]) >= 1e-20         # the filler leaves such spectra untouched
+        rows = usable[good]
+        if not rows.size:
+            continue
+        lags = spectrum[good] @ transform.T
+        scale = wt * lags[:, 0][:, None]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = lags[:, 1:nchan] / scale
+        corrected = np.empty_like(ratio)
+        four = cat44[rows]                             # cat22 rows take rho_2
+        if (~four).any():
+            corrected[~four] = np.sin(np.pi * ratio[~four] / 2.0)
+        if four.any():
+            corrected[four] = _rho_4(ratio[four])
+        lags[:, 1:nchan] = scale * corrected
+        lags[:, nchan] = 0.0
+        back = lags @ transform.T
+        if correlator == "VLBA":
+            sat = 1.0 + (0.25 if ncorr > 2 else 0.125) * wmag[rows][:, :, pol]
+        else:
+            sat = 1.0                                  # DiFX doesn't suffer from saturation
+        data[rows, :, pol] = (sat * back[:, :nchan] / (2.0 * nchan)).astype(np.complex64)
+    return data
+
+
 def convert_block(flux: np.ndarray, band: int, swapped: np.ndarray, cross: np.ndarray, interval: np.ndarray,
-                  setup: dict, spw: int) -> dict:
+                  setup: dict, spw: int, weights: Optional[np.ndarray] = None,
+                  ant1: Optional[np.ndarray] = None, ant2: Optional[np.ndarray] = None) -> dict:
     """DATA, FLAG, WEIGHT_SPECTRUM, SIGMA_SPECTRUM, SIGMA, WEIGHT and FLAG_ROW of rows of one band.
 
     Parameters
@@ -286,9 +388,15 @@ def convert_block(flux: np.ndarray, band: int, swapped: np.ndarray, cross: np.nd
     interval : numpy.ndarray
         INTTIM of the rows (float32).
     setup : dict
-        ``corr_index``, ``corr_swap_index``, ``vis_scale``, ``eff_chan_bw``, ``uv_data_has_weights``.
+        ``corr_index``, ``corr_swap_index``, ``vis_scale``, ``eff_chan_bw``, ``uv_data_has_weights``,
+        ``corr_product``, ``correlator``, ``corver``, ``vanvleck``, ``digi_levels``, ``weightyp``.
     spw : int
         The output subband (selects the channel width).
+    weights : numpy.ndarray, optional
+        The WEIGHT random parameter of the rows, (nrow, nband x nstokes); the weights of DiFX data,
+        which carries none inside FLUX.
+    ant1, ant2 : numpy.ndarray, optional
+        MS antenna ids of the rows (needed for the digitizer levels of DiFX/VLBA data).
     """
     cells = np.asarray(flux[:, band], dtype=np.float32)                      # (nrow, nchan, nstokes, k)
     nrow, nchan, nstokes = cells.shape[:3]
@@ -306,10 +414,25 @@ def convert_block(flux: np.ndarray, band: int, swapped: np.ndarray, cross: np.nd
     data.imag = np.where(swapped[:, None, None], imag, -imag)
     if setup["uv_data_has_weights"]:
         raw = picked[..., 2]
+    elif weights is not None:
+        # The WEIGHT random parameter: one weight per (band, FITS correlation), constant over channels.
+        raw = np.broadcast_to(weights[np.arange(nrow)[:, None], band * nstokes + take][:, None, :],
+                              (nrow, nchan, nstokes)).astype(np.float32)
     else:
         raw = np.ones((nrow, nchan, nstokes), dtype=np.float32)
     flag = raw <= 0.0
     weight = np.where(flag, -raw, raw).astype(np.float32)
+    correlator = str(setup.get("correlator", "")).upper()
+    if correlator in ("DIFX", "VLBA"):
+        data = _digital_correction(data, weight, ant1, ant2, cross, setup)
+    if str(setup.get("weightyp", "")).upper() == "CORRELAT":
+        # WEIGHTYP=CORRELAT: vis /= weightScale x weightSpec (raw weight magnitude), where weightScale is
+        # VIS_SCAL, times the integration for VLBA correlator versions >= 4.17.
+        scale = np.full(nrow, float(setup["vis_scale"]), dtype=np.float64)
+        if correlator == "VLBA" and float(setup.get("corver", 0.0)) >= 4.17:
+            scale *= interval.astype(np.float64)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            data /= (scale[:, None, None] * weight).astype(np.complex64)
     factor = (float(setup["vis_scale"]) * np.where(cross, 2.0, 1.0) * interval.astype(np.float64)
               * float(setup["eff_chan_bw"][spw]))
     weight = (weight.astype(np.float64) * factor[:, None, None]).astype(np.float32)
@@ -323,9 +446,10 @@ def convert_block(flux: np.ndarray, band: int, swapped: np.ndarray, cross: np.nd
 
 
 def _gather(tables: list[dict], maps: dict, index: dict, block: np.ndarray, setup: dict) -> tuple:
-    """FLUX cells ``(n, nband, nchan, nstokes, k)`` and UVW [s] ``(n, 3)`` of the input rows ``block`` (indices into
+    """FLUX cells ``(n, nband, nchan, nstokes, k)``, UVW [s] ``(n, 3)`` and the WEIGHT random parameter
+    ``(n, nband x nstokes)`` — None when the tables have none — of the input rows ``block`` (indices into
     ``index``), in that order, read from the memory maps of their tables."""
-    flux, uvw = None, np.empty((block.size, 3), dtype=np.float64)
+    flux, uvw, weights = None, np.empty((block.size, 3), dtype=np.float64), None
     shape = (int(setup["nif"]), int(setup["nchan"]), int(setup["ncorr"]), -1)
     for table_index in np.unique(index["table"][block]):
         where = np.flatnonzero(index["table"][block] == table_index)
@@ -339,7 +463,12 @@ def _gather(tables: list[dict], maps: dict, index: dict, block: np.ndarray, setu
         flux[where] = cells
         for axis, name in enumerate(("UU", "VV", "WW")):
             uvw[where, axis] = rows[_column(rows, name)][source_rows]
-    return flux, uvw
+        if "WEIGHT" in rows.dtype.names:
+            row_weights = np.asarray(rows["WEIGHT"][source_rows]).reshape(where.size, -1)
+            if weights is None:
+                weights = np.empty((block.size,) + row_weights.shape[1:], dtype=row_weights.dtype)
+            weights[where] = row_weights
+    return flux, uvw, weights
 
 
 def _declare_empty_cube_rank(path: Path, column: str, template: str) -> None:
@@ -390,11 +519,12 @@ def write_part_job(*, path: str, tables: list[dict], chunks: list[dict], index: 
         for chunk in chunks:
             for first in range(0, chunk["rows"].size, BLOCK_ROWS):
                 block = chunk["rows"][first:first + BLOCK_ROWS]
-                flux, uvw = _gather(tables, maps, index, block, setup)
+                flux, uvw, weights = _gather(tables, maps, index, block, setup)
                 swapped = index["swapped"][block]
                 cross = index["ant1"][block] != index["ant2"][block]
                 values = convert_block(flux, chunk["band"], swapped, cross, index["interval"][block], setup,
-                                       chunk["spw"])
+                                       chunk["spw"], weights=weights,
+                                       ant1=index["ant1"][block], ant2=index["ant2"][block])
                 for name in ("DATA", "FLAG", "WEIGHT_SPECTRUM", "SIGMA_SPECTRUM", "SIGMA", "WEIGHT"):
                     out.putcol(name, values[name], start)
                 out.putcol("UVW", np.where(swapped[:, None], -uvw, uvw) * SPEED_OF_LIGHT, start)
@@ -443,10 +573,8 @@ def import_fitsidi(idi_files: list, mms, *, scan_gap: float = 15.0, nparts: Opti
             raise FileExistsError(f"{mms} exists")
         shutil.rmtree(mms)
     setup = read_idi_setup([str(f) for f in idi_files])
-    if str(setup.get("correlator", "")).upper() in ("DIFX", "VLBA") or str(setup.get("weightyp", "")).upper() \
-            == "CORRELAT":
-        raise NotImplementedError(f"FITS-IDI from correlator {setup.get('correlator')!r} (weight type "
-                                  f"{setup.get('weightyp')!r}) needs corrections the native import does not make")
+    if str(setup.get("weightyp", "")).upper() not in ("", "NORMAL", "CORRELAT"):
+        raise NotImplementedError(f"unsupported FITS-IDI WEIGHTYP {setup['weightyp']!r}")
     tables = uv_tables(idi_files)
     index = read_index(tables, setup)
     scans = scan_numbers(index["time"], index["field"], index["array"], float(scan_gap))

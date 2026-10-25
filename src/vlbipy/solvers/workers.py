@@ -53,8 +53,6 @@ from ..resources import available_memory, parse_size, usable_cpus
 
 #: Environment variable overriding the number of worker processes.
 WORKERS_ENV = "VLBIPY_WORKERS"
-#: Upper bound on the default pool size (the Multi-MS parts and scans rarely feed more).
-MAX_DEFAULT_WORKERS = 16
 #: Memory planned per worker process when sizing the pool. Measured on LBA data (32 channels, 4
 #: correlations): 0.13 GB idle, 0.45 GB for a split job, up to 0.9 GB with the calibration tables it keeps.
 WORKER_MEMORY = 1 << 30
@@ -99,14 +97,15 @@ def worker_memory() -> int:
 def default_workers() -> int:
     """Number of worker processes to use: ``$VLBIPY_WORKERS``, else as many as the machine can run.
 
-    That is the CPUs this process may use (its affinity and any cgroup CPU quota), at most 16, and no more
-    than fit in :data:`POOL_MEMORY_FRACTION` of the available memory (the system's, or what a container,
-    batch job or ``systemd-run -p MemoryMax=`` unit leaves) at :func:`worker_memory` each.
+    That is every CPU this process may use (its affinity and any cgroup CPU quota), and no more than
+    fit in :data:`POOL_MEMORY_FRACTION` of the available memory (the system's, or what a container,
+    batch job or ``systemd-run -p MemoryMax=`` unit leaves) at :func:`worker_memory` each — the memory
+    budget, not a hard cap, keeps a large machine from overspawning.
     """
     configured = os.environ.get(WORKERS_ENV, "").strip()
     if configured:
         return max(1, int(configured))
-    by_cpu = min(_cpus(), MAX_DEFAULT_WORKERS)
+    by_cpu = _cpus()
     free = available_memory()
     if free is None:
         return max(1, by_cpu)

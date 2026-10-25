@@ -374,7 +374,8 @@ def scan_idi_file(path) -> dict:
     Returns
     -------
     dict
-        ``path``, ``correlat`` (primary CORRELAT, trimmed), ``hdus``: one dict per binary table in file order with
+        ``path``, ``correlat`` (primary CORRELAT, trimmed), ``corver`` (primary FXCORVER, float),
+        ``vanvleck`` (primary VANVLECK, float), ``hdus``: one dict per binary table in file order with
         ``name``, ``header`` (astropy Header copy), ``data`` (``{column: numpy array / list of str}``, None for
         UV_DATA), ``repeat`` (``{column: (repeat count, TFORM letter)}``) and, for UV_DATA, ``times`` (see
         :func:`_uv_times`).
@@ -383,7 +384,16 @@ def scan_idi_file(path) -> dict:
     path = str(path)
     hdus = []
     with fits.open(path, memmap=True) as hdulist:
-        correlat = str(hdulist[0].header.get("CORRELAT", "")).strip()
+        primary = hdulist[0].header
+        correlat = str(primary.get("CORRELAT", "")).strip()
+        try:
+            corver = float(primary.get("FXCORVER") or 0.0)
+        except (TypeError, ValueError):
+            corver = 0.0
+        try:
+            vanvleck = float(primary.get("VANVLECK") or 0.0)
+        except (TypeError, ValueError):
+            vanvleck = 0.0
         for hdu in hdulist[1:]:
             if not isinstance(hdu, fits.BinTableHDU):
                 continue
@@ -404,7 +414,7 @@ def scan_idi_file(path) -> dict:
                         data[column] = np.array(values)
                 entry["data"] = data
             hdus.append(entry)
-    return {"path": path, "correlat": correlat, "hdus": hdus}
+    return {"path": path, "correlat": correlat, "corver": corver, "vanvleck": vanvleck, "hdus": hdus}
 
 
 def _nrows(entry: dict) -> int:
@@ -697,6 +707,18 @@ def read_idi_setup(idi_files: list) -> dict:
                   "chan_freq": np.asarray(spw["chan_freq"], dtype=np.float64).reshape(-1, spw["nchan"]),
                   "nfield_from_source_table": max([i if i != -1 else 1 for i in source_ids] + [0]),
                   "source_ids": source_ids})
+    # NO_LEVELS of every ANTENNA table -> the MS antenna id, as the filler's digiLevels (missing -> 0,
+    # an "unsupported" number of digitizer levels: no digital correction, no amplitude scaling).
+    digi_levels: dict = {}
+    for one in scanned:
+        antenna = _first(one, "ANTENNA")
+        if antenna is None or not antenna["data"] or "NO_LEVELS" not in antenna["data"]:
+            continue
+        numbering = _antenna_numbering(one)
+        for number, levels in zip(antenna["data"]["ANTENNA_NO"], antenna["data"]["NO_LEVELS"]):
+            digi_levels[numbering[int(number)]] = int(levels)
+    setup.update({"digi_levels": digi_levels, "corver": float(first["corver"]),
+                  "vanvleck": float(first["vanvleck"])})
     logger.debug("read_idi_setup: {} file(s), {} antennas, {} spw x {} chan x {} corr, correlator {!r} in "
                  "{:.2f}s", len(idi_files), len(setup["antenna_ids"]), setup["nspw"], setup["nchan"],
                  setup["ncorr"], setup["correlator"], _time.perf_counter() - started)
