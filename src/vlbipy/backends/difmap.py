@@ -33,6 +33,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -677,8 +680,6 @@ MODELFIT_REVISION = 2
 IMAGE_BYTES_PER_PIXEL = 52
 #: Share of the free memory the imaging jobs running together may take.
 IMAGE_MEMORY_FRACTION = 0.6
-#: The worker job of :func:`run_image_jobs`, as :mod:`vlbipy.solvers.workers` addresses it.
-IMAGE_JOB = "vlbipy.backends.difmap:image_in_worker"
 
 
 def imaging_settings(img_cfg: dict) -> dict:
@@ -701,19 +702,32 @@ def method_keywords(settings: dict) -> dict:
 
 
 def image_in_worker(*, log: dict, **kwargs) -> dict:
-    """Worker job of :func:`run_image_jobs`: :func:`image_source`, logging to the parent's run log."""
+    """The job run by each subprocess of :func:`run_image_jobs` (the module ``__main__``):
+    :func:`image_source`, logging to the parent's run log."""
     from ..logging_utils import attach_logging
     attach_logging(log)
     return image_source(**kwargs)
 
 
-def run_image_jobs(jobs: list[dict], *, max_workers: Optional[int] = None) -> list:
-    """Run :func:`image_source` for every job (its keyword arguments), several at once in worker processes.
+def _image_subprocess(spec_path: str, result_path: str, threads: int) -> subprocess.Popen:
+    """Start one ``image_in_worker`` subprocess (``threads`` CPUs for its numerics) on the spec file."""
+    env = dict(os.environ)
+    # The shared worker pool pins these to 1, which is what made difmapy crawl: its clean/bayes work is
+    # threaded through BLAS, FFTW and ThreadPoolExecutors. Here each concurrent image gets its share.
+    for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VLBIPY_FFT_WORKERS"):
+        env[name] = str(threads)
+    return subprocess.Popen([sys.executable, "-m", "vlbipy.backends.difmap", spec_path, result_path],
+                            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
-    difmapy works on one core, and an epoch has several sources to image, so they are imaged side by
-    side in the processes of :mod:`vlbipy.solvers.workers`: as many at a time as there are CPUs and as
-    fit together in :data:`IMAGE_MEMORY_FRACTION` of the free memory (:data:`IMAGE_BYTES_PER_PIXEL`
-    per map pixel), at most ``max_workers``. One job, or room for only one, runs here.
+
+def run_image_jobs(jobs: list[dict], *, max_workers: Optional[int] = None) -> list:
+    """Run :func:`image_source` for every job (its keyword arguments), several at once in subprocesses.
+
+    As many at a time as there are CPUs and as fit together in :data:`IMAGE_MEMORY_FRACTION` of the
+    free memory (:data:`IMAGE_BYTES_PER_PIXEL` per map pixel), at most ``max_workers``; each running
+    job gets ``usable_cpus // workers`` threads for its numerical work. These do not go through the
+    worker pool: its processes pin the numerical libraries to one thread, which difmapy needs.
+    One job, or room for only one, runs here.
 
     Returns
     -------
@@ -721,9 +735,11 @@ def run_image_jobs(jobs: list[dict], *, max_workers: Optional[int] = None) -> li
         One entry per job, in order: its report, or the exception it raised (a failed image must not
         lose the others).
     """
+    import pickle
+    import tempfile
+
     from ..logging_utils import logging_setup
     from ..resources import available_memory, usable_cpus
-    from ..solvers.workers import submit_jobs
     if not jobs:
         return []
     per_job = IMAGE_BYTES_PER_PIXEL * max(int(job.get("mapsize", IMAGE_PIXELS)) for job in jobs) ** 2
@@ -731,21 +747,33 @@ def run_image_jobs(jobs: list[dict], *, max_workers: Optional[int] = None) -> li
     fit = max(1, int(free * IMAGE_MEMORY_FRACTION // per_job)) if free is not None else len(jobs)
     workers = max(1, min(len(jobs), usable_cpus(), fit, int(max_workers) if max_workers else len(jobs)))
     if workers > 1:
-        logger.info("difmapy: imaging {} source(s), {} at a time ({:.1f} GB each, {} free)", len(jobs), workers,
-                    per_job / 1e9, f"{free / 1e9:.1f} GB" if free is not None else "unknown")
+        threads = max(1, usable_cpus() // workers)
+        logger.info("difmapy: imaging {} source(s), {} at a time, {} thread(s) each ({:.1f} GB each, {} free)",
+                    len(jobs), workers, threads, per_job / 1e9,
+                    f"{free / 1e9:.1f} GB" if free is not None else "unknown")
         log = logging_setup()
-        try:
-            futures = submit_jobs(IMAGE_JOB, [dict(job, log=log) for job in jobs], workers)
-        except Exception as exc:  # noqa: BLE001 - the images can still be made here, one at a time
-            logger.warning("difmapy: the worker processes could not start ({}); imaging one source at a time", exc)
-        else:
-            results = []
-            for future in futures:
+        results: list = [None] * len(jobs)
+        for first in range(0, len(jobs), workers):
+            running = []
+            for index, job in enumerate(jobs[first:first + workers], start=first):
+                spec = tempfile.NamedTemporaryFile("wb", prefix="vlbipy_img_", suffix=".pickle", delete=False)
+                pickle.dump(dict(job, log=log), spec)
+                spec.close()
+                result_path = spec.name + ".result"
+                running.append((index, spec.name, result_path,
+                                _image_subprocess(spec.name, result_path, threads)))
+            for index, spec_path, result_path, proc in running:
+                _, stderr = proc.communicate()
                 try:
-                    results.append(future.result())
-                except Exception as exc:  # noqa: BLE001 - WorkerError: reported per source by the caller
-                    results.append(exc)
-            return results
+                    with open(result_path, "rb") as handle:
+                        results[index] = pickle.load(handle)
+                except OSError:
+                    errors = stderr.decode(errors="replace").strip().splitlines() if stderr else []
+                    results[index] = RuntimeError(f"imaging subprocess failed "
+                                                  f"({errors[-1] if errors else f'exit status {proc.returncode}'})")
+                for path in (spec_path, result_path):
+                    os.unlink(path) if os.path.exists(path) else None
+        return results
     results = []
     for job in jobs:
         try:
@@ -753,3 +781,14 @@ def run_image_jobs(jobs: list[dict], *, max_workers: Optional[int] = None) -> li
         except Exception as exc:  # noqa: BLE001 - reported per source by the caller
             results.append(exc)
     return results
+
+
+if __name__ == "__main__":
+    # The one-image runner of :func:`run_image_jobs`: a clean process whose numerical libraries get a
+    # fair thread share, unlike the worker pool that pins them to one thread.
+    import pickle
+
+    spec = pickle.load(open(sys.argv[1], "rb"))
+    result = image_in_worker(**spec)
+    with open(sys.argv[2], "wb") as handle:
+        pickle.dump(result, handle)
