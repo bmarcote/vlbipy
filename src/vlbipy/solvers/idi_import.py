@@ -458,7 +458,8 @@ def import_fitsidi(idi_files: list, mms, *, scan_gap: float = 15.0, nparts: Opti
     names = [f"{mms.name}.{k:04d}.ms" for k in range(len(parts))]
     jobs = [{"path": str(submss / name), "tables": tables, "chunks": chunks, "index": index, "setup": setup}
             for name, chunks in zip(names, parts)]
-    reports = run_jobs("vlbipy.solvers.idi_import:write_part_job", jobs, workers)
+    reports = run_jobs("vlbipy.solvers.idi_import:write_part_job", jobs, workers,
+                       desc="importfitsidi: writing parts")
     written = time_index_summary(index, setup, scans)
     first = submss / names[0]
     # In CASA's keyword order (write_subtables returns it; WEATHER and PHASE_CAL depend on the files).

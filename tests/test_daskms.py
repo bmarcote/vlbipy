@@ -174,3 +174,59 @@ def test_casa_tasks_get_a_deferred_calibration_written_before_reading_it(tmp_pat
     assert run("clearcal") == ["clearcal", "forget"]
     assert run("applycal") == ["write", "applycal", "external:casa"]
     assert run("tclean", vis=plain) == ["tclean"]                     # no record: nothing deferred there
+
+
+def test_import_data_uses_the_native_fitsidi_import(tmp_path, monkeypatch):
+    """mms import goes to solvers.idi_import, not to CASA's importfitsidi."""
+    from pathlib import Path
+
+    backend = DaskMsBackend(work_dir=str(tmp_path))
+    files = [str(tmp_path / f"{PROJECT}_{i}.IDI") for i in range(2)]
+    for name in files:
+        Path(name).write_bytes(b"idi")
+    calls = {}
+
+    def fake_import(idi_files, mms, **kwargs):
+        calls.update(files=list(idi_files), mms=str(mms), kwargs=kwargs)
+        Path(str(mms)).mkdir(parents=True)
+        return {"rows": 0, "parts": 0, "scans": 0, "seconds": 0.0}
+
+    monkeypatch.setattr("vlbipy.solvers.idi_import.import_fitsidi", fake_import)
+    backend.data.import_data(PROJECT, [], files=files, scan_gap=20)
+    assert calls["files"] == files
+    assert calls["mms"] == str(tmp_path / f"{PROJECT}.mms")
+    assert calls["kwargs"]["scan_gap"] == 20.0
+
+
+def test_import_data_falls_back_to_casa_when_native_cannot(tmp_path, monkeypatch):
+    """A FITS-IDI file the native importer rejects goes through the CASA path (with a warning)."""
+    from pathlib import Path
+
+    from vlbipy.backends.casa import CasaDataOps
+
+    backend = DaskMsBackend(work_dir=str(tmp_path))
+    files = [str(tmp_path / f"{PROJECT}_1.IDI")]
+    Path(files[0]).write_bytes(b"idi")
+    monkeypatch.setattr("vlbipy.solvers.idi_import.import_fitsidi",
+                        lambda *a, **k: (_ for _ in ()).throw(NotImplementedError("DIFX")))
+    calls = []
+    monkeypatch.setattr(CasaDataOps, "import_data",
+                        lambda self, code, names, **kw: calls.append((code, kw)))
+    backend.data.import_data(PROJECT, [], files=files)
+    assert calls[0][0] == PROJECT
+    assert not (tmp_path / f"{PROJECT}.mms").exists()
+
+
+def test_import_data_existing_mms_skips(tmp_path, monkeypatch):
+    """An existing <code>.mms is not re-imported (the CASA path handles the skip)."""
+    from vlbipy.backends.casa import CasaDataOps
+
+    calls = []
+    monkeypatch.setattr("vlbipy.solvers.idi_import.import_fitsidi",
+                        lambda *a, **k: calls.append("native"))
+    backend = DaskMsBackend(work_dir=str(tmp_path))
+    (tmp_path / f"{PROJECT}.mms").mkdir()
+    monkeypatch.setattr(CasaDataOps, "import_data",
+                        lambda self, code, names, **kw: calls.append("casa"))
+    backend.data.import_data(PROJECT, [], files=[str(tmp_path / "x.IDI")])
+    assert calls == ["casa"]           # the existing-MMS skip lives in the CASA path

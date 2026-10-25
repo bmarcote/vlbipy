@@ -10,6 +10,7 @@ observation.
 # from __future__ import annotations
 import functools
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterator, Optional, Union
 from .errors import ConfigError
@@ -37,11 +38,25 @@ class _Fanout:
     and ``repr`` lists the available operations.
     """
 
-    def __init__(self, children: list) -> None:
+    def __init__(self, children: list, parallel: bool = False) -> None:
         self._children = children
+        self._parallel = parallel
+
+    def _each(self, call) -> list:
+        """``[call(child) for child in children]``, in parallel threads when this fan-out allows it.
+
+        Parallel calls share the solver worker pool (their jobs interleave there) and the shared
+        progress display (each child contributes its own bars); CASA fallbacks serialize internally.
+        """
+        children = object.__getattribute__(self, "_children")
+        if not object.__getattribute__(self, "_parallel") or len(children) <= 1:
+            return [call(child) for child in children]
+        logger.info("running {} projects in parallel", len(children))
+        with ThreadPoolExecutor(max_workers=len(children), thread_name_prefix="vlbipy-fanout") as pool:
+            return list(pool.map(call, children))
 
     def __call__(self, *args, **kwargs):
-        results = [child(*args, **kwargs) for child in self._children]
+        results = self._each(lambda child: child(*args, **kwargs))
         return results[0] if len(results) == 1 else results
 
     def __getattr__(self, name: str):
@@ -56,7 +71,7 @@ class _Fanout:
             return results[0] if len(results) == 1 else results
 
         def _dispatch(*args, **kwargs):
-            results = [getattr(child, name)(*args, **kwargs) for child in children]
+            results = self._each(lambda child: getattr(child, name)(*args, **kwargs))
             return results[0] if len(results) == 1 else results
 
         functools.update_wrapper(_dispatch, getattr(children[0], name))
@@ -216,8 +231,8 @@ class VLBIObs:
     # -- fan-out namespaces (pre-merge, per project) --
     @property
     def import_data(self) -> _Fanout:
-        """Import namespace, fanned out across all observations."""
-        return _Fanout([o.import_data for o in self._observations])
+        """Import namespace, fanned out across all observations; a campaign's projects import in parallel."""
+        return _Fanout([o.import_data for o in self._observations], parallel=True)
 
     @property
     def calibrate(self) -> _Fanout:
@@ -482,7 +497,7 @@ class VLBIObs:
         summary = warnings.summary()
         logs = ", ".join(str(path) for path in run_logs()) or "the run log"
         headline("run finished: {} warning(s){}; details in {} and summary.md", len(summary),
-                 " (see below)" if summary else "")
+                 " (see below)" if summary else "", logs)
         if summary:
             for item in summary:
                 logger.warning("  - {}", item)

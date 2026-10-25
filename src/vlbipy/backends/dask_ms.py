@@ -1,7 +1,10 @@
 """Dask-MS backend: the CASA pipeline with the calibration engine replaced by fast numpy solvers.
 
-The measurement set stays the single source of truth. CASA still imports, flags
-and exports it; what changes is every step that used to dominate the run time:
+The measurement set stays the single source of truth, written by the native
+FITS-IDI import (:func:`vlbipy.solvers.idi_import.import_fitsidi` — CASA's
+``importfitsidi`` + ``partition`` without CASA; a file the native importer does
+not cover still goes through the CASA tasks). CASA still flags and exports the
+measurement set; what changes is every step that used to dominate the run time:
 
 * fringe fitting (single-band delay, multi-band delay, the per-scan SNR survey),
 * bandpass and gain solves,
@@ -33,6 +36,7 @@ Two conversion paths produce identical stores:
 
 """
 import shutil
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -43,9 +47,16 @@ from ..errors import BackendError
 from ..logging_utils import get_logger, warnings
 from ..models import Antenna, FreqSetup, ObsMetadata, Scan, Stokes
 from ..solvers.msio import table_engine
-from .casa import CasaBackend, CasaCalibrationOps, CasaDataOps, CasaExportOps, CasaFlagOps
+from ..tools import space_available_gb
+from .casa import (IMPORT_FLAG_VERSION, CasaBackend, CasaCalibrationOps, CasaDataOps, CasaExportOps,
+                   CasaFlagOps)
 
 logger = get_logger()
+
+#: casatools/casatasks are not thread-safe: the CASA fallbacks (a file the native FITS-IDI import does
+#: not cover, a plain-MS request, an MS upgrade) go through this lock, so a parallel multi-epoch
+#: fan-out runs them one project at a time.
+_CASA_LOCK = threading.Lock()
 
 #: Main-table columns that can never be stored (variable shape / index-only).
 _SKIP_MAIN_COLUMNS = {"FLAG_CATEGORY"}
@@ -615,15 +626,22 @@ class DaskMsDataOps(DaskMsPlotReads, CasaDataOps):
 
     def import_data(self, project_code: str, source_names: list[str], *, scan_gap: int = 15,
                     files: Optional[list[str]] = None, delete: bool = False, mms: bool = True,
-                    zarr_store: bool = False, **kwargs) -> None:
-        """Import FITS-IDI files to a measurement set (CASA) and optionally convert it to a dask-ms store.
+                    zarr_store: bool = False, workers: Optional[int] = None, **kwargs) -> None:
+        """Import FITS-IDI files natively (:func:`vlbipy.solvers.idi_import.import_fitsidi`) and optionally
+        convert the measurement set to a dask-ms store.
+
+        The native import writes the Multi-MS itself (the parts land in ``SUBMSS/`` as the worker
+        processes write them), so no CASA task runs at all; a file the native importer does not cover —
+        DiFX/VLBA correlator output needing van Vleck or weight corrections — falls back to CASA's
+        ``importfitsidi`` + ``partition`` with a warning. Anything else (an existing plain MS to upgrade,
+        ``mms=False``) keeps the CASA path.
 
         Parameters
         ----------
         project_code : str
             Project code (names the MS and the store).
         source_names : list of str
-            Passed through to the CASA import.
+            Passed through to the CASA import (the native one needs no source list).
         scan_gap : int
             Scan-boundary gap in seconds (importfitsidi scanreindexgap_s).
         files : list of str
@@ -636,19 +654,57 @@ class DaskMsDataOps(DaskMsPlotReads, CasaDataOps):
         zarr_store : bool
             Also write ``<code>.zarr`` (``[import].zarr_store``): a compact copy for lazy access and for
             rebuilding the report after the MS is gone. The pipeline itself never reads it.
+        workers : int
+            Worker processes writing the parts (native import only).
         """
         store = self.backend.store_path(project_code)
         if store.is_dir() and not self._has_ms(project_code) and not delete:
             logger.info("dask-ms store {} already exists and there is no measurement set; skipping import", store)
             return
         kwargs.pop("keep_ms", None)  # legacy option: the measurement set is always kept now
-        super().import_data(project_code, source_names, scan_gap=scan_gap, files=files, delete=delete, mms=mms,
-                            **kwargs)
+        target = self.work_dir / f"{project_code}.mms"
+        plain_ms = self.work_dir / f"{project_code}.ms"
+        if mms and files and not plain_ms.is_dir() and (delete or not target.exists()):
+            if target.exists():
+                logger.warning("removing existing {}", target)
+                shutil.rmtree(target)
+            try:
+                self._import_fitsidi_native(project_code, files, target, float(scan_gap), workers)
+            except NotImplementedError as exc:
+                warnings.warn(f"{project_code}: {exc}; importing with CASA instead")
+                shutil.rmtree(target, ignore_errors=True)          # drop any partial import
+                with _CASA_LOCK:
+                    super().import_data(project_code, source_names, scan_gap=scan_gap, files=files,
+                                        delete=delete, mms=mms, **kwargs)
+        else:
+            # An existing MS to upgrade or skip, a plain-MS request, or no files: casatools is not
+            # thread-safe, so a parallel multi-epoch fan-out runs these one project at a time.
+            with _CASA_LOCK:
+                super().import_data(project_code, source_names, scan_gap=scan_gap, files=files,
+                                    delete=delete, mms=mms, **kwargs)
         if store.is_dir() and delete:
             logger.warning("removing existing dask-ms store {}", store)
             shutil.rmtree(store)
         if zarr_store and not store.is_dir():
             ms_to_daskms(self.backend.ms_path(project_code), store)
+
+    def _import_fitsidi_native(self, project_code: str, files: list[str], target: Path, scan_gap: float,
+                               workers: Optional[int]) -> None:
+        """Write ``<code>.mms`` with the native FITS-IDI import and save the as-imported flags."""
+        from ..solvers.idi_import import import_fitsidi
+        idi_size_gb = sum(Path(f).stat().st_size for f in files) / 1e9
+        # The Multi-MS is written once (no transient plain MS): ~the size of the FITS-IDI data.
+        needed = 1.5 * idi_size_gb
+        if space_available_gb(self.work_dir) < needed:
+            raise BackendError(f"not enough disk space in {self.work_dir} to create the MMS "
+                               f"(~{needed:.0f} GB needed)")
+        import_fitsidi([str(f) for f in files], target, scan_gap=scan_gap, workers=workers)
+        # Keep the flags the import itself made (zero-weight data): a later reset returns to this state.
+        try:
+            self.backend.tasks.flagmanager(vis=str(target), mode="save", versionname=IMPORT_FLAG_VERSION,
+                                           comment="flags as imported", merge="replace")
+        except RuntimeError as exc:
+            logger.warning("could not save the as-imported flags of {} ({})", target.name, exc)
 
     # -- data access --
     def _store_datasets(self, project_code: str) -> list:
@@ -1077,6 +1133,16 @@ class NativeFlagTasks:
 
         return guarded
 
+    def flagmanager(self, **kwargs):
+        """Run ``flagmanager`` natively (:mod:`vlbipy.solvers.flagmanager` — same files), CASA as fallback."""
+        from ..solvers.flagmanager import flagmanager
+        try:
+            return flagmanager(**kwargs)
+        except Exception as exc:  # noqa: BLE001 - a broken version table must not stop the pipeline
+            logger.debug("flagmanager[native] failed ({}); using casatasks.flagmanager", exc)
+            with _CASA_LOCK:
+                return self._tasks.flagmanager(**kwargs)
+
     def flagdata(self, **kwargs):
         """Run ``flagdata`` natively when the call is a supported selection, otherwise through CASA."""
         from ..solvers.flagdata import Unsupported, apply_flag_selections, compile_flagdata, read_flag_setup
@@ -1089,7 +1155,7 @@ class NativeFlagTasks:
                 logger.debug("flagdata: {}; using casatasks.flagdata", exc)
             else:
                 if kwargs.get("flagbackup"):
-                    self._tasks.flagmanager(vis=str(vis), mode="save", versionname=f"flagdata_{int(time.time())}")
+                    self.flagmanager(vis=str(vis), mode="save", versionname=f"flagdata_{int(time.time())}")
                 stats = apply_flag_selections(vis, selections, setup=setup)
                 logger.info("flagdata[native]: {} command(s) -> {} selection(s), {} of {} row(s) touched, "
                             "{} cell(s) changed in {} part(s), {:.2f}s", len(selections) if kwargs.get("mode")
@@ -1101,7 +1167,7 @@ class NativeFlagTasks:
                 from ..solvers.corrected import write_pending
                 write_pending(vis)
             if kwargs.get("flagbackup"):
-                self._tasks.flagmanager(vis=str(vis), mode="save", versionname=f"flagdata_{int(time.time())}")
+                self.flagmanager(vis=str(vis), mode="save", versionname=f"flagdata_{int(time.time())}")
             try:
                 logfile = str(self._tasks.casalog.logfile())
             except Exception:  # noqa: BLE001 - the parts then log to their own default file

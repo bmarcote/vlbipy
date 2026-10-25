@@ -374,3 +374,38 @@ def test_reset_failure_does_not_block_the_run(tmp_path):
     obs = _make_obs(tmp_path, backend)
     obs.prepare_run(scratch=True)
     assert obs.import_data() is not None      # metadata still loaded
+
+
+def test_import_fanout_runs_projects_in_parallel():
+    """The import_data fan-out of a multi-project campaign runs the projects concurrently."""
+    import threading
+    import time
+
+    from vlbipy.vlbiobs import _Fanout
+
+    running = 0
+    peak = 0
+    lock = threading.Lock()
+
+    def make_child():
+        def call():
+            nonlocal running, peak
+            with lock:
+                running += 1
+                peak = max(peak, running)
+            try:
+                time.sleep(0.05)
+                return "done"
+            finally:
+                with lock:
+                    running -= 1
+        return call
+
+    results = _Fanout([make_child(), make_child(), make_child()], parallel=True)()
+    assert results == ["done", "done", "done"]
+    assert peak == 3
+
+    serial = _Fanout([make_child(), make_child()])
+    running = peak = 0
+    assert serial() == ["done", "done"]
+    assert peak == 1

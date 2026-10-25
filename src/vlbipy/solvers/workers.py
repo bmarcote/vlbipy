@@ -43,7 +43,7 @@ import sys
 import threading
 import traceback
 from collections import OrderedDict
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from multiprocessing.connection import Client, Listener
 from typing import Optional
 
@@ -318,15 +318,26 @@ class WorkerPool:
         """Run ``function(**kwargs)`` in an idle worker (waiting for one) and return its result."""
         return self._run((function_path, kwargs), digests={})
 
-    def map(self, function_path: str, jobs: list[dict]) -> list:
-        """Run ``function(**kwargs)`` for every kwargs dict of ``jobs``; results come back in job order."""
+    def map(self, function_path: str, jobs: list[dict], on_done=None) -> list:
+        """Run ``function(**kwargs)`` for every kwargs dict of ``jobs``; results come back in job order.
+
+        ``on_done``, when given, is called once per finished job (in completion order), which is what
+        drives the progress bars of :func:`run_jobs`.
+        """
         if self.closed:
             raise RuntimeError("the worker pool is closed")
         self._digests = {}     # object ids are only stable while the caller holds the jobs
         # The cores are shared among the jobs that run at the same time (see :func:`thread_map`).
         self._job_threads = max(1, (os.cpu_count() or 1) // max(1, min(len(jobs), self.size)))
         try:
-            return list(self._threads.map(self._run, [(function_path, kwargs) for kwargs in jobs]))
+            futures = [self._threads.submit(self._run, (function_path, kwargs)) for kwargs in jobs]
+            results = [None] * len(futures)
+            positions = {future: index for index, future in enumerate(futures)}
+            for future in as_completed(positions):
+                results[positions[future]] = future.result()
+                if on_done is not None:
+                    on_done()
+            return results
         finally:
             self._digests = {}
 
@@ -370,15 +381,29 @@ def close_pool() -> None:
 atexit.register(close_pool)
 
 
-def run_jobs(function_path: str, jobs: list[dict], workers: Optional[int] = None) -> list:
-    """Run ``jobs`` and return their results in order: in this process for one job or ``workers=1``, else in the pool."""
+def _job_desc(function_path: str) -> str:
+    """A progress-bar label out of a worker function path (``...:write_part_job`` -> ``write part``)."""
+    return function_path.rpartition(":")[2].removesuffix("_job").replace("_", " ")
+
+
+def run_jobs(function_path: str, jobs: list[dict], workers: Optional[int] = None, desc: str = "") -> list:
+    """Run ``jobs`` and return their results in order: in this process for one job or ``workers=1``, else
+    in the pool. A progress bar (``desc``, else a label made from the function name) tracks the jobs on
+    the shared display (:mod:`vlbipy.progress`)."""
     if not jobs:
         return []
+    from ..progress import track_jobs
     size = int(workers) if workers else default_workers()
     if size <= 1 or len(jobs) == 1:
         function = resolve(function_path)
-        return [function(**kwargs) for kwargs in jobs]
-    return get_pool(workers).map(function_path, jobs)
+        with track_jobs(desc or _job_desc(function_path), len(jobs)) as advance:
+            results = []
+            for kwargs in jobs:
+                results.append(function(**kwargs))
+                advance()
+            return results
+    with track_jobs(desc or _job_desc(function_path), len(jobs)) as advance:
+        return get_pool(workers).map(function_path, jobs, on_done=advance)
 
 
 def submit_jobs(function_path: str, jobs: list[dict], workers: int) -> list[Future]:
