@@ -516,6 +516,7 @@ def write_part_job(*, path: str, tables: list[dict], chunks: list[dict], index: 
     maps: dict = {}
     with Table(Path(path), readonly=False) as out:
         start = 0
+        zero_rows, partial_rows, partial_mask = [], [], []
         for chunk in chunks:
             for first in range(0, chunk["rows"].size, BLOCK_ROWS):
                 block = chunk["rows"][first:first + BLOCK_ROWS]
@@ -529,8 +530,24 @@ def write_part_job(*, path: str, tables: list[dict], chunks: list[dict], index: 
                     out.putcol(name, values[name], start)
                 out.putcol("UVW", np.where(swapped[:, None], -uvw, uvw) * SPEED_OF_LIGHT, start)
                 flag_row[start:start + block.size] = values["FLAG_ROW"]
+                # The flag-statistics "observable" mask of this block, saved as the part's cache at
+                # the end (see flagdata._observable_cache): DATA is already in memory, so building it
+                # here costs nothing against the full-column scan the cache is built to avoid.
+                flat = values["DATA"].reshape(block.size, -1)
+                is_zero = flat == 0.0
+                count = is_zero.sum(axis=1)
+                zero_rows.append(np.flatnonzero(count == flat.shape[1]) + start)
+                partial = np.flatnonzero((count > 0) & (count < flat.shape[1]))
+                partial_rows.append(partial + start)
+                partial_mask.append((~is_zero[partial]).reshape((partial.size,) + values["DATA"].shape[1:]))
                 start += block.size
         out.putcol("FLAG_ROW", flag_row, 0)
+    from .flagdata import OBSERVABLE_CACHE
+    shape = (0,) + (int(setup["nchan"]), int(setup["ncorr"]))
+    np.savez(Path(path) / OBSERVABLE_CACHE, nrows=nrow,
+             zero_rows=np.concatenate(zero_rows) if zero_rows else np.zeros(0, np.int64),
+             partial_rows=np.concatenate(partial_rows) if partial_rows else np.zeros(0, np.int64),
+             partial_mask=np.concatenate(partial_mask) if partial_mask else np.zeros(shape, bool))
     return {"rows": nrow, "seconds": _time.perf_counter() - started}
 
 
