@@ -1044,6 +1044,10 @@ class CalibrateNamespace(Namespace):
         antennas; the same antennas are then held fixed in difmapy self-calibration.
         """
         obs = self._obs
+        present = {n.lower(): n for n in (obs.metadata.antennas if obs.metadata else {})}
+        antennas = [present[n] for n in present if n in {s.lower() for s in self.EMERLIN_OUTSTATIONS}]
+        if not antennas:
+            return None
         if not obs._state.should_run("emerlin_scale", force=force):
             return None
         cfg = obs.config.get("calibration", {}).get("emerlin", {})
@@ -1052,10 +1056,8 @@ class CalibrateNamespace(Namespace):
         if not self._backend.supports("calibrate", "emerlin_scale"):
             obs._state.mark_complete("emerlin_scale", outputs=[])
             return None
-        present = {n.lower(): n for n in (obs.metadata.antennas if obs.metadata else {})}
-        antennas = [present[n] for n in present if n in {s.lower() for s in self.EMERLIN_OUTSTATIONS}]
         jb = next((present[n] for n in present if n.startswith(self.EMERLIN_REFERENCE.lower())), "")
-        if not antennas or not jb:
+        if not jb:
             obs._state.mark_complete("emerlin_scale", outputs=["no e-MERLIN array"])
             return None
         observed = set(obs.metadata.source_names or []) if obs.metadata else set()
