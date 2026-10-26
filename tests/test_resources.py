@@ -110,14 +110,16 @@ def test_macos_vm_stat_available_memory():
 
 def test_pool_size_follows_cpus_and_memory(fake_host, monkeypatch):
     monkeypatch.setattr(workers, "_CPUS", 20)
+    monkeypatch.setattr(workers, "available_memory", lambda: 64 * GB)
+    assert workers.default_workers() == 20                              # a workstation: CPU-bound, capped
     monkeypatch.setattr(workers, "available_memory", lambda: 23 * GB)
-    assert workers.default_workers() == workers.MAX_DEFAULT_WORKERS      # a workstation: CPU-bound, capped
+    assert workers.default_workers() == 17
     monkeypatch.setattr(workers, "available_memory", lambda: 6 * GB)
     assert workers.default_workers() == 4                                # 6 GB x 0.75 at 1 GB each
     monkeypatch.setattr(workers, "available_memory", lambda: GB // 2)
     assert workers.default_workers() == 1                                # never fewer than one
     monkeypatch.setattr(workers, "available_memory", lambda: None)
-    assert workers.default_workers() == workers.MAX_DEFAULT_WORKERS      # memory unknown: by CPUs
+    assert workers.default_workers() == 20                              # memory unknown: by CPUs
     monkeypatch.setattr(workers, "_CPUS", 8)
     monkeypatch.setattr(workers, "available_memory", lambda: 64 * GB)
     assert workers.default_workers() == 8                                # a laptop with plenty of memory

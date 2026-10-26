@@ -204,8 +204,10 @@ enabled = true
 solints = []                 # phase ladder; empty = 30min, 10min, 5min, scan (+ 2min for scans > 5 min)
 min_improvement = 0.002      # a step must lower the weighted chi-squared by this fraction (0.2%)
 max_bad_fraction = 0.25      # ... and fail in at most this fraction of its solution bins
-bayes_models = ["clean", "gauss1", "gauss2", "gauss3"]  # source models weighed by bayes_gscale
+bayes_models = ["current", "gauss1", "gauss2", "gauss3"]  # source models weighed by bayes_gscale
 prior_sigma = 0.1            # width of the prior on log-amplitude corrections (10%)
+joint_max_components = 10
+joint_model_rounds = 3
 joint_amplitude = false      # multi-epoch stage: also re-solve the station amplitudes of each epoch against the
                              # joint calibrator model (off: phases only; the model comes from other epochs of a
                              # source that varies, and amplitudes fitted to it degraded the targets in tests)
@@ -220,6 +222,12 @@ EVN = ["Hh", "Ur", "T6", "Sh"]
 LBA = ["Hh"]
 
 [imaging]
+method = "modelfit"
+max_components = 1
+component_sigma = 5.0
+component_improvement = 0.01
+epoch_workers = "auto"
+epoch_memory_fraction = 0.6
 mapsize = 8192               # difmapy: width in pixels of the map the images are made on (the FITS keeps the
                              # valid inner half, 4096 px); cell = resolution / 10
 average_channels = true      # difmapy: average each subband to one channel before CLEAN (much faster; set

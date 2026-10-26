@@ -25,6 +25,7 @@ in this process.
 from __future__ import annotations
 
 import json
+import os
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -215,6 +216,11 @@ def _workers_for(backend, project_code: str, jobs: list[PlotJob], max_workers: i
     cpus = usable_cpus()
     free = available_memory()
     budget = int(free * memory_fraction) if free is not None else None
+    allowance = os.environ.get("VLBIPY_EPOCH_MEMORY_BYTES")
+    if allowance is not None:
+        from .epoch_jobs import EPOCH_RUNTIME_BYTES
+        epoch_budget = max(0, int(allowance) - EPOCH_RUNTIME_BYTES)
+        budget = epoch_budget if budget is None else min(budget, epoch_budget)
     workers = plan_workers(peaks, max_workers=min(max_workers, cpus), available=budget)
     together = sum(sorted((peak or 0 for peak in peaks), reverse=True)[:workers])
     known = [peak for peak in peaks if peak is not None]
@@ -249,6 +255,9 @@ def _submit(backend, project_code: str, jobs: list[PlotJob], max_workers: int, m
     payloads = [{"backend": spec, "project_code": project_code, "method": jobs[index].method,
                  "kwargs": jobs[index].kwargs, "log": log} for index in remote]
     try:
+        if os.environ.get("VLBIPY_EPOCH_MEMORY_BYTES") is not None:
+            from .solvers.workers import get_pool
+            get_pool(workers)
         futures = submit_jobs(WORKER_FUNCTION, payloads, workers)
     except Exception as exc:  # noqa: BLE001 - the plots can still be drawn here, one at a time
         warnings.warn(f"{project_code}: the plot worker processes could not start ({exc}); drawing the "

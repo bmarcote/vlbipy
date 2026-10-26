@@ -5685,11 +5685,15 @@ class CasaExportOps(ExportOps):
             target.unlink()
         logger.info("exportuvfits: {} -> {} (combinespw={}, padwithflags={})",
                     source_ms.name, target.name, combinespw, padwithflags)
+        from ..solvers.uvfits import exportuvfits
+        options = dict(vis=str(source_ms), fitsfile=str(target), datacolumn="data", multisource=multisource,
+                       combinespw=combinespw, padwithflags=padwithflags, overwrite=overwrite)
         try:
-            self.backend.tasks.exportuvfits(vis=str(source_ms), fitsfile=str(target),
-                                            datacolumn="data", multisource=multisource,
-                                            combinespw=combinespw, padwithflags=padwithflags,
-                                            overwrite=overwrite)
+            try:
+                exportuvfits(**options)
+            except NotImplementedError as exc:
+                logger.info("exportuvfits: {}; using CASA", exc)
+                self.backend.tasks.exportuvfits(**options)
         except RuntimeError as exc:
             raise BackendError(f"{project_code}: exportuvfits of {source!r} failed: {exc}") from exc
         return str(target)

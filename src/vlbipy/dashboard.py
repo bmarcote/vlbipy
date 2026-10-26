@@ -956,9 +956,11 @@ def collect(obs, *, flag_statistics: Optional[dict] = None) -> dict:
 CSS = """
 :root{--ground:#f5f8fa;--panel:#fff;--panel2:#eef3f6;--border:#d7e0e6;--ink:#15222c;--muted:#5b6b78;
   --accent:#0c8f96;--accent-ink:#0a6b70;--good:#158a63;--warn:#a5741a;--crit:#c0384a;--mid:#c9a400;--role-ff:#c0303f;--role-pc:#2463c9;--role-tg:#d2690f;
+  --role-cs:#7a55c2;--role-pl:#c2468a;
   --shadow:0 1px 2px rgba(20,40,55,.06),0 8px 24px rgba(20,40,55,.06)}
 :root[data-theme="dark"]{--ground:#080d12;--panel:#101922;--panel2:#0b141c;--border:#1d2b37;--ink:#d9e6ee;
   --muted:#7f94a3;--accent:#37d3d9;--accent-ink:#8ff0f3;--good:#3ad39a;--warn:#e7b755;--crit:#e5586b;--mid:#e8d64b;--role-ff:#ff6b7a;--role-pc:#6aa5ff;--role-tg:#ffa24a;
+  --role-cs:#b9a0ff;--role-pl:#ff8ec4;
   --shadow:0 1px 0 rgba(0,0,0,.4),0 12px 32px rgba(0,0,0,.35)}
 *{box-sizing:border-box}
 body{margin:0;background:var(--ground);color:var(--ink);line-height:1.5;
@@ -999,6 +1001,7 @@ section:first-of-type{border-top:0;padding-top:8px}
 .skymap text{paint-order:stroke;stroke:var(--panel);stroke-width:3px;stroke-linejoin:round}
 .skymap .src{fill:var(--muted);stroke:var(--panel);stroke-width:1.5}
 .skymap .src.fringefinder{fill:var(--role-ff)} .skymap .src.phasecal{fill:var(--role-pc)} .skymap .src.target{fill:var(--role-tg)}
+.skymap .src.checksource{fill:var(--role-cs)} .skymap .src.polcal{fill:var(--role-pl)}
 .facts{display:flex;flex-wrap:wrap;gap:10px;margin:16px 0 8px}
 .fact{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px 14px;min-width:120px;
   box-shadow:var(--shadow)}
@@ -1040,7 +1043,9 @@ td.num{font-variant-numeric:tabular-nums;text-align:right}
 .badge.fringefinder{background:var(--panel2);background:color-mix(in srgb,var(--role-ff) 20%,transparent);color:var(--role-ff)}
 .badge.phasecal{background:var(--panel2);background:color-mix(in srgb,var(--role-pc) 20%,transparent);color:var(--role-pc)}
 .badge.target{background:var(--panel2);background:color-mix(in srgb,var(--role-tg) 22%,transparent);color:var(--role-tg)}
-.badge.other,.badge.checksource,.badge.polcal{background:var(--panel2);color:var(--muted)}
+.badge.checksource{background:var(--panel2);background:color-mix(in srgb,var(--role-cs) 20%,transparent);color:var(--role-cs)}
+.badge.polcal{background:var(--panel2);background:color-mix(in srgb,var(--role-pl) 20%,transparent);color:var(--role-pl)}
+.badge.other{background:var(--panel2);color:var(--muted)}
 .sbbar{display:inline-flex;gap:2px;height:10px;width:160px;vertical-align:middle}
 .sbbar i{flex:1;border-radius:2px;background:var(--panel2);border:1px solid var(--border)}
 .sbbar i.on{background:var(--accent);border-color:var(--accent)}
@@ -1302,6 +1307,8 @@ def _comments_section(ctx: dict) -> str:
 
 
 SKY_MAP_MAX_RINGS = 4
+SKY_MAP_RING_STEPS_DEG = (1 / 60, 2 / 60, 5 / 60, 10 / 60, 20 / 60, 30 / 60, 1, 2, 5, 10, 20, 45)
+SKY_MAP_ROLE_ORDER = ("target", "phasecal", "fringefinder", "checksource", "polcal", "other")
 
 
 def _unit_vector(ra_deg: float, dec_deg: float) -> tuple[float, float, float]:
@@ -1390,7 +1397,8 @@ def _sky_map(sources: list[dict]) -> str:
         calibrator with the separation written along the line. Empty when fewer than two sources have
         coordinates.
     """
-    placed = [s for s in sources if s.get("ra_deg") is not None and s.get("dec_deg") is not None]
+    placed = [s for s in sources
+              if all(isinstance(s.get(k), (int, float)) and math.isfinite(s[k]) for k in ("ra_deg", "dec_deg"))]
     if len(placed) < 2:
         return ""
     vectors = [_unit_vector(s["ra_deg"], s["dec_deg"]) for s in placed]
@@ -1430,22 +1438,27 @@ def _sky_map(sources: list[dict]) -> str:
         parts.append(f'<line class="pair" x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}"/>')
         parts.append(f'<text class="seplabel" x="{(x1 + x2) / 2:.1f}" y="{(y1 + y2) / 2 - 4:.1f}" '
                      f'text-anchor="middle">{escape(_format_separation(sep))}</text>')
-    labels = _sky_map_labels([s["name"] for s in placed], points, cx + radius * 0.4)
-    for source, (x, y), (lx, ly, anchor) in zip(placed, points, labels):
+    names = [str(s.get("name") or "") for s in placed]
+    labels = _sky_map_labels(names, points, cx + radius * 0.4)
+    for name, source, (x, y), (lx, ly, anchor) in zip(names, placed, points, labels):
         role = escape(str(source.get("type") or "other"), quote=True)
-        tip = f'{source["name"]} ({source.get("ra", "")}, {source.get("dec", "")})'
+        tip = f'{name} ({source.get("ra", "")}, {source.get("dec", "")})'
         if abs(ly - (y + 4)) > 1:
             parts.append(f'<line class="leader" x1="{x:.1f}" y1="{y:.1f}" x2="{lx + (2 if anchor == "end" else -2):.1f}" '
                          f'y2="{ly - 4:.1f}"/>')
         parts.append(f'<circle class="src {role}" cx="{x:.1f}" cy="{y:.1f}" r="5"><title>{escape(tip)}</title></circle>')
         parts.append(f'<text class="srclabel" x="{lx:.1f}" y="{ly:.1f}" text-anchor="{anchor}">'
-                     f'{escape(source["name"])}</text>')
+                     f'{escape(name)}</text>')
+    types = sorted({str(s.get("type") or "other") for s in placed},
+                   key=lambda t: (SKY_MAP_ROLE_ORDER.index(t) if t in SKY_MAP_ROLE_ORDER else len(SKY_MAP_ROLE_ORDER), t))
+    legend = ('<div class="legend">'
+              + "".join(f'<span class="badge {escape(t, quote=True)}">{escape(t)}</span>' for t in types) + "</div>")
     caption = (f"Source positions about their mean direction (RA {ra0 / 15:.2f} h, Dec {dec0:+.1f}\u00b0) in an "
                "azimuthal equidistant projection: distances from the centre and directions are true. North up, east "
                "left; dashed lines join each target to its nearest phase calibrator.")
     return (f'<figure class="skymap"><svg viewBox="0 0 {width} {height}" role="img" '
             f'aria-label="Sky positions of the observed sources">{"".join(parts)}</svg>'
-            f'<figcaption><div class="d">{escape(caption)}</div></figcaption></figure>')
+            f'<figcaption>{legend}<div class="d">{escape(caption)}</div></figcaption></figure>')
 
 
 def render_overview(ctx: dict, html_dir: Path) -> str:

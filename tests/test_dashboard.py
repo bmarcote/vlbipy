@@ -830,3 +830,87 @@ def test_overview_of_a_context_without_comments(tmp_path):
     context["comments"] = []
     text = Path(render_pages(context, tmp_path / "empty")).read_text(encoding="utf-8")
     assert '<p class="empty">Nothing to report.</p>' in text
+
+
+# -- sky map ------------------------------------------------------------------------------------
+
+def sky_sources():
+    """One source of every role, spread over a few degrees on the sky."""
+    return [
+        {"name": "TAR1", "type": "target", "ra_deg": 10.0, "dec_deg": 20.0, "ra": "00:40:00", "dec": "+20:00:00"},
+        {"name": "PCAL", "type": "phasecal", "ra_deg": 11.0, "dec_deg": 21.0, "ra": "00:44:00", "dec": "+21:00:00"},
+        {"name": "FF", "type": "fringefinder", "ra_deg": 9.0, "dec_deg": 19.0, "ra": "00:36:00", "dec": "+19:00:00"},
+        {"name": "CHK", "type": "checksource", "ra_deg": 10.5, "dec_deg": 19.5, "ra": "00:42:00", "dec": "+19:30:00"},
+        {"name": "POL", "type": "polcal", "ra_deg": 9.5, "dec_deg": 20.5, "ra": "00:38:00", "dec": "+20:30:00"},
+        {"name": "OTH", "type": "other", "ra_deg": 10.2, "dec_deg": 20.8, "ra": "00:40:48", "dec": "+20:48:00"},
+    ]
+
+
+def test_sky_map_shows_every_source_coloured_by_type_with_a_legend():
+    """All source types appear on the map and the legend explains each colour."""
+    from vlbipy.dashboard import _sky_map
+
+    html = _sky_map(sky_sources())
+    assert '<figure class="skymap">' in html
+    for role in ("target", "phasecal", "fringefinder", "checksource", "polcal", "other"):
+        assert f'class="src {role}"' in html, role
+        assert f'<span class="badge {role}">{role}</span>' in html, role
+    for name in ("TAR1", "PCAL", "FF", "CHK", "POL", "OTH"):
+        assert f">{name}</text>" in html
+    # A target is joined to its nearest phase calibrator.
+    assert 'class="pair"' in html and 'class="seplabel"' in html
+    # Rings at round angular radii carry labels.
+    assert 'class="ringlabel"' in html
+
+
+def test_sky_map_legend_lists_only_the_types_present():
+    from vlbipy.dashboard import _sky_map
+
+    html = _sky_map([s for s in sky_sources() if s["type"] in ("target", "phasecal")])
+    assert '<span class="badge target">target</span>' in html
+    assert '<span class="badge phasecal">phasecal</span>' in html
+    assert '<span class="badge fringefinder">' not in html
+
+
+def test_sky_map_handles_coincident_coordinates():
+    """Sources on top of each other (max angular radius 0) must not break the map."""
+    from vlbipy.dashboard import _sky_map
+
+    coincident = [dict(s, ra_deg=10.0, dec_deg=20.0) for s in sky_sources()[:3]]
+    html = _sky_map(coincident)
+    assert '<figure class="skymap">' in html and 'class="src' in html
+
+
+def test_sky_map_handles_ra_wrapping_across_zero():
+    """Sources at RA 359.9 and 0.1 degrees sit next to each other, not on opposite sides."""
+    from vlbipy.dashboard import _sky_map
+
+    wrapped = [dict(sky_sources()[0], ra_deg=359.9, dec_deg=0.0),
+               dict(sky_sources()[1], ra_deg=0.1, dec_deg=0.0)]
+    html = _sky_map(wrapped)
+    assert '<figure class="skymap">' in html
+    # 12 arcminutes apart: the ring labels stay in the arcminute regime, not ~180 degrees.
+    assert ">12.0\u2032</text>" in html and "\u00b0</text>" not in html
+
+
+def test_sky_map_skips_non_finite_and_missing_coordinates():
+    from vlbipy.dashboard import _sky_map
+
+    sources = [dict(sky_sources()[0], ra_deg=float("nan")),
+               dict(sky_sources()[1], dec_deg=float("inf")),
+               dict(sky_sources()[2], ra_deg=None),
+               sky_sources()[3], sky_sources()[4]]
+    html = _sky_map(sources)
+    assert '<figure class="skymap">' in html
+    assert html.count('class="src ') == 2
+    # Fewer than two finite positions: no map at all.
+    assert _sky_map(sources[:3]) == ""
+
+
+def test_sky_map_escapes_source_names():
+    from vlbipy.dashboard import _sky_map
+
+    sources = [dict(sky_sources()[0], name='A<B&"C">'), dict(sky_sources()[1], name="D<E")]
+    html = _sky_map(sources)
+    assert "A&lt;B" in html and "A<B" not in html
+    assert "D&lt;E</text>" in html and "D<E</text>" not in html

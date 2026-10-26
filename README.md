@@ -153,6 +153,30 @@ minsnr = 4.0
 
 See [Configuration](docs/configuration.md) for the full reference.
 
+### Modelfit-first imaging and self-calibration
+
+Difmapy imaging defaults to a **single circular Gaussian fitted directly to the visibilities**.
+Calibrators remain parametric throughout phase self-calibration, Bayesian amplitude calibration and
+joint-epoch model refinement; Bayesian model comparison does not include CLEAN candidates. Targets
+and check sources also start with one fitted component, without target self-calibration. The same
+visibility-fitted model is restored at each requested Briggs weighting, with untouched residuals added.
+A failed fit is reported, never silently replaced by CLEAN. CLEAN remains an explicit opt-in.
+
+```toml
+[imaging]
+method = "modelfit"
+max_components = 1
+epoch_workers = "auto"
+epoch_memory_fraction = 0.6
+```
+
+Increasing `max_components` permits additional Gaussian components only when significant positive
+residuals and an improved fit support them. Each independent epoch receives the full available CPU
+thread allowance in a fresh process; a memory-aware batch queue limits how many epochs run together.
+Existing CLEAN-derived or unverified self-calibration/joint tables are rejected under the new policy:
+rebuild from pre-selfcal data with `--scratch` rather than mixing old gains with new model fits.
+Already-running processes retain their previous code and native library until restarted.
+
 ### Fast calibration (dask-ms backend)
 
 The `dask-ms` backend is the CASA backend (import, flagging, imaging, plotting

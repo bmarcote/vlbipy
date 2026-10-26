@@ -15,7 +15,8 @@ The sequence for a calibrator follows the standard interactive difmap session:
 4. **amplitude calibration** with the Bayesian gscale (``bayes_gscale``), which
    compares source models, leaves each station out in turn and shrinks the
    corrections towards the a-priori calibration;
-5. **CLEAN images** at the requested Briggs robust values, written as FITS.
+5. **visibility-domain model fitting**, starting with one circular Gaussian; the fitted model plus untouched
+   residuals are restored at the requested Briggs robust values and written as FITS. CLEAN is explicit opt-in only.
 
 The phase and amplitude gains are exported as CASA "G Jones" tables that
 refer to the *parent* multi-source measurement set, so the CASA side can apply
@@ -65,6 +66,7 @@ SEARCH_MAX_PIXELS = 16384
 #: Width in pixels of the map the final images are made on (difmapy's own default is 4096). Only the inner
 #: half along each axis is valid and kept in the FITS file, so the images are IMAGE_PIXELS / 2 wide on disk.
 IMAGE_PIXELS = 8192
+MODEL_RESIDUAL_PRECISION = 8 * np.finfo(np.float32).eps
 
 
 def _load_difmapy():
@@ -123,14 +125,14 @@ def scan_lengths(obs) -> list[float]:
 
 
 def fit_starting_model(obs) -> dict:
-    """Fit a single circular Gaussian (flux, position, size free) at the phase centre.
+    """Fit a single circular Gaussian (flux, position, size free), seeded at the dirty-map peak.
 
     This is always the starting model: with no model difmapy seeds exactly that
     component at the residual peak (``seed_model``) and ``modelfit`` refines it.
     """
     obs.clrmod()
-    result = obs.modelfit(quiet=True)
-    comp = result["components"][0] if result.get("components") else {}
+    result = _checked_modelfit(obs.modelfit(quiet=True))
+    comp = result["components"][0]
     logger.info("difmapy modelfit: {:.3f} Jy circular Gaussian, FWHM {:.2f} mas at ({:+.2f}, {:+.2f}) mas, "
                 "rchisq {:.3g}, converged={}", comp.get("flux", float("nan")), comp.get("major", float("nan")),
                 comp.get("x", 0.0), comp.get("y", 0.0), result.get("rchisq", float("nan")),
@@ -179,21 +181,30 @@ def phase_selfcal(obs, solints: list[str], *, min_improvement: float = 0.002,
                     "accepted" if accepted else "rejected")
         if not accepted:
             break
-        obs = trial
         if refit:
-            obs.modelfit(quiet=True)
+            try:
+                _checked_modelfit(trial.modelfit(quiet=True))
+            except BackendError:
+                rounds[-1].update(accepted=False, reason="modelfit refit failed")
+                logger.warning("difmapy selfcal phase solint={}: model refit failed; keeping the previous round", solint)
+                break
+        obs = trial
     return obs, rounds
 
 
-def amplitude_calibration(obs, prefix: str, parent_ms: str, *, models=("clean", "gauss1", "gauss2", "gauss3"),
-                          prior_sigma: float = 0.1, workers: Optional[int] = None) -> dict:
+def amplitude_calibration(obs, prefix: str, parent_ms: str, *, models=("current", "gauss1", "gauss2", "gauss3"),
+                          prior_sigma: float = 0.1, workers: Optional[int] = None, allow_clean: bool = False) -> dict:
     """Bayesian station amplitude calibration; writes ``<prefix>.json``, ``.png`` and the CASA table.
 
     The table refers to ``parent_ms`` (the multi-source measurement set), so
     CASA can apply the corrections to every field. Returns the JSON-able summary
     with the table path under ``"caltable"``.
     """
-    result = obs.bayes_gscale(models=tuple(models), prior_sigma=prior_sigma, prefix=str(prefix),
+    models = tuple(models)
+    if not allow_clean:
+        models = tuple(model for model in models if not str(getattr(model, "kind", model)).strip().lower().startswith("clean"))
+        models = models or ("current", "gauss1", "gauss2", "gauss3")
+    result = obs.bayes_gscale(models=models, prior_sigma=prior_sigma, prefix=str(prefix),
                               outformat="CASA", ms=str(parent_ms), workers=workers, plot=False, quiet=True)
     raw_files = dict(getattr(result, "files", {}) or {})
     files = {k: [str(x) for x in v] if isinstance(v, (list, tuple)) else str(v) for k, v in raw_files.items()}
@@ -337,23 +348,111 @@ def _crop_to_valid(fits_path: str, valid: tuple) -> None:
         hdul.flush()
 
 
-def image_all_robust(obs, imagename: str, robust_values, **clean_kwargs) -> dict[float, dict]:
-    """CLEAN images at every robust value; ``imagename`` gets ``.robust<r>.fits`` appended."""
+def _checked_modelfit(result: dict) -> dict:
+    """Reject failed or nonphysical visibility fits rather than replacing them with CLEAN."""
+    components = result.get("components") or []
+    valid = bool(components) and result.get("converged", False) and math.isfinite(float(result.get("rchisq", math.nan)))
+    for component in components:
+        valid = valid and all(math.isfinite(float(component.get(key, 0.0)))
+                              for key in ("flux", "x", "y", "major"))
+        valid = valid and float(component.get("flux", 0.0)) > 0 and float(component.get("major", 0.0)) >= 0
+    if not valid:
+        raise BackendError("difmapy modelfit did not produce a converged, finite positive-flux model; no CLEAN fallback")
+    return result
+
+
+def fit_image_model(obs, *, max_components: int = 1, component_sigma: float = 5.0,
+                    component_improvement: float = 0.01) -> tuple[object, dict]:
+    """Fit one Gaussian first; add components only above noise and float32 visibility precision, with fit gains."""
+    if int(max_components) < 1 or component_sigma <= 0 or not 0 <= component_improvement < 1:
+        raise ValueError("invalid modelfit component limit, significance or improvement threshold")
+    fit = _checked_modelfit(obs.modelfit(quiet=True))
+    stopped = "component limit reached"
+    while len(obs.model) < int(max_components):
+        obs.invert()
+        rms = float(obs.noise_stats().get("rms", 0.0))
+        _, peak = obs.peak_offset()
+        floor = MODEL_RESIDUAL_PRECISION * abs(float(obs.model_flux))
+        if not math.isfinite(rms) or rms <= 0 or not math.isfinite(float(peak)) or float(peak) < max(component_sigma * rms, floor):
+            stopped = "no significant positive residual component"
+            break
+        trial = obs.copy()
+        trial.seed_model(type="gauss", free=("flux", "pos", "major"))
+        try:
+            candidate = _checked_modelfit(trial.modelfit(quiet=True))
+        except BackendError:
+            stopped = "additional component fit rejected"
+            break
+        before, after = float(fit["rchisq"]), float(candidate["rchisq"])
+        if before <= 0 or (before - after) / before < component_improvement:
+            stopped = "additional component did not improve the fit"
+            break
+        obs, fit = trial, candidate
+    report = {**fit, "components": list(obs.model), "method": "modelfit", "stopped": stopped}
+    logger.info("difmapy modelfit model: {} component(s), rchisq {:.4g}, {}",
+                len(report["components"]), float(fit["rchisq"]), stopped)
+    return obs, report
+
+
+def modelfit_image(obs, fits_path: str, *, robust: float, model_report: Optional[dict] = None,
+                   max_components: int = 1, component_sigma: float = 5.0,
+                   component_improvement: float = 0.01) -> tuple[object, dict]:
+    """Restore the visibility-fitted model plus untouched residuals, without deconvolving the residual map."""
+    if model_report is None:
+        obs, model_report = fit_image_model(obs, max_components=max_components, component_sigma=component_sigma,
+                                            component_improvement=component_improvement)
+    obs.uvweight(robust=float(robust))
+    obs.invert()
+    stats = obs.imstat()
+    noise = float(obs.noise_stats().get("rms", stats.get("rms", 0.0)))
+    obs.restore(no_residual=False)
+    obs.wmap(str(fits_path), overwrite=True)
+    _crop_to_valid(fits_path, obs.valid_slice)
+    peak = float(np.nanmax(np.asarray(obs.restored_map)[obs.valid_slice]))
+    beam = obs.estimated_beam
+    info = {"fits": str(fits_path), "robust": float(robust), "peak": peak, "rms": noise,
+            "dynamic_range": peak / noise if noise > 0 else 0.0, "model_flux": float(obs.model_flux),
+            "ncomponents": len(obs.model), "beam": [float(b) for b in np.atleast_1d(beam)] if beam is not None else [],
+            "stopped": model_report["stopped"], "method": "modelfit", "model": model_report,
+            "image_kind": "fitted model plus residuals"}
+    logger.info("difmapy modelfit robust={:+g}: {:.4g} Jy in {} component(s), peak {:.4g} Jy/beam, rms {:.3g} -> {}",
+                robust, info["model_flux"], info["ncomponents"], peak, noise, Path(fits_path).name)
+    return obs, info
+
+
+def image_all_robust(obs, imagename: str, robust_values, *, method: str = "modelfit", niter: int = 4000,
+                     gain: float = 0.05, threshold_sigma: float = 3.0, max_components: int = 1,
+                     component_sigma: float = 5.0, component_improvement: float = 0.01) -> dict[float, dict]:
+    """Fit once in the visibility domain and render at each robustness; CLEAN requires an explicit opt-in."""
+    method = str(method).strip().lower()
+    if method not in ("modelfit", "clean"):
+        raise ValueError(f"unknown imaging method {method!r}; choose modelfit or explicitly request clean")
+    robust_values = list(robust_values)
+    if not robust_values:
+        return {}
+    model_report = None
+    if method == "modelfit":
+        obs, model_report = fit_image_model(obs, max_components=max_components, component_sigma=component_sigma,
+                                            component_improvement=component_improvement)
     images = {}
     for robust in robust_values:
-        tag = f"robust{float(robust):g}"
-        obs, images[float(robust)] = clean_image(obs, f"{imagename}.{tag}.fits", robust=float(robust),
-                                                 **clean_kwargs)
+        robust = float(robust)
+        path = f"{imagename}.robust{robust:g}.fits"
+        if method == "modelfit":
+            obs, images[robust] = modelfit_image(obs, path, robust=robust, model_report=model_report)
+        else:
+            obs, images[robust] = clean_image(obs, path, robust=robust, niter=niter, gain=gain,
+                                             threshold_sigma=threshold_sigma)
     return images
 
 
 def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_values=(-2.0, 0.0, 2.0),
                      solints: Optional[list[str]] = None, min_improvement: float = 0.002,
-                     max_bad_fraction: float = 0.25, bayes_models=("clean", "gauss1", "gauss2", "gauss3"),
+                     max_bad_fraction: float = 0.25, bayes_models=("current", "gauss1", "gauss2", "gauss3"),
                      prior_sigma: float = 0.1, workers: Optional[int] = None, imagename: Optional[str] = None,
                      search_fov_mas: float = 0.0, search_sigma: float = 10.0, recentre_min_beams: float = 10.0,
                      mapsize: int = IMAGE_PIXELS, fixed_antennas: tuple = (), deferred_antennas: tuple = (),
-                     fix_stage1: bool = True, **clean_kwargs) -> dict:
+                     fix_stage1: bool = True, **imaging_kwargs) -> dict:
     """Full difmapy calibrator sequence: model, phase ladder, amplitude gains, images, tables.
 
     Products (``prefix`` is a path stem, e.g. ``<work_dir>/selfcal/<code>.<source>``):
@@ -406,7 +505,7 @@ def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_value
     phase_table = export_phase_table(obs, f"{prefix}.phase", parent_ms, snapshot) if any(r["accepted"] for r in rounds) \
         else {}
     amplitude = amplitude_calibration(obs, f"{prefix}.amp", parent_ms, models=bayes_models, prior_sigma=prior_sigma,
-                                      workers=workers)
+                                      workers=workers, allow_clean=imaging_kwargs.get("method", "modelfit") == "clean")
     gains = write_gain_record(obs, f"{prefix}.gains.json", amplitude)
     # One accumulated table (phase + amplitude corrections since the first model) is what
     # gets transferred to the targets and check sources.
@@ -418,7 +517,7 @@ def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_value
     except Exception as exc:  # noqa: BLE001 - the separate phase/amp tables still cover it
         logger.warning("difmapy: could not export the accumulated gain table ({})", exc)
     obs.auto_mapsize(npix=int(mapsize))
-    images = image_all_robust(obs, imagename or prefix, robust_values, **clean_kwargs)
+    images = image_all_robust(obs, imagename or prefix, robust_values, **imaging_kwargs)
     if any(shift):
         for info in images.values():
             _record_shift(info["fits"], shift[0], shift[1])
@@ -427,6 +526,7 @@ def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_value
               "model_rchisq": model.get("rchisq"), "ladder": ladder, "rounds": rounds,
               "phase_table": phase_table.get("path", ""), "amplitude": amplitude, "images": images,
               "accumulated_table": accumulated,
+              "image_model": next(iter(images.values()), {}).get("model", {}),
               "station_gains": {k: float(v) for k, v in obs.station_gains().items()},
               "station_gains_per_if": gains["gain_per_if"], "gains_file": f"{prefix}.gains.json"}
     Path(f"{prefix}.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
@@ -435,7 +535,8 @@ def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_value
 
 def joint_model(combined_ms: str, prefix: str, *, robust_values=(-2.0, 0.0, 2.0), model_robust: float = 0.0,
                 solints: Optional[list[str]] = None, min_improvement: float = 0.002,
-                max_bad_fraction: float = 0.25, mapsize: int = IMAGE_PIXELS, **clean_kwargs) -> dict:
+                max_bad_fraction: float = 0.25, mapsize: int = IMAGE_PIXELS,
+                model_rounds: int = 3, **imaging_kwargs) -> dict:
     """Model a calibrator from the data of several epochs together; write ``<prefix>.mod``.
 
     ``combined_ms`` is the concatenation of the calibrated per-epoch splits of
@@ -443,30 +544,67 @@ def joint_model(combined_ms: str, prefix: str, *, robust_values=(-2.0, 0.0, 2.0)
     one epoch lacks: structure that no single epoch constrains is fixed here.
     The sequence is the calibrator one (single Gaussian, phase self-cal ladder)
     without amplitude calibration - the stations kept their names but not
-    their gains from one epoch to the next - followed by CLEAN. The CLEAN
-    components of the ``model_robust`` image are the model.
+    their gains from one epoch to the next - followed by a visibility-domain
+    modelfit. Up to ``model_rounds`` cycles alternate the phase ladder with deeper
+    Gaussian fitting, so newly constrained structure enters the next solve. The
+    default joint component limit is ten, independent of the target's one-component
+    policy. Iteration stops when neither phase gains nor component count improve.
+    Its parametric components are the joint model; CLEAN is never an automatic fallback.
 
     Returns a JSON-able report with ``model`` (the ``.mod`` file), ``model_flux``,
     the self-cal ``rounds`` and the ``images`` (one per robust value).
     """
+    if int(model_rounds) < 1:
+        raise ValueError("model_rounds must be at least one")
+    method = str(imaging_kwargs.get("method", "modelfit")).strip().lower()
+    if method not in ("modelfit", "clean"):
+        raise ValueError(f"unknown imaging method {method!r}")
+    options = {"max_components": int(imaging_kwargs.get("max_components", 10)),
+               "component_sigma": float(imaging_kwargs.get("component_sigma", 5.0)),
+               "component_improvement": float(imaging_kwargs.get("component_improvement", 0.01))}
     obs = load(combined_ms, average_channels=True)
     fit_starting_model(obs)
     ladder = solints or selfcal_ladder(scan_lengths(obs))
-    obs, rounds = phase_selfcal(obs, ladder, min_improvement=min_improvement, max_bad_fraction=max_bad_fraction)
+    image_model, rounds, history = {}, [], []
+    for iteration in range(int(model_rounds) if method == "modelfit" else 1):
+        before = len(obs.model)
+        obs, phase_rounds = phase_selfcal(obs, ladder, min_improvement=min_improvement,
+                                          max_bad_fraction=max_bad_fraction)
+        rounds.extend(dict(round_, model_round=iteration + 1) for round_ in phase_rounds)
+        if method != "modelfit":
+            break
+        obs, image_model = fit_image_model(obs, **options)
+        accepted = sum(bool(round_["accepted"]) for round_ in phase_rounds)
+        history.append({"round": iteration + 1, "ncomponents": len(obs.model),
+                        "rchisq": image_model.get("rchisq"), "accepted_phase_steps": accepted})
+        logger.info("difmapy joint model round {}: {} component(s), {} accepted phase steps",
+                    iteration + 1, len(obs.model), accepted)
+        if not accepted and len(obs.model) == before:
+            break
     obs.auto_mapsize(npix=int(mapsize))
     # The model image goes last so that its CLEAN components are the ones left in the observation.
-    order = [float(r) for r in robust_values if float(r) != float(model_robust)] + [float(model_robust)]
+    requested = [float(r) for r in robust_values]
+    order = [r for r in requested if r != float(model_robust)]
+    if float(model_robust) in requested or method == "clean":
+        order.append(float(model_robust))
     images = {}
     for robust in order:
-        obs, images[robust] = clean_image(obs, f"{prefix}.robust{robust:g}.fits", robust=robust, **clean_kwargs)
+        if method == "modelfit":
+            obs, images[robust] = modelfit_image(obs, f"{prefix}.robust{robust:g}.fits", robust=robust,
+                                                model_report=image_model)
+        else:
+            options = {key: imaging_kwargs[key] for key in ("niter", "gain", "threshold_sigma") if key in imaging_kwargs}
+            obs, images[robust] = clean_image(obs, f"{prefix}.robust{robust:g}.fits", robust=robust, **options)
     model_path = f"{prefix}.mod"
     obs.wmodel(model_path)
     report = {"source": obs.source, "combined_ms": str(combined_ms), "model": model_path,
               "model_flux": float(obs.model_flux), "ladder": ladder, "rounds": rounds,
+              "image_model": image_model, "method": method, "model_rounds": len(history),
+              "model_iterations": history,
               "images": {robust: images[robust] for robust in sorted(images)}}
     Path(f"{prefix}.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
-    logger.info("difmapy joint model of {}: {:.4g} Jy in CLEAN components -> {}", obs.source, report["model_flux"],
-                Path(model_path).name)
+    logger.info("difmapy joint model of {}: {:.4g} Jy in {} components -> {}", obs.source, report["model_flux"],
+                method, Path(model_path).name)
     return report
 
 
@@ -489,14 +627,16 @@ def scale_model_file(model_path: str, out_path: str, factor: float) -> str:
 
 def refine_against_model(split_ms: str, parent_ms: str, prefix: str, model_path: str, *,
                          solints: Optional[list[str]] = None, min_improvement: float = 0.002,
-                         max_bad_fraction: float = 0.25, amplitude: bool = True) -> dict:
+                         max_bad_fraction: float = 0.25, amplitude: bool = True, prior_sigma: float = 0.1,
+                         outlier_sigma: float = 1.0, model_sigma: Optional[dict] = None,
+                         workers: Optional[int] = None) -> dict:
     """Self-calibrate one epoch of a calibrator against a fixed model; write ``<prefix>.G``.
 
     The model (a ``.mod`` file, e.g. the multi-epoch one of :func:`joint_model`
     scaled to this epoch's flux density) is not touched: only the antenna gains
     move. Phases go down the same accept/revert ladder as the calibrator
-    sequence; then one amplitude factor per station and IF (``gscale``, which
-    keeps the flux scale of the data) is kept if it improves the fit. The gains
+    sequence; then Bayesian station/IF amplitude corrections against that same
+    fixed parametric model are kept if they improve the fit. The gains
     accumulated here are exported as one CASA table for ``parent_ms``.
 
     Returns a JSON-able report: ``caltable`` ("" when no step was accepted),
@@ -506,30 +646,39 @@ def refine_against_model(split_ms: str, parent_ms: str, prefix: str, model_path:
     obs = load(split_ms, average_channels=True)
     obs.clrmod()
     obs.rmodel(str(model_path))
+    parametric = bool(obs.model) and all(component.get("type") in ("gauss", "gaussian") or component.get("freepar", 0)
+                                        for component in obs.model)
+    model_policy = {"method": "modelfit" if parametric else "unverified", "revision": MODELFIT_REVISION}
     start = float(obs.moddif()["chisq"])
     snapshot = obs.gain_snapshot()
     ladder = solints or selfcal_ladder(scan_lengths(obs))
     obs, rounds = phase_selfcal(obs, ladder, min_improvement=min_improvement, max_bad_fraction=max_bad_fraction,
                                 refit=False)
     gains: dict = {}
+    amplitude_files: dict = {}
     if amplitude:
         trial = obs.copy()
-        result = trial.gscale(quiet=True)
-        before, after = float(result["fit_before"]["chisq"]), float(result["fit_after"]["chisq"])
+        trial._replace_model([{**component, "freepar": 0} for component in trial.model])
+        before = float(trial.moddif()["chisq"])
+        result = trial.bayes_gscale(models=("current",), prior_sigma=prior_sigma, outlier_sigma=outlier_sigma,
+                                     model_sigma=model_sigma, workers=workers, nloop=0, apply=True,
+                                     prefix=f"{prefix}.amp", outformat="CASA", ms=str(parent_ms), plot=False, quiet=True)
+        amplitude_files = dict(getattr(result, "files", {}) or {})
+        after = float(trial.moddif()["chisq"])
         accepted = math.isfinite(after) and before > 0 and (before - after) / before >= min_improvement
-        logger.info("difmapy gscale against the joint model: chisq {:.4g} -> {:.4g} -> {}", before, after,
+        logger.info("difmapy Bayesian amplitudes against the joint model: chisq {:.4g} -> {:.4g} -> {}", before, after,
                     "accepted" if accepted else "rejected")
         if accepted:
             obs = trial
-            gains = {name: float(value) for name, value in result.get("gains", {}).items()
-                     if math.isfinite(float(value))}
+            gains = {row["station"]: float(row["correction"]) for row in result.station_table()
+                     if row.get("has_data") and math.isfinite(float(row.get("correction", math.nan)))}
     table = ""
     if gains or any(r["accepted"] for r in rounds):
         info = obs.savecaltable(f"{prefix}", outformat="CASA", ms=str(parent_ms), since=snapshot, quiet=True)
         table = str(info.get("path", f"{prefix}"))
     report = {"source": obs.source, "split_ms": str(split_ms), "model": str(model_path), "caltable": table,
-              "ladder": ladder, "rounds": rounds, "amplitude": gains, "chisq_before": start,
-              "chisq_after": float(obs.moddif()["chisq"])}
+              "ladder": ladder, "rounds": rounds, "amplitude": gains, "amplitude_files": amplitude_files,
+              "model_policy": model_policy, "chisq_before": start, "chisq_after": float(obs.moddif()["chisq"])}
     Path(f"{prefix}.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     return report
 
@@ -646,11 +795,11 @@ def locate_source(obs, imagename: str, *, search_fov_mas: float = 1000.0, search
 
 def image_source(split_ms: str, imagename: str, *, robust_values=(-2.0, 0.0, 2.0), search_fov_mas: float = 0.0,
                  search_sigma: float = 10.0, recentre_min_beams: float = 10.0, average_channels: bool = True,
-                 mapsize: int = IMAGE_PIXELS, **clean_kwargs) -> dict:
-    """Image an already-calibrated source (target / check source) with CLEAN only, no self-cal.
+                 mapsize: int = IMAGE_PIXELS, **imaging_kwargs) -> dict:
+    """Fit one Gaussian to an already-calibrated target/check source first, without self-calibration or CLEAN fallback.
 
     ``average_channels`` (default on) collapses every IF to one channel while loading, as the
-    self-calibration path does: CLEAN then works on a fraction of the visibilities. The price is
+    self-calibration path does: visibility fitting then works on a fraction of the visibilities. The price is
     bandwidth smearing of emission far from the phase centre, which is small inside the ~1 arcsec the
     source search covers; turn it off (``[imaging].average_channels = false``) for wider fields.
     The images are made on a map ``mapsize`` pixels wide (``[imaging].mapsize``), of which the FITS
@@ -664,17 +813,19 @@ def image_source(split_ms: str, imagename: str, *, robust_values=(-2.0, 0.0, 2.0
     obs = load(split_ms, average_channels=average_channels)
     search, shift = locate_source(obs, imagename, search_fov_mas=search_fov_mas, search_sigma=search_sigma,
                                   recentre_min_beams=recentre_min_beams)
+    if str(imaging_kwargs.get("method", "modelfit")).strip().lower() == "modelfit":
+        fit_starting_model(obs)
     obs.auto_mapsize(npix=int(mapsize))
-    images = image_all_robust(obs, imagename, robust_values, **clean_kwargs)
+    images = image_all_robust(obs, imagename, robust_values, **imaging_kwargs)
     if any(shift):
         for info in images.values():
             _record_shift(info["fits"], shift[0], shift[1])
     return {"source": obs.source, "split_ms": str(split_ms), "images": images, "search": search,
-            "shift_mas": list(shift)}
+            "image_model": next(iter(images.values()), {}).get("model", {}), "shift_mas": list(shift)}
 
 
 #: Revision tag recorded in the image report with the modelfit settings (bump when the defaults change).
-MODELFIT_REVISION = 2
+MODELFIT_REVISION = 3
 #: Peak memory of one imaging job per map pixel: 3.5 GB measured for an 8192-pixel map (the map, its beam and
 #: the FFT grid, plus the double-precision copies the noise statistics make).
 IMAGE_BYTES_PER_PIXEL = 52
@@ -687,10 +838,9 @@ def imaging_settings(img_cfg: dict) -> dict:
     return {"method": str(img_cfg.get("method", "modelfit")).strip().lower(),
             "niter": int(img_cfg.get("niter", 4000)), "gain": float(img_cfg.get("clean_gain", 0.05)),
             "threshold_sigma": float(img_cfg.get("threshold_sigma", 3.0)),
-            "max_components": int(img_cfg.get("max_components", 10)),
+            "max_components": int(img_cfg.get("max_components", 1)),
             "component_sigma": float(img_cfg.get("component_sigma", 5.0)),
-            "component_improvement": float(img_cfg.get("component_improvement", 0.01)),
-            "clean_sigma": float(img_cfg.get("clean_residual_sigma", 5.0))}
+            "component_improvement": float(img_cfg.get("component_improvement", 0.01))}
 
 
 def method_keywords(settings: dict) -> dict:
@@ -714,7 +864,8 @@ def _image_subprocess(spec_path: str, result_path: str, threads: int) -> subproc
     env = dict(os.environ)
     # The shared worker pool pins these to 1, which is what made difmapy crawl: its clean/bayes work is
     # threaded through BLAS, FFTW and ThreadPoolExecutors. Here each concurrent image gets its share.
-    for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VLBIPY_FFT_WORKERS"):
+    for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "RAYON_NUM_THREADS",
+                 "VLBIPY_FFT_WORKERS", "VECLIB_MAXIMUM_THREADS"):
         env[name] = str(threads)
     return subprocess.Popen([sys.executable, "-m", "vlbipy.backends.difmap", spec_path, result_path],
                             env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -725,7 +876,7 @@ def run_image_jobs(jobs: list[dict], *, max_workers: Optional[int] = None) -> li
 
     As many at a time as there are CPUs and as fit together in :data:`IMAGE_MEMORY_FRACTION` of the
     free memory (:data:`IMAGE_BYTES_PER_PIXEL` per map pixel), at most ``max_workers``; each running
-    job gets ``usable_cpus // workers`` threads for its numerical work. These do not go through the
+    job gets all usable CPUs for its numerical work. These do not go through the
     worker pool: its processes pin the numerical libraries to one thread, which difmapy needs.
     One job, or room for only one, runs here.
 
@@ -747,7 +898,7 @@ def run_image_jobs(jobs: list[dict], *, max_workers: Optional[int] = None) -> li
     fit = max(1, int(free * IMAGE_MEMORY_FRACTION // per_job)) if free is not None else len(jobs)
     workers = max(1, min(len(jobs), usable_cpus(), fit, int(max_workers) if max_workers else len(jobs)))
     if workers > 1:
-        threads = max(1, usable_cpus() // workers)
+        threads = usable_cpus()
         logger.info("difmapy: imaging {} source(s), {} at a time, {} thread(s) each ({:.1f} GB each, {} free)",
                     len(jobs), workers, threads, per_job / 1e9,
                     f"{free / 1e9:.1f} GB" if free is not None else "unknown")

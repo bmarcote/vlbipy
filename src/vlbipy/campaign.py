@@ -83,7 +83,7 @@ def epoch_image_statistics(obs) -> dict:
 
 
 def _epoch_flux(obs, source: str) -> Optional[float]:
-    """Flux density of ``source`` in this epoch, from the CLEAN model of its own self-calibration."""
+    """Flux density of ``source`` in this epoch, from the fitted model of its own self-calibration."""
     path = Path(obs.work_dir) / "selfcal" / f"{obs.project_code}.{source}.json"
     try:
         images = json.loads(path.read_text()).get("images", {})
@@ -128,21 +128,72 @@ def _epochs_changed_since(observations: list, report_path: Path) -> list[str]:
     return changed
 
 
-def stale_reason(observations: list, report_path: Path, report: dict) -> str:
+def joint_model_settings(config: dict) -> dict:
+    """Deep calibrator fitting limits, independent of the target's single-component starting policy."""
+    from .backends.difmap import imaging_settings
+    settings = imaging_settings(config.get("imaging", {}))
+    cfg = config.get("selfcal", {})
+    settings.update(max_components=int(cfg.get("joint_max_components", 10)),
+                    model_rounds=int(cfg.get("joint_model_rounds", 3)))
+    return settings
+
+
+def _campaign_settings(config: dict) -> dict:
+    """Scientific settings used to decide whether combined models and images can be reused."""
+    from .backends.difmap import imaging_settings, method_keywords
+    from .namespaces import _search_settings
+    img_cfg, cfg = config.get("imaging", {}), config.get("selfcal", {})
+    return {"imaging": {**method_keywords(imaging_settings(img_cfg)), **_search_settings(img_cfg),
+                        "robust": [float(value) for value in img_cfg.get("robust", [-2, 0, 2])],
+                        "average_channels": bool(img_cfg.get("average_channels", True))},
+            "joint": {**method_keywords(joint_model_settings(config)), "solints": cfg.get("solints") or [],
+                      "min_improvement": float(cfg.get("min_improvement", 0.002)),
+                      "max_bad_fraction": float(cfg.get("max_bad_fraction", 0.25)),
+                      "joint_amplitude": bool(cfg.get("joint_amplitude", False)),
+                      "prior_sigma": float(cfg.get("prior_sigma", 0.1)),
+                      "outlier_sigma": float(cfg.get("outlier_sigma", 1.0))},
+            "phase_referencing": config.get("phase_referencing", {})}
+
+
+def stale_reason(observations: list, report_path: Path, report: dict, settings: Optional[dict] = None) -> str:
     """Why an existing campaign report cannot be reused ("" when it can).
 
-    Two cases: an epoch was calibrated again after the report was written, or
-    the combination that wrote it did not complete (it lists what ``failed``).
+    Rebuild when calibration or scientific settings changed, a combination failed,
+    or its calibrated data, fitted models or images are no longer present.
     """
+    if "epochs" in report and set(report["epochs"]) != {obs.project_code for obs in observations}:
+        return "the campaign epochs changed"
     outdated = _epochs_changed_since(observations, report_path)
     if outdated:
         return f"the calibration of {', '.join(outdated)} changed after the last combination"
     if report.get("failed"):
         return f"the last combination was incomplete ({'; '.join(report['failed'])})"
+    if settings is not None and report.get("settings") != settings:
+        return "the combined-model or imaging settings changed"
+    if not report.get("combined"):
+        return "no combined images were recorded"
+    for source, record in report.get("calibrators", {}).items():
+        if not record.get("model") or not Path(record["model"]).is_file():
+            return f"the joint model of {source} is missing"
+        for code, table in record.get("tables", {}).items():
+            if not Path(table).is_dir():
+                return f"the joint table of {source} in {code} is missing"
+    for source, record in report["combined"].items():
+        if not record.get("ms") or not Path(record["ms"]).is_dir():
+            return f"the combined calibrated data of {source} are missing"
+        if not record.get("images") or any(not info.get("fits") or not Path(info["fits"]).is_file()
+                                            for info in record["images"].values()):
+            return f"the combined images of {source} are missing"
     return ""
 
 
+def _has_source(obs, source: str) -> bool:
+    """An epoch participates only when it observed the source, not merely when the campaign declared it."""
+    return source in (obs.metadata.source_names if obs.metadata is not None else obs.sources.names)
+
+
 def _joint_step(source: str) -> str:
+    """Pipeline step owning a calibrator's per-epoch joint-model corrections."""
     return f"joint_{source}"
 
 
@@ -205,7 +256,10 @@ def refine_calibrator(observations: list, source: str, root: Path, name: str, co
     (root / "selfcal").mkdir(parents=True, exist_ok=True)
     model = difmap.joint_model(combined, str(root / "selfcal" / f"{name}.{source}.joint"),
                                robust_values=robust_values, solints=solints,
-                               mapsize=int(img_cfg.get("mapsize", 8192)), **limits, **difmap.imaging_settings(img_cfg))
+                               mapsize=int(img_cfg.get("mapsize") or 8192), **limits, **joint_model_settings(config))
+    model_flux = float(model["model_flux"])
+    if not np.isfinite(model_flux) or model_flux <= 0:
+        raise ValueError(f"joint model of {source} has invalid total flux {model_flux}")
     record = {"epochs": codes, "flux_jy": dict(zip(codes, fluxes)), "reference_flux_jy": reference,
               "model": model["model"], "model_flux_jy": model["model_flux"], "joint_rounds": model["rounds"],
               "joint_images": {str(robust): info for robust, info in model["images"].items()},
@@ -214,37 +268,39 @@ def refine_calibrator(observations: list, source: str, root: Path, name: str, co
     step = _joint_step(source)
     for obs, split, flux in zip(observations, splits, fluxes):
         code = obs.project_code
-        out_dir = Path(obs.work_dir) / "selfcal"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        prefix = out_dir / f"{code}.{source}.joint"
-        # The joint model carries the structure; the flux density is this epoch's own.
-        epoch_model = difmap.scale_model_file(model["model"], f"{prefix}.mod", flux / reference)
         try:
+            out_dir = Path(obs.work_dir) / "selfcal"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            prefix = out_dir / f"{code}.{source}.joint"
+            # The joint model carries the structure; the flux density is this epoch's own.
+            epoch_model = difmap.scale_model_file(model["model"], f"{prefix}.mod", flux / model_flux)
             report = difmap.refine_against_model(split, str(obs._backend.ms_path(code)), str(prefix), epoch_model,
-                                                 solints=solints, amplitude=bool(cfg.get("joint_amplitude", True)),
+                                                 solints=solints, amplitude=bool(cfg.get("joint_amplitude", False)),
                                                  prior_sigma=float(cfg.get("prior_sigma", 0.1)),
                                                  outlier_sigma=float(cfg.get("outlier_sigma", 1.0)),
                                                  model_sigma=_own_model_sigma(obs, source),
                                                  workers=cfg.get("workers") or None, **limits)
+            if report["caltable"] and Path(report["caltable"]).is_dir():
+                table = CalTable(cal_type=f"joint_{source}", path=report["caltable"], field=source,
+                                 gainfield=source, interp="linear", apply_to=obs.selfcal._apply_to(source), snr=0.0)
+                try:
+                    obs.add_gaintable(table, step)
+                finally:
+                    if any(registered is table for registered in obs.gaintables):
+                        record["tables"][code] = report["caltable"]
+            accepted = [r["solint"] for r in report["rounds"] if r["accepted"]]
+            record["refinement"][code] = {"accepted_phase_solints": accepted, "amplitude": report["amplitude"],
+                                          "amplitude_report": report["amplitude_files"].get("json", ""),
+                                          "chisq_before": report["chisq_before"], "chisq_after": report["chisq_after"]}
+            amplitudes = ", ".join(f"{name} x{value:.2f}" for name, value in report["amplitude"].items())
+            logger.info("[{}] {} against the joint model: phase steps accepted {}; amplitudes {}; chisq {:.4g} -> {:.4g}",
+                        code, source, ", ".join(accepted) or "none", amplitudes or "kept",
+                        report["chisq_before"], report["chisq_after"])
+            obs._state.mark_complete(step, outputs=[report["caltable"]] if report["caltable"] else [])
         except Exception as exc:  # noqa: BLE001 - one epoch failing must not lose the others
             warnings.warn(f"{code}: refinement of {source} against the joint model failed ({exc})")
             obs._state.mark_failed(step, str(exc))
             record["failed_epochs"].append(code)
-            continue
-        accepted = [r["solint"] for r in report["rounds"] if r["accepted"]]
-        record["refinement"][code] = {"accepted_phase_solints": accepted, "amplitude": report["amplitude"],
-                                      "amplitude_report": report["amplitude_files"].get("json", ""),
-                                      "chisq_before": report["chisq_before"], "chisq_after": report["chisq_after"]}
-        amplitudes = ", ".join(f"{name} x{value:.2f}" for name, value in report["amplitude"].items())
-        logger.info("[{}] {} against the joint model: phase steps accepted {}; amplitudes {}; chisq {:.4g} -> {:.4g}",
-                    code, source, ", ".join(accepted) or "none", amplitudes or "kept",
-                    report["chisq_before"], report["chisq_after"])
-        if report["caltable"] and Path(report["caltable"]).is_dir():
-            obs.add_gaintable(CalTable(cal_type=f"joint_{source}", path=report["caltable"], field=source,
-                                       gainfield=source, interp="linear", apply_to=obs.selfcal._apply_to(source),
-                                       snr=0.0), step)
-            record["tables"][code] = report["caltable"]
-        obs._state.mark_complete(step, outputs=[report["caltable"]] if report["caltable"] else [])
     return record
 
 
@@ -296,7 +352,7 @@ def image_combined(by_source: dict[str, list], root: Path, name: str, config: di
             warnings.warn(f"{name}: image preview of {source} failed ({exc})")
             png = []
         results[source].update(png=png[0] if png else "", shift_mas=report.get("shift_mas", [0.0, 0.0]),
-                               search=report.get("search"), model=report.get("model", {}),
+                               search=report.get("search"), model=report.get("image_model") or report.get("model", {}),
                                images={str(robust): info for robust, info in report["images"].items()})
     return results
 
@@ -311,24 +367,33 @@ def combine_epochs(vlbi, *, force: bool = False) -> dict:
     force : bool
         Redo the stage even when ``<name>.campaign.json`` already exists.
     """
+    from .backends.difmap import imaging_settings
     observations = list(vlbi.observations)
+    config = vlbi.config
+    settings = imaging_settings(config.get("imaging", {}))
+    policy = _campaign_settings(config)
+    policy["reference_plans"] = {obs.project_code: list(obs.phaseref_plan().references) for obs in observations}
     codes = [obs.project_code for obs in observations]
     name = campaign_name(codes)
     root = campaign_dir(observations)
     report_path = root / f"{name}.campaign.json"
     if report_path.is_file() and not force:
-        previous = json.loads(report_path.read_text())
-        reason = stale_reason(observations, report_path, previous)
+        try:
+            previous = json.loads(report_path.read_text())
+        except (OSError, ValueError):
+            previous = {}
+        previous = previous if isinstance(previous, dict) else {}
+        reason = stale_reason(observations, report_path, previous, settings=policy)
         if not reason:
             logger.info("campaign {}: already combined ({}); use force=True to redo", name, report_path)
             return previous
         logger.info("campaign {}: {}; combining again", name, reason)
     root.mkdir(parents=True, exist_ok=True)
-    config = vlbi.config
     logger.info("campaign {}: combining {} epochs ({}) -> {}", name, len(codes), ", ".join(codes), root)
     # Whatever fails is recorded: a report with failures is a record of an attempt, and the
     # next run combines again instead of taking the stage for done.
-    report: dict = {"name": name, "epochs": codes, "calibrators": {}, "combined": {}, "failed": []}
+    report: dict = {"name": name, "epochs": codes, "settings": policy,
+                    "calibrators": {}, "combined": {}, "failed": []}
 
     # A previous combination left its tables in the chains: the joint model must be built from the
     # per-epoch calibration alone, so they come out first (and the splits are redone without them).
@@ -339,6 +404,9 @@ def combine_epochs(vlbi, *, force: bool = False) -> dict:
         for source in obs.phaseref_plan().references:
             if source not in calibrators:
                 calibrators.append(source)
+    joint_steps = {_joint_step(source) for source in calibrators}
+    joint_steps.update(table.step for obs in observations for table in obs.gaintables
+                       if table.step.startswith("joint_"))
     for obs in observations:
         dropped = obs.drop_gaintables(joint_steps)
         if dropped:
@@ -355,7 +423,7 @@ def combine_epochs(vlbi, *, force: bool = False) -> dict:
 
     changed: set[str] = set()
     for source in calibrators:
-        having = [obs for obs in observations if source in obs.sources.names]
+        having = [obs for obs in observations if _has_source(obs, source)]
         if len(having) < 2:
             logger.info("campaign {}: {} was observed in one epoch only ({}); no joint model", name, source,
                         ", ".join(obs.project_code for obs in having) or "none")
@@ -393,7 +461,7 @@ def combine_epochs(vlbi, *, force: bool = False) -> dict:
         for source in ordered:
             if source not in sources and (obs.metadata is None or source in obs.metadata.source_names):
                 sources.append(source)
-    by_source = {source: [obs for obs in observations if source in obs.sources.names] for source in sources}
+    by_source = {source: [obs for obs in observations if _has_source(obs, source)] for source in sources}
     for source, result in image_combined(by_source, root, name, config).items():
         if isinstance(result, Exception):
             warnings.warn(f"campaign {name}: combined image of {source} failed ({result})")

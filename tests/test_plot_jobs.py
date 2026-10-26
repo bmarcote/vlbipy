@@ -299,3 +299,35 @@ def test_submit_jobs_returns_one_future_per_job_and_isolates_failures():
         futures[0].result(timeout=60)
     assert [future.result(timeout=60) for future in futures[1:]] == [[1], 2]
     assert workers.submit_jobs("json:loads", [], workers=2) == []
+
+
+@pytest.mark.parametrize("free,allowance,expected", [(10000, 250, 2), (250, 10000, 2),
+                                                    (None, 250, 2), (10000, 0, 1)])
+def test_nested_plot_budget_keeps_epoch_and_free_memory_limits(monkeypatch, free, allowance, expected):
+    """The fixed epoch allowance reserves its runtime without relaxing the free-memory bound."""
+    from vlbipy.epoch_jobs import EPOCH_RUNTIME_BYTES
+    backend = SimpleNamespace(plot=SimpleNamespace(estimate_memory=lambda *args: 100))
+    monkeypatch.setattr(plot_jobs, "available_memory", lambda: free)
+    monkeypatch.setattr(plot_jobs, "usable_cpus", lambda: 8)
+    monkeypatch.setenv("VLBIPY_EPOCH_MEMORY_BYTES", str(EPOCH_RUNTIME_BYTES + allowance))
+    jobs = [PlotJob(str(index), method="good") for index in range(5)]
+    count, peaks = plot_jobs._workers_for(backend, "A", jobs, 8, 0.8, "final")
+    assert count == expected
+    assert peaks == [100] * 5
+
+
+def test_nested_plot_pool_starts_only_planned_workers(monkeypatch):
+    """Idle pool processes must not consume the memory saved by limiting active plots."""
+    from vlbipy.epoch_jobs import EPOCH_RUNTIME_BYTES
+    backend = SimpleNamespace(plot=SimpleNamespace(estimate_memory=lambda *args: 100),
+                              worker_spec=lambda code: {"backend": "fake"})
+    monkeypatch.setattr(plot_jobs, "available_memory", lambda: 10000)
+    monkeypatch.setattr(plot_jobs, "usable_cpus", lambda: 8)
+    monkeypatch.setenv("VLBIPY_EPOCH_MEMORY_BYTES", str(EPOCH_RUNTIME_BYTES + 250))
+    started = []
+    monkeypatch.setattr(workers, "get_pool", lambda count: started.append(count))
+    monkeypatch.setattr(workers, "submit_jobs", lambda *args: [object()] * len(args[1]))
+    jobs = [PlotJob(str(index), method="good") for index in range(5)]
+    futures, estimates, count = plot_jobs._submit(backend, "A", jobs, 8, 0.8, "final")
+    assert started == [2]
+    assert count == 2 and len(futures) == len(estimates) == 5

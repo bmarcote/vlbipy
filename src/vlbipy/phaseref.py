@@ -65,7 +65,7 @@ logger = get_logger()
 SETTING_KEYS = ("inverse", "strategy", "brightness_ratio", "order", "max_extrapolation", "max_gap")
 STRATEGIES = ("auto", "sequential", "interpolate", "time")
 #: Self-calibration tables registered once per reference source, as ``<kind>_<source>``.
-PER_SOURCE_KINDS = ("selfamp", "selfphase", "joint")
+PER_SOURCE_KINDS = ("selfcal", "selfamp", "selfphase", "joint")
 #: Spacing of the rows of a derived table inside each scan of its field [s].
 DERIVED_CADENCE = 30.0
 TWO_PI = 2.0 * np.pi
@@ -578,8 +578,8 @@ def transfer_chain(tables: list, plan: PhaseRefPlan, metadata, out_dir) -> list:
     """The apply chain with the receivers' solutions interpolated between two references (``interpolate``).
 
     Two kinds of tables are interpolated: a table solved on several references (a fringe fit: its
-    ``gainfield`` names them) and the per-reference self-calibration tables (``selfamp_<source>``,
-    ``selfphase_<source>``, ``joint_<source>``), paired by kind. For every receiver a derived table
+    ``gainfield`` names them) and the per-reference self-calibration tables (``selfcal_<source>``,
+    ``selfamp_<source>``, ``selfphase_<source>``, ``joint_<source>``), paired by kind. For every receiver a derived table
     (:func:`interpolated_table`) is appended with ``apply_to`` that receiver, and the receiver is removed from
     the ``apply_to`` of the tables it replaces. Any other strategy returns ``tables`` unchanged, and so does a
     receiver whose derived table could not be made.

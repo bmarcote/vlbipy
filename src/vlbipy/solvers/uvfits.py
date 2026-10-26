@@ -661,7 +661,7 @@ def _primary_cards(main: dict, sub: dict, setup: dict, names: list, comments: li
     ra, dec = sub["phase_dir"] * (180.0 / math.pi)
     if ra < 0:
         ra += 360.0
-    if "2000" in sub["direction_ref"]:
+    if sub["direction_ref"] == "ICRS" or "2000" in sub["direction_ref"]:
         epoch = 2000.0
     elif "1950" in sub["direction_ref"]:
         epoch = 1950.0
@@ -677,6 +677,8 @@ def _primary_cards(main: dict, sub: dict, setup: dict, names: list, comments: li
               _card("GROUPS", True, "Random Group UV data"), _card("PCOUNT", len(names), "Number of random parameters"),
               _card("GCOUNT", gcount, "Number of groups (rows) in the file"), _card(""),
               _card("EPOCH", epoch), _card("BSCALE", 1.0), _card("BZERO", 0.0), _card("BUNIT", bunit)]
+    if sub["direction_ref"] == "ICRS":
+        cards.append(_card("RADESYS", "ICRS"))
     axes = (("COMPLEX", 1.0, 1.0, 1.0), ("STOKES", setup["crval3"], setup["cdelt3"], 1.0),
             ("FREQ", setup["ref_freq"], setup["bw0"], float(setup["ref_pix"])), ("IF", 1.0, 1.0, 1.0),
             ("RA", float(ra), 1.0, 1.0), ("DEC", float(dec), 1.0, 1.0))

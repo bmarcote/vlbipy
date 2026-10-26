@@ -1318,7 +1318,7 @@ class ScanSNRPlotter:
         # constrained layout (not tight_layout): it reserves room for the colorbar and the
         # right-hand source axis instead of letting them overlap the matrix.
         figure, axis = plt.subplots(figsize=(max(5.0, 0.5 * n_antennas + 3.5),
-                                             max(3.5, 0.16 * n_scans + 2.0)),
+                                             min(12.0, max(3.5, 0.16 * n_scans + 2.0))),
                                     layout="constrained")
         colormap = matplotlib.colormaps[SNR_COLORMAP].with_extremes(bad=NO_DATA_COLOR)
         image = axis.imshow(matrix, aspect="auto", interpolation="nearest", origin="upper",
@@ -1326,6 +1326,7 @@ class ScanSNRPlotter:
                             extent=(-0.5, n_antennas - 0.5, n_scans - 0.5, -0.5))
 
         style_axis(axis, grid=False)
+        axis.minorticks_off()
         axis.set_xticks(range(n_antennas), survey.antennas, rotation=90, fontsize=8)
         self._label_scans(axis, survey, n_scans)
         axis.set_xlabel("antenna", fontsize=9)
@@ -1353,9 +1354,14 @@ class ScanSNRPlotter:
         vmax = max(vmin * 10.0, float(np.nanpercentile(finite, 99)))
         return LogNorm(vmin=vmin, vmax=vmax)
 
+    def _label_budget(self, axis) -> int:
+        """Allow at least a quarter inch per categorical label, with at most thirty labels."""
+        height = axis.figure.get_size_inches()[1] * axis.get_position().height
+        return max(2, min(30, int(height / 0.25)))
+
     def _label_scans(self, axis, survey: ScanSNRSurvey, n_scans: int) -> None:
         """Label the y axis with scan numbers, thinned so the ticks stay readable."""
-        step = max(1, n_scans // 30)
+        step = max(1, math.ceil(n_scans / self._label_budget(axis)))
         positions = list(range(0, n_scans, step))
         axis.set_yticks(positions, [str(survey.scan_numbers[i]) for i in positions], fontsize=7)
 
@@ -1376,7 +1382,13 @@ class ScanSNRPlotter:
                 if index < len(sources):
                     axis.axhline(index - 0.5, color="white", lw=1.2)
                 start = index
-        right.set_yticks(ticks, labels, fontsize=7)
+        gap = len(sources) / self._label_budget(axis)
+        keep = []
+        for index, position in enumerate(ticks):
+            if not keep or position - ticks[keep[-1]] >= gap:
+                keep.append(index)
+        right.set_yticks([ticks[i] for i in keep], [labels[i] for i in keep], fontsize=7)
+        right.minorticks_off()
 
 
 class CalTablePlotter:

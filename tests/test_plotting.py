@@ -203,6 +203,35 @@ def test_scan_snr_plotter_writes_one_png_per_polarization(tmp_path):
     assert all(p.is_file() and p.stat().st_size > 1000 for p in paths)
 
 
+@pytest.mark.parametrize("n_scans", [259, 2000])
+def test_scan_snr_ticks_remain_readable(tmp_path, monkeypatch, caplog, n_scans):
+    """Long, alternating source schedules have bounded ticks and no categorical minor ticks."""
+    from matplotlib.figure import Figure
+    from vlbipy.plotting import ScanSNRPlotter
+
+    survey = _demo_survey(n_scans)
+    survey.scan_sources = ["3C345" if i % 2 else "J1848+3219" for i in range(n_scans)]
+    captured = []
+
+    def inspect(figure, *args, **kwargs):
+        figure.canvas.draw()
+        axis = figure.axes[0]
+        right = axis.child_axes[0]
+        assert len(axis.get_yticks()) <= 30
+        assert len(right.get_yticks()) <= 30
+        assert len(axis.yaxis.get_minorticklocs()) == 0
+        assert len(right.yaxis.get_minorticklocs()) == 0
+        for labels in (axis.get_yticklabels(), right.get_yticklabels()):
+            boxes = sorted((label.get_window_extent() for label in labels), key=lambda box: box.y0)
+            assert all(a.y1 < b.y0 for a, b in zip(boxes, boxes[1:]))
+        captured.append(figure)
+
+    monkeypatch.setattr(Figure, "savefig", inspect)
+    ScanSNRPlotter(tmp_path)._plot_one(survey, "RR", tmp_path / "snr.png")
+    assert captured
+    assert "Locator attempting" not in caplog.text
+
+
 def test_scan_snr_plotter_handles_all_nan_and_empty(tmp_path):
     """An all-failed polarization still renders; an empty survey writes nothing."""
     from vlbipy.models import ScanSNRSurvey

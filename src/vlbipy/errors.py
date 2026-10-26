@@ -48,3 +48,11 @@ class StepError(Exception):
             detail += f" [params={self.params}]"
 
         super().__init__(f"{message} {detail}")
+
+
+class StaleCalibrationError(StepError):
+    """Raised when legacy calibration provenance makes continuing the pipeline unsafe.
+
+    Uses the :class:`StepError` constructor and context fields, but must propagate
+    past best-effort step handlers so stale gains cannot enter final products.
+    """

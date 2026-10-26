@@ -107,8 +107,8 @@ def test_incomplete_campaign_report_is_not_reused(tmp_path):
     stamp = report.stat().st_mtime - 100
     os.utime(chain, (stamp, stamp))
     epochs = [SimpleNamespace(project_code="V589A", _caltables_path=chain)]
-    assert stale_reason(epochs, report, {"failed": []}) == ""
-    assert stale_reason(epochs, report, {}) == ""                      # a report written before failures were recorded
+    assert "no combined images" in stale_reason(epochs, report, {"failed": []})
+    assert "no combined images" in stale_reason(epochs, report, {})    # a report written before failures were recorded
     assert "incomplete" in stale_reason(epochs, report, {"failed": ["joint model of J1346-6024"]})
 
 

@@ -13,7 +13,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterator, Optional, Union
-from .errors import ConfigError
+from .errors import ConfigError, StaleCalibrationError
 from .config import _deep_merge, kwargs_to_overrides, load_config
 from .logging_utils import get_logger, headline, run_logs, warnings
 from .observation import Observation
@@ -405,6 +405,8 @@ class VLBIObs:
         if len(self._observations) == 1:
             logger.info("combine requested, but it is a single project")
             return {}
+        for observation in self._observations:
+            self._require_imaging_policy(observation)
         from .campaign import combine_epochs
         return combine_epochs(self, force=force)
 
@@ -429,6 +431,9 @@ class VLBIObs:
         dict
             Mapping of target source name -> produced image(s).
         """
+        if not scratch:
+            for observation in self._observations:
+                self._require_imaging_policy(observation)
         for observation in self._observations:
             observation.prepare_run(scratch=scratch, from_step=from_step)
 
@@ -544,25 +549,43 @@ class VLBIObs:
                         ", ".join(o.project_code for o in expanded[-len(bands):]))
         self._observations = expanded
 
+    def _require_imaging_policy(self, obs: Observation) -> None:
+        """Stop before changing products when a real difmap epoch still carries legacy calibration."""
+        imager = getattr(obs._backend, "imager", None) or obs.config.get("imaging", {}).get("imager", "difmap")
+        if obs._backend.requires_data_files and imager == "difmap":
+            from .backends.difmap import imaging_settings
+            from .namespaces import _require_current_selfcal
+            _require_current_selfcal(obs, imaging_settings(obs.config.get("imaging", {})))
+
     def _finish_campaign(self, *, force: bool = False) -> dict:
         """Steps 16-21 for a campaign: split, self-calibrate and image every epoch, then combine them.
 
         Returns ``{project_code: {source: images}}`` plus the campaign report under ``"combined"``.
         """
-        images: dict = {}
-        for obs in self._observations:
-            obs.export.per_source(force=force)
-            obs.flag.statistics()
-            self._selfcal_all(obs, force=force)
-            self._calibrated_diagnostics(obs)
-            images[obs.project_code] = self._image_all(obs, force=force)
-            self._final_plots(obs)
+        if all(obs._backend.requires_data_files and (getattr(obs._backend, "imager", "") or
+               obs.config.get("imaging", {}).get("imager", "difmap")) == "difmap"
+               for obs in self._observations):
+            from .epoch_jobs import run_epochs
+            images = run_epochs(self._observations, force=force)
+        else:
+            images = {obs.project_code: self._finish_epoch(obs, force=force) for obs in self._observations}
         try:
             # Band splits share one epoch: combining them into a joint model would be wrong.
             if not all(getattr(o, "_band_of", None) for o in self._observations):
                 images["combined"] = self.combine(force=force)
         except Exception as exc:  # noqa: BLE001 - the per-epoch products are complete and must survive
             warnings.warn(f"multi-epoch combination failed: {exc}")
+        return images
+
+    def _finish_epoch(self, obs: Observation, *, force: bool = False) -> dict:
+        """Finish one epoch in dependency order; independent epochs may run in isolated processes."""
+        self._require_imaging_policy(obs)
+        obs.export.per_source(force=force)
+        obs.flag.statistics()
+        self._selfcal_all(obs, force=force)
+        self._calibrated_diagnostics(obs)
+        images = self._image_all(obs, force=force)
+        self._final_plots(obs)
         return images
 
     def _calibrated_diagnostics(self, obs: Optional[Observation] = None) -> None:
@@ -621,6 +644,8 @@ class VLBIObs:
         obs = obs or self._imaging_target()
         try:
             return obs.selfcal.run_all(force=force)
+        except StaleCalibrationError:
+            raise
         except Exception as exc:  # noqa: BLE001 - self-cal must not abort the run
             obs._state.mark_failed("selfcal", str(exc))
             warnings.warn(f"{obs.project_code}: self-calibration stage failed: {exc}")
@@ -653,6 +678,8 @@ class VLBIObs:
                 continue
             try:
                 images[name] = obs.clean(target=name, robust=robust)
+            except StaleCalibrationError:
+                raise
             except Exception as exc:  # noqa: BLE001 - imaging failure must not abort the run
                 obs._state.mark_failed(f"clean_{name}", str(exc))
                 warnings.warn(f"imaging {name} failed: {exc}")

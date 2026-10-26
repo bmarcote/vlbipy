@@ -22,7 +22,7 @@ import numpy as np
 
 from .applycal import read_view_runs
 from .corrected import view as corrected_view
-from .msio import read_layout, read_setup, run_specs, select_runs, split_rows, table_engine
+from .msio import read_layout, read_runs, read_setup, run_specs, select_runs, split_rows, table_engine
 from .workers import run_jobs
 
 #: Rows per worker job: 100k rows x 64 channels x 2 hands of complex64 is ~100 MB.

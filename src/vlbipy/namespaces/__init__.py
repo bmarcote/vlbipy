@@ -2477,7 +2477,7 @@ class CleanNamespace(Namespace):
 
     def _image_with_difmap(self, src: str, robust_values: list[float], img_cfg: dict, weighting: str,
                            niter: int, **kwargs) -> list[Image]:
-        """CLEAN ``src`` with difmapy at every robust value (see :mod:`vlbipy.backends.difmap`).
+        """Image ``src`` with difmapy at every robust value (see :mod:`vlbipy.backends.difmap`).
 
         The source is first searched for in a wide dirty map and re-centred only when a
         significant peak lies far from the phase centre (``[imaging].search_fov``,
@@ -2485,15 +2485,17 @@ class CleanNamespace(Namespace):
         """
         from ..backends import difmap
         obs = self._obs
+        settings = difmap.imaging_settings(img_cfg)
+        settings.update({key: kwargs[key] for key in settings if key in kwargs})
+        settings["niter"] = int(niter)
+        _require_current_selfcal(obs, settings)
         split = self.split_ms(src)
         image_dir = Path(obs.work_dir) / "images"
         image_dir.mkdir(parents=True, exist_ok=True)
         report = difmap.image_source(split, str(image_dir / f"{self._code}_{src}"), robust_values=robust_values,
-                                     niter=int(niter), gain=float(img_cfg.get("clean_gain", 0.05)),
-                                     threshold_sigma=float(kwargs.get("threshold_sigma", 3.0)),
                                      average_channels=bool(img_cfg.get("average_channels", True)),
-                                     **_search_settings(img_cfg))
-        _write_search_report(image_dir / f"{self._code}_{src}.search.json", report)
+                                     **settings, **_search_settings(img_cfg))
+        _write_search_report(image_dir / f"{self._code}_{src}.search.json", report, settings)
         return [_image_from_difmap(src, info, weighting) for info in report["images"].values()]
 
     def _image(self, target, robust, imager, *, imsize=None, weighting=None, niter=None,
@@ -2568,6 +2570,55 @@ def _write_image_report(path: Path, report: dict, settings: Optional[dict] = Non
 _write_search_report = _write_image_report
 
 
+def _require_current_selfcal(obs, settings: dict, sources=()) -> None:
+    """Reject reuse of legacy calibration before any split, apply, or report overwrite.
+
+    Selfcal solutions refine the preceding calibrators and may already be applied
+    to cached splits. Replacing just one table is not a safe migration: restart
+    from pre-selfcal data instead of silently mixing calibration policies.
+    """
+    if settings.get("method") != "modelfit":
+        return
+    from ..backends.difmap import method_keywords
+    from ..errors import StaleCalibrationError
+    state = getattr(obs, "_state", None)
+    completed = state.completed() if state is not None and hasattr(state, "completed") else []
+    steps = {step for step in completed if step.startswith("selfcal_")}
+    steps.update(table.step for table in getattr(obs, "gaintables", [])
+                 if getattr(table, "step", "").startswith("selfcal_"))
+    steps.update(f"selfcal_{source}" for source in sources)
+    revision = method_keywords(settings).get("revision")
+    joint_sources = {step: step[len("joint_"):] for step in completed if step.startswith("joint_")}
+    joint_sources.update({table.step: getattr(table, "field", "") or table.step[len("joint_"):]
+                          for table in getattr(obs, "gaintables", [])
+                          if getattr(table, "step", "").startswith("joint_")})
+    for step, source in sorted(joint_sources.items()):
+        path = Path(obs.work_dir) / "selfcal" / f"{obs.project_code}.{source}.joint.json"
+        try:
+            policy = json.loads(path.read_text(encoding="utf-8")).get("model_policy") or {}
+            current = policy.get("method") == "modelfit" and policy.get("revision") == revision
+        except (OSError, ValueError, TypeError, AttributeError):
+            current = False
+        if not current:
+            raise StaleCalibrationError(step, f"stale or unverified joint-model provenance in {path}; the current "
+                                        "modelfit revision requires rebuilding the joint refinement and dependent "
+                                        "applied/split/image products from pre-selfcal data. Restart with --scratch; "
+                                        "--force alone cannot safely undo already-applied legacy gains.")
+    for step in sorted(steps):
+        source = step[len("selfcal_"):]
+        path = Path(obs.work_dir) / "images" / f"{obs.project_code}_{source}.search.json"
+        try:
+            imaging = json.loads(path.read_text(encoding="utf-8")).get("imaging") or {}
+            current = imaging.get("method") == "modelfit" and imaging.get("revision") == revision
+        except (OSError, ValueError, TypeError, AttributeError):
+            current = False
+        if not current:
+            raise StaleCalibrationError(step, f"stale or unverified calibrator policy in {path}; the current modelfit "
+                            "revision requires rebuilding all selfcal tables and dependent applied/split/image "
+                            "products from pre-selfcal data. Restart with --scratch; --force alone cannot "
+                            "safely undo already-applied legacy gains.")
+
+
 def _image_from_difmap(source: str, info: dict, weighting: str = "briggs") -> Image:
     """Build an :class:`Image` from a :func:`vlbipy.backends.difmap.clean_image` report."""
     beam = tuple(info.get("beam") or (0.0, 0.0, 0.0))
@@ -2631,10 +2682,18 @@ class SelfcalNamespace(Namespace):
         src = self._resolve_source_name(target) if target is not None else \
             (obs.sources.fringe_finders or obs.sources.phase_calibrators or obs.sources.targets)[0].name
         step = f"selfcal_{src}"
-        if not obs._state.should_run(step, force=force):
-            return obs._selfcal_results.get(src) or SelfcalResult(src, [], True)
         cfg = self._config()
         img_cfg = obs.config.get("imaging", {})
+        settings = difmap.imaging_settings(img_cfg)
+        settings.update({key: kwargs.pop(key) for key in settings if key in kwargs})
+        should_run = obs._state.should_run(step, force=force)
+        _require_current_selfcal(obs, settings, sources=() if should_run else (src,))
+        if not should_run:
+            return obs._selfcal_results.get(src) or SelfcalResult(src, [], True)
+        bayes_models = tuple(cfg.get("bayes_models", ["current", "gauss1", "gauss2", "gauss3"]))
+        if settings["method"] == "modelfit":
+            bayes_models = tuple(model for model in bayes_models if not str(model).lower().startswith("clean"))
+            bayes_models = bayes_models or ("current", "gauss1", "gauss2", "gauss3")
         is_finder = src in {s.name for s in obs.sources.fringe_finders}
         transfer = (not is_finder) if transfer_phases is None else bool(transfer_phases)
         obs.drop_gaintables({step})
@@ -2657,21 +2716,20 @@ class SelfcalNamespace(Namespace):
             solints=list(solints) if solints else None,
             min_improvement=float(cfg.get("min_improvement", 0.002)),
             max_bad_fraction=float(cfg.get("max_bad_fraction", 0.25)),
-            bayes_models=tuple(cfg.get("bayes_models", ["clean", "gauss1", "gauss2", "gauss3"])),
+            bayes_models=bayes_models,
             prior_sigma=float(cfg.get("prior_sigma", 0.1)), workers=cfg.get("workers") or None,
-            imagename=str(image_dir / f"{self._code}_{src}"), niter=int(img_cfg.get("niter", 4000)),
-            gain=float(img_cfg.get("clean_gain", 0.05)), threshold_sigma=float(img_cfg.get("threshold_sigma", 3.0)),
+            imagename=str(image_dir / f"{self._code}_{src}"), **settings,
             fixed_antennas=tuple(fixed), deferred_antennas=tuple(deferred),
             fix_stage1=bool(cfg.get("fix_stage1", True)),
             **{**_search_settings(img_cfg), **kwargs})
-        _write_search_report(image_dir / f"{self._code}_{src}.search.json", report)
+        _write_search_report(image_dir / f"{self._code}_{src}.search.json", report, settings)
         apply_to = self._apply_to(src)
         accumulated = report.get("accumulated_table") or ""
         if accumulated and Path(accumulated).is_dir():
             # Single table carrying phase + amplitude corrections accumulated by the difmapy session.
             obs.add_gaintable(CalTable(cal_type=f"selfcal_{src}", path=accumulated, field=src, gainfield=src,
                                        interp="linear", apply_to=apply_to, snr=0.0), step)
-            _write_search_report(image_dir / f"{self._code}_{src}.search.json", report)
+            _write_search_report(image_dir / f"{self._code}_{src}.search.json", report, settings)
             images = [_image_from_difmap(src, info) for info in report["images"].values()]
             rounds = [dict(r, mode="phase") for r in report["rounds"]]
             result = SelfcalResult(src, rounds, any(r["accepted"] for r in rounds), images[0] if images else None)
@@ -2741,6 +2799,8 @@ class SelfcalNamespace(Namespace):
         if not self._backend.requires_data_files:
             logger.info("selfcal: backend {} has no on-disk data for difmapy; skipping", self._backend.kind)
             return results
+        from ..backends.difmap import imaging_settings
+        _require_current_selfcal(obs, imaging_settings(obs.config.get("imaging", {})))
         with_data = set(obs.metadata.source_names) if obs.metadata else set(obs.sources.names)
         finders = [s.name for s in obs.sources.fringe_finders if s.name in with_data]
         phasecals = [s.name for s in obs.sources.phase_calibrators if s.name in with_data and s.name not in finders]

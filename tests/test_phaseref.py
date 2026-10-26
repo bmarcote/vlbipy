@@ -190,8 +190,8 @@ def _fringe_table(path, ms, *, phase, delay, flagged=()):
     return str(path)
 
 
-def _gain_table(path, ms, field, gain):
-    times = np.array([T0, T0 + 600])
+def _gain_table(path, ms, field, gain, times=None):
+    times = np.array([T0, T0 + 600]) if times is None else np.asarray(times, dtype=np.float64)
     rows = [(antenna, time) for antenna in range(NANT) for time in times]
     cparam = np.full((len(rows), 1, 2), gain, dtype=complex)
     caltable.write_jones_table(path, ms, viscal="G Jones", times=[r[1] for r in rows],
@@ -272,6 +272,57 @@ def test_transfer_chain_gives_the_receiver_interpolated_tables(three_field_ms, t
     # Any other strategy keeps the chain as solved.
     assert phaseref.transfer_chain(chain, PhaseRefPlan("time", ["CAL_A", "CAL_B"], ["TARGET"]), metadata,
                                    tmp_path / "phaseref") == chain
+
+
+def test_transfer_chain_interpolates_the_accumulated_selfcal_tables(three_field_ms, tmp_path):
+    """The single complex ``selfcal_<source>`` table the difmapy stage registers (phase + amplitude
+    accumulated over the session) is paired by kind like the selfamp/selfphase pair and the campaign's
+    ``joint_<source>``: without it the receiver takes both calibrators' tables in series whatever the
+    strategy says."""
+    cal_a = _gain_table(tmp_path / "a.gains", three_field_ms, 0, np.exp(0.1j))
+    cal_b = _gain_table(tmp_path / "b.gains", three_field_ms, 1, 2.0 * np.exp(0.5j))
+    joint_a = _gain_table(tmp_path / "a.joint", three_field_ms, 0, np.exp(0.3j))
+    joint_b = _gain_table(tmp_path / "b.joint", three_field_ms, 1, np.exp(0.7j))
+    chain = [CalTable("selfcal_CAL_A", path=cal_a, field="CAL_A", gainfield="CAL_A", interp="linear",
+                      step="selfcal_CAL_A", apply_to="CAL_A,TARGET"),
+             CalTable("selfcal_CAL_B", path=cal_b, field="CAL_B", gainfield="CAL_B", interp="linear",
+                      step="selfcal_CAL_B", apply_to="CAL_B,TARGET"),
+             CalTable("joint_CAL_A", path=joint_a, field="CAL_A", gainfield="CAL_A", interp="linear",
+                      step="joint_CAL_A", apply_to="CAL_A,TARGET"),
+             CalTable("joint_CAL_B", path=joint_b, field="CAL_B", gainfield="CAL_B", interp="linear",
+                      step="joint_CAL_B", apply_to="CAL_B,TARGET")]
+    metadata = SimpleNamespace(source_names=FIELDS,
+                               source_coords={"CAL_A": (10.0, 0.0), "CAL_B": (12.0, 0.0),
+                                              "TARGET": (10.5, 0.2)},
+                               scans=[SimpleNamespace(source="TARGET", time_start=T0 + 100,
+                                                      time_end=T0 + 220)])
+    plan = PhaseRefPlan("interpolate", references=["CAL_A", "CAL_B"], receivers=["TARGET"])
+    _, _, x, _ = phaseref.interpolation_pair(plan.references, metadata.source_coords, "TARGET")
+    out = phaseref.transfer_chain(chain, plan, metadata, tmp_path / "phaseref")
+    by_type = {t.cal_type: t for t in out}
+    assert by_type["selfcal>TARGET"].apply_to == "TARGET" and by_type["selfcal>TARGET"].gainfield == "TARGET"
+    assert by_type["joint>TARGET"].apply_to == "TARGET"
+    assert by_type["selfcal_CAL_A"].apply_to == "CAL_A" and by_type["selfcal_CAL_B"].apply_to == "CAL_B"
+    assert by_type["joint_CAL_A"].apply_to == "CAL_A" and by_type["joint_CAL_B"].apply_to == "CAL_B"
+    gain, flags = _target_value(by_type["selfcal>TARGET"].path, 0)
+    assert not flags.any()
+    assert np.allclose(np.angle(gain), 0.1 + x * 0.4, atol=1e-3)
+    assert np.allclose(np.abs(gain), 2 ** x, rtol=1e-5)
+
+
+def test_selfcal_tables_fall_back_to_the_nearer_reference_in_time(three_field_ms, tmp_path):
+    """CAL_A's accumulated table is solved at T0 only and CAL_B's brackets T0 + 575 s; with a small max_gap
+    the derived rows far from either take the solutions of the reference observed closer in time."""
+    first = _gain_table(tmp_path / "a.gains", three_field_ms, 0, np.exp(0.1j), times=[T0])
+    second = _gain_table(tmp_path / "b.gains", three_field_ms, 1, np.exp(0.5j), times=[T0 + 550, T0 + 600])
+    times = np.array([T0 + 50.0, T0 + 575.0])
+    summary = phaseref.interpolated_table((first, "CAL_A"), (second, "CAL_B"), 0.25, "TARGET", times,
+                                          tmp_path / "derived", max_gap=100.0)
+    assert summary["time_interpolated"] == pytest.approx(1.0)
+    table = load_caltable(tmp_path / "derived")
+    rows = table.antenna1 == 1
+    gain = table.param[rows, 0, 0][np.argsort(table.time[rows])]
+    assert np.allclose(np.angle(gain), [0.1, 0.5], atol=1e-3)
 
 
 # -- pipeline input ----------------------------------------------------------------------------------------------------
