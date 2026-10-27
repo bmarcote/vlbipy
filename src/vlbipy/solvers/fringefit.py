@@ -177,11 +177,13 @@ def _first_refant_with_data(chain: list[int], antenna1: np.ndarray, antenna2: np
 # The task
 # ---------------------------------------------------------------------------
 def _solve_block(block: dict, setup: dict, spw_sel: dict, spw_groups: list[list[int]], refant_chain: list[int],
-                 solint_sec: float, solve_kwargs: dict, field_id: int, scan: int) -> list[dict]:
+                 solint_sec: float, solve_kwargs: dict, field_id: int, scan: int,
+                 fringe_priors: Optional[dict] = None, prior_window=(2.0, 1e-12)) -> list[dict]:
     """Solve every (interval, spw group) of one scan block; returns the table rows as dicts of arrays.
 
     ``block`` comes from :func:`vlbipy.solvers.calblock.load_block`: its cubes already hold only the selected
-    channels (``block["chan_freq"]`` are their frequencies) and the parallel hands.
+    channels (``block["chan_freq"]`` are their frequencies) and the parallel hands. ``fringe_priors`` maps
+    :func:`_interval_key` to the predicted delays and rates of that interval (see :func:`predict_from_previous`).
     """
     nant = len(setup["antenna_names"])
     rows = []
@@ -208,14 +210,79 @@ def _solve_block(block: dict, setup: dict, spw_sel: dict, spw_groups: list[list[
                                              block["spw"][keep], freq,
                                              nant=nant, f_ref_hz=group_reference_freq(freq, group))
             t_sol = 0.5 * (t_lo + t_hi)
-            solution = fringefit_interval(data, refant, t_sol=t_sol, **solve_kwargs)
+            prior = (fringe_priors or {}).get(_interval_key(t_sol, int(min(group))))
+            solution = fringefit_interval(data, refant, t_sol=t_sol, priors=prior, prior_window=prior_window,
+                                          **solve_kwargs)
             table = solution.to_fparam()
             rows.append({"time": t_sol, "interval": 0.0 if not np.isfinite(solint_sec) else solint_sec,
                          "field_id": field_id, "scan": scan, "spw": int(min(group)), "refant": refant,
                          "f_ref_hz": solution.f_ref_hz, "nchan_sel": int(chans.size * len(group)), **table,
+                         "n_prior": int(np.count_nonzero(solution.prior_used)),
                          "n_ok": int((~solution.flag).sum()), "snr_median": float(np.median(
                              solution.snr[~solution.flag])) if (~solution.flag).any() else 0.0})
     return rows
+
+
+def _interval_key(t_sol: float, spw: int) -> tuple:
+    """Key of one solution interval: its time (to the millisecond) and the lowest subband of its group."""
+    return (round(float(t_sol), 3), int(spw))
+
+
+def predict_from_previous(rows: list[dict], nprev: int = 3) -> dict[int, np.ndarray]:
+    """Predict each interval's delays and rates from the previous solutions of the same field.
+
+    For every row (one interval and subband group, see :func:`_solve_block`), the prediction of an antenna and
+    polarization is the median of its last ``nprev`` unflagged solutions (fewer if there are not so many) among
+    the previous ``2 * nprev`` intervals with the same field, subband group and reference antenna: the residual
+    delay and rate drift slowly, so this is the smoothed value the solution should be near, and the look-back
+    is bounded so that it stays local in time. Delays and rates are relative to the reference antenna, so
+    intervals with another one are not used.
+
+    Returns
+    -------
+    dict
+        ``{row index: float array (nant, 2, 2)}`` of (delay_ns, rate) per antenna and polarization, ``nan``
+        where no previous solution exists; rows without any previous interval are absent.
+    """
+    series: dict[tuple, list[int]] = {}
+    for index, row in enumerate(rows):
+        series.setdefault((row["field_id"], row["spw"], row["refant"]), []).append(index)
+    predictions = {}
+    for indices in series.values():
+        indices.sort(key=lambda i: rows[i]["time"])
+        for position, index in enumerate(indices):
+            previous = indices[max(0, position - 2 * nprev):position]
+            if not previous:
+                continue
+            fparam = np.stack([rows[i]["fparam"] for i in previous]).astype(np.float64)   # (nprev, nant, 8)
+            flags = np.stack([rows[i]["flag"] for i in previous])
+            nant = fparam.shape[1]
+            prediction = np.full((nant, 2, 2), np.nan)
+            for pol in range(2):
+                good = ~flags[:, :, 4 * pol + 1]
+                for ant in range(nant):
+                    last = np.flatnonzero(good[:, ant])[-nprev:]
+                    if last.size:
+                        prediction[ant, pol] = np.median(fparam[last, ant][:, [4 * pol + 1, 4 * pol + 2]], axis=0)
+            prediction[rows[index]["refant"]] = np.nan
+            predictions[index] = prediction
+    return predictions
+
+
+def _departs_from_prediction(row: dict, prediction: np.ndarray, window) -> bool:
+    """Whether an antenna with a prediction was flagged or solved outside its window (see predict_from_previous)."""
+    fparam, flag = row["fparam"], row["flag"]
+    for pol in range(2):
+        delay0, rate0 = prediction[:, pol, 0], prediction[:, pol, 1]
+        known = np.isfinite(delay0) & np.isfinite(rate0)
+        if not known.any():
+            continue
+        flagged = flag[:, 4 * pol + 1]
+        off = ((np.abs(fparam[:, 4 * pol + 1] - delay0) > window[0])
+               | (np.abs(fparam[:, 4 * pol + 2] - rate0) > window[1]))
+        if (known & (flagged | off)).any():
+            return True
+    return False
 
 
 def group_reference_freq(chan_freq, group: list[int]) -> float:
@@ -245,10 +312,13 @@ def group_reference_freq(chan_freq, group: list[int]) -> float:
 def solve_scan_job(*, specs: list[dict], setup: dict, engine: str, columns: list[str], data_column: str,
                    spw_sel: dict, spw_groups: list[list[int]], refant_chain: list[int], solint_sec: float,
                    solve_kwargs: dict, antennas: Optional[set], among: bool, timerange: Optional[tuple],
-                   parang: bool, priors: list) -> list[dict]:
+                   parang: bool, priors: list, fringe_priors: Optional[dict] = None,
+                   prior_window=(2.0, 1e-12)) -> list[dict]:
     """Worker job: read one (field, scan), apply the priors and fringe fit its solution intervals.
 
-    Returns the table rows of the scan as dicts of small arrays (see :func:`_solve_block`).
+    ``priors`` are the calibration tables applied first; ``fringe_priors`` the predicted delays and rates of
+    the intervals to search around (see :func:`_solve_block`). Returns the table rows of the scan as dicts of
+    small arrays.
     """
     from .calblock import load_block
     block = load_block(specs, setup=setup, engine=engine, columns=columns, data_column=data_column, chans=spw_sel,
@@ -257,14 +327,15 @@ def solve_scan_job(*, specs: list[dict], setup: dict, engine: str, columns: list
     if block is None:
         return []
     return _solve_block(block, setup, spw_sel, spw_groups, refant_chain, solint_sec, solve_kwargs, block["field"],
-                        int(specs[0]["scan"]))
+                        int(specs[0]["scan"]), fringe_priors=fringe_priors, prior_window=prior_window)
 
 
 def fringefit(vis: str, caltable: str, *, field="", spw="", scan="", timerange="", antenna="",
                   solint="inf", combine="", refant="", minsnr=3.0, zerorates=False, globalsolve=True, niter=100,
                   paramactive=None, delaywindow=None, ratewindow=None, parang=False, gaintable=None,
                   gainfield=None, interp=None, spwmap=None, docallib=False, workers: Optional[int] = None,
-                  data_column: str = "DATA", **ignored) -> Path:
+                  data_column: str = "DATA", prior_scans: int = 0, prior_delay_window_ns: float = 2.0,
+                  prior_rate_window: float = 1e-12, **ignored) -> Path:
     """Fringe fit ``vis`` into the CASA-format table ``caltable`` (``casatasks.fringefit`` keyword set).
 
     Parameters follow the CASA task. ``paramactive`` is ``[delay, rate, dispersive]`` (default
@@ -272,6 +343,16 @@ def fringefit(vis: str, caltable: str, *, field="", spw="", scan="", timerange="
     lists; ``docallib`` is rejected. ``workers`` is the number of worker processes (default
     :func:`vlbipy.solvers.workers.default_workers`; 1 solves in this process). Unknown keywords
     (``corrdepflags``, ``selectdata``, ...) are ignored. Returns the table path.
+
+    Every interval is first solved on its own, all scans in parallel. Then each antenna solution is compared
+    with the median of the same antenna's up to ``prior_scans`` previous solutions on that field (see
+    :func:`predict_from_previous`); the intervals where one was flagged or landed more than
+    ``prior_delay_window_ns`` / ``prior_rate_window`` away are solved again with the FFT peak also searched
+    around that prediction, so that a weak antenna keeps the fringe consistent with its neighbours instead of
+    a stronger noise peak elsewhere. Intervals with no previous solution keep the plain search; ``prior_scans``
+    = 0 (the default) disables the second pass. It is meant for the solve that is applied (the mbd); a survey
+    of the detections (scan SNR) must keep each scan's own search, or it reports detections the scan alone
+    does not support.
     """
     if docallib:
         raise NotImplementedError("fringefit: cal-library files are not supported; pass gaintable lists")
@@ -330,6 +411,9 @@ def fringefit(vis: str, caltable: str, *, field="", spw="", scan="", timerange="
     rows = [r for group in results for r in group]
     if not rows:
         raise RuntimeError("fringefit: no solution interval had data")
+    if int(prior_scans) > 0 and not zerorates:
+        rows = _resolve_around_previous(rows, [jobs[i] for i in order], int(prior_scans),
+                                        (float(prior_delay_window_ns), float(prior_rate_window)), workers)
     _write_table(caltable, vis, setup, rows, spw_sel, combine_spw)
     n_ok = sum(r["n_ok"] for r in rows)
     logger.info("fringefit[dask-ms]: {} interval(s) on {} scan(s), {} antenna solutions, median SNR {:.0f}; "
@@ -337,6 +421,40 @@ def fringefit(vis: str, caltable: str, *, field="", spw="", scan="", timerange="
                 float(np.median([r["snr_median"] for r in rows if r["n_ok"]])) if n_ok else 0.0,
                 caltable.name, _time.time() - t_start)
     return caltable
+
+
+def _resolve_around_previous(rows: list[dict], jobs: list[dict], nprev: int, window: tuple,
+                             workers: Optional[int]) -> list[dict]:
+    """Second pass of :func:`fringefit`: re-solve the intervals that depart from the previous solutions."""
+    predictions = predict_from_previous(rows, nprev)
+    wanted: dict[tuple, dict] = {}
+    for index, prediction in predictions.items():
+        row = rows[index]
+        if _departs_from_prediction(row, prediction, window):
+            wanted.setdefault((row["field_id"], row["scan"]), {})[_interval_key(row["time"], row["spw"])] = prediction
+    if not wanted:
+        return rows
+    again = [dict(job, fringe_priors=wanted[key], prior_window=window)
+             for job in jobs for key in [(_job_field(job), int(job["specs"][0]["scan"]))] if key in wanted]
+    replaced = {(r["field_id"], _interval_key(r["time"], r["spw"])): r
+                for group in run_jobs("vlbipy.solvers.fringefit:solve_scan_job", again, workers) for r in group}
+    out, changed = [], 0
+    for row in rows:
+        new = replaced.get((row["field_id"], _interval_key(row["time"], row["spw"])))
+        if new is not None and new["n_prior"]:
+            changed += new["n_prior"]
+            out.append(new)
+        else:
+            out.append(row)
+    logger.info("fringefit: {} interval(s) on {} scan(s) departed from the median of their previous {} "
+                "solution(s); {} antenna solution(s) taken from a search around it",
+                sum(len(v) for v in wanted.values()), len(wanted), nprev, changed)
+    return out
+
+
+def _job_field(job: dict) -> int:
+    """Field id of a :func:`solve_scan_job` job (all its runs share it)."""
+    return int(job["specs"][0]["field"])
 
 
 def _prior_entries(gaintable, gainfield, interp, spwmap, field_names: list[str]) -> list[dict]:

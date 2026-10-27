@@ -357,7 +357,8 @@ def _empty_fft_result(nant, npol):
     """All-flagged FFT result dictionary."""
     z = np.zeros((nant, npol), dtype=np.float64)
     return dict(phase=z.copy(), delay_ns=z.copy(), rate=z.copy(), snr=z.copy(), peak=z.copy(), sumw=z.copy(),
-                sumww=z.copy(), xcount=np.zeros((nant, npol), dtype=np.int64), ok=np.zeros((nant, npol), dtype=bool))
+                sumww=z.copy(), xcount=np.zeros((nant, npol), dtype=np.int64), ok=np.zeros((nant, npol), dtype=bool),
+                prior_used=np.zeros((nant, npol), dtype=bool))
 
 
 def _contiguous_segments(index):
@@ -376,7 +377,13 @@ def _place_on_grid(grid, z, t_off, chan_offset):
             grid[..., t_dst, c_dst] = z[..., t_src, c_src]
 
 
-def fringe_fft_search(data, refant, *, pad=4, delay_window_ns=None, rate_window=None):
+#: A prior-window peak is kept over the global FFT peak unless the global one is this many times stronger in SNR:
+#: a much stronger peak elsewhere is a real jump of the delay or rate, not a false detection.
+PRIOR_SNR_RATIO = 2.0
+
+
+def fringe_fft_search(data, refant, *, pad=4, delay_window_ns=None, rate_window=None, priors=None,
+                      prior_window=(2.0, 1e-12), minsnr=0.0):
     """FFT delay/rate search on the baselines to the reference antenna (CASA DelayRateFFT).
 
     Parameters
@@ -390,13 +397,23 @@ def fringe_fft_search(data, refant, *, pad=4, delay_window_ns=None, rate_window=
         Delay search window [ns]; default the full unambiguous range.
     rate_window : (float, float), optional
         Rate search window [s/s]; default the full range.
+    priors : float array (nant, 2, 2), optional
+        Predicted (delay_ns, rate) per antenna and polarization, ``nan`` where there is none (see
+        :func:`vlbipy.solvers.fringefit.predict_from_previous`). Where there is one, the peak is also searched
+        within ``prior_window`` of it, and that peak is kept when its SNR reaches ``minsnr`` and the global
+        peak is not more than :data:`PRIOR_SNR_RATIO` times stronger: a false peak elsewhere in the delay-rate
+        plane then cannot win over the one consistent with the neighbouring solutions.
+    prior_window : (float, float)
+        Half-widths of the prior window: delay [ns] and rate [s/s]; never less than two FFT bins.
+    minsnr : float
+        Minimum SNR of a prior-window peak.
 
     Returns
     -------
     dict
         Arrays of shape (nant, npol): phase [rad], delay_ns, rate [s/s] (phase referenced to the first channel
-        and the first integration of the grid), snr, peak, sumw, sumww, xcount, ok (bool), plus scalars
-        f0_hz (centroid frequency used for the rate), f_grid0_hz, t_grid0, bin_delay_ns, bin_rate.
+        and the first integration of the grid), snr, peak, sumw, sumww, xcount, ok (bool), prior_used (bool),
+        plus scalars f0_hz (centroid frequency used for the rate), f_grid0_hz, t_grid0, bin_delay_ns, bin_rate.
     """
     t_start = _time.perf_counter()
     nant, npol = data.nant, data.npol
@@ -445,6 +462,30 @@ def fringe_fft_search(data, refant, *, pad=4, delay_window_ns=None, rate_window=
     sumw = w.sum(axis=(1, 2), dtype=np.float64)
     sumww = np.einsum("ktfp,ktfp->kp", w, w, dtype=np.float64)
     xcount = np.count_nonzero(~flagged, axis=(1, 2))
+    prior_used = np.zeros((ants.size, npol), dtype=bool)
+    if priors is not None:
+        flat_power = power.reshape(ants.size, npol, -1)
+        global_snr = _fft_snr(peak, sumw, sumww, xcount)
+        half_delay = max(float(prior_window[0]), 2.0 * bin_delay)
+        half_rate = max(float(prior_window[1]), 2.0 * bin_rate)
+        for k, ant in enumerate(ants):
+            for p in range(npol):
+                delay0, rate0 = priors[ant, min(p, priors.shape[1] - 1)]
+                if not (np.isfinite(delay0) and np.isfinite(rate0)):
+                    continue
+                inside = ((np.abs(rate_axis - rate0) <= half_rate)[:, None]
+                          & (np.abs(delay_axis - delay0) <= half_delay)[None, :]).reshape(-1)
+                if not inside.any():
+                    continue
+                candidates = np.where(inside, flat_power[k, p], -1.0)
+                best = int(np.argmax(candidates))
+                local = float(np.sqrt(max(candidates[best], 0.0)))
+                local_snr = float(_fft_snr(np.array([local]), sumw[k:k + 1, p], sumww[k:k + 1, p],
+                                           xcount[k:k + 1, p])[0])
+                if local_snr >= minsnr and global_snr[k, p] <= PRIOR_SNR_RATIO * local_snr:
+                    it[k, p], jf[k, p] = np.unravel_index(best, (nt_pad, nf_pad))
+                    peak[k, p] = local
+                    prior_used[k, p] = True
     ok = (sumw > 0) & (peak > 0)
     x = (data.freq - f_grid0) * 1e-9
     y = (data.time - t_grid0) * f0
@@ -458,6 +499,7 @@ def fringe_fft_search(data, refant, *, pad=4, delay_window_ns=None, rate_window=
     result["peak"][ants], result["sumw"][ants], result["sumww"][ants] = peak, sumw, sumww
     result["xcount"][ants], result["ok"][ants] = xcount, ok
     result["snr"][ants] = _fft_snr(peak, sumw, sumww, xcount)
+    result["prior_used"][ants] = prior_used
     log.info("fringe_fft_search: refant=%d nant=%d grid=(%d x %d) pad=%d in %.3f s", refant, ants.size, nt_grid, ngrid,
              pad, _time.perf_counter() - t_start)
     return result
@@ -719,6 +761,8 @@ class FringeSolution:
     n_iter: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))
     cost: np.ndarray = field(default_factory=lambda: np.zeros(0))
     timings: dict = field(default_factory=dict)
+    #: (nant, npol) True where the FFT peak came from the window around the prior (see fringe_fft_search).
+    prior_used: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=bool))
 
     @property
     def npol(self):
@@ -754,7 +798,8 @@ class FringeSolution:
 
 
 def fringefit_interval(data, refant, *, active=(True, True, False), minsnr=5.0, pad=4, zerorates=False,
-                       global_solve=True, max_iter=100, t_sol=None, delay_window_ns=None, rate_window=None):
+                       global_solve=True, max_iter=100, t_sol=None, delay_window_ns=None, rate_window=None,
+                       priors=None, prior_window=(2.0, 1e-12)):
     """Fringe fit one solution interval: FFT search -> SNR threshold -> global least squares -> re-reference.
 
     Parameters
@@ -776,13 +821,17 @@ def fringefit_interval(data, refant, *, active=(True, True, False), minsnr=5.0, 
         Solution time [s]; default the centre of the interval.
     delay_window_ns, rate_window : (float, float), optional
         FFT search windows.
+    priors, prior_window
+        Predicted delay and rate per antenna and the window around them (see :func:`fringe_fft_search`); the
+        least squares then start from the peak chosen there.
 
     Returns
     -------
     FringeSolution
     """
     t0 = _time.perf_counter()
-    fft = fringe_fft_search(data, refant, pad=pad, delay_window_ns=delay_window_ns, rate_window=rate_window)
+    fft = fringe_fft_search(data, refant, pad=pad, delay_window_ns=delay_window_ns, rate_window=rate_window,
+                            priors=priors, prior_window=prior_window, minsnr=minsnr)
     t1 = _time.perf_counter()
     nant, npol = data.nant, data.npol
     if global_solve:
@@ -812,4 +861,5 @@ def fringefit_interval(data, refant, *, active=(True, True, False), minsnr=5.0, 
              timings["fft"], timings["lsq"])
     return FringeSolution(antenna=np.arange(nant), refant=int(refant), phase=phase, delay_ns=delay, rate=rate, disp=disp,
                           snr=snr, flag=flag, paramerr=paramerr, f_ref_hz=f_ref, t_sol=t_sol, time_centroid=centroid,
-                          n_iter=np.asarray(n_iter), cost=np.asarray(cost), timings=timings)
+                          n_iter=np.asarray(n_iter), cost=np.asarray(cost), timings=timings,
+                          prior_used=np.asarray(fft["prior_used"], dtype=bool))

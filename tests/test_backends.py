@@ -858,3 +858,31 @@ def test_noise_departures_ignore_sample_count_and_catch_excess_noise():
     # The level-based test, on the same baseline, condemns bins for their sample count.
     spikes, _ = ops._spike_departures(amplitude, np.isfinite(amplitude), 5.0, 9)
     assert len(spikes) > 2
+
+
+def test_structure_signature_ignores_data_writes_but_not_structure(tmp_path):
+    import os
+
+    from vlbipy.backends.casa import _structure_signature
+
+    ms = tmp_path / "x.ms"
+    for table in (ms, ms / "ANTENNA", ms / "HISTORY"):
+        table.mkdir(parents=True, exist_ok=True)
+        (table / "table.dat").write_bytes(b"0" * 100)
+    before = _structure_signature(ms)
+
+    def touch(path):
+        stat = path.stat()
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**9))
+
+    touch(ms / "table.dat")                       # flushed after a flag write: same size
+    touch(ms / "HISTORY" / "table.dat")           # a task logged itself
+    frozen = ms / ".vlbipy_corrected" / "tables" / "abc" / "x.mbd"
+    frozen.mkdir(parents=True)
+    (frozen / "table.dat").write_bytes(b"1")      # a deferred apply froze its tables in the set
+    assert _structure_signature(ms) == before
+    (ms / "table.dat").write_bytes(b"0" * 120)    # more rows or columns
+    assert _structure_signature(ms) != before
+    (ms / "table.dat").write_bytes(b"0" * 100)
+    touch(ms / "ANTENNA" / "table.dat")           # a subtable edited
+    assert _structure_signature(ms) != before

@@ -340,3 +340,28 @@ def test_outliers_in_time_flags_a_false_detection_but_not_a_slow_drift():
     assert not outliers_in_time(drift, times, window=7200.0, threshold=5.0, min_points=4, floor=2.0).any()
     # Too few neighbours: nothing is judged.
     assert not outliers_in_time(values, times, window=1000.0, threshold=5.0, min_points=4).any()
+
+
+def test_predict_from_previous_uses_the_median_of_up_to_three_previous_solutions():
+    import numpy as np
+    import pytest
+
+    from vlbipy.solvers.fringefit import _departs_from_prediction, predict_from_previous
+
+    def row(t, delay, field=0, refant=0, flagged=False):
+        fparam = np.zeros((3, 8), np.float32)
+        fparam[1, [1, 5]] = delay
+        flag = np.zeros((3, 8), bool)
+        flag[1] = flagged
+        return {"time": t, "field_id": field, "spw": 0, "refant": refant, "fparam": fparam, "flag": flag}
+
+    rows = [row(0, 1.0), row(10, 1.2), row(15, 9.0, field=1), row(20, 10.0), row(30, 1.1),
+            row(40, 0.0, flagged=True), row(50, 1.3), row(60, 1.0, refant=2)]
+    pred = predict_from_previous(rows, 3)
+    assert 0 not in pred and 2 not in pred and 7 not in pred       # nothing before them on that field/refant
+    assert pred[1][1, 0, 0] == 1.0
+    assert pred[4][1, 0, 0] == pytest.approx(1.2)                  # median of 1.0, 1.2, 10.0
+    assert pred[6][1, 0, 0] == pytest.approx(1.2)                  # last three solutions, the flagged one skipped
+    assert np.isnan(pred[4][0]).all()                               # the reference antenna has no prediction
+    assert _departs_from_prediction(rows[3], pred[3], (2.0, 1e-12))      # 10 ns against ~1.1
+    assert not _departs_from_prediction(rows[4], pred[4], (2.0, 1e-12))

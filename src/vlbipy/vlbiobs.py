@@ -491,10 +491,13 @@ class VLBIObs:
                 self.merge(force=force)
             # Step 16: calibrated, per-source measurement sets — the deliverable of the
             # calibration. After merge() for a campaign, so the split covers the combined data.
-            self.export.per_source(force=force)
-            self.flag.statistics()                                         # step 20 (report)
-
-            self._selfcal_all(force=force)                                 # step 17a (difmapy)
+            if len(self._observations) > 1:
+                self.export.per_source(force=force)
+                self.flag.statistics()                                     # step 20 (report)
+                self._selfcal_all(force=force)                             # step 17a (difmapy)
+            else:
+                self.flag.statistics()                                     # step 20 (report)
+                self._selfcal_then_split(force=force)                      # steps 17a and 16
             self._calibrated_diagnostics()                                 # step 15
             images = self._image_all(force=force)                          # step 17b
             self._final_plots()                                            # step 18
@@ -580,9 +583,8 @@ class VLBIObs:
     def _finish_epoch(self, obs: Observation, *, force: bool = False) -> dict:
         """Finish one epoch in dependency order; independent epochs may run in isolated processes."""
         self._require_imaging_policy(obs)
-        obs.export.per_source(force=force)
         obs.flag.statistics()
-        self._selfcal_all(obs, force=force)
+        self._selfcal_then_split(obs, force=force)
         self._calibrated_diagnostics(obs)
         images = self._image_all(obs, force=force)
         self._final_plots(obs)
@@ -633,6 +635,20 @@ class VLBIObs:
         if obs.metadata is not None and obs.metadata.source_names:
             names = [n for n in names if n in set(obs.metadata.source_names)]
         return names
+
+    def _selfcal_then_split(self, obs: Optional[Observation] = None, *, force: bool = False) -> dict:
+        """Self-calibrate (step 17a), then make sure the per-source products exist (step 16).
+
+        The self-calibration stage ends by applying the whole chain and splitting every source again
+        (``selfcal.run_all``), and each calibrator is split on its own before its session; a full split
+        before it would only be thrown away (half a minute on an LBA epoch). It is made here only when the
+        stage produced nothing: disabled, no on-disk data for difmapy, or failed.
+        """
+        obs = obs or self._imaging_target()
+        results = self._selfcal_all(obs, force=force)
+        if not results:
+            obs.export.per_source(force=force)
+        return results
 
     def _selfcal_all(self, obs: Optional[Observation] = None, *, force: bool = False) -> dict:
         """Self-calibrate the calibrators with difmapy and transfer the gains (``selfcal.run_all``).

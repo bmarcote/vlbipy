@@ -34,8 +34,10 @@ casatools is imported lazily; getcol returns Fortran order so array columns are 
 """
 from __future__ import annotations
 
+import copy
 import logging
 import time as _time
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from typing import ClassVar
 from pathlib import Path
@@ -208,11 +210,43 @@ def _match_param_grid(column, param_shape, name, path) -> np.ndarray:
     return np.ascontiguousarray(column)
 
 
+#: Tables read by :func:`load_caltable` in this process, newest last: {path: (signature, CalTableData)}.
+_TABLE_CACHE: "OrderedDict[str, tuple]" = OrderedDict()
+#: How many tables :data:`_TABLE_CACHE` keeps (a chain holds about a dozen).
+TABLE_CACHE_SIZE = 32
+
+
+def _signature(path: Path) -> tuple:
+    """Size and modification time of every file of a table (lock files aside): changes when it is rewritten."""
+    return tuple((str(p.relative_to(path)), p.stat().st_size, p.stat().st_mtime_ns)
+                 for p in sorted(path.rglob("*")) if p.is_file() and p.name != "table.lock")
+
+
 def load_caltable(path) -> CalTableData:
     """Read a CASA calibration table (main columns + SPECTRAL_WINDOW/ANTENNA/FIELD subtables) into a CalTableData.
 
     CPARAM tables give complex `param`, FPARAM tables float64.  All spws must have the same number of channels.
+    A table read before and unchanged on disk since is returned from memory: every apply, solve and plot
+    normalises its chain again, and re-reading the same tables was 7 s of an LBA epoch. Each call gets its own
+    (shallow) copy, so reassigning an attribute does not leak to other callers; the arrays are shared, so they
+    must not be modified in place.
     """
+    path = Path(path).absolute()
+    key, signature = str(path), _signature(path)
+    cached = _TABLE_CACHE.get(key)
+    if cached is not None and cached[0] == signature:
+        _TABLE_CACHE.move_to_end(key)
+        return copy.copy(cached[1])
+    table = _read_caltable(path)
+    _TABLE_CACHE[key] = (signature, table)
+    _TABLE_CACHE.move_to_end(key)
+    while len(_TABLE_CACHE) > TABLE_CACHE_SIZE:
+        _TABLE_CACHE.popitem(last=False)
+    return copy.copy(table)
+
+
+def _read_caltable(path: Path) -> CalTableData:
+    """Read a calibration table from disk (see :func:`load_caltable`)."""
     import casatools
 
     t_start = _time.perf_counter()

@@ -417,26 +417,25 @@ def create_tiled_shape_manager(table_path, seqnr: int, column: ColumnDesc, row_s
     (``row_map[i]`` = last row of interval ``i``, ``pos_map[i]`` = its position in cube ``cube_map[i]``).
     """
     nrow = len(row_shapes)
-    shapes: list[tuple] = []
-    counts: list[int] = []
-    row_map, cube_map, pos_map = [], [], []
-    for row, shape in enumerate(row_shapes):
-        if shape is None:
-            continue
-        fortran = tuple(int(n) for n in shape[::-1])
-        if fortran not in shapes:
-            shapes.append(fortran)
-            counts.append(0)
-        cube = shapes.index(fortran) + 1
-        position = counts[cube - 1]
-        counts[cube - 1] += 1
-        if row_map and cube_map[-1] == cube and pos_map[-1] + 1 == position and row_map[-1] + 1 == row:
-            row_map[-1] += 1
-            pos_map[-1] += 1
-        else:
-            row_map.append(row)
-            cube_map.append(cube)
-            pos_map.append(position)
+    # Vectorised: the per-row loop this replaces was 20 s of a 10-minute LBA reduction (480k rows per column).
+    # Cubes are numbered from 1 in the order their shape first appears; 0 marks an undefined cell.
+    ids_of: dict = {}
+    cube_ids = np.fromiter((0 if shape is None else ids_of.setdefault(tuple(shape), len(ids_of) + 1)
+                            for shape in row_shapes), dtype=np.int64, count=nrow)
+    shapes = [tuple(int(n) for n in shape[::-1]) for shape in ids_of]        # Fortran order, by cube number
+    counts = np.bincount(cube_ids, minlength=len(shapes) + 1)[1:].tolist()
+    positions = np.zeros(nrow, dtype=np.int64)
+    for cube in range(1, len(shapes) + 1):
+        rows_of_cube = cube_ids == cube
+        positions[rows_of_cube] = np.arange(int(rows_of_cube.sum()))
+    defined = np.flatnonzero(cube_ids)
+    # An interval of the row map: consecutive rows of one cube (their positions are then consecutive too).
+    last = np.ones(defined.size, dtype=bool)
+    if defined.size > 1:
+        last[:-1] = (np.diff(defined) != 1) | (np.diff(cube_ids[defined]) != 0)
+    row_map = defined[last].tolist()
+    cube_map = cube_ids[row_map].tolist()
+    pos_map = positions[row_map].tolist()
     cubes = [Cube((), (), -1, 0)]
     files = {}
     for index, (fortran, count) in enumerate(zip(shapes, counts), start=1):

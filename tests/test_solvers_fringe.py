@@ -216,3 +216,22 @@ def test_speed_12_antennas():
     good[truth["refant"]] = False
     d_delay = np.abs(sol.delay_ns - truth["params"][..., 1])[good]
     assert np.all(d_delay < np.maximum(3 * sol.paramerr[..., 1][good], 0.1))
+
+
+def test_prior_window_keeps_the_true_peak():
+    data, truth = simulate()
+    plain = fringe_fft_search(data, truth["refant"])
+    nant = truth["params"].shape[0]
+    at_truth = np.stack([truth["params"][..., 1], truth["params"][..., 2]], axis=-1)    # (nant, npol, 2)
+    guided = fringe_fft_search(data, truth["refant"], priors=at_truth, minsnr=5.0)
+    ok = plain["ok"]
+    np.testing.assert_allclose(guided["delay_ns"][ok], plain["delay_ns"][ok])
+    np.testing.assert_allclose(guided["rate"][ok], plain["rate"][ok])
+    assert guided["prior_used"][ok].all()
+    # A prior far from the truth: the window holds only noise, and the true peak, much stronger, wins.
+    wrong = at_truth.copy()
+    wrong[..., 0] += 30.0
+    misled = fringe_fft_search(data, truth["refant"], priors=wrong, minsnr=5.0)
+    np.testing.assert_allclose(misled["delay_ns"][ok], plain["delay_ns"][ok])
+    assert not misled["prior_used"][ok].any()
+    assert nant == wrong.shape[0]

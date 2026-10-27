@@ -12,6 +12,7 @@ CASA installation; constructing this backend without them raises a clear
 """
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import json
 import math
@@ -57,6 +58,9 @@ FRINGE_SMOOTH_PARAMETERS = ("delay", "rate")
 #: peak lands a sizeable fraction of 1/bandwidth (several ns) or of 1/scan away.
 FRINGE_OUTLIER_FLOOR = {"delay": 2.0, "rate": 1e-12}
 
+#: Fringe-fit keywords of the native solver only (:func:`vlbipy.solvers.fringefit.fringefit`), not of CASA's task.
+NATIVE_FRINGEFIT_KEYS = ("prior_scans", "prior_delay_window_ns", "prior_rate_window")
+
 #: Parallel-hand polarization pairs, by correlation basis.
 _PARALLEL_HANDS = {Stokes.RR: "RR", Stokes.LL: "LL", Stokes.XX: "XX", Stokes.YY: "YY"}
 
@@ -79,6 +83,32 @@ IMPORT_FLAG_VERSION = "as_imported"
 
 #: Telescope names a correlator may write for a network other than the network's own name.
 _TELESCOPE_ALIASES = {"LBA": {"VLBA", "ATLBA"}}
+
+#: Metadata read by CasaDataOps.get_metadata: {(ms, sources, observatory): (structure signature, ObsMetadata)}.
+_METADATA_CACHE: dict = {}
+#: Subtables that tasks append to as they run: their changes say nothing about the structure of the set.
+_LOG_SUBTABLES = {"HISTORY", "FLAG_CMD"}
+
+
+def _structure_signature(ms: Path) -> tuple:
+    """What changes when the structure of a measurement set (or Multi-MS) does, and not when its data or flags do.
+
+    casacore rewrites a table's ``table.dat`` whenever the table is flushed after a write, so its time says
+    nothing; its size does change with the number of rows and the set of columns. Subtables (ANTENNA, FIELD,
+    SPECTRAL_WINDOW, ...) are only written when they are edited, so for them the time counts too. Hidden
+    directories are not part of the set: the deferred calibration freezes copies of its tables in one
+    (``.vlbipy_corrected``), a new set of them at every apply.
+    """
+    entries = []
+    for path in sorted(ms.rglob("table.dat")):
+        table = path.parent
+        relative = path.relative_to(ms).parts
+        if table.name in _LOG_SUBTABLES or any(part.startswith(".") for part in relative[:-1]):
+            continue
+        stat = path.stat()
+        is_main = table == ms or table.name.endswith((".ms", ".mms"))
+        entries.append((str(path.relative_to(ms)), stat.st_size, None if is_main else stat.st_mtime_ns))
+    return tuple(entries)
 
 
 #: Polynomial coefficients per polarization that CASA's gain-curve table (``gencal caltype='gc'``,
@@ -764,6 +794,29 @@ class CasaDataOps(DataOps):
 
     # -- metadata --
     def get_metadata(self, project_code: str, source_names: list[str], observatory: str) -> ObsMetadata:
+        """The observation metadata of :meth:`_read_metadata`, read once per state of the measurement set.
+
+        Every step that needs the metadata asks for it again, and one msmetadata session on an LBA
+        Multi-MS takes 1.5 s. The metadata only describe the structure of the set (rows, scans,
+        subtables), which flagging and calibration leave alone; so the cache is keyed by the size and
+        modification time of every ``table.dat`` in it, which change when rows or subtables do. Each call
+        gets its own copy: callers attach results to the metadata.
+        """
+        ms = Path(self.backend.ms_path(project_code))
+        try:
+            signature = _structure_signature(ms)
+        except OSError:
+            signature = None
+        key = (str(ms.absolute()), tuple(source_names or ()), str(observatory))
+        cached = _METADATA_CACHE.get(key)
+        if signature and cached is not None and cached[0] == signature:
+            return copy.deepcopy(cached[1])
+        metadata = self._read_metadata(project_code, source_names, observatory)
+        if signature:
+            _METADATA_CACHE[key] = (signature, copy.deepcopy(metadata))
+        return metadata
+
+    def _read_metadata(self, project_code: str, source_names: list[str], observatory: str) -> ObsMetadata:
         """Read the full observation metadata from the measurement set (one msmd session).
 
         Reads antennas (position, diameter, mount, scan count), scans (source,
@@ -2992,6 +3045,7 @@ class CasaCalibrationOps(CalibrationOps):
                   minsnr: float = 5.0, zerorates: bool = False, suffix: str = "mbd",
                   dispersive: bool = False, channel_fraction: float = 0.8,
                   retry_minsnr: float = 3.0, retry_below: float = 0.5, max_delay_step: float = 0.0,
+                  prior_scans: int = 3, prior_delay_window_ns: float = 2.0, prior_rate_window: float = 1e-12,
                   metadata: Optional[ObsMetadata] = None, callib: bool = False,
                   **kwargs) -> CalTable:
         """Global (multi-band delay) fringe fit on the calibrators.
@@ -3046,6 +3100,12 @@ class CasaCalibrationOps(CalibrationOps):
             of the fringe search land anywhere in the search window (GL048: JB
             and UR jump ~130 ns between scans, at SNR 3 and SNR 5 alike, where a
             detected antenna moves by < 0.5 ns).
+        prior_scans, prior_delay_window_ns, prior_rate_window
+            Re-solve the intervals whose solution departs from the median of the
+            antenna's previous ``prior_scans`` solutions on that field, searching
+            the fringe peak around that median (+-window, ns and s/s) as well
+            (:func:`vlbipy.solvers.fringefit.fringefit`; native engine only, CASA
+            ignores them). 0 disables it.
         callib : bool
             Use a CASA cal-library file for the on-the-fly priors instead of
             explicit parallel lists.
@@ -3071,6 +3131,9 @@ class CasaCalibrationOps(CalibrationOps):
         for window in ("delaywindow", "ratewindow"):
             if kwargs.get(window) is not None:
                 params[window] = kwargs[window]
+        if int(prior_scans) > 0:
+            params.update(prior_scans=int(prior_scans), prior_delay_window_ns=float(prior_delay_window_ns),
+                          prior_rate_window=float(prior_rate_window))
         if dispersive:
             # paramactive = [delay, rate, dispersive delay]; zerorates is separate,
             # it zeroes the fitted rates in the output rather than not fitting them.
@@ -3135,6 +3198,9 @@ class CasaCalibrationOps(CalibrationOps):
         retry_scans = sorted(set().union(*(scans - solved.get(name, set()) for name, scans in weak.items())))
         retry_path = table_path.with_name(table_path.name + ".retry")
         retry = dict(params, caltable=str(retry_path), minsnr=minsnr, scan=",".join(map(str, retry_scans)))
+        # Only weak scans are re-solved here: their neighbours in this run are no basis for a prediction.
+        for name in NATIVE_FRINGEFIT_KEYS:
+            retry.pop(name, None)
         logger.info("fringefit: retrying {} on their {} unsolved scan(s) with minsnr={:g}",
                     ", ".join(sorted(weak)), len(retry_scans), minsnr)
         original = self._delay_series(table_path)
@@ -3316,7 +3382,12 @@ class CasaCalibrationOps(CalibrationOps):
         finally:
             handle.close()
         if spw_ids.size != 1:
-            logger.info("fringefit: solutions span {} subbands; no spw map needed", spw_ids.size)
+            # Solved with combine='spw', every interval should sit in one subband. Intervals written to
+            # different ones (CASA stores each in the first subband its reference antenna has) cannot be
+            # described by a spw map: each subband would then only find the intervals stored in itself.
+            warnings.warn(f"{table_path.name}: combined-subband solutions are stored in {spw_ids.size} subbands "
+                          f"({', '.join(map(str, spw_ids))}); no spw map can send every subband to all of them, "
+                          "so the subbands without solutions of their own will be flagged on apply")
             return []
         reference = int(spw_ids[0])
         logger.info("fringefit: solutions stored in subband {}; mapping all {} subbands to it",
@@ -3608,7 +3679,7 @@ class CasaCalibrationOps(CalibrationOps):
         with another engine replace this method only; everything around it (table paths,
         staging, spw maps, SNR reading) stays shared.
         """
-        self.backend.tasks.fringefit(**params)
+        self.backend.tasks.fringefit(**{k: v for k, v in params.items() if k not in NATIVE_FRINGEFIT_KEYS})
 
     def _run_bandpass_task(self, params: dict) -> None:
         """Run the bandpass solver (the override point for alternate engines)."""

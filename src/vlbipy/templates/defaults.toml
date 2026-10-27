@@ -144,6 +144,11 @@ retry_below = 0.5            # observed is re-solved on the rest at this SNR; th
 max_delay_step = 0.0         # ...and only if its delays are consistent: median change between solutions
                              # at most this (ns; 0 = 1/total bandwidth). Noise peaks jump across the
                              # search window; an antenna failing this is lost (its solutions flagged)
+prior_scans = 3              # an interval whose solution departs from the median of the antenna's previous
+prior_delay_window_ns = 2.0  # prior_scans solutions on that field (by more than these windows, or flagged)
+prior_rate_window = 1e-12    # is solved again with the fringe peak also searched around that median, so a
+                             # weak antenna keeps the fringe consistent with its neighbours rather than a
+                             # noise peak elsewhere (native engine only; 0 disables)
 # delaywindow = [-200, 200]  # fringe-search delay window limits in ns (unset = full window; restricting
                              # it cuts false detections on weak calibrators — check no real solution is clipped)
 # ratewindow = [-50, 50]     # the same for the rate, in mHz

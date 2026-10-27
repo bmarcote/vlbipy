@@ -979,3 +979,33 @@ def test_jobs_started_inside_a_worker_run_in_that_worker():
     for pids in results:
         assert len(set(pids)) == 1 and pids[0] != os.getpid()
     workers.close_pool()
+
+
+def test_load_caltable_reads_a_table_again_only_when_it_changed(tmp_path, sim):
+    import os
+
+    from vlbipy.solvers.apply import load_caltable
+    from vlbipy.solvers.fringefit import fringefit
+    path = fringefit(str(sim["ms"]), str(tmp_path / "sim.K"), field="CAL", solint="20s", refant="A0",
+                     minsnr=3.0, workers=1)
+    first = load_caltable(path)
+    again = load_caltable(path)
+    assert again.param is first.param and again is not first    # unchanged on disk: from memory, own copy
+    main = path / "table.f0"
+    os.utime(main, ns=(main.stat().st_atime_ns, main.stat().st_mtime_ns + 1_000_000))
+    assert load_caltable(path).param is not first.param         # rewritten: read again
+    workers.close_pool()
+
+
+def test_combined_spw_map_points_at_the_subband_the_solutions_were_stored_in(sim, tmp_path):
+    """Subband 0 not selected: the combined solutions go to subband 1, and the map must say so."""
+    from types import SimpleNamespace
+
+    from vlbipy.backends.casa import CasaCalibrationOps
+    path = fringefit(str(sim["ms"]), str(tmp_path / "sim.mbd"), field="CAL", spw="1", solint="inf",
+                     combine="spw", refant="A0", minsnr=3.0, workers=1)
+    ops = CasaCalibrationOps.__new__(CasaCalibrationOps)
+    ops._backend = SimpleNamespace(tools=SimpleNamespace(table=casatools.table))
+    meta = SimpleNamespace(freq_setup=SimpleNamespace(n_subbands=NSPW))
+    assert ops._combined_spwmap(path, meta) == [1] * NSPW
+    workers.close_pool()

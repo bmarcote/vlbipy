@@ -103,7 +103,13 @@ def test_epoch_steps_keep_calibration_dependencies(tmp_path, monkeypatch):
     monkeypatch.setattr(run, "_image_all", lambda *a, **kw: events.append("images") or {"target": "image"})
     monkeypatch.setattr(run, "_final_plots", lambda *a: events.append("plots"))
     assert run._finish_epoch(obs) == {"target": "image"}
-    assert events == ["split", "flags", "selfcal", "diagnostics", "images", "plots"]
+    # Self-cal produced nothing (the stub returns None): the split is still made, after it.
+    assert events == ["flags", "selfcal", "split", "diagnostics", "images", "plots"]
+    # Self-cal produced results: its stage already split every source, so no split before or after it.
+    events.clear()
+    monkeypatch.setattr(run, "_selfcal_all", lambda *a, **kw: events.append("selfcal") or {"cal": "result"})
+    run._finish_epoch(obs)
+    assert events == ["flags", "selfcal", "diagnostics", "images", "plots"]
 
 
 @pytest.mark.parametrize("failure", ["spec", "launch", "corrupt", "exit", "missing_images"])
