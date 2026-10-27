@@ -958,3 +958,24 @@ def test_caltable_subtables_copied_from_a_set_record_their_rows(sim, tmp_path):
     table = ct.table(str(copied), ack=False)
     assert table.nrows() == nspw
     table.close()
+
+
+def test_casacore_tables_lets_casatools_initialise_afterwards():
+    """python-casacore first, then casatools: the order a pool worker can see across jobs."""
+    import subprocess
+    import sys
+    pytest.importorskip("casacore.tables")
+    # A bare "import casacore.tables" here makes the casatools import fail.
+    code = "from vlbipy.solvers.msio import casacore_tables\ncasacore_tables()\nimport casatools\nprint('ok')"
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=300)
+    assert result.returncode == 0 and "ok" in result.stdout, result.stderr[-2000:]
+
+
+def test_jobs_started_inside_a_worker_run_in_that_worker():
+    """A pool job that itself runs jobs must not start a pool of its own in the worker."""
+    import os
+    jobs = [{"function_path": "os:getpid", "jobs": [{}, {}, {}], "workers": 4} for _ in range(2)]
+    results = workers.run_jobs("vlbipy.solvers.workers:run_jobs", jobs, workers=2)
+    for pids in results:
+        assert len(set(pids)) == 1 and pids[0] != os.getpid()
+    workers.close_pool()

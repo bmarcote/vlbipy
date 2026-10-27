@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import time as _time
 from pathlib import Path
 from typing import Optional
 
@@ -44,6 +45,7 @@ class StepState:
         self.project_code = project_code
         self.work_dir = Path(work_dir) if work_dir else None
         self._steps: dict[str, dict] = {}
+        self._started: dict[str, float] = {}
         if self.work_dir is not None:
             self.load()
 
@@ -101,16 +103,31 @@ class StepState:
             logger.info("[{}] skipping: {} (already done)", self.project_code, step)
             return False
         headline("[{}] {}{}", self.project_code, step, " (forced)" if force and done else "")
+        self._started[step] = _time.perf_counter()
         return True
 
+    def _elapsed(self, step: str) -> Optional[float]:
+        """Wall-clock seconds since :meth:`should_run` let ``step`` run (None when it was not timed)."""
+        started = self._started.pop(step, None)
+        return None if started is None else round(_time.perf_counter() - started, 2)
+
     def mark_complete(self, step: str, outputs=None, inputs=None) -> None:
-        """Mark a step complete, recording optional inputs/outputs."""
+        """Mark a step complete, recording optional inputs/outputs and its wall-clock duration.
+
+        The duration (``seconds``) runs from the :meth:`should_run` that let the step
+        start; it is logged and kept in the state file, so a run can be profiled step
+        by step afterwards.
+        """
+        seconds = self._elapsed(step)
         self._steps[step] = {
             "status": "done",
             "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
             "outputs": [str(o) for o in (outputs or [])],
             "inputs": [str(i) for i in (inputs or [])],
         }
+        if seconds is not None:
+            self._steps[step]["seconds"] = seconds
+            logger.info("[{}] {} done in {:.1f} s", self.project_code, step, seconds)
         self.save()
 
     def mark_failed(self, step: str, error: str) -> None:
@@ -124,6 +141,9 @@ class StepState:
             "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
             "error": str(error),
         }
+        seconds = self._elapsed(step)
+        if seconds is not None:
+            self._steps[step]["seconds"] = seconds
         self.save()
 
     def invalidate_downstream(self, step: str, ordered_steps: list[str]) -> None:

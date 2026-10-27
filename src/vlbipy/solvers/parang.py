@@ -478,7 +478,8 @@ def ms_parang_inputs(ms_path, field_id):
         tb.close()
         ra_rad, dec_rad = float(phase_dir[0, 0, field_id]), float(phase_dir[1, 0, field_id])
     else:
-        from casacore.tables import table as _cc_table
+        from .msio import casacore_tables
+        _cc_table = casacore_tables().table
         with _cc_table(f"{ms_path}/ANTENNA", ack=False) as t:
             antenna_xyz = np.asarray(t.getcol("POSITION"), dtype=float)
             mounts = [str(m) for m in t.getcol("MOUNT")]

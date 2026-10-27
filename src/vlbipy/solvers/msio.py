@@ -80,6 +80,23 @@ def table_tool():
     return casatools.table()
 
 
+def casacore_tables():
+    """Return ``casacore.tables``, with casatools initialised first when it is installed.
+
+    The two packages each bring a copy of casacore, and both register the ``derivedmscal`` TaQL functions in
+    one shared registry. casatools registers them eagerly when it initialises and fails if they already exist,
+    while python-casacore loads them on first use only when they are missing — so casatools has to come first.
+    A worker process that ran a python-casacore job before a casatools one otherwise cannot initialise
+    casatools at all ("User defined TaQL function derivedmscal.help already exists").
+    """
+    try:
+        import casatools  # noqa: F401 - imported for its side effect, see above
+    except ImportError:
+        pass
+    import casacore.tables
+    return casacore.tables
+
+
 @functools.cache
 def compiled_engine() -> str:
     """The casacore-library engine: ``"casacore"`` when python-casacore imports cleanly, else ``"casatools"``.
@@ -102,8 +119,7 @@ class _CasacoreTable:
     """python-casacore table handle with the minimal row-major interface the solvers need."""
 
     def __init__(self, path: str, readonly: bool) -> None:
-        from casacore.tables import table
-        self._table = table(str(path), readonly=readonly, ack=False)
+        self._table = casacore_tables().table(str(path), readonly=readonly, ack=False)
 
     def nrows(self) -> int:
         """Number of rows."""
@@ -128,7 +144,7 @@ class _CasacoreTable:
 
     def add_column_like(self, name: str, template: str) -> None:
         """Add column ``name`` with the description and storage manager layout of ``template``."""
-        from casacore.tables import makecoldesc
+        makecoldesc = casacore_tables().makecoldesc
         description = dict(self._table.getcoldesc(template))
         description["comment"] = f"The {name.lower().replace('_', ' ')} column"
         manager = dict(self._table.getdminfo(template))

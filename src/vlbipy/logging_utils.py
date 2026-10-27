@@ -20,8 +20,10 @@ _ATTACHED: dict = {}
 _FORMAT = "<level>{message}</level>\n{exception}"
 #: Step headlines (:func:`headline`) render in bold.
 _HEADLINE_FORMAT = "<bold>{message}</bold>\n{exception}"
-#: File sink format: timestamped and level-tagged, so a run can be audited afterwards.
-_FILE_FORMAT = "{time:YYYY-MM-DD HH:mm:ss} | {level: <7} | {message}"
+#: File sink format: timestamped (UTC) and level-tagged, so a run can be audited afterwards. The zone is fixed
+#: because the local one does not stay put: the vendored casavlbitools sets ``TZ=UTC`` for the whole process
+#: when it is imported, which switched every later line of a run log from local time to UTC.
+_FILE_FORMAT = "{time:YYYY-MM-DD HH:mm:ss!UTC} | {level: <7} | {message}"
 #: Log files already attached, keyed by directory, so re-entry does not duplicate sinks.
 _FILE_SINKS: dict = {}
 

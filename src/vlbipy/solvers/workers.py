@@ -41,6 +41,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import traceback
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
@@ -72,6 +73,10 @@ _POOL: Optional["WorkerPool"] = None
 _POOL_LOCK = threading.Lock()
 #: Threads the job running in this worker process may use (set by the pool with every job).
 _JOB_THREADS: Optional[int] = None
+#: True inside a pool worker: jobs it starts run in it rather than in a pool of its own. The pool already
+#: occupies every core, and a nested pool per worker multiplied the processes (13 -> 77 during a raw plot
+#: set, each initialising CASA) and starved them all — reads of 0.2 s took 80 s.
+_IN_WORKER = False
 _EXECUTOR: Optional[tuple] = None                # (executor, number of threads)
 _EXECUTOR_LOCK = threading.Lock()
 _IN_THREAD = threading.local()
@@ -250,7 +255,11 @@ class WorkerPool:
         """Start ``size`` workers and wait until every one has connected back."""
         self.size = int(size)
         authkey = os.urandom(32)
-        listener = Listener(authkey=authkey)
+        # A backlog for every worker: multiprocessing's default is 1, and on macOS a Unix socket whose
+        # backlog is full refuses a connection (ECONNREFUSED) instead of queueing it, so workers starting
+        # together while another one is still in its handshake would exit, and accept() wait for them
+        # until START_TIMEOUT.
+        listener = Listener(authkey=authkey, backlog=max(1, self.size))
         environment = dict(os.environ)
         # One job per core: numerical libraries inside a worker must not start their own thread teams.
         for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VLBIPY_FFT_WORKERS"):
@@ -393,7 +402,7 @@ def run_jobs(function_path: str, jobs: list[dict], workers: Optional[int] = None
         return []
     from ..progress import track_jobs
     size = int(workers) if workers else default_workers()
-    if size <= 1 or len(jobs) == 1:
+    if size <= 1 or len(jobs) == 1 or _IN_WORKER:
         function = resolve(function_path)
         with track_jobs(desc or _job_desc(function_path), len(jobs)) as advance:
             results = []
@@ -414,11 +423,23 @@ def submit_jobs(function_path: str, jobs: list[dict], workers: int) -> list[Futu
     """
     if not jobs:
         return []
+    if _IN_WORKER:
+        return [_run_here(function_path, kwargs) for kwargs in jobs]
     pool = get_pool()
     executor = ThreadPoolExecutor(max_workers=max(1, min(int(workers), pool.size)))
     futures = [executor.submit(pool.run, function_path, kwargs) for kwargs in jobs]
     executor.shutdown(wait=False)       # the submitted jobs still run; the threads end with the last one
     return futures
+
+
+def _run_here(function_path: str, kwargs: dict) -> Future:
+    """Run one job in this process and return its outcome as a finished future (see :data:`_IN_WORKER`)."""
+    future: Future = Future()
+    try:
+        future.set_result(resolve(function_path)(**kwargs))
+    except Exception:  # noqa: BLE001 - reported through the future, as a pool job would be
+        future.set_exception(WorkerError(f"worker job {function_path} failed:\n{traceback.format_exc()}"))
+    return future
 
 
 def kwargs_digests(value, depth: int = 0) -> list[str]:
@@ -434,11 +455,23 @@ def kwargs_digests(value, depth: int = 0) -> list[str]:
     return []
 
 
+def _connect(address: str, authkey: bytes, attempts: int = 50, pause: float = 0.1):
+    """Connect back to the pool, retrying a refused connection (a momentarily full listen backlog)."""
+    for attempt in range(attempts):
+        try:
+            return Client(address, authkey=authkey)
+        except ConnectionRefusedError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(pause)
+
+
 def _serve(address: str) -> None:
     """Worker main loop: receive ``(function path, kwargs, shared objects, threads)``, reply ``(True, result)``
     or ``(False, traceback)``; shared objects are kept for later jobs (see :func:`_share`)."""
-    global _JOB_THREADS
-    connection = Client(address, authkey=bytes.fromhex(os.environ["VLBIPY_WORKER_AUTHKEY"]))
+    global _JOB_THREADS, _IN_WORKER
+    _IN_WORKER = True
+    connection = _connect(address, bytes.fromhex(os.environ["VLBIPY_WORKER_AUTHKEY"]))
     cache: OrderedDict = OrderedDict()
     while True:
         try:

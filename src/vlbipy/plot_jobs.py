@@ -271,8 +271,12 @@ def _collect(backend, project_code: str, job: PlotJob, future, label: str, estim
     try:
         outcome = future.result()
     except Exception as exc:  # noqa: BLE001 - WorkerError: the worker died or could not rebuild the backend
+        # A WorkerError carries the remote traceback: its first line is only "worker job ... failed:",
+        # the exception itself is the last one.
+        lines = [line for line in str(exc).splitlines() if line.strip()] or [type(exc).__name__]
         logger.warning("{}: the worker process could not draw {} ({}); drawing it here",
-                       project_code, job.name, str(exc).splitlines()[0])
+                       project_code, job.name, lines[-1].strip())
+        logger.debug("plot job {} failed in the worker:\n{}", job.name, exc)
         return _draw_here(backend, project_code, job, label), None
     if outcome["error"]:
         warnings.warn(f"{project_code}: {label} {job.name} plot failed ({outcome['error']})")
