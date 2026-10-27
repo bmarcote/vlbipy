@@ -18,12 +18,13 @@ from __future__ import annotations
 import glob
 import json
 import math
+import shutil
 from pathlib import Path
 from typing import Optional, Union
 
 from ..diagnostics import write_summary
 from ..errors import BackendError, StepError
-from ..logging_utils import get_logger, warnings
+from ..logging_utils import get_logger, headline, warnings
 from ..models import CalTable, QualityMetrics
 from ..plot_jobs import PlotJob, draw, run_plot_jobs
 from ..results import Image, ImageSet, SelfcalResult
@@ -274,6 +275,8 @@ class ImportDataNamespace(Namespace):
         if not handler.auto_download:
             raise Exception(f"no raw data found in {obs.work_dir} and {handler.name} has no "
                               f"auto-download. {handler.manual_download_instructions()}")
+        headline("import_data: no raw data of {} in {}; downloading them from the {}", self._code, obs.work_dir,
+                 handler.archive_name or f"{handler.name} archive")
         return handler.download_data(self._code, obs.work_dir,
                                      obsdate=imp_cfg.get("obsdate") or None,
                                      username=imp_cfg.get("username") or None,
@@ -1863,6 +1866,9 @@ class PlotNamespace(Namespace):
             if self._lacks_time_evolution():
                 job = PlotJob("time_evolution", call=lambda: self.time_evolution(column=column, label=label))
                 self._run_jobs([job], label)
+            # Likewise the per-antenna spectra, for a raw set drawn with one figure per scan.
+            if self._lacks_antenna_diagnostics():
+                self._run_jobs(self._scan_diagnostic_jobs(column=column, label=label), label)
             return sorted(str(p) for p in self._backend.plot.plot_dir("raw").glob("*.png"))
         calibrators = obs.sources.calibrators or obs.sources.targets
         # Raw diagnostics trigger the calibrator-only survey used for calibration
@@ -1876,11 +1882,16 @@ class PlotNamespace(Namespace):
         if column == "data" and self._backend.supports("plot", "diagnostic"):
             jobs.append(self._uv_coverage_job("uv_coverage"))
         if self._use_jplotter():
-            # Per-scan spectra, per-field spectra and time series and the whole-track time evolution in one
-            # batch of parallel jplotter sessions (seconds per figure instead of minutes).
+            # Per-field spectra and time series and the whole-track time evolution in one batch of parallel
+            # jplotter sessions (seconds per figure instead of minutes). The per-scan spectra are drawn per
+            # antenna, which jplotter has no layout for, unless the backend cannot.
+            per_antenna = column == "data" and self._backend.supports("plot", "antenna_scan_spectra")
             jobs.append(PlotJob("jplotter", call=lambda: self.jplotter_set(
-                column=column, label=label, fields=[s.name for s in calibrators], per_scan=column == "data",
+                column=column, label=label, fields=[s.name for s in calibrators],
+                per_scan=column == "data" and not per_antenna,
                 time_evolution=column == "data" and self._backend.supports("plot", "time_evolution"))))
+            if per_antenna:
+                jobs += self._scan_diagnostic_jobs(column=column, label=label)
         else:
             if column == "data":
                 jobs += self._scan_diagnostic_jobs(column=column, label=label)
@@ -1906,20 +1917,28 @@ class PlotNamespace(Namespace):
         """The final-data set on the calibrated column: every source, labelled ``final``.
 
         uv coverage of all sources in one figure plus a single-panel copy per
-        source, amplitude/phase vs uv distance with the model overlaid (when a
-        MODEL column exists), spectra and per-baseline light curves for every
-        source, and the total coherent amplitude light curve. Failing plots warn
-        and the set carries on.
+        source, amplitude/phase vs uv distance, spectra and per-baseline light
+        curves for every source, and the total coherent amplitude light curve.
+        The latest model of each imaged source (:func:`~vlbipy.solvers.skymodel.recorded_model`)
+        is drawn over its radplot, spectrum and light curves as a grey dashed line,
+        averaged exactly like the data (backends whose readers can; a MODEL column
+        stands in on the radplot otherwise). Failing plots warn and the set carries on.
         """
+        from ..solvers.skymodel import recorded_model
         names = self._all_source_names()
+        models = {name: recorded_model(self._obs.work_dir, self._code, name) for name in names}
+        logger.info("plot.final_data: model overlay for {}", ", ".join(f"{name} ({len(models[name])} component(s))"
+                                                                      for name in names if models[name]) or "no source")
         jobs: list[PlotJob] = []
         if self._backend.supports("plot", "diagnostic"):
             jobs.append(self._uv_coverage_job("uv_coverage"))
-        jobs += self._radplot_jobs(all_sources=True, column="corrected", label="final", with_model=True)
-        jobs += [self._spectrum_job(f"spectrum[{name}]", field=name, column="corrected", label=f"final_{name}")
-                 for name in names]
-        jobs += [self._timeseries_job(f"timeseries[{name}]", field=name, column="corrected", label=f"final_{name}")
-                 for name in names]
+        for job in self._radplot_jobs(all_sources=True, column="corrected", label="final", with_model=True):
+            job.kwargs["model"] = models.get(job.kwargs["field"]) or None
+            jobs.append(job)
+        jobs += [self._spectrum_job(f"spectrum[{name}]", field=name, column="corrected", label=f"final_{name}",
+                                    model=models[name] or None) for name in names]
+        jobs += [self._timeseries_job(f"timeseries[{name}]", field=name, column="corrected", label=f"final_{name}",
+                                      model=models[name] or None) for name in names]
         jobs.append(self._lightcurve_job("lightcurve", column="corrected", label="final"))
         written = self._run_jobs(jobs, "final")
         logger.info("plot.final_data: {} plot(s) over {} source(s)", len(written), len(names))
@@ -2075,18 +2094,23 @@ class PlotNamespace(Namespace):
         return sorted(chosen, key=lambda s: s.time_start)
 
     def scan_diagnostics(self, *, column: str = "data", label: str = "raw") -> list[str]:
-        """Autocorrelation and cross-correlation spectra of individual scans.
+        """Autocorrelation and cross-correlation spectra of the diagnostic scans, one figure per antenna.
 
         On each diagnostic scan (see :meth:`_diagnostic_scans`) the autocorrelations
         of every antenna and the cross-correlation spectra to a reference antenna
-        present in that scan. On the raw column the cross-correlations are shown
+        present in that scan; each antenna then gets one figure of each kind with a
+        panel per scan (:meth:`antenna_diagnostics`), so a change of that station
+        from scan to scan stands out. On the raw column the cross-correlations are shown
         in full Stokes: before calibration the cross-hands carry the
         instrumental polarization signature, afterwards they are only noise.
         """
         return self._run_jobs(self._scan_diagnostic_jobs(column=column, label=label), label)
 
     def _scan_diagnostic_jobs(self, *, column: str, label: str) -> list[PlotJob]:
-        """The plots of :meth:`scan_diagnostics`: autocorrelations, then cross-correlation spectra, per scan."""
+        """The plots of :meth:`scan_diagnostics`: one job drawing the per-antenna figures when the backend can,
+        else the older per-scan figures (autocorrelations, then cross-correlation spectra, per scan)."""
+        if self._backend.supports("plot", "antenna_scan_spectra"):
+            return [PlotJob("antenna_diagnostics", call=lambda: self.antenna_diagnostics(column=column, label=label))]
         scans = self._diagnostic_scans()
         logger.info("scan_diagnostics: {} scan(s) ({})", len(scans),
                     ", ".join(str(s.scan_number) for s in scans) or "none")
@@ -2099,6 +2123,54 @@ class PlotNamespace(Namespace):
                                            scans=[scan.scan_number], column=column, all_pols=(column == "data"),
                                            label=tag, refant=self._refant_for_scan(scan)))
         return jobs
+
+    def antenna_diagnostics(self, *, column: str = "data", label: str = "raw") -> list[str]:
+        """Per-antenna autocorrelation and cross-correlation figures, one panel per diagnostic scan.
+
+        The scans are read in parallel jobs, each saving its spectra beside the plots (a hidden
+        ``.scan_spectra`` folder, removed afterwards); the figures are then drawn from those, one job per
+        antenna and kind, as ``<code>.<label>_ant<ANT>.autocorr.png`` and ``....spectrum.png``. The per-scan
+        figures of earlier versions are deleted, so the report never mixes the two.
+
+        Returns
+        -------
+        list of str
+            The PNG files written.
+        """
+        obs = self._obs
+        scans = self._diagnostic_scans()
+        logger.info("antenna_diagnostics: {} scan(s) ({})", len(scans),
+                    ", ".join(str(s.scan_number) for s in scans) or "none")
+        folder = self._backend.plot.plot_dir(self._backend.plot.category_for_column(column))
+        cache = folder / ".scan_spectra"
+        reads: list[PlotJob] = []
+        for scan in scans:
+            tag = f"{label}_scan{scan.scan_number}"
+            reads.append(self._autocorr_job(f"autocorr[{scan.scan_number}]", field=scan.source,
+                                            scans=[scan.scan_number], column=column, label=tag,
+                                            data_file=str(cache / f"{tag}.autocorr.pkl")))
+            reads.append(self._spectrum_job(f"spectrum[{scan.scan_number}]", field=scan.source,
+                                            scans=[scan.scan_number], column=column, all_pols=(column == "data"),
+                                            label=tag, refant=self._refant_for_scan(scan),
+                                            data_file=str(cache / f"{tag}.spectrum.pkl")))
+        try:
+            saved = self._run_jobs(reads, label)
+            antennas = [name for name in (obs.metadata.antennas if obs.metadata else [])
+                        if any(name in scan.antennas for scan in scans)]
+            jobs = []
+            for kind in ("autocorr", "spectrum"):
+                files = [path for path in saved if path.endswith(f".{kind}.pkl")]
+                jobs += [PlotJob(f"antenna_spectra[{kind},{name}]", method="antenna_scan_spectra",
+                                 kwargs=dict(kind=kind, antenna=name, data_files=files, label=label, column=column))
+                         for name in antennas if files]
+            written = self._run_jobs(jobs, label)
+        finally:
+            shutil.rmtree(cache, ignore_errors=True)
+        for stale in list(folder.glob(f"{self._code}.{label}_scan*.autocorr.png")) + \
+                list(folder.glob(f"{self._code}.{label}_scan*.spectrum.png")):
+            stale.unlink(missing_ok=True)
+        logger.info("antenna_diagnostics: {} figure(s) for {} antenna(s)", len(written), len(antennas))
+        return written
 
     def raw_stokes(self, **kwargs) -> list[str]:
         """Backwards-compatible alias of :meth:`scan_diagnostics` on the raw data."""
@@ -2350,6 +2422,15 @@ class PlotNamespace(Namespace):
         return [self._backend.plot.time_evolution(self._code, refant=entry["refant"], subband=entry["subband"],
                                                   column=column, label=label, series=series, metadata=metadata,
                                                   source_roles=roles, reason=entry["reason"])]
+
+    def _lacks_antenna_diagnostics(self) -> bool:
+        """True when the raw per-antenna spectra can be made (data on disk) and none exists yet."""
+        backend = self._backend
+        if not backend.supports("plot", "antenna_scan_spectra") or not backend.supports("data", "is_imported"):
+            return False
+        if not backend.data.is_imported(self._code):
+            return False
+        return not any(backend.plot.plot_dir("raw").glob(f"{self._code}.raw_ant*.autocorr.png"))
 
     def _lacks_time_evolution(self) -> bool:
         """True when the raw time-evolution figures can be made (data on disk) and none exists yet."""

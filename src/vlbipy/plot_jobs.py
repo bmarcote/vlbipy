@@ -68,8 +68,8 @@ class PlotJob:
 
 
 def as_paths(result) -> list:
-    """Return a plot method's result as a list of paths (methods return one path or a list)."""
-    return list(result) if isinstance(result, list) else [result]
+    """Return a plot method's result as a list of paths (methods return one path, a list, or None for nothing)."""
+    return [path for path in (result if isinstance(result, list) else [result]) if path]
 
 
 def draw(backend, project_code: str, job: PlotJob):

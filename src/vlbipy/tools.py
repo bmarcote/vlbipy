@@ -17,7 +17,7 @@ import subprocess
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 from .logging_utils import get_logger
 
 logger = get_logger()
@@ -158,8 +158,16 @@ def fetch_url_text(url: str, username: Optional[str] = None, password: Optional[
 
 
 def download_file(url: str, dest: Union[str, Path], username: Optional[str] = None,
-                  password: Optional[str] = None, timeout: float = 600.0) -> Path:
+                  password: Optional[str] = None, timeout: float = 600.0,
+                  progress: Optional[Callable[[int, Optional[int]], None]] = None) -> Path:
     """Download a URL to ``dest`` (a file path), streaming to disk; return the path.
+
+    Parameters
+    ----------
+    progress : callable, optional
+        ``progress(n_bytes, size)``: called once with ``(0, size)`` when the transfer starts (``size`` from the
+        Content-Length header, None when the server does not send one), then with ``(n_bytes, None)`` for every
+        block written.
 
     Raises
     ------
@@ -171,7 +179,14 @@ def download_file(url: str, dest: Union[str, Path], username: Optional[str] = No
     opener = _build_opener(url, username, password)
     try:
         with opener.open(url, timeout=timeout) as response, open(dest, "wb") as fh:
-            shutil.copyfileobj(response, fh, length=1 << 20)
+            if progress is None:
+                shutil.copyfileobj(response, fh, length=1 << 20)
+            else:
+                length = response.headers.get("Content-Length")
+                progress(0, int(length) if length and length.isdigit() else None)
+                for block in iter(lambda: response.read(1 << 20), b""):
+                    fh.write(block)
+                    progress(len(block), None)
     except urllib.error.HTTPError as exc:
         dest.unlink(missing_ok=True)
         hint = " (are archive credentials required/correct?)" if exc.code in (401, 403) else ""

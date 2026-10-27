@@ -219,6 +219,13 @@ def test_raw_diagnostics_are_listed_once_in_reading_order(tmp_path):
     names = [p.name for p in step_plots(obs, "plot_raw")]
     assert names == ["db01.snr_matrix.RR.png", "db01.raw_scan1.autocorr.png", "db01.raw_scan1.spectrum.png",
                      "db01.raw_3C345.spectrum.png"]
+    # The per-antenna figures replace the per-scan ones (which antenna_diagnostics deletes).
+    for name in ("db01.raw_scan1.autocorr.png", "db01.raw_scan1.spectrum.png"):
+        (Path(obs.work_dir) / "plots/raw" / name).unlink()
+    touch(obs.work_dir, "plots/raw/db01.raw_antEF.autocorr.png", "plots/raw/db01.raw_antEF.spectrum.png")
+    names = [p.name for p in step_plots(obs, "plot_raw")]
+    assert names == ["db01.snr_matrix.RR.png", "db01.raw_antEF.autocorr.png", "db01.raw_antEF.spectrum.png",
+                     "db01.raw_3C345.spectrum.png"]
 
 
 def test_calibrated_data_section_lists_final_plots_and_images(tmp_path):

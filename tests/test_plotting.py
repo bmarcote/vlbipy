@@ -196,17 +196,44 @@ def _demo_survey(n_scans=6, n_antennas=4):
                          antennas=antennas, snr=matrices, channel_fraction=0.8, refant="EF")
 
 
-def test_scan_snr_plotter_writes_one_png_per_polarization(tmp_path):
+def test_scan_snr_plotter_writes_one_png_per_source_and_polarization(tmp_path):
+    from vlbipy.dashboard import snr_matrix_key
     from vlbipy.plotting import ScanSNRPlotter
+    (tmp_path / "rsm07.snr_matrix.RR.png").write_bytes(b"old")        # the all-source figure of an older run
     paths = ScanSNRPlotter(tmp_path).plot(_demo_survey())
-    assert [p.name for p in paths] == ["rsm07.snr_matrix.RR.png", "rsm07.snr_matrix.LL.png"]
+    assert [p.name for p in paths] == ["rsm07.snr_matrix.3C345.RR.png", "rsm07.snr_matrix.J1848+3219.RR.png",
+                                       "rsm07.snr_matrix.3C345.LL.png", "rsm07.snr_matrix.J1848+3219.LL.png"]
     assert all(p.is_file() and p.stat().st_size > 1000 for p in paths)
+    assert not (tmp_path / "rsm07.snr_matrix.RR.png").exists()
+    assert [snr_matrix_key(p) for p in paths[:2]] == [("3C345", "RR"), ("J1848+3219", "RR")]
+    assert snr_matrix_key(Path("rsm07.snr_matrix.LL.png")) == ("", "LL")
+
+
+def test_scan_snr_rows_of_one_source_are_contiguous(tmp_path, monkeypatch):
+    """A source observed in alternating blocks gets only its own scans, one after the other."""
+    from matplotlib.figure import Figure
+
+    from vlbipy.plotting import ScanSNRPlotter
+    survey = _demo_survey(8)
+    survey.scan_sources = ["A", "B", "A", "B", "B", "A", "C", "A"]
+    shown = {}
+
+    def inspect(figure, outfile, *args, **kwargs):
+        image = figure.axes[0].get_images()[0]
+        labels = [label.get_text() for label in figure.axes[0].get_yticklabels()]
+        shown[Path(outfile).name] = (image.get_array().shape, labels)
+
+    monkeypatch.setattr(Figure, "savefig", inspect)
+    ScanSNRPlotter(tmp_path).plot(survey)
+    assert shown["rsm07.snr_matrix.A.RR.png"] == ((4, 4), ["1", "3", "6", "8"])
+    assert shown["rsm07.snr_matrix.C.LL.png"][0] == (1, 4)
 
 
 @pytest.mark.parametrize("n_scans", [259, 2000])
 def test_scan_snr_ticks_remain_readable(tmp_path, monkeypatch, caplog, n_scans):
-    """Long, alternating source schedules have bounded ticks and no categorical minor ticks."""
+    """Long schedules have bounded, non-overlapping ticks and no categorical minor ticks."""
     from matplotlib.figure import Figure
+
     from vlbipy.plotting import ScanSNRPlotter
 
     survey = _demo_survey(n_scans)
@@ -216,18 +243,14 @@ def test_scan_snr_ticks_remain_readable(tmp_path, monkeypatch, caplog, n_scans):
     def inspect(figure, *args, **kwargs):
         figure.canvas.draw()
         axis = figure.axes[0]
-        right = axis.child_axes[0]
         assert len(axis.get_yticks()) <= 30
-        assert len(right.get_yticks()) <= 30
         assert len(axis.yaxis.get_minorticklocs()) == 0
-        assert len(right.yaxis.get_minorticklocs()) == 0
-        for labels in (axis.get_yticklabels(), right.get_yticklabels()):
-            boxes = sorted((label.get_window_extent() for label in labels), key=lambda box: box.y0)
-            assert all(a.y1 < b.y0 for a, b in zip(boxes, boxes[1:]))
+        boxes = sorted((label.get_window_extent() for label in axis.get_yticklabels()), key=lambda box: box.y0)
+        assert all(a.y1 < b.y0 for a, b in zip(boxes, boxes[1:]))
         captured.append(figure)
 
     monkeypatch.setattr(Figure, "savefig", inspect)
-    ScanSNRPlotter(tmp_path)._plot_one(survey, "RR", tmp_path / "snr.png")
+    ScanSNRPlotter(tmp_path).plot(survey)
     assert captured
     assert "Locator attempting" not in caplog.text
 
@@ -333,6 +356,7 @@ def test_plot_radplot_with_model_line(tmp_path):
 
 def test_stacked_pair_amplitude_on_top_without_gap():
     import matplotlib.pyplot as plt
+
     from vlbipy.plotting import _stacked_pair, _style_stacked_pair
     figure = plt.figure()
     amp_axis, phase_axis = _stacked_pair(figure, figure.add_gridspec(1, 1)[0])
@@ -383,6 +407,7 @@ def test_plot_autocorr_spectrum_writes_png(tmp_path):
 def test_plot_autocorr_one_linestyle_polarization_colors(tmp_path, monkeypatch):
     """All subbands share a solid line; only polarization sets the colour."""
     from matplotlib.axes import Axes
+
     from vlbipy.plotting import plot_autocorr_spectrum, polarization_color
     calls = []
     original = Axes.plot
@@ -491,6 +516,7 @@ def test_caltable_scalar_bandpass_is_amplitude_only(tmp_path):
 def test_lightcurve_panels_have_their_own_amplitude_axis(tmp_path, monkeypatch):
     """A faint target and a bright calibrator must not share y limits: each panel scales to its own source."""
     import matplotlib.pyplot as plt
+
     from vlbipy import plotting
     assert plotting.lightcurve_amplitude_limit([]) == 1.0
     assert plotting.lightcurve_amplitude_limit([np.array([0.5, np.nan]), np.array([2.0])]) == pytest.approx(2.1, rel=1e-2)
@@ -503,3 +529,59 @@ def test_lightcurve_panels_have_their_own_amplitude_axis(tmp_path, monkeypatch):
         {axis.get_title(loc="left"): axis.get_ylim() for axis in figure.axes}))
     plotting.plot_total_lightcurve({"sources": sources, "column": "corrected", "time_start": 5e9}, tmp_path, "lc03")
     assert limits["TARGET"] == pytest.approx((0.0, 0.021)) and limits["CAL"] == pytest.approx((0.0, 1.575))
+
+
+def _scan_read(scan, antennas, refant=None, field="3C345"):
+    """A per-scan read as the spectrum/autocorr readers return it: 2 subbands x 8 channels x 2 hands."""
+    rng = np.random.default_rng(scan)
+    spectra = {name: (1.0 + rng.random((2, 8, 2))) * np.exp(1j * rng.random((2, 8, 2))) for name in antennas}
+    read = {"antennas": antennas, "spectra": spectra, "n_spw": 2, "n_channels": 8, "polarizations": ["RR", "LL"],
+            "frequencies_ghz": [list(np.linspace(1.6, 1.61, 8)), list(np.linspace(1.62, 1.63, 8))],
+            "scans": [scan], "field": field, "column": "data"}
+    if refant:
+        read["refant"] = refant
+    return read
+
+
+def test_antenna_scan_spectra_has_one_panel_per_scan_of_that_antenna(tmp_path, monkeypatch):
+    from matplotlib.figure import Figure
+
+    from vlbipy.plotting import antenna_scan_filename, plot_antenna_scan_spectra
+    titles = {}
+
+    def inspect(figure, outfile, *args, **kwargs):
+        titles[Path(outfile).name] = [axis.get_title(loc="left") for axis in figure.axes if axis.get_title(loc="left")]
+
+    monkeypatch.setattr(Figure, "savefig", inspect)
+    autos = [_scan_read(7, ["EF", "WB"]), _scan_read(3, ["EF", "WB", "O8"])]
+    crosses = [_scan_read(7, ["WB"], refant="EF"), _scan_read(3, ["EF", "O8"], refant="WB")]
+    assert plot_antenna_scan_spectra(autos, "O8", "autocorr", tmp_path, "rsm07", label="raw").name == \
+        antenna_scan_filename("rsm07", "raw", "O8", "autocorr") == "rsm07.raw_antO8.autocorr.png"
+    plot_antenna_scan_spectra(autos, "EF", "autocorr", tmp_path, "rsm07", label="raw")
+    assert titles["rsm07.raw_antEF.autocorr.png"] == ["scan 3 · 3C345", "scan 7 · 3C345"]      # in time order
+    plot_antenna_scan_spectra(crosses, "EF", "spectrum", tmp_path, "rsm07", label="raw")
+    assert titles["rsm07.raw_antEF.spectrum.png"] == ["scan 3 · 3C345 · WB-EF"]                # not as refant
+    assert plot_antenna_scan_spectra(crosses, "TR", "spectrum", tmp_path, "rsm07", label="raw") is None
+
+
+def test_model_is_drawn_as_a_grey_dashed_line_broken_at_gaps_and_wraps(tmp_path, monkeypatch):
+    from matplotlib.figure import Figure
+
+    from vlbipy.plotting import MODEL_LINE, _model_line, plot_baseline_timeseries
+    hours = np.array([0.0, 0.1, 0.2, 2.0, 2.1])
+    values = np.exp(1j * np.radians([170.0, 179.0, -179.0, 0.0, 10.0]))[:, None].repeat(2, axis=1)
+    (amp_x, amplitude), (_, phase) = _model_line(hours, values, ["RR", "LL"], gap=0.3)
+    assert np.isnan(amplitude).sum() == 1 and np.isnan(amp_x[3])           # one break: the gap after 0.2 h
+    assert np.isnan(phase).sum() == 2                                        # and the wrap at +-180 deg
+    lines = []
+
+    def inspect(figure, *args, **kwargs):
+        lines.extend(line for axis in figure.axes for line in axis.get_lines()
+                     if line.get_color() == MODEL_LINE["color"] and line.get_linestyle() == "--")
+
+    monkeypatch.setattr(Figure, "savefig", inspect)
+    times = (5.0e9 + hours * 3600.0).tolist()
+    series = {"baselines": {"EF-WB": values * 0.9, "EF-O8": values}, "times": times, "polarizations": ["RR", "LL"],
+              "model_baselines": {"EF-WB": values}, "field": "TGT", "column": "corrected"}
+    plot_baseline_timeseries(series, tmp_path, "p1", label="final_TGT")
+    assert len(lines) == 2                                                   # amplitude and phase of EF-WB only

@@ -624,6 +624,16 @@ class PlotOps(BackendComponent):
         """Plot the autocorrelation amplitude spectra, one panel per antenna."""
         raise self._unsupported("autocorr")
 
+    def antenna_scan_spectra(self, project_code: str, *, kind: str, antenna: str, data_files: list[str],
+                             label: str = "", column: str = "data", **kwargs) -> Optional[str]:
+        """Plot one antenna's spectrum on every diagnostic scan, one panel per scan.
+
+        ``data_files`` are the per-scan reads that :meth:`autocorr` (``kind="autocorr"``) or :meth:`spectrum`
+        (``kind="spectrum"``) saved when given a ``data_file``. Returns the PNG, None when the antenna is in
+        none of those scans.
+        """
+        raise self._unsupported("antenna_scan_spectra")
+
     def radplot(self, project_code: str, *, field: str = "", column: str = "corrected",
                 time_bin: float = 10.0, label: str = "", with_model: bool = False, **kwargs) -> str:
         """Plot amplitude and phase vs uv distance for one source (optionally with the model)."""

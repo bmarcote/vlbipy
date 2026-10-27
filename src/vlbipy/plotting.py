@@ -91,6 +91,12 @@ def style_axis(axis, *, grid: bool = True) -> None:
         axis.grid(True, alpha=0.25, linewidth=0.5)
 
 
+def percent_sign() -> str:
+    """``%`` for a plot text, escaped when matplotlib renders text with LaTeX (``text.usetex``, set in some
+    users' matplotlibrc), where a bare ``%`` starts a comment and drops the rest of the line."""
+    return r"\%" if matplotlib.rcParams.get("text.usetex") else "%"
+
+
 def subplot_grid(n_panels: int, max_cols: int = 4) -> tuple[int, int]:
     """Return (nrows, ncols) for a grid of ``n_panels`` antenna subplots."""
     ncols = min(max_cols, max(1, n_panels))
@@ -226,9 +232,36 @@ def _style_stacked_pair(amp_axis, phase_axis, *, phase_ylim: tuple = (-180.0, 18
         style_axis(axis)
 
 
+#: Colour, dash pattern and width of a model drawn over the data.
+MODEL_LINE = {"color": "#6b6b6b", "ls": (0, (4, 2)), "lw": 1.1}
+
+
+def _model_line(x: np.ndarray, values: np.ndarray, pol_labels: list, *, gap: Optional[float] = None) -> tuple:
+    """``((x, amplitude), (x, phase in degrees))`` of a model segment, ready to draw as lines.
+
+    The parallel hands (equal for a Stokes I model) are averaged. Both lines are broken wherever consecutive
+    points are further apart than ``gap`` in x (a line across the gap between two scans would show a model
+    value nobody measured), and the phase also wherever it wraps by more than 180 degrees.
+    """
+    x = np.asarray(x, dtype=float)
+    stokes = np.asarray(_parallel_hand_mean(np.asarray(values), pol_labels))[:x.size]
+    x = x[:stokes.size]
+    amplitude, phase = np.abs(stokes).astype(float), np.degrees(np.angle(stokes))
+    phase[~np.isfinite(stokes)] = np.nan
+    gaps = np.diff(x) > gap if gap is not None else np.zeros(max(x.size - 1, 0), dtype=bool)
+    wraps = gaps | (np.abs(np.diff(phase)) > 180.0)
+
+    def broken(values: np.ndarray, at: np.ndarray) -> tuple:
+        index = np.flatnonzero(at) + 1
+        return np.insert(x, index, np.nan), np.insert(values, index, np.nan)
+
+    return broken(amplitude, gaps), broken(phase, wraps)
+
+
 def plot_baseline_panels(panels: list, plot_dir: Union[str, Path], project_code: str, *,
                          pol_labels: list, x_label: str, title: str, outfile_stem: str,
-                         phase_ylim: tuple = (-180.0, 180.0), dpi: int = 150) -> Path:
+                         phase_ylim: tuple = (-180.0, 180.0), dpi: int = 150,
+                         models: Optional[list] = None, model_gap: Optional[float] = None) -> Path:
     """Render one figure of per-baseline amplitude+phase panels.
 
     Each baseline gets a stacked pair of axes sharing an x axis with no gap:
@@ -253,6 +286,11 @@ def plot_baseline_panels(panels: list, plot_dir: Union[str, Path], project_code:
         Figure title and output file stem.
     phase_ylim : tuple
         Phase limits in degrees.
+    models : list, optional
+        The model on each baseline, in the order of ``panels``: segments like those of ``panels`` (None for a
+        baseline without one). Drawn as a grey dashed line over amplitude and phase.
+    model_gap : float, optional
+        Largest step in x the model line is drawn across (see :func:`_model_line`).
 
     Returns
     -------
@@ -264,6 +302,7 @@ def plot_baseline_panels(panels: list, plot_dir: Union[str, Path], project_code:
     if not panels:
         logger.warning("no baselines to plot for {}", project_code)
         return plot_dir / f"{outfile_stem}.png"
+    models = list(models or [])
 
     nrows, ncols = subplot_grid(len(panels))
     figure = plt.figure(figsize=(3.7 * ncols, 3.0 * nrows), layout="constrained")
@@ -286,6 +325,10 @@ def plot_baseline_panels(panels: list, plot_dir: Union[str, Path], project_code:
                 amp_axis.plot(x[:len(column)], np.abs(column), ls="none", marker=".",
                               ms=2.0, color=color,
                               label=name if segment == 0 else None)
+        for x, values in (models[index] if index < len(models) and models[index] else []):
+            amplitude, phase = _model_line(x, values, pol_labels, gap=model_gap)
+            amp_axis.plot(*amplitude, zorder=3, **MODEL_LINE)
+            phase_axis.plot(*phase, zorder=3, **MODEL_LINE)
         _style_stacked_pair(amp_axis, phase_axis, phase_ylim=phase_ylim, fontsize=7)
         if shared_xlim and shared_xlim[0] < shared_xlim[1]:
             phase_axis.set_xlim(*shared_xlim)
@@ -295,6 +338,8 @@ def plot_baseline_panels(panels: list, plot_dir: Union[str, Path], project_code:
 
     handles = [Line2D([], [], color=polarization_color(name, i), lw=2, label=name)
                for i, name in enumerate(pol_labels)]
+    if any(models):
+        handles.append(Line2D([], [], label="model", **MODEL_LINE))
     figure.legend(handles=handles, loc="outside upper right", ncols=min(len(handles), 6),
                   frameon=False, fontsize=8)
     figure.suptitle(title, x=0.01, ha="left", fontsize=11, fontweight="bold")
@@ -333,12 +378,16 @@ def plot_corrected_spectrum(spectrum: dict, plot_dir: Union[str, Path], project_
     refant = spectrum.get("refant", "")
     frequencies = spectrum.get("frequencies_ghz") or [list(range(n_chan)) for _ in range(n_spw)]
 
-    panels = []
+    panels, models = [], []
+    model_spectra = spectrum.get("model_spectra") or {}
     for antenna in antennas:
         values = np.asarray(spectrum["spectra"][antenna])          # (n_spw, n_chan, n_pol)
         segments = [(np.asarray(frequencies[spw], dtype=float), values[spw])
                     for spw in range(min(n_spw, values.shape[0]))]
         panels.append((f"{refant}-{antenna}", segments))
+        model = model_spectra.get(antenna)
+        models.append([(np.asarray(frequencies[spw], dtype=float), np.asarray(model)[spw])
+                       for spw in range(min(n_spw, np.asarray(model).shape[0]))] if model is not None else None)
 
     scans = spectrum.get("scans") or []
     details = [f"{spectrum.get('column', '')} data"]
@@ -350,7 +399,7 @@ def plot_corrected_spectrum(spectrum: dict, plot_dir: Union[str, Path], project_
     return [plot_baseline_panels(
         panels, plot_dir, project_code, pol_labels=pol_labels, x_label="frequency (GHz)",
         title=f"{project_code} — amplitude and phase vs frequency ({', '.join(details)})",
-        outfile_stem=f"{project_code}{suffix}.spectrum", dpi=dpi)]
+        outfile_stem=f"{project_code}{suffix}.spectrum", dpi=dpi, models=models)]
 
 
 def plot_baseline_timeseries(series: dict, plot_dir: Union[str, Path], project_code: str = "",
@@ -374,6 +423,12 @@ def plot_baseline_timeseries(series: dict, plot_dir: Union[str, Path], project_c
     hours = (times - times.min()) / 3600.0 if times.size else np.array([0.0])
     panels = [(name if isinstance(name, str) else "-".join(name), [(hours, np.asarray(values))])
               for name, values in baselines.items()]
+    model_baselines = series.get("model_baselines") or {}
+    models = [[(hours, np.asarray(model_baselines[name]))] if name in model_baselines else None
+              for name in baselines]
+    # The model line is broken between scans: a bin further than a few bin widths from the previous one.
+    steps = np.diff(hours)
+    gap = 3.0 * float(np.median(steps[steps > 0])) if (steps > 0).any() else None
     details = [f"{series.get('column', '')} data"]
     if series.get("field"):
         details.append(series["field"])
@@ -382,7 +437,7 @@ def plot_baseline_timeseries(series: dict, plot_dir: Union[str, Path], project_c
         panels, plot_dir, project_code, pol_labels=pol_labels,
         x_label="time (hours from start)",
         title=f"{project_code} — amplitude and phase vs time ({', '.join(details)})",
-        outfile_stem=f"{project_code}{suffix}.timeseries", dpi=dpi)]
+        outfile_stem=f"{project_code}{suffix}.timeseries", dpi=dpi, models=models, model_gap=gap)]
 
 
 #: Fixed-order source colours of the time-evolution figures: Okabe-Ito without its yellow (which does not
@@ -550,6 +605,20 @@ def plot_time_evolution(series: dict, plot_dir: Union[str, Path], project_code: 
     return outfile
 
 
+def _binned_median(x: np.ndarray, y: np.ndarray, n_bins: int = 60) -> tuple[np.ndarray, np.ndarray]:
+    """Median of ``y`` in ``n_bins`` equal bins of ``x`` (empty bins left out): a curve through a scatter."""
+    if not x.size:
+        return np.zeros(0), np.zeros(0)
+    edges = np.linspace(float(x.min()), float(x.max()), n_bins + 1)
+    index = np.clip(np.digitize(x, edges) - 1, 0, n_bins - 1)
+    centres, medians = [], []
+    for bin_index in np.unique(index):
+        members = index == bin_index
+        centres.append(float(np.median(x[members])))
+        medians.append(float(np.median(y[members])))
+    return np.asarray(centres), np.asarray(medians)
+
+
 def plot_radplot(uvdata: dict, plot_dir: Union[str, Path], project_code: str = "",
                  label: str = "", dpi: int = 150) -> Path:
     """Plot amplitude and phase against uv distance for one source (a "radplot").
@@ -568,8 +637,9 @@ def plot_radplot(uvdata: dict, plot_dir: Union[str, Path], project_code: str = "
     ----------
     uvdata : dict
         Output of the backend's ``read_uvdistance``. An optional ``"model"`` entry
-        ``{"uvdist_mlambda", "values"}`` is drawn as a black Stokes-I-like line
-        (mean of the parallel hands) over both panels.
+        ``{"uvdist_mlambda", "values"}`` (the model averaged like the data) is drawn in grey: its amplitude
+        (mean of the parallel hands) as a dashed line through the median of bins in uv distance, its phase as
+        points.
     label : str
         Extra tag for the file name.
 
@@ -608,11 +678,15 @@ def plot_radplot(uvdata: dict, plot_dir: Union[str, Path], project_code: str = "
     model_uv = np.asarray(model.get("uvdist_mlambda", []), dtype=float)
     model_values = np.asarray(model.get("values", []))
     if model_uv.size and model_values.size:
-        stokes = _parallel_hand_mean(model_values, pol_labels)
-        order = np.argsort(model_uv)
-        amp_axis.plot(model_uv[order], np.abs(stokes)[order], color="black", lw=1.2, label="model")
-        phase_axis.plot(model_uv[order], np.degrees(np.angle(stokes))[order], color="black", lw=0.6)
-        handles.append(Line2D([], [], color="black", lw=1.2, label="model"))
+        stokes = np.asarray(_parallel_hand_mean(model_values, pol_labels))
+        finite = np.isfinite(stokes) & np.isfinite(model_uv)
+        centres, amplitude = _binned_median(model_uv[finite], np.abs(stokes[finite]))
+        amp_axis.plot(centres, amplitude, zorder=3, **MODEL_LINE)
+        # The model phase depends on the direction of the baseline as much as on its length (any component
+        # off the phase centre), so it is not a function of uv distance: points, not a line.
+        phase_axis.plot(model_uv[finite], np.degrees(np.angle(stokes[finite])), ls="none", marker=".", ms=1.2,
+                        alpha=0.6, color=MODEL_LINE["color"], zorder=3)
+        handles.append(Line2D([], [], label="model", **MODEL_LINE))
     _style_stacked_pair(amp_axis, phase_axis, fontsize=8)
     phase_axis.set_xlabel(r"uv distance (M$\lambda$)", fontsize=9)
     amp_axis.set_ylim(bottom=0.0)
@@ -979,6 +1053,121 @@ def plot_autocorr_spectrum(spectrum: dict, plot_dir: Union[str, Path], project_c
     return str(outfile)
 
 
+#: Most panels per row of a per-antenna figure (one panel per diagnostic scan).
+ANTENNA_SCAN_COLUMNS = 5
+
+
+def antenna_scan_filename(project_code: str, label: str, antenna: str, kind: str) -> str:
+    """File name of the per-antenna diagnostic figure: ``<code>.<label>_ant<ANT>.<kind>.png``.
+
+    ``kind`` is ``autocorr`` or ``spectrum``. The dashboard reads the antenna back from the name, so it is kept
+    free of dots (any character outside ``A-Z a-z 0-9 _ + -`` becomes ``_``).
+    """
+    return f"{project_code}.{label}_ant{re.sub(r'[^A-Za-z0-9_+-]', '_', str(antenna))}.{kind}.png"
+
+
+def _scan_panel_title(entry: dict) -> str:
+    """``"scan 40 · 1057-797"``: the scan(s) and source of one per-scan read."""
+    scans = entry.get("scans") or []
+    scan_text = f"scan {scans[0]}" if len(scans) == 1 else f"{len(scans)} scans" if scans else "all scans"
+    return f"{scan_text} · {entry['field']}" if entry.get("field") else scan_text
+
+
+def _shared_amplitude_limit(values: list) -> Optional[float]:
+    """Upper amplitude limit shared by the panels of one figure: a little above the 99.5th percentile, so one
+    spike does not flatten every panel."""
+    finite = np.concatenate([np.abs(np.asarray(v)).ravel() for v in values]) if values else np.array([])
+    finite = finite[np.isfinite(finite) & (finite > 0)]
+    return float(np.percentile(finite, 99.5)) * 1.15 if finite.size else None
+
+
+def plot_antenna_scan_spectra(entries: list, antenna: str, kind: str, plot_dir: Union[str, Path],
+                              project_code: str = "", label: str = "", dpi: int = 120) -> Optional[Path]:
+    """One antenna's spectrum on every diagnostic scan, one panel per scan in time order.
+
+    Changes of one station from scan to scan (a subband dying, RFI appearing, a phase slope after a clock
+    jump) are much easier to see side by side for that station than spread over one figure per scan with
+    every antenna in it. The panels share their amplitude scale.
+
+    Parameters
+    ----------
+    entries : list of dict
+        One read per scan: the output of ``read_autocorr_spectrum`` (``kind="autocorr"``) or of
+        ``read_spectrum`` on the baselines to that scan's reference antenna (``kind="spectrum"``).
+    antenna : str
+        The antenna. In a cross-correlation figure a scan whose reference antenna it is has no panel: its
+        baselines are in every other antenna's figure.
+    kind : str
+        ``"autocorr"`` (amplitude against frequency) or ``"spectrum"`` (amplitude and phase against
+        frequency on the baseline to the reference antenna).
+
+    Returns
+    -------
+    pathlib.Path or None
+        The PNG (:func:`antenna_scan_filename`); None when the antenna is in none of the scans.
+    """
+    plot_dir = Path(plot_dir)
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    cross = kind == "spectrum"
+    shown = [entry for entry in sorted(entries, key=lambda e: min(e.get("scans") or [0]))
+             if antenna in (entry.get("antennas") or []) and not (cross and entry.get("refant") == antenna)]
+    if not shown:
+        return None
+    pol_labels = shown[0].get("polarizations") or ["P1", "P2"]
+    limit = _shared_amplitude_limit([entry["spectra"][antenna] for entry in shown])
+    nrows, ncols = subplot_grid(len(shown), max_cols=ANTENNA_SCAN_COLUMNS)
+    figure = plt.figure(figsize=(3.3 * ncols, (2.6 if cross else 1.9) * nrows + 0.6), layout="constrained")
+    outer = figure.add_gridspec(nrows, ncols)
+    for index, entry in enumerate(shown):
+        cell = outer[index // ncols, index % ncols]
+        values = np.asarray(entry["spectra"][antenna])                       # (n_spw, n_chan, n_pol)
+        n_spw, n_chan = int(entry["n_spw"]), int(entry["n_channels"])
+        frequencies = entry.get("frequencies_ghz") or [np.arange(n_chan) for _ in range(n_spw)]
+        if cross:
+            amp_axis, phase_axis = _stacked_pair(figure, cell)
+        else:
+            amp_axis, phase_axis = figure.add_subplot(cell), None
+        for spw in range(min(n_spw, values.shape[0])):
+            x = np.asarray(frequencies[spw], dtype=float)
+            for pol in range(values.shape[2] if values.ndim > 2 else 1):
+                column = values[spw, :, pol] if values.ndim > 2 else values[spw]
+                name = pol_labels[pol] if pol < len(pol_labels) else f"P{pol + 1}"
+                color = polarization_color(name, pol)
+                amplitude = np.abs(column).astype(float)
+                amplitude[amplitude == 0] = np.nan
+                if cross:
+                    amp_axis.plot(x[:amplitude.size], amplitude[:x.size], ls="none", marker=".", ms=1.6, color=color)
+                    phase_axis.plot(x[:amplitude.size], np.degrees(np.angle(column))[:x.size], ls="none",
+                                    marker=".", ms=1.6, color=color)
+                else:
+                    amp_axis.plot(x[:amplitude.size], amplitude[:x.size], color=color, ls="-", lw=0.8)
+        title = _scan_panel_title(entry) + (f" · {entry.get('refant', '')}-{antenna}" if cross else "")
+        amp_axis.set_title(title, fontsize=8.5, fontweight="bold", loc="left")
+        if limit:
+            amp_axis.set_ylim(0.0, limit)
+        if cross:
+            _style_stacked_pair(amp_axis, phase_axis, fontsize=7)
+        else:
+            amp_axis.set_ylabel("amplitude", fontsize=7)
+            amp_axis.tick_params(labelsize=7)
+            style_axis(amp_axis)
+        if index // ncols == nrows - 1 or index + ncols >= len(shown):
+            (phase_axis or amp_axis).set_xlabel("frequency (GHz)" if shown[0].get("frequencies_ghz") else "channel",
+                                                fontsize=8)
+    handles = [Line2D([], [], color=polarization_color(name, p), lw=2, label=str(name))
+               for p, name in enumerate(pol_labels)]
+    figure.legend(handles=handles, loc="outside upper right", ncols=min(len(handles), 8), frameon=False, fontsize=8)
+    what = "cross-correlations to the reference antenna" if cross else "autocorrelations"
+    column_name = {"data": "raw", "corrected": "calibrated"}.get(shown[0].get("column", ""), shown[0].get("column", ""))
+    figure.suptitle(f"{project_code} — {antenna}: {what} on {len(shown)} scan{'s' if len(shown) != 1 else ''} "
+                    f"({column_name} data)", x=0.01, ha="left", fontsize=11, fontweight="bold")
+    outfile = plot_dir / antenna_scan_filename(project_code, label, antenna, kind)
+    figure.savefig(outfile, dpi=dpi)
+    plt.close(figure)
+    logger.info("per-antenna {} plot written: {}", kind, outfile)
+    return outfile
+
+
 def _bin_lightcurve(times: np.ndarray, vis_sum: np.ndarray, n_vis: np.ndarray, scans: np.ndarray,
                     width_sec: float) -> tuple[np.ndarray, np.ndarray]:
     """Coherently average integrations into bins of ``width_sec`` within each scan.
@@ -1273,12 +1462,23 @@ def plot_image_grid(images: dict, plot_dir: Union[str, Path], project_code: str 
     return written
 
 
-class ScanSNRPlotter:
-    """Render a :class:`~vlbipy.models.ScanSNRSurvey` as a scan x antenna SNR matrix.
+def snr_matrix_filename(project_code: str, source: str, polarization: str) -> str:
+    """File name of one SNR matrix: ``<code>.snr_matrix.<source>.<pol>.png``.
 
-    One figure per polarization: antennas along x, scans along y, one filled cell
-    per (scan, antenna) with no gaps, colored by fringe SNR on a logarithmic
-    scale (SNR spans orders of magnitude between a big dish and a weak one).
+    The dashboard reads the source back from it (everything between ``snr_matrix.`` and the last dot), so a
+    name with a dot or a path separator in it still parses; ``/`` becomes ``_``.
+    """
+    return f"{project_code}.snr_matrix.{str(source).replace('/', '_')}.{polarization}.png"
+
+
+class ScanSNRPlotter:
+    """Render a :class:`~vlbipy.models.ScanSNRSurvey` as scan x antenna SNR matrices, one per source.
+
+    One figure per source and polarization: antennas along x, the scans of that
+    source along y (contiguous, whatever else was observed in between), one filled
+    cell per (scan, antenna), colored by fringe SNR on a logarithmic scale (SNR
+    spans orders of magnitude between a big dish and a weak one). Every figure of
+    a polarization shares one color scale, so the sources compare at a glance.
     Cells with no solution — antenna absent from the scan, failed solve, or the
     reference antenna itself — are drawn flat grey, so gaps in the array are
     immediately visible.
@@ -1297,59 +1497,76 @@ class ScanSNRPlotter:
         self.dpi = dpi
 
     def plot(self, survey: ScanSNRSurvey, outfile: Optional[str] = None) -> list[Path]:
-        """Plot every polarization of a survey; return the written PNG paths.
+        """Plot every source and polarization of a survey; return the written PNG paths.
 
         Parameters
         ----------
         survey : ScanSNRSurvey
             The survey to render.
         outfile : str, optional
-            Base output path; the polarization label is inserted before ``.png``.
-            Defaults to ``<plot_dir>/<project>.snr_matrix.<pol>.png``.
+            Directory-and-stem override: the figures go next to it, named after its stem in place of the
+            project code. Defaults to :func:`snr_matrix_filename` under ``plot_dir``.
 
         Returns
         -------
         list of pathlib.Path
+            In order of first appearance of the source in the survey, then polarization.
         """
         if not survey.scan_numbers or not survey.antennas:
             logger.warning("scan SNR survey is empty; nothing to plot")
             return []
+        directory = Path(outfile).parent if outfile else self.plot_dir
+        stem = Path(outfile).name.split(".")[0] if outfile else survey.project_code
+        sources = survey.scan_sources if len(survey.scan_sources) == len(survey.scan_numbers) \
+            else [""] * len(survey.scan_numbers)
         written = []
         for polarization in survey.polarizations:
-            base = (Path(outfile) if outfile
-                    else self.plot_dir / f"{survey.project_code}.snr_matrix.png")
-            target = base.with_suffix(f".{polarization}.png")
-            written.append(self._plot_one(survey, polarization, target))
+            matrix = np.array(survey.matrix(polarization), dtype=float)
+            norm = self._norm(matrix)
+            for source in dict.fromkeys(sources):
+                rows = [index for index, name in enumerate(sources) if name == source]
+                target = directory / snr_matrix_filename(stem, source or "all", polarization)
+                written.append(self._plot_one(survey, polarization, target, rows=rows, source=source, norm=norm))
+        self._remove_stale(directory, stem, written)
         return written
 
-    def _plot_one(self, survey: ScanSNRSurvey, polarization: str, outfile: Path) -> Path:
-        """Render one polarization's SNR matrix to ``outfile``."""
-        matrix = np.array(survey.matrix(polarization), dtype=float)
+    def _remove_stale(self, directory: Path, stem: str, written: list[Path]) -> None:
+        """Delete SNR matrices of an earlier run that this one did not redraw (a source no longer surveyed, or
+        the single all-source figure of older versions), so the report never shows them beside the new ones."""
+        keep = {path.name for path in written}
+        for path in directory.glob(f"{stem}.snr_matrix.*.png"):
+            if path.name not in keep:
+                path.unlink(missing_ok=True)
+
+    def _plot_one(self, survey: ScanSNRSurvey, polarization: str, outfile: Path, *, rows: list[int],
+                  source: str, norm: LogNorm) -> Path:
+        """Render the ``rows`` (scans of ``source``) of one polarization's SNR matrix to ``outfile``."""
+        matrix = np.array(survey.matrix(polarization), dtype=float)[rows]
+        scan_numbers = [survey.scan_numbers[index] for index in rows]
         n_scans, n_antennas = matrix.shape
-        # constrained layout (not tight_layout): it reserves room for the colorbar and the
-        # right-hand source axis instead of letting them overlap the matrix.
+        # constrained layout (not tight_layout): it reserves room for the colorbar instead of letting it
+        # overlap the matrix.
         figure, axis = plt.subplots(figsize=(max(5.0, 0.5 * n_antennas + 3.5),
-                                             min(12.0, max(3.5, 0.16 * n_scans + 2.0))),
+                                             min(12.0, max(3.0, 0.16 * n_scans + 2.0))),
                                     layout="constrained")
         colormap = matplotlib.colormaps[SNR_COLORMAP].with_extremes(bad=NO_DATA_COLOR)
         image = axis.imshow(matrix, aspect="auto", interpolation="nearest", origin="upper",
-                            cmap=colormap, norm=self._norm(matrix),
-                            extent=(-0.5, n_antennas - 0.5, n_scans - 0.5, -0.5))
+                            cmap=colormap, norm=norm, extent=(-0.5, n_antennas - 0.5, n_scans - 0.5, -0.5))
 
         style_axis(axis, grid=False)
         axis.minorticks_off()
         axis.set_xticks(range(n_antennas), survey.antennas, rotation=90, fontsize=8)
-        self._label_scans(axis, survey, n_scans)
+        self._label_scans(axis, scan_numbers)
         axis.set_xlabel("antenna", fontsize=9)
         axis.set_ylabel("scan", fontsize=9)
 
         colorbar = figure.colorbar(image, ax=axis, pad=0.01, fraction=0.05, aspect=40)
         colorbar.set_label("fringe SNR", fontsize=9)
-        # Added after the colorbar so constrained layout accounts for its labels too.
-        self._mark_source_blocks(axis, survey)
         refant = f", refant {survey.refant}" if survey.refant else ""
-        axis.set_title(f"{survey.project_code} — fringe SNR, {polarization}\n"
-                       f"central {survey.channel_fraction:.0%} of channels{refant}; "
+        name = f"{source}, " if source else ""
+        axis.set_title(f"{survey.project_code} — fringe SNR, {name}{polarization} ({n_scans} scan"
+                       f"{'s' if n_scans != 1 else ''})\ncentral {100 * survey.channel_fraction:.0f}{percent_sign()} of "
+                       f"channels{refant}; "
                        "grey = no solution", fontsize=10, loc="left")
         figure.savefig(outfile, dpi=self.dpi)
         plt.close(figure)
@@ -1370,36 +1587,12 @@ class ScanSNRPlotter:
         height = axis.figure.get_size_inches()[1] * axis.get_position().height
         return max(2, min(30, int(height / 0.25)))
 
-    def _label_scans(self, axis, survey: ScanSNRSurvey, n_scans: int) -> None:
+    def _label_scans(self, axis, scan_numbers: list[int]) -> None:
         """Label the y axis with scan numbers, thinned so the ticks stay readable."""
+        n_scans = len(scan_numbers)
         step = max(1, math.ceil(n_scans / self._label_budget(axis)))
         positions = list(range(0, n_scans, step))
-        axis.set_yticks(positions, [str(survey.scan_numbers[i]) for i in positions], fontsize=7)
-
-    def _mark_source_blocks(self, axis, survey: ScanSNRSurvey) -> None:
-        """Separate consecutive runs of the same source and name them on the right edge."""
-        sources = survey.scan_sources
-        if not sources or len(sources) != len(survey.scan_numbers):
-            return
-        right = axis.secondary_yaxis("right")
-        right.spines["right"].set_visible(False)
-        right.tick_params(length=0)
-        start = 0
-        ticks, labels = [], []
-        for index in range(1, len(sources) + 1):
-            if index == len(sources) or sources[index] != sources[start]:
-                ticks.append((start + index - 1) / 2.0)
-                labels.append(sources[start])
-                if index < len(sources):
-                    axis.axhline(index - 0.5, color="white", lw=1.2)
-                start = index
-        gap = len(sources) / self._label_budget(axis)
-        keep = []
-        for index, position in enumerate(ticks):
-            if not keep or position - ticks[keep[-1]] >= gap:
-                keep.append(index)
-        right.set_yticks([ticks[i] for i in keep], [labels[i] for i in keep], fontsize=7)
-        right.minorticks_off()
+        axis.set_yticks(positions, [str(scan_numbers[i]) for i in positions], fontsize=7)
 
 
 class CalTablePlotter:

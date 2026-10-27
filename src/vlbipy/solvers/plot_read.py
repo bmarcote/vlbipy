@@ -11,6 +11,11 @@ fields), and reduce every block by integer keys with numpy (sort once,
 The averages are the same as the CASA readers' (a vector average over channels,
 then over the samples of a bin, ignoring flagged samples); only the order of the
 floating-point sums differs.
+
+The spectrum, time-series and uv-distance readers also average a component model
+(:mod:`vlbipy.solvers.skymodel`) when given one: predicted at every row and channel,
+flagged where the data are and averaged exactly like them, so the overlay shows what
+the model predicts for the plotted average, decorrelation included.
 """
 from __future__ import annotations
 
@@ -23,10 +28,19 @@ import numpy as np
 from .applycal import read_view_runs
 from .corrected import view as corrected_view
 from .msio import read_layout, read_runs, read_setup, run_specs, select_runs, split_rows, table_engine
+from .skymodel import masked_model, usable
 from .workers import run_jobs
 
 #: Rows per worker job: 100k rows x 64 channels x 2 hands of complex64 is ~100 MB.
 PLOT_ROWS = 100_000
+
+
+def _model_kwargs(setup: dict, model: Optional[list[dict]]) -> dict:
+    """The job arguments of a model overlay: the components and the frequency grid (none without a model)."""
+    if not usable(model):
+        return {}
+    return {"model": list(model), "chan_freq": np.asarray(setup["chan_freq"], dtype=np.float64).tolist(),
+            "ddid_to_spw": [int(spw) for spw in setup["ddid_to_spw"]]}
 
 
 def _jobs(ms, fields: Optional[list[str]], engine: str, **extra) -> tuple[dict, list[dict]]:
@@ -140,22 +154,29 @@ def read_dynamic_spectra(ms, *, fields: Optional[list[str]], column: str, corrs:
 # ---------------------------------------------------------------------------
 def uvdistance_job(*, specs: list[dict], column: str, corrs: Optional[list[int]], ncorr: int, engine: str,
                    time_bin: float, scan_starts: dict, nant: int, nddid: int, with_model: bool,
-                   view: Optional[dict] = None) -> dict:
-    """Worker job: per (scan, baseline, subband, time bin), mean u, v and the summed channel-averaged values."""
+                   view: Optional[dict] = None, model: Optional[list[dict]] = None, chan_freq=None,
+                   ddid_to_spw=None) -> dict:
+    """Worker job: per (scan, baseline, subband, time bin), mean u, v and the summed channel-averaged values.
+
+    The model averaged alongside is the MODEL_DATA column (``with_model``) or the component ``model``.
+    """
     columns = [column, "FLAG", "UVW", "TIME", "ANTENNA1", "ANTENNA2"] + (["MODEL_DATA"] if with_model else [])
     block = read_view_runs(specs, columns, engine=engine, view=view)
     if not block:
         return {}
-    model = block.pop("MODEL_DATA", None)
+    model_column = block.pop("MODEL_DATA", None)
     flags = np.asarray(block["FLAG"], dtype=bool)
+    if corrs is not None:
+        flags = flags[:, :, corrs]
     values = _masked(block, column, corrs)
+    model_values = masked_model(model, block, flags, chan_freq, ddid_to_spw)
+    if model_values is None and model_column is not None:
+        model_values = np.where(flags, np.nan, model_column[:, :, corrs] if corrs is not None else model_column)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
         per_row = np.nanmean(values, axis=1)                         # vector average over channels
-        if model is not None:
-            if corrs is not None:
-                model, flags = model[:, :, corrs], flags[:, :, corrs]
-            model_row = np.nanmean(np.where(flags, np.nan, model), axis=1)
+        if model_values is not None:
+            model_row = np.nanmean(model_values, axis=1)
     times = np.asarray(block["TIME"], dtype=np.float64)
     scans = np.asarray(block["SCAN_NUMBER"], dtype=np.int64)
     # Bins count from each scan's start, so a bin never depends on how the rows were split into jobs.
@@ -170,15 +191,18 @@ def uvdistance_job(*, specs: list[dict], column: str, corrs: Optional[list[int]]
     unique, value_sums, value_counts = _reduce(keys, per_row.astype(np.complex128))
     _, uv_sums, uv_counts = _reduce(keys, uvw[:, :2])
     out = {"keys": unique, "sums": value_sums, "counts": value_counts, "uv": uv_sums, "rows": uv_counts[:, 0]}
-    if model is not None:
+    if model_values is not None:
         _, out["model_sums"], out["model_counts"] = _reduce(keys, model_row.astype(np.complex128))
     return out
 
 
 def read_uvdistance(ms, *, fields: Optional[list[str]], column: str, corrs: Optional[list[int]],
                     time_bin: float, scan_starts: dict, with_model: bool = False,
-                    workers: Optional[int] = None) -> dict:
+                    workers: Optional[int] = None, model: Optional[list[dict]] = None) -> dict:
     """Channel- and time-averaged visibilities per (scan, baseline, subband, ``time_bin``) with their uv distance.
+
+    ``model`` (components, :mod:`vlbipy.solvers.skymodel`) is averaged alongside instead of the MODEL_DATA
+    column of ``with_model``.
 
     Returns
     -------
@@ -189,9 +213,10 @@ def read_uvdistance(ms, *, fields: Optional[list[str]], column: str, corrs: Opti
     engine = table_engine()
     setup = read_setup(ms, engine=engine)
     nant, nddid = len(setup["antenna_names"]), len(setup["ddid_to_spw"])
+    overlay = _model_kwargs(setup, model)
     _, jobs = _jobs(ms, fields, engine, column=column, corrs=corrs, time_bin=float(time_bin),
                     scan_starts={int(k): float(v) for k, v in scan_starts.items()}, nant=nant, nddid=nddid,
-                    with_model=with_model)
+                    with_model=with_model and not overlay, **overlay)
     parts = [p for p in run_jobs("vlbipy.solvers.plot_read:uvdistance_job", jobs, workers) if p]
     if not parts:
         npol = len(corrs) if corrs is not None else int(setup["ncorr"])
@@ -212,7 +237,7 @@ def read_uvdistance(ms, *, fields: Optional[list[str]], column: str, corrs: Opti
     with np.errstate(invalid="ignore", divide="ignore"):
         values = np.where(counts > 0, sums / np.maximum(counts, 1), np.nan)
     model = None
-    if with_model and "model_sums" in parts[0]:
+    if "model_sums" in parts[0]:
         model_sums = np.zeros(sums.shape, dtype=np.complex128)
         model_counts = np.zeros(sums.shape, dtype=np.int64)
         np.add.at(model_sums, inverse, np.concatenate([p["model_sums"] for p in parts]))
@@ -405,10 +430,12 @@ def read_baseline_timeline(ms, *, field: str, column: str, corrs: Optional[list[
 # Baselines to one antenna, averaged over frequency (time series)
 # ---------------------------------------------------------------------------
 def timeseries_job(*, specs: list[dict], column: str, corrs: Optional[list[int]], ncorr: int, engine: str,
-                   edges: list[float], refant: int, nant: int, view: Optional[dict] = None) -> dict:
+                   edges: list[float], refant: int, nant: int, view: Optional[dict] = None,
+                   model: Optional[list[dict]] = None, chan_freq=None, ddid_to_spw=None) -> dict:
     """Worker job: per (other antenna, time bin), the sum and count of the unflagged samples of ``refant``'s
-    baselines over channels and rows, per hand."""
-    block = read_view_runs(specs, [column, "FLAG", "TIME", "ANTENNA1", "ANTENNA2"], engine=engine, view=view,
+    baselines over channels and rows, per hand (and of the component ``model`` under the same flags)."""
+    columns = [column, "FLAG", "TIME", "ANTENNA1", "ANTENNA2"] + (["UVW"] if model else [])
+    block = read_view_runs(specs, columns, engine=engine, view=view,
                            corrs=None if corrs is None else np.asarray(corrs), ncorr=ncorr)
     if not block:
         return {}
@@ -418,7 +445,8 @@ def timeseries_job(*, specs: list[dict], column: str, corrs: Optional[list[int]]
     keep = ((ant1 == refant) | (ant2 == refant)) & (ant1 != ant2) & (other < nant)
     if not keep.any():
         return {}
-    values = np.where(np.asarray(block["FLAG"], dtype=bool)[keep], np.nan, block[column][keep])
+    flags = np.asarray(block["FLAG"], dtype=bool)[keep]
+    values = np.where(flags, np.nan, block[column][keep])
     finite = np.isfinite(values)
     row_sums = np.where(finite, values, 0).sum(axis=1, dtype=np.complex128)      # (nrow, npol)
     row_counts = finite.sum(axis=1)
@@ -427,13 +455,20 @@ def timeseries_job(*, specs: list[dict], column: str, corrs: Optional[list[int]]
     keys = other[keep] * n_time + bins
     order = np.argsort(keys, kind="stable")
     unique, starts = np.unique(keys[order], return_index=True)
-    return {"keys": unique, "sums": np.add.reduceat(row_sums[order], starts, axis=0),
-            "counts": np.add.reduceat(row_counts[order], starts, axis=0)}
+    out = {"keys": unique, "sums": np.add.reduceat(row_sums[order], starts, axis=0),
+           "counts": np.add.reduceat(row_counts[order], starts, axis=0)}
+    model_values = masked_model(model, block, flags, chan_freq, ddid_to_spw, rows=keep)
+    if model_values is not None:
+        model_finite = np.isfinite(model_values)
+        out["model_sums"] = np.add.reduceat(np.where(model_finite, model_values, 0).sum(
+            axis=1, dtype=np.complex128)[order], starts, axis=0)
+        out["model_counts"] = np.add.reduceat(model_finite.sum(axis=1)[order], starts, axis=0)
+    return out
 
 
 def read_timeseries(ms, *, fields: Optional[list[str]], scans: Optional[list[int]], column: str,
                     corrs: Optional[list[int]], refant: int, edges: np.ndarray,
-                    workers: Optional[int] = None) -> dict:
+                    workers: Optional[int] = None, model: Optional[list[dict]] = None) -> dict:
     """Vector averages over channels and the rows of each time bin (``edges``, MJD seconds) of every baseline
     to ``refant``, per hand, as the CASA reader computes them.
 
@@ -441,7 +476,8 @@ def read_timeseries(ms, *, fields: Optional[list[str]], scans: Optional[list[int
     -------
     dict
         ``{other antenna id: complex (n_time, npol)}`` (``nan`` where a bin has no unflagged sample) under
-        ``baselines``, and ``seconds``.
+        ``baselines``, the same for the component ``model`` under ``model_baselines`` (empty without one),
+        and ``seconds``.
     """
     started = _time.perf_counter()
     engine = table_engine()
@@ -455,35 +491,43 @@ def read_timeseries(ms, *, fields: Optional[list[str]], scans: Optional[list[int
     nant = len(setup["antenna_names"])
     n_time = len(edges) - 1
     jobs = [{"specs": chunk, "column": column, "corrs": corrs, "ncorr": int(setup["ncorr"]), "engine": engine,
-             "edges": list(map(float, edges)), "refant": int(refant), "nant": nant, "view": view}
+             "edges": list(map(float, edges)), "refant": int(refant), "nant": nant, "view": view,
+             **_model_kwargs(setup, model)}
             for chunk in split_rows(run_specs(layout, selected), PLOT_ROWS)]
-    sums: dict[int, np.ndarray] = {}
-    counts: dict[int, np.ndarray] = {}
+    accumulated = {"": ({}, {}), "model_": ({}, {})}
     for part in run_jobs("vlbipy.solvers.plot_read:timeseries_job", jobs, workers):
         if not part:
             continue
         others, bins = np.divmod(part["keys"], n_time)
-        for other, bin_index, total, count in zip(others, bins, part["sums"], part["counts"]):
-            if int(other) not in sums:
-                sums[int(other)] = np.zeros((n_time, total.size), dtype=np.complex128)
-                counts[int(other)] = np.zeros((n_time, total.size), dtype=np.float64)
-            sums[int(other)][bin_index] += total
-            counts[int(other)][bin_index] += count
-    baselines = {}
-    for other, total in sums.items():
-        with np.errstate(invalid="ignore", divide="ignore"):
-            baselines[other] = np.where(counts[other] > 0, total / np.maximum(counts[other], 1), np.nan)
-    return {"baselines": baselines, "seconds": _time.perf_counter() - started}
+        for prefix, (sums, counts) in accumulated.items():
+            if f"{prefix}sums" not in part:
+                continue
+            for other, bin_index, total, count in zip(others, bins, part[f"{prefix}sums"], part[f"{prefix}counts"]):
+                if int(other) not in sums:
+                    sums[int(other)] = np.zeros((n_time, total.size), dtype=np.complex128)
+                    counts[int(other)] = np.zeros((n_time, total.size), dtype=np.float64)
+                sums[int(other)][bin_index] += total
+                counts[int(other)][bin_index] += count
+    averages = {}
+    for prefix, (sums, counts) in accumulated.items():
+        averages[prefix] = {}
+        for other, total in sums.items():
+            with np.errstate(invalid="ignore", divide="ignore"):
+                averages[prefix][other] = np.where(counts[other] > 0, total / np.maximum(counts[other], 1), np.nan)
+    return {"baselines": averages[""], "model_baselines": averages["model_"],
+            "seconds": _time.perf_counter() - started}
 
 
 # ---------------------------------------------------------------------------
 # Time-averaged spectra: cross-correlations to a reference antenna, autocorrelations; subband phases per scan
 # ---------------------------------------------------------------------------
 def spectrum_job(*, specs: list[dict], column: str, corrs: Optional[list[int]], ncorr: int, engine: str,
-                 refant: int, nant: int, nddid: int, view: Optional[dict] = None) -> dict:
+                 refant: int, nant: int, nddid: int, view: Optional[dict] = None,
+                 model: Optional[list[dict]] = None, chan_freq=None, ddid_to_spw=None) -> dict:
     """Worker job: per (other antenna, subband), the sum and count over rows of the unflagged samples of
-    ``refant``'s cross-correlations, per channel and hand."""
-    block = read_view_runs(specs, [column, "FLAG", "ANTENNA1", "ANTENNA2"], engine=engine, view=view,
+    ``refant``'s cross-correlations, per channel and hand (and of the component ``model`` under the same flags)."""
+    columns = [column, "FLAG", "ANTENNA1", "ANTENNA2"] + (["UVW"] if model else [])
+    block = read_view_runs(specs, columns, engine=engine, view=view,
                            corrs=None if corrs is None else np.asarray(corrs), ncorr=ncorr)
     if not block:
         return {}
@@ -493,10 +537,15 @@ def spectrum_job(*, specs: list[dict], column: str, corrs: Optional[list[int]], 
     keep = ((ant1 == refant) | (ant2 == refant)) & (ant1 != ant2) & (other < nant)
     if not keep.any():
         return {}
-    values = np.where(np.asarray(block["FLAG"], dtype=bool)[keep], np.nan, block[column][keep])
+    flags = np.asarray(block["FLAG"], dtype=bool)[keep]
+    values = np.where(flags, np.nan, block[column][keep])
     keys = other[keep] * nddid + np.asarray(block["DATA_DESC_ID"], dtype=np.int64)[keep]
     unique, sums, counts = _reduce(keys, values.astype(np.complex128))
-    return {"keys": unique, "sums": sums, "counts": counts}
+    out = {"keys": unique, "sums": sums, "counts": counts}
+    model_values = masked_model(model, block, flags, chan_freq, ddid_to_spw, rows=keep)
+    if model_values is not None:
+        _, out["model_sums"], out["model_counts"] = _reduce(keys, model_values)
+    return out
 
 
 def autocorr_job(*, specs: list[dict], column: str, corrs: Optional[list[int]], ncorr: int, engine: str,
@@ -562,11 +611,13 @@ def _run_keyed(ms, function: str, *, fields: Optional[list[str]], scans: Optiona
     return setup, [part for part in run_jobs(f"vlbipy.solvers.plot_read:{function}", jobs, workers) if part]
 
 
-def _per_key(parts: list[dict]) -> tuple[dict, dict]:
-    """Sums and counts of the job results added up per key."""
+def _per_key(parts: list[dict], prefix: str = "") -> tuple[dict, dict]:
+    """Sums and counts of the job results added up per key (``prefix="model_"``: those of the model)."""
     sums, counts = {}, {}
     for part in parts:
-        for key, total, count in zip(part["keys"], part["sums"], part["counts"]):
+        if f"{prefix}sums" not in part:
+            continue
+        for key, total, count in zip(part["keys"], part[f"{prefix}sums"], part[f"{prefix}counts"]):
             key = int(key)
             sums[key] = sums.get(key, 0) + total
             counts[key] = counts.get(key, 0) + count
@@ -574,23 +625,30 @@ def _per_key(parts: list[dict]) -> tuple[dict, dict]:
 
 
 def read_spectrum(ms, *, fields: Optional[list[str]], scans: Optional[list[int]], column: str,
-                  corrs: Optional[list[int]], refant: int, workers: Optional[int] = None) -> dict:
+                  corrs: Optional[list[int]], refant: int, workers: Optional[int] = None,
+                  model: Optional[list[dict]] = None) -> dict:
     """Time-averaged (vector) spectra of the baselines to ``refant``: ``{other antenna: complex (nspw, nchan,
-    npol)}`` (``nan`` where no unflagged sample) under ``spectra``; ``seconds``."""
+    npol)}`` (``nan`` where no unflagged sample) under ``spectra``, the same for the component ``model`` under
+    ``model_spectra`` (empty without one); ``seconds``."""
     started = _time.perf_counter()
+    setup = read_setup(ms, engine=table_engine())
     setup, parts = _run_keyed(ms, "spectrum_job", fields=fields, scans=scans, column=column, corrs=corrs,
-                              workers=workers, refant=int(refant))
+                              workers=workers, refant=int(refant), **_model_kwargs(setup, model))
     nddid = len(setup["ddid_to_spw"])
     nspw = int(np.max(setup["ddid_to_spw"])) + 1 if nddid else 0
-    sums, counts = _per_key(parts)
-    spectra: dict[int, np.ndarray] = {}
-    for key, total in sums.items():
-        other, ddid = divmod(key, nddid)
-        if other not in spectra:
-            spectra[other] = np.full((nspw,) + total.shape, np.nan + 0j)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            spectra[other][int(setup["ddid_to_spw"][ddid])] = np.where(counts[key] > 0, total / counts[key], np.nan)
-    return {"spectra": spectra, "seconds": _time.perf_counter() - started}
+    out = {}
+    for prefix in ("", "model_"):
+        sums, counts = _per_key(parts, prefix)
+        spectra: dict[int, np.ndarray] = {}
+        for key, total in sums.items():
+            other, ddid = divmod(key, nddid)
+            if other not in spectra:
+                spectra[other] = np.full((nspw,) + total.shape, np.nan + 0j)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                spectra[other][int(setup["ddid_to_spw"][ddid])] = np.where(counts[key] > 0, total / counts[key],
+                                                                           np.nan)
+        out[f"{prefix}spectra"] = spectra
+    return dict(out, seconds=_time.perf_counter() - started)
 
 
 def read_autocorr_spectrum(ms, *, fields: Optional[list[str]], scans: Optional[list[int]], column: str,

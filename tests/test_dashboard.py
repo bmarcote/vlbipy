@@ -5,6 +5,8 @@ import json
 import re
 from pathlib import Path
 
+import pytest
+
 from vlbipy import VLBIObs
 from vlbipy.dashboard import (AUTOCORR_PATTERNS, CALIBRATION_GROUPS, CROSSCORR_PATTERNS, FINAL_GROUPS,
                               TIME_EVOLUTION_PATTERNS, build_dashboard, collect, find_plots, format_obs_date,
@@ -184,11 +186,12 @@ def test_dashboard_cross_browser_subtabs_and_css(tmp_path):
     js = (html_dir / "dashboard.js").read_text(encoding="utf-8")
     page = (html_dir / "calibration.html").read_text(encoding="utf-8")
 
-    # CSS: no `inset` shorthand, every color-mix rule preceded by a plain fallback.
+    # CSS: no `inset` shorthand, every color-mix value preceded by a plain fallback of the same property.
     assert "inset:" not in css
     for line in css.splitlines():
-        if "color-mix(" in line:
-            assert line.index("background:") < line.index("color-mix(")
+        for prop in re.findall(r"([\w-]+):color-mix\(", line):
+            fallback = re.search(rf"(?<![\w-]){re.escape(prop)}:(?!color-mix)", line)
+            assert fallback and fallback.start() < line.index(f"{prop}:color-mix("), line
     # No padding/border shift on the active tab (keeps tab names visible in Safari).
     assert ".tabs a.active" in css and "padding-left:9px" not in css
 
@@ -663,7 +666,7 @@ def test_diagnostics_page_has_three_horizontal_subtabs(tmp_path):
     assert "db01.raw_scan1.spectrum.png" in cross and "autocorr.png" not in cross and "time_evolution" not in cross
     assert "autocorr.png" not in evolution and "spectrum.png" not in evolution
     assert "plot(s)" not in auto + cross + evolution
-    assert "Auto-correlation spectra per antenna" in auto and "vector-averaged over the central channels" in evolution
+    assert "Auto-correlation spectra of each antenna" in auto and "vector-averaged over the central channels" in evolution
     # The observation's reference antenna (EF) leads although AR sorts first; subbands in numeric order;
     # a file that does not follow the naming convention is still shown, last.
     order = ["Reference antenna EF", "refEF.spw2.png", "refEF.spw10.png", "Reference antenna AR", "refAR.spw0.png",
@@ -712,17 +715,25 @@ def commented_obs(tmp_path):
     return obs
 
 
-def test_overview_shows_the_general_comments_between_observation_and_antennas(tmp_path):
+def test_overview_shows_calibration_and_results_boxes_then_the_comments(tmp_path):
     obs = commented_obs(tmp_path)
     build_dashboard(obs)
     html = Path(obs["db01"].work_dir) / "html"
     text = (html / "index.html").read_text(encoding="utf-8")
-    assert text.index('id="observation"') < text.index('id="comments"') < text.index('id="antennas"')
-    assert '<a href="#observation">Observation</a><a href="#comments">General comments</a><a href="#antennas">' in text
-    section = text[text.index('id="comments"'):text.index('id="antennas"')]
-    assert "<h3>Calibration and results</h3>" in section and "<h3>Antennas</h3>" in section
+    order = ['id="observation"', 'id="calibration"', 'id="results"', 'id="comments"', 'id="antennas"']
+    assert [text.index(anchor) for anchor in order] == sorted(text.index(anchor) for anchor in order)
+    assert ('<a href="#observation">Observation</a><a href="#calibration">Calibration</a><a href="#results">Results'
+            '</a><a href="#comments">Comments</a><a href="#antennas">') in text
+    calibration = text[text.index('id="calibration"'):text.index('id="results"')]
+    # The instrumental delay as a box: the scan as the big number, its source, refant and the antennas covered.
+    assert '<div class="card note"><div class="kicker"><span>Instrumental delay</span></div>' in calibration
+    assert '<div class="big"><span class="unit">scan</span> 3</div>' in calibration
+    assert "<dt>Reference antenna</dt><dd><span class=\"mono\">EF</span></dd>" in calibration
+    assert "<dt>Applied to</dt><dd><span class=\"mono\">all</span></dd>" in calibration
     assert ("Scan 3 (3C345) was selected for the instrumental delay (reference antenna EF): it was observed by all 7 "
-            "antennas with usable data, and all were solved there.") in section
+            "antennas with usable data, and all were solved there.") in calibration
+    section = text[text.index('id="comments"'):text.index('id="antennas"')]
+    assert "Calibration and results" not in section and "<h3>Antennas</h3>" in section
     # One block per antenna with something to say, its code prominent and the severity as a chip.
     for name in ("YS", "O8", "TR"):
         assert f'<div class="cmt-name mono">{name}</div>' in section
@@ -730,12 +741,57 @@ def test_overview_shows_the_general_comments_between_observation_and_antennas(tm
     assert '<li class="cmt-warning"><span class="chip warn">warning</span><span>no data in scans 4-9</span></li>' in section
     assert '<span class="chip mut">note</span><span>recorded only subbands 1-2 (2 of 8)</span>' in section
     assert "Nothing to report for: EF, MC, WB, JB, NT." in section
-    assert "2 warning(s) · 2 note(s)" in section
+    assert "2 warning(s) · 1 note(s)" in section
     # The page shows exactly the list the context carries.
     context = json.loads((html / "dashboard.json").read_text())
     assert [c["category"] for c in context["comments"]] == ["calibration", "antenna", "antenna", "antenna", "antenna"]
     for comment in context["comments"]:
-        assert comment["text"] in section
+        assert comment["text"] in (calibration if comment["category"] == "calibration" else section)
+
+
+def test_result_and_flagging_boxes_carry_the_numbers(tmp_path):
+    """A source box: role chip, the dynamic range as the big number and the model flux; flagging: the percentage."""
+    from vlbipy.dashboard import _calibration_section, _results_section
+    ctx = {"sources": [{"name": "TGT", "type": "target"}, {"name": "PC", "type": "phasecal"}],
+           "comments": [
+               {"severity": "warning", "category": "result", "antenna": "", "text": "68.6% flagged.",
+                "data": {"kind": "flagging", "fraction": 0.686, "without": 0.5, "excluded": ["O8"]}},
+               {"severity": "note", "category": "result", "antenna": "", "text": "PC (phasecal): fine.",
+                "data": {"kind": "source", "source": "PC", "role": "phasecal", "detected": True, "snr": 2175.0,
+                         "snr_label": "dynamic range (robust 0)", "flux": 0.812,
+                         "flux_label": "total flux density of the model (Jy)", "offset_mas": 0.0}},
+               {"severity": "warning", "category": "result", "antenna": "", "text": "TGT (target): not detected.",
+                "data": {"kind": "source", "source": "TGT", "role": "target", "detected": False, "snr": 4.2,
+                         "snr_label": "peak SNR in the search map", "flux": None, "flux_label": "", "offset_mas": None}}]}
+    results = _results_section(ctx)
+    assert results.index("<b>TGT</b>") < results.index("<b>PC</b>")                  # source-table order
+    assert '<div class="big">2175</div><div class="sub">dynamic range (robust 0)</div>' in results
+    assert "<dt>Estimated flux density</dt><dd>812 mJy" in results
+    assert '<div class="card warning result">' in results and '<div class="big word">not detected</div>' in results
+    assert '<span class="badge target">target</span>' in results
+    calibration = _calibration_section(ctx)
+    assert '<div class="card warning"><div class="kicker"><span>Flagged data</span>' in calibration
+    assert '<div class="big">68.6<span class="unit">%</span></div>' in calibration
+    assert "50.0%" in calibration and "excluding O8" in calibration
+
+
+def test_antenna_map_places_every_antenna_and_marks_the_ones_without_data():
+    """Positions from ITRF, an opening view around the array (also across the date line), light red without data."""
+    from vlbipy.dashboard import _antenna_map, _unwrapped_longitudes, geodetic_position
+    latitude, longitude = geodetic_position((-4752329.0, 2790324.0, -3200483.0))              # ATCA
+    assert latitude == pytest.approx(-30.31, abs=0.05) and longitude == pytest.approx(149.56, abs=0.05)
+    assert geodetic_position((0.0, 0.0, 0.0)) == (None, None)
+    assert _unwrapped_longitudes([179.0, -179.0, 178.0]) == [179.0, 181.0, 178.0]
+    antennas = [{"name": "AT", "observed": True, "flagged_fraction": 0.5, "lat_deg": -30.3, "lon_deg": 149.6},
+                {"name": "PA", "observed": True, "flagged_fraction": 1.0, "lat_deg": -33.0, "lon_deg": 148.3},
+                {"name": "HO", "observed": False, "flagged_fraction": None, "lat_deg": -42.8, "lon_deg": 147.4},
+                {"name": "XX", "observed": True, "flagged_fraction": 0.1, "lat_deg": None, "lon_deg": None}]
+    svg = _antenna_map(antennas)
+    assert svg.count('<g class="ant ok"') == 1 and svg.count('<g class="ant off"') == 2 and "XX" not in svg
+    view = [float(v) for v in re.search(r'data-array="([^"]+)"', svg).group(1).split()]
+    assert view[2] == view[3] and view[0] < 147.4 + 180 < 149.6 + 180 < view[0] + view[2]
+    assert 'data-world="' in svg and 'id="vlbipy-land"' in svg
+    assert _antenna_map([{"name": "AT", "lat_deg": None, "lon_deg": None}]) == ""
 
 
 def test_collect_gathers_what_the_comments_need_from_the_caches(tmp_path):
@@ -914,3 +970,32 @@ def test_sky_map_escapes_source_names():
     html = _sky_map(sources)
     assert "A&lt;B" in html and "A<B" not in html
     assert "D&lt;E</text>" in html and "D<E</text>" not in html
+
+
+def test_diagnostics_spectra_get_one_subtab_per_antenna_in_array_order(tmp_path):
+    """Per-antenna figures sit in nested sub-tabs, antennas in the order of the array; the refant of every scan
+    has no cross-correlation figure and so no tab there."""
+    from vlbipy.dashboard import antenna_figure_key
+    obs = make_obs(tmp_path, phasecal="J1848+3219", fringe_finder="3C345")
+    work = Path(obs["db01"].work_dir)
+    raw = work / "plots" / "raw"
+    raw.mkdir(parents=True, exist_ok=True)
+    antennas = [a["name"] for a in collect(obs)["antennas"]]
+    for name in reversed(antennas):
+        (raw / f"db01.raw_ant{name}.autocorr.png").write_bytes(b"")
+        if name != antennas[0]:
+            (raw / f"db01.raw_ant{name}.spectrum.png").write_bytes(b"")
+    (raw / "db01.raw_scan1.autocorr.png").write_bytes(b"")        # left over from an older run: not shown
+    build_dashboard(obs)
+    page = (work / "html" / "diagnostics.html").read_text(encoding="utf-8")
+    bodies = dict(zip(["diag-autocorr", "diag-crosscorr"],
+                      re.split(r'<div class="subpanel[^"]*" id="diag-(?:autocorr|crosscorr|time-evolution)">', page)[1:]))
+    auto_tabs = re.findall(r'data-panel="auto-[^"]+"><span class="mono">([^<]+)</span>', bodies["diag-autocorr"])
+    cross_tabs = re.findall(r'data-panel="cross-[^"]+"><span class="mono">([^<]+)</span>', bodies["diag-crosscorr"])
+    assert auto_tabs == antennas and cross_tabs == antennas[1:]
+    assert "raw_scan1" not in page
+    assert antenna_figure_key(Path("db01.raw_antEF.spectrum.png")) == "EF"
+    assert antenna_figure_key(Path("db01.raw_scan12.spectrum.png")) is None
+    # Nested sub-tabs switch only their own buttons and panels.
+    script = (work / "html" / "dashboard.js").read_text(encoding="utf-8")
+    assert ":scope>.subtabs button" in script and ":scope>.subpanel" in script

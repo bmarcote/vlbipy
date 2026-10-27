@@ -12,7 +12,10 @@ A comment is a plain dict:
 * ``category``: ``"calibration"``, ``"result"``, ``"antenna"`` or ``"pipeline"``;
 * ``antenna``: station code, ``""`` when the comment is not about one station;
 * ``text``: the sentence;
-* ``when`` (warnings recorded by the pipeline only): UTC time the warning was first seen.
+* ``when`` (warnings recorded by the pipeline only): UTC time the warning was first seen;
+* ``data`` (calibration and result comments only): the numbers behind the sentence, for the boxes of the
+  Overview page - ``kind`` (``"flagging"``, ``"instrumental_delay"``, ``"selfcal"``, ``"table"`` or
+  ``"source"``) and the fields of that kind (see the rule that writes it).
 
 The module also owns the small file that keeps the warnings of the pipeline between
 processes (``.run_warnings.json``), since those warnings live in memory otherwise.
@@ -104,11 +107,14 @@ TEXT_WIDTH: int = 100
 
 # -- small helpers -----------------------------------------------------------------------------
 
-def make_comment(severity: str, category: str, text: str, antenna: str = "", when: str = "") -> dict:
-    """Build one comment dict (see the module docstring); ``when`` is only stored when given."""
+def make_comment(severity: str, category: str, text: str, antenna: str = "", when: str = "",
+                 data: Optional[dict] = None) -> dict:
+    """Build one comment dict (see the module docstring); ``when`` and ``data`` are only stored when given."""
     comment = {"severity": severity, "category": category, "antenna": antenna, "text": text}
     if when:
         comment["when"] = when
+    if data:
+        comment["data"] = data
     return comment
 
 
@@ -131,6 +137,18 @@ def format_ranges(values) -> str:
         else:
             groups.append([number, number])
     return ", ".join(str(a) if a == b else f"{a}-{b}" for a, b in groups)
+
+
+def compact_antennas(names, everyone) -> str:
+    """The shortest of ``"all"``, ``"all but X, Y"`` and the list itself for ``names`` out of ``everyone``."""
+    names, everyone = list(names), list(everyone)
+    missing = [name for name in everyone if name not in names]
+    if everyone and not missing:
+        return "all"
+    listed = ", ".join(names)
+    if everyone and len(missing) < len(names) and set(everyone) & set(names):
+        return f"all but {', '.join(missing)}"
+    return listed
 
 
 def join_names(names: list[str]) -> str:
@@ -386,6 +404,9 @@ def fringe_comments(context: dict) -> list[dict]:
     calibrator (any source when no role is declared), or another source on which this antenna is detected
     in at least :data:`USUAL_DETECTION_FRACTION` of the surveyed scans (a bright target). The reference
     antenna(s) and the antennas without usable data are never judged.
+
+    Missing fringes are a problem (a stretch of scans, or every scan); scans missed here and there, never
+    :data:`MIN_RUN_SCANS` in a row, are a warning.
     """
     scans = ordered_scans(context)
     skipped = _dead_antennas(context) | _reference_antennas(context)
@@ -415,7 +436,7 @@ def fringe_comments(context: dict) -> list[dict]:
         if all(failing):
             where = describe_stretch(own, 0, len(own) - 1, open_ended=False)
             many = f"any of the {len(own)} scans" if len(own) > 1 else "the one scan"
-            comments.append(make_comment("problem" if len(own) > 1 else "warning", "antenna", f"no fringes in {many} "
+            comments.append(make_comment("problem", "antenna", f"no fringes in {many} "
                                          f"it should have been detected in, while the rest of the array fringes "
                                          f"({where})", name))
             continue
@@ -424,9 +445,9 @@ def fringe_comments(context: dict) -> list[dict]:
             text = "no fringes " + ", and ".join(describe_stretch(own, a, b, open_ended=False) for a, b in listed)
             if others:
                 text += f"; none either in {others} other scan{'s' if others != 1 else ''} where the array fringes"
-            comments.append(make_comment("warning", "antenna", text, name))
+            comments.append(make_comment("problem", "antenna", text, name))
         elif others >= max(MIN_RUN_SCANS, SCATTERED_FRACTION * len(own)):
-            comments.append(make_comment("note", "antenna", f"no fringes in {others} of the {len(own)} scans where the "
+            comments.append(make_comment("warning", "antenna", f"no fringes in {others} of the {len(own)} scans where the "
                                          f"rest of the array fringes, never more than {MIN_RUN_SCANS - 1} in a row",
                                          name))
     return comments
@@ -471,9 +492,13 @@ def instrumental_delay_comments(context: dict) -> list[dict]:
         reference = f" (reference antenna {stage['refant']})" if stage.get("refant") else ""
         solved = [name for name in stage.get("antennas") or []]
         covered.update(solved)
+        data = {"kind": "instrumental_delay", "stage": index + 1, "scan": stage.get("scan"), "source": source,
+                "role": (scan or {}).get("role") or "", "refant": stage.get("refant") or "",
+                "antennas": compact_antennas(solved, usable)}
         if index > 0:
             comments.append(make_comment("note", "calibration", f"{label} was used for the instrumental delay of "
-                                         f"{join_names(solved)}{reference}, which the first stage does not cover."))
+                                         f"{join_names(solved)}{reference}, which the first stage does not cover.",
+                                         data=data))
             continue
         present = set(scan.get("antennas") or []) if scan else None
         not_in_scan = [name for name in usable if present is not None and name not in present]
@@ -488,7 +513,8 @@ def instrumental_delay_comments(context: dict) -> list[dict]:
             if not_solved:
                 reason += f"; not solved there: {join_names(not_solved)}"
         comments.append(make_comment("note", "calibration",
-                                     f"{label} was selected for the instrumental delay{reference}: {reason}."))
+                                     f"{label} was selected for the instrumental delay{reference}: {reason}.",
+                                     data=data))
     if stages:
         for name in usable:
             if name not in covered:
@@ -643,7 +669,8 @@ def gain_comments(context: dict) -> list[dict]:
                      f"{'scale is' if len(blamed) == 1 else 'scales are'} off against the rest of the array (see "
                      f"{'that antenna' if len(blamed) == 1 else 'those antennas'})." if blamed else "")
             comments.append(make_comment(
-                "warning", "calibration", f"The amplitude self-calibration of {source} is poorly constrained: an "
+                "warning", "calibration", data={"kind": "selfcal", "source": source},
+                text=f"The amplitude self-calibration of {source} is poorly constrained: an "
                 f"unconstrained gscale would change {len(off)} of its {len(solved)} antennas by more than "
                 f"{GAIN_WARN_DEVIATION:.0%} ({wanted}), but the corrections applied stayed within "
                 f"{GAIN_UNFIXED_DEVIATION:.0%} of 1.{cause} Treat the amplitude scale of this source, and its "
@@ -654,11 +681,13 @@ def gain_comments(context: dict) -> list[dict]:
                     unfixed.setdefault(name, []).append((source, values))
         if entry.get("applied") is False:
             comments.append(make_comment("warning", "calibration", f"The amplitude corrections of {source} were "
-                                         "computed but not applied to the data."))
+                                         "computed but not applied to the data.",
+                                         data={"kind": "selfcal", "source": source}))
         findings = _general_findings(entry)
         if findings:
             comments.append(make_comment("note", "calibration",
-                                         f"Amplitude self-calibration of {source}: {'; '.join(findings)}."))
+                                         f"Amplitude self-calibration of {source}: {'; '.join(findings)}.",
+                                         data={"kind": "selfcal", "source": source}))
     for name, values in medians.items():
         large = any(level == "bad" for _, _, level in values)
         listed = ", ".join(f"x{median:.{GAIN_DECIMALS}f} on {source}" for source, median, _ in values)
@@ -693,7 +722,9 @@ def flagging_comments(context: dict) -> list[dict]:
     if without is not None and excluded:
         text += f" ({without:.1%} without the antennas that have no usable signal: {join_names(excluded)})"
     effective = without if without is not None and excluded else fraction
-    return [make_comment("warning" if effective >= HIGH_FLAGGED_FRACTION else "note", "result", text + ".")]
+    data = {"kind": "flagging", "fraction": fraction, "without": without if excluded else None, "excluded": excluded}
+    return [make_comment("warning" if effective >= HIGH_FLAGGED_FRACTION else "note", "result", text + ".",
+                         data=data)]
 
 
 def _search_text(search: dict, with_peak: bool) -> str:
@@ -722,13 +753,26 @@ def source_comments(context: dict) -> list[dict]:
         parts, severity = [], "note"
         search = entry.get("search")
         images = [image for image in entry.get("images") or [] if _finite(image.get("peak")) is not None]
+        data = {"kind": "source", "source": entry.get("source", ""), "role": role,
+                "detected": bool(search.get("detected")) if search else None, "snr": None, "snr_label": "",
+                "flux": None, "flux_label": "", "offset_mas": _finite((search or {}).get("offset_mas"))}
         if search:
             parts.append(_search_text(search, with_peak=not images))
             if not search.get("detected"):
                 severity = "warning"
+            data.update(snr=_finite(search.get("snr")), snr_label="peak SNR in the search map")
+            if _finite(search.get("peak")) is not None:
+                data.update(flux=_finite(search.get("peak")), flux_label="peak in the search map (Jy/beam)")
         if images:
             image = next((i for i in images if _finite(i.get("robust")) == 0.0), images[0])
             peak, rms, dynamic = _finite(image["peak"]), _finite(image.get("rms")), _finite(image.get("dynamic_range"))
+            if dynamic is not None:
+                data.update(snr=dynamic, snr_label=f"dynamic range (robust {float(image.get('robust') or 0.0):g})")
+            model_flux = _finite(image.get("model_flux"))
+            if model_flux is not None and model_flux > 0:
+                data.update(flux=model_flux, flux_label="total flux density of the model (Jy)")
+            elif peak is not None:
+                data.update(flux=peak, flux_label="image peak (Jy/beam)")
             text = f"CLEAN image (robust {float(image.get('robust') or 0.0):g}): peak {format_flux(peak)}/beam"
             text += f", rms {format_flux(rms)}/beam" if rms is not None else ""
             if dynamic is not None:
@@ -739,7 +783,7 @@ def source_comments(context: dict) -> list[dict]:
             parts.append(text)
         if parts:
             comments.append(make_comment(severity, "result",
-                                         f"{entry.get('source', '')} ({role}): {'; '.join(parts)}."))
+                                         f"{entry.get('source', '')} ({role}): {'; '.join(parts)}.", data=data))
     return comments
 
 
@@ -750,7 +794,9 @@ def table_comments(context: dict) -> list[dict]:
         snr = _finite(table.get("snr"))
         if snr is not None and 0.0 < snr < POOR_TABLE_SNR:
             comments.append(make_comment("warning", "calibration", f"The {table.get('cal_type', '?')} table (step "
-                                         f"{table.get('step', '?')}) has a low median solution SNR: {snr:.1f}."))
+                                         f"{table.get('step', '?')}) has a low median solution SNR: {snr:.1f}.",
+                                         data={"kind": "table", "table": str(table.get("cal_type", "?")),
+                                               "snr": snr}))
     return comments
 
 

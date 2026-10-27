@@ -335,6 +335,16 @@ def count_query_text(ms: str, column: str, *, where: str = "", groupby: str = ""
             + (f" GROUPBY {groupby}" if groupby else ""))
 
 
+def _model_cube(model: Optional[list], record: dict, frequencies_hz, shape: tuple) -> Optional[np.ndarray]:
+    """Visibilities of a component ``model`` (:mod:`vlbipy.solvers.skymodel`) for the rows of an ``ms.getdata``
+    record that holds ``uvw``, shaped like its data ``(npol, nchan, nrow)``; None without a model."""
+    if not model:
+        return None
+    from ..solvers.skymodel import predict
+    predicted = predict(model, np.asarray(record["uvw"]).T, np.asarray(frequencies_hz, dtype=float)[:shape[1]])
+    return np.broadcast_to(predicted.T[None, :, :], shape)
+
+
 def parallel_hand_indices(metadata: ObsMetadata) -> tuple[list[int], list[str]]:
     """Return the indices and labels of the parallel-hand correlations.
 
@@ -994,7 +1004,7 @@ class CasaDataOps(DataOps):
 
     def read_spectrum(self, project_code: str, *, field: str = "", scans: Optional[list] = None,
                       refant: str = "", column: str = "corrected", all_pols: bool = False,
-                      metadata: Optional[ObsMetadata] = None) -> dict:
+                      metadata: Optional[ObsMetadata] = None, model: Optional[list] = None) -> dict:
         """Read time-averaged visibility spectra on baselines to the reference antenna.
 
         Vector-averages every baseline over time within the selection, one
@@ -1012,14 +1022,20 @@ class CasaDataOps(DataOps):
             Reference antenna; only baselines including it are returned.
         column : str
             ``"corrected"`` (post-applycal) or ``"data"`` (raw).
+        model : list, optional
+            Components of a model (:mod:`vlbipy.solvers.skymodel`) to average alongside, under the
+            same flags.
 
         Returns
         -------
         dict
             ``antennas`` (the other end of each baseline), ``spectra``
             (``{antenna: complex array (n_spw, n_chan, n_pol)}``), ``refant``,
-            ``n_spw``, ``n_channels``, ``polarizations``.
+            ``n_spw``, ``n_channels``, ``polarizations``; ``model_spectra`` likewise for ``model``
+            (empty without one).
         """
+        from ..solvers.skymodel import usable
+        model = usable(model)
         meta = metadata or self.backend.data.get_metadata(project_code, [], "")
         refant = refant or self.backend.calibrate.refant_chain(meta, "").split(",")[0]
         antenna_names = list(meta.antennas)
@@ -1038,6 +1054,7 @@ class CasaDataOps(DataOps):
 
         accumulated: dict[int, np.ndarray] = {}
         counts: dict[int, np.ndarray] = {}
+        model_accumulated: dict[int, np.ndarray] = {}
         ms_tool = self.backend.tools.ms()
         if not ms_tool.open(str(self.backend.ms_path(project_code))):
             raise BackendError(f"could not open MS for {project_code}")
@@ -1046,7 +1063,8 @@ class CasaDataOps(DataOps):
                 ms_tool.selectinit(datadescid=spw)
                 select_ms_rows(ms_tool, field=field, baseline=f"{refant}&*", scans=scans)
                 try:
-                    record = ms_tool.getdata([column_name, "flag", "antenna1", "antenna2"])
+                    record = ms_tool.getdata([column_name, "flag", "antenna1", "antenna2"]
+                                             + (["uvw"] if model else []))
                 except RuntimeError as exc:
                     raise BackendError(f"{project_code}: could not read the {column} column "
                                        f"(has applycal run?): {exc}") from exc
@@ -1055,10 +1073,14 @@ class CasaDataOps(DataOps):
                 if values is None or not values.size:
                     continue
                 flags = np.asarray(record["flag"], dtype=bool)
+                predicted = _model_cube(model, record, np.asarray(meta.freq_setup.frequencies_ghz(spw)) * 1e9,
+                                        values.shape)
                 values = np.where(flags, np.nan, values)          # (npol, nchan, nrow)
                 # Cross-hands carry no useful phase on an unpolarized calibrator and
                 # would dominate the plot with noise; keep the parallel hands only.
                 values = values[pol_indices, :, :]
+                if predicted is not None:
+                    predicted = np.where(flags, np.nan, predicted)[pol_indices, :, :]
                 ant1 = np.asarray(record["antenna1"])
                 ant2 = np.asarray(record["antenna2"])
                 other = np.where(ant1 == refant_id, ant2, ant1)
@@ -1076,20 +1098,27 @@ class CasaDataOps(DataOps):
                         counts[key] = np.zeros((n_spw, n_chan, summed.shape[1]), dtype=float)
                     accumulated[key][spw, :summed.shape[0]] += summed
                     counts[key][spw, :valid.shape[0]] += valid
+                    if predicted is not None:
+                        model_sum = np.nansum(predicted[:, :, rows], axis=2).T
+                        model_accumulated.setdefault(key, np.zeros(accumulated[key].shape, dtype=complex))
+                        model_accumulated[key][spw, :model_sum.shape[0]] += model_sum
         finally:
             ms_tool.close()
 
-        spectra = {}
+        spectra, model_spectra = {}, {}
         for antenna_id, total in accumulated.items():
             with np.errstate(invalid="ignore", divide="ignore"):
                 spectra[antenna_names[antenna_id]] = np.where(counts[antenna_id] > 0,
                                                               total / counts[antenna_id], np.nan)
+                if antenna_id in model_accumulated:     # the model is flagged like the data: same counts
+                    model_spectra[antenna_names[antenna_id]] = np.where(
+                        counts[antenna_id] > 0, model_accumulated[antenna_id] / counts[antenna_id], np.nan)
         logger.info("read_spectrum: {} baseline(s) to {} from the {} column ({} x {} channels)",
                     len(spectra), refant, column, n_spw, n_chan)
         return {"antennas": sorted(spectra), "spectra": spectra, "refant": refant,
                 "n_spw": n_spw, "n_channels": n_chan, "polarizations": pol_labels,
                 "frequencies_ghz": [meta.freq_setup.frequencies_ghz(s) for s in range(n_spw)],
-                "column": column, "field": field, "scans": list(scans or [])}
+                "column": column, "field": field, "scans": list(scans or []), "model_spectra": model_spectra}
 
     def read_dynamic_spectra(self, project_code: str, *, field: str = "",
                              column: str = "corrected", max_time_bins: int = 200,
@@ -1306,7 +1335,7 @@ class CasaDataOps(DataOps):
 
     def read_timeseries(self, project_code: str, *, field: str = "", scans: Optional[list] = None,
                         refant: str = "", column: str = "corrected", max_time_bins: int = 300,
-                        metadata: Optional[ObsMetadata] = None) -> dict:
+                        metadata: Optional[ObsMetadata] = None, model: Optional[list] = None) -> dict:
         """Read amplitude/phase vs time per baseline, averaged over frequency.
 
         The time companion to :meth:`read_spectrum`: same baselines to the
@@ -1322,12 +1351,16 @@ class CasaDataOps(DataOps):
             Reference antenna; only baselines including it are returned.
         max_time_bins : int
             Number of time bins spanning the selection.
+        model : list, optional
+            Components of a model (:mod:`vlbipy.solvers.skymodel`) to average alongside, under the
+            same flags.
 
         Returns
         -------
         dict
             ``baselines`` (``{name: complex array (n_time, n_pol)}``), ``times``
-            (MJD seconds), ``polarizations``, ``refant``.
+            (MJD seconds), ``polarizations``, ``refant``; ``model_baselines`` likewise for ``model`` (empty
+            without one).
         """
         meta = metadata or self.backend.data.get_metadata(project_code, [], "")
         refant = refant or self.backend.calibrate.refant_chain(meta, "").split(",")[0]
@@ -1357,9 +1390,12 @@ class CasaDataOps(DataOps):
         n_time = len(edges) - 1
         pol_indices, pol_labels = parallel_hand_indices(meta)
         column_name = {"corrected": "corrected_data", "data": "data"}[column]
+        from ..solvers.skymodel import usable
+        model = usable(model)
 
         sums: dict[str, np.ndarray] = {}
         counts: dict[str, np.ndarray] = {}
+        model_sums: dict[str, np.ndarray] = {}
         ms_tool = self.backend.tools.ms()
         if not ms_tool.open(str(self.backend.ms_path(project_code))):
             raise BackendError(f"could not open MS for {project_code}")
@@ -1369,7 +1405,8 @@ class CasaDataOps(DataOps):
                 select_ms_rows(ms_tool, field=",".join(wanted), baseline=f"{refant}&*",
                                scans=sorted(wanted_scans))
                 try:
-                    record = ms_tool.getdata([column_name, "flag", "antenna1", "antenna2", "time"])
+                    record = ms_tool.getdata([column_name, "flag", "antenna1", "antenna2", "time"]
+                                             + (["uvw"] if model else []))
                 except RuntimeError as exc:
                     raise BackendError(f"{project_code}: could not read {column}: {exc}") from exc
                 ms_tool.reset()
@@ -1377,6 +1414,10 @@ class CasaDataOps(DataOps):
                 if values is None or not values.size:
                     continue
                 flags = np.asarray(record["flag"], dtype=bool)
+                predicted = _model_cube(model, record, np.asarray(meta.freq_setup.frequencies_ghz(spw)) * 1e9,
+                                        values.shape)
+                if predicted is not None:
+                    predicted = np.where(flags, np.nan, predicted)[pol_indices, :, :]
                 values = np.where(flags, np.nan, values)[pol_indices, :, :]
                 ant1, ant2 = np.asarray(record["antenna1"]), np.asarray(record["antenna2"])
                 other = np.where(ant1 == refant_id, ant2, ant1)
@@ -1390,24 +1431,33 @@ class CasaDataOps(DataOps):
                         sums[name] = np.zeros((n_time, len(pol_indices)), dtype=complex)
                         counts[name] = np.zeros((n_time, len(pol_indices)), dtype=float)
                     chunk = values[:, :, rows]                       # (n_pol, n_chan, n_rows)
+                    model_chunk = predicted[:, :, rows] if predicted is not None else None
                     for bin_index in np.unique(bins[rows]):
-                        block = chunk[:, :, bins[rows] == bin_index]
+                        in_bin = bins[rows] == bin_index
+                        block = chunk[:, :, in_bin]
                         ok = np.isfinite(block)
                         sums[name][bin_index] += np.where(ok, block, 0.0).sum(axis=(1, 2))
                         counts[name][bin_index] += ok.sum(axis=(1, 2))
+                        if model_chunk is not None:
+                            model_sums.setdefault(name, np.zeros(sums[name].shape, dtype=complex))
+                            model_sums[name][bin_index] += np.nansum(model_chunk[:, :, in_bin], axis=(1, 2))
         finally:
             ms_tool.close()
 
-        baselines = {}
+        baselines, model_baselines = {}, {}
         for name, total in sums.items():
             with np.errstate(invalid="ignore", divide="ignore"):
                 baselines[name] = np.where(counts[name] > 0, total / np.maximum(counts[name], 1),
                                            np.nan)
+                if name in model_sums:                 # the model is flagged like the data: same counts
+                    model_baselines[name] = np.where(counts[name] > 0, model_sums[name] / np.maximum(counts[name], 1),
+                                                     np.nan)
         centres = (edges[:-1] + edges[1:]) / 2.0
         logger.info("read_timeseries: {} baseline(s) to {} over {} time bins",
                     len(baselines), refant, n_time)
         return {"baselines": dict(sorted(baselines.items())), "times": centres.tolist(),
-                "polarizations": pol_labels, "refant": refant, "field": field, "column": column}
+                "polarizations": pol_labels, "refant": refant, "field": field, "column": column,
+                "model_baselines": model_baselines}
 
     def _time_evolution_rows(self, project_code: str, meta: ObsMetadata, scans: list, refant: str,
                              refant_id: int, subband: int, first: int, last: int, column_name: str,
@@ -1543,7 +1593,7 @@ class CasaDataOps(DataOps):
 
     def read_uvdistance(self, project_code: str, *, field: str = "", column: str = "corrected",
                         time_bin: float = 10.0, with_model: bool = False,
-                        metadata: Optional[ObsMetadata] = None) -> dict:
+                        metadata: Optional[ObsMetadata] = None, model: Optional[list] = None) -> dict:
         """Read visibilities against uv distance, averaged per subband and in time.
 
         Channels are averaged within each subband and samples within
@@ -1563,6 +1613,9 @@ class CasaDataOps(DataOps):
             Averaging interval in seconds.
         with_model : bool
             Also bin the MODEL_DATA column (same bins, same flags) when the MS has one.
+        model : list, optional
+            Components of a model (:mod:`vlbipy.solvers.skymodel`) to average alongside, under the
+            same flags.
 
         Returns
         -------
@@ -1576,9 +1629,11 @@ class CasaDataOps(DataOps):
         column_name = {"corrected": "corrected_data", "data": "data"}[column]
         light_speed = 299792458.0
         ms_path = self.backend.ms_path(project_code)
-        with_model = with_model and self._has_column(ms_path, "MODEL_DATA")
+        from ..solvers.skymodel import usable
+        model = usable(model)
+        with_model = bool(model) or (with_model and self._has_column(ms_path, "MODEL_DATA"))
         columns = [column_name, "flag", "uvw", "time", "antenna1", "antenna2"]
-        if with_model:
+        if with_model and not model:
             columns.append("model_data")
 
         distances: list[float] = []
@@ -1608,8 +1663,10 @@ class CasaDataOps(DataOps):
                     continue
                 flags = np.asarray(record["flag"], dtype=bool)
                 per_row = _channel_average(values, flags, pol_indices)          # (nrow, npol)
-                model_row = (_channel_average(record["model_data"], flags, pol_indices)
-                             if with_model else None)
+                predicted = _model_cube(model, record, np.asarray(meta.freq_setup.frequencies_ghz(spw)) * 1e9,
+                                        values.shape)
+                model_row = (_channel_average(predicted, flags, pol_indices) if predicted is not None
+                             else _channel_average(record["model_data"], flags, pol_indices) if with_model else None)
                 uvw = np.asarray(record["uvw"])                    # (3, nrow)
                 times = np.asarray(record["time"], dtype=float)
                 ant1, ant2 = np.asarray(record["antenna1"]), np.asarray(record["antenna2"])
@@ -2407,15 +2464,22 @@ class CasaCalibrationOps(CalibrationOps):
         return report
 
     def smooth(self, project_code: str, table: CalTable, *, threshold: float = 6.0,
-               max_passes: int = 3, window: int = 5, **kwargs) -> CalTable:
-        """De-spike a calibration table in place, per antenna / subband / polarization.
+               max_passes: int = 3, window: int = 5, time_window: float = 600.0, min_points: int = 3,
+               smoothtype: str = "median", **kwargs) -> CalTable:
+        """De-spike and smooth a calibration table in place, per antenna / subband / polarization / field.
 
-        Each antenna-subband-polarization time series is tested against its own
+        Each antenna-subband-polarization time series of one field is tested against its own
         median and MAD: points deviating by more than ``threshold`` robust sigmas
         are replaced with the local running median, repeating until a pass finds
-        nothing (or ``max_passes``). Values that are non-positive to begin with
-        (the -999.9 placeholders correlators write for stations without a
-        measurement) cannot be repaired and are flagged instead.
+        nothing (or ``max_passes``). The series is then smoothed with a running median (or mean) over
+        ``time_window`` seconds (:func:`~vlbipy.statistics.smooth_in_time`), which takes the measurement
+        noise out of a system temperature that only changes on the time scale of the elevation and the
+        weather. Values that are non-positive to begin with (the -999.9 placeholders correlators write for
+        stations without a measurement) cannot be repaired and are flagged instead.
+
+        Every field is a series of its own: the system temperature includes the source, so a bright
+        calibrator raises it against a faint target, and a filter across the change of source would
+        smear one level into the other (or take the step for a spike).
 
         Parameters
         ----------
@@ -2429,13 +2493,20 @@ class CasaCalibrationOps(CalibrationOps):
             Maximum de-spiking passes (``[calibration].tsys_smooth_passes``).
         window : int
             Running-median window, in solutions, used for replacement values.
+        time_window : float
+            Full width (seconds) of the smoothing window; <= 0 only de-spikes
+            (``[calibration.tsys_smooth].time_window``).
+        min_points : int
+            Leave a solution unsmoothed when its window holds fewer usable solutions of the same field.
+        smoothtype : str
+            ``"median"`` or ``"mean"``.
 
         Returns
         -------
         CalTable
             The same table, with ``snr`` left untouched.
         """
-        from ..statistics import despike
+        from ..statistics import despike, smooth_in_time
 
         path = Path(table.path)
         if not path.is_dir():
@@ -2449,6 +2520,8 @@ class CasaCalibrationOps(CalibrationOps):
             flags = np.asarray(handle.getcol("FLAG")).astype(bool)
             antenna_ids = np.asarray(handle.getcol("ANTENNA1"))
             spw_ids = np.asarray(handle.getcol("SPECTRAL_WINDOW_ID"))
+            field_ids = (np.asarray(handle.getcol("FIELD_ID")) if "FIELD_ID" in handle.colnames()
+                         else np.zeros(antenna_ids.shape, dtype=int))
             times = np.asarray(handle.getcol("TIME"))
 
             # Non-positive Tsys is a placeholder, not a measurement: flag, never smooth.
@@ -2456,28 +2529,31 @@ class CasaCalibrationOps(CalibrationOps):
             n_invalid = int(invalid.sum())
             flags |= invalid
 
-            n_replaced = 0
-            for antenna in np.unique(antenna_ids):
-                for spw in np.unique(spw_ids):
-                    rows = np.where((antenna_ids == antenna) & (spw_ids == spw))[0]
-                    if rows.size < 3:
-                        continue
-                    order = rows[np.argsort(times[rows])]
-                    for par in range(values.shape[0]):
-                        for chan in range(values.shape[1]):
-                            series = values[par, chan, order]
-                            usable = ~flags[par, chan, order]
-                            if usable.sum() < 3:
-                                continue
-                            masked = np.where(usable, series, np.nan)
-                            cleaned, replaced = despike(masked, threshold=threshold,
-                                                        max_passes=max_passes, window=window)
-                            if not replaced.any():
-                                continue
-                            fixed = replaced & np.isfinite(cleaned)
-                            values[par, chan, order[fixed]] = cleaned[fixed]
-                            n_replaced += int(fixed.sum())
-            if n_replaced or n_invalid:
+            n_replaced = n_smoothed = 0
+            groups = np.unique(np.stack([antenna_ids, spw_ids, field_ids]), axis=1).T
+            for antenna, spw, field in groups:
+                rows = np.where((antenna_ids == antenna) & (spw_ids == spw) & (field_ids == field))[0]
+                if rows.size < 3:
+                    continue
+                order = rows[np.argsort(times[rows], kind="stable")]
+                for par in range(values.shape[0]):
+                    for chan in range(values.shape[1]):
+                        series = values[par, chan, order]
+                        usable = ~flags[par, chan, order]
+                        if usable.sum() < 3:
+                            continue
+                        masked = np.where(usable, series, np.nan)
+                        cleaned, replaced = despike(masked, threshold=threshold,
+                                                    max_passes=max_passes, window=window)
+                        fixed = replaced & np.isfinite(cleaned)
+                        masked[fixed] = cleaned[fixed]
+                        n_replaced += int(fixed.sum())
+                        smoothed, changed = smooth_in_time(masked, times[order], window=time_window,
+                                                           kind=smoothtype, min_points=min_points)
+                        moved = (changed | fixed) & np.isfinite(smoothed)
+                        values[par, chan, order[moved]] = smoothed[moved]
+                        n_smoothed += int((changed & np.isfinite(smoothed)).sum())
+            if n_replaced or n_invalid or n_smoothed:
                 handle.putcol(param_column, values)
                 handle.putcol("FLAG", flags)
                 handle.flush()
@@ -2485,8 +2561,11 @@ class CasaCalibrationOps(CalibrationOps):
             handle.close()
 
         total = values.size
-        logger.info("smooth[{}]: flagged {} non-positive and de-spiked {} of {} solutions "
-                    "(>{:.0f} sigma MAD)", table.cal_type, n_invalid, n_replaced, total, threshold)
+        n_fields = len(np.unique(field_ids))
+        logger.info("smooth[{}]: flagged {} non-positive and de-spiked {} of {} solutions (>{:.0f} sigma MAD); "
+                    "{} smoothed with a {:.0f} s running {} per antenna, subband, polarization and field "
+                    "({} field(s))", table.cal_type, n_invalid, n_replaced, total, threshold, n_smoothed,
+                    time_window, smoothtype, n_fields)
         if n_replaced > 0.1 * total:
             warnings.warn(f"{project_code}: {n_replaced / total:.0%} of the {table.cal_type} "
                           "solutions had to be de-spiked; check the table plot")
@@ -6066,6 +6145,17 @@ class CasaImagingOps(ImagingOps):
                 "integrated_flux": flux, "beam": beam}
 
 
+def _save_read(read: dict, path: str) -> str:
+    """Save the output of a plot reader for a later figure (:meth:`CasaPlotOps.antenna_scan_spectra`)."""
+    import pickle
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    partial = Path(f"{path}.partial")
+    with open(partial, "wb") as handle:
+        pickle.dump(read, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    partial.replace(path)
+    return str(path)
+
+
 class CasaPlotOps(PlotOps):
     """Diagnostic plots rendered from CASA tables with matplotlib."""
 
@@ -6159,33 +6249,61 @@ class CasaPlotOps(PlotOps):
     def spectrum(self, project_code: str, *, field: str = "", scans: Optional[list] = None,
                  refant: str = "", column: str = "corrected", label: str = "",
                  all_pols: bool = False, metadata: Optional[ObsMetadata] = None,
-                 **kwargs) -> list[str]:
-        """Plot amplitude and phase vs frequency on baselines to the reference antenna."""
+                 data_file: Optional[str] = None, model: Optional[list] = None, **kwargs) -> list[str]:
+        """Plot amplitude and phase vs frequency on baselines to the reference antenna.
+
+        With ``data_file`` the spectra are saved there instead (for :meth:`antenna_scan_spectra`) and that
+        path is returned. ``model`` (components) is drawn over the data when the reader computes it.
+        """
         from ..plotting import plot_corrected_spectrum
         spectrum = self.backend.data.read_spectrum(project_code, field=field, scans=scans,
                                                    refant=refant, column=column,
-                                                   all_pols=all_pols, metadata=metadata)
+                                                   all_pols=all_pols, metadata=metadata, model=model)
+        if data_file:
+            return [_save_read(spectrum, data_file)]
         return [str(p) for p in plot_corrected_spectrum(
             spectrum, self.plot_dir(self.category_for_column(column)), project_code, label=label)]
 
     def autocorr(self, project_code: str, *, field: str = "", scans: Optional[list] = None,
                  column: str = "data", label: str = "", metadata: Optional[ObsMetadata] = None,
-                 **kwargs) -> str:
-        """Plot the autocorrelation amplitude spectra (one panel per antenna) for a selection."""
+                 data_file: Optional[str] = None, **kwargs) -> str:
+        """Plot the autocorrelation amplitude spectra (one panel per antenna) for a selection.
+
+        With ``data_file`` the spectra are saved there instead (for :meth:`antenna_scan_spectra`) and that
+        path is returned.
+        """
         from ..plotting import plot_autocorr_spectrum
         spectrum = self.backend.data.read_autocorr_spectrum(project_code, field=field, scans=scans,
                                                             column=column, metadata=metadata)
+        if data_file:
+            return _save_read(spectrum, data_file)
         return str(plot_autocorr_spectrum(spectrum, self.plot_dir(self.category_for_column(column)),
                                           project_code, label=label))
 
+    def antenna_scan_spectra(self, project_code: str, *, kind: str, antenna: str, data_files: list[str],
+                             label: str = "", column: str = "data", **kwargs) -> Optional[str]:
+        """Plot one antenna's spectrum on every diagnostic scan (:func:`~vlbipy.plotting.plot_antenna_scan_spectra`)
+        from the reads :meth:`autocorr` / :meth:`spectrum` saved."""
+        import pickle
+
+        from ..plotting import plot_antenna_scan_spectra
+        entries = []
+        for path in data_files:
+            with open(path, "rb") as handle:
+                entries.append(pickle.load(handle))
+        outfile = plot_antenna_scan_spectra(entries, antenna, kind, self.plot_dir(self.category_for_column(column)),
+                                            project_code, label=label)
+        return str(outfile) if outfile is not None else None
+
     def radplot(self, project_code: str, *, field: str = "", column: str = "corrected",
                 time_bin: float = 10.0, label: str = "", with_model: bool = False,
-                metadata: Optional[ObsMetadata] = None, **kwargs) -> str:
-        """Plot amplitude and phase vs uv distance for one source (model overlaid when asked)."""
+                metadata: Optional[ObsMetadata] = None, model: Optional[list] = None, **kwargs) -> str:
+        """Plot amplitude and phase vs uv distance for one source (model overlaid when asked: the components
+        of ``model``, else the MODEL_DATA column)."""
         from ..plotting import plot_radplot
         uvdata = self.backend.data.read_uvdistance(project_code, field=field, column=column,
                                                    time_bin=time_bin, with_model=with_model,
-                                                   metadata=metadata)
+                                                   metadata=metadata, model=model)
         return str(plot_radplot(uvdata, self.plot_dir(self.category_for_column(column)),
                                 project_code, label=label))
 

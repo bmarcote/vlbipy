@@ -27,7 +27,7 @@ from loguru import logger
 
 # The thresholds shared with the general comments are defined once, in vlbipy.comments.
 from .comments import (FRINGE_DETECTION_SNR, GAIN_BAD_DEVIATION, GAIN_DECIMALS, GAIN_WARN_DEVIATION,
-                       NO_DATA_FLAGGED_FRACTION, build_comments, group_comments, load_run_warnings)
+                       NO_DATA_FLAGGED_FRACTION, build_comments, format_flux, group_comments, load_run_warnings)
 
 #: (file stem, tab title) in display order. ``index`` is the overview.
 PAGES: list[tuple[str, str]] = [("index", "Overview"), ("diagnostics", "Diagnostics"),
@@ -58,10 +58,14 @@ GAIN_CELL_CLASSES: list[tuple[float, str]] = [(GAIN_WARN_DEVIATION, "gain-good")
 COMMENT_CHIP_CLASSES: dict[str, str] = {"problem": "crit", "warning": "warn", "note": "mut"}
 
 #: Diagnostics sub-tabs: glob patterns relative to <work_dir>/plots.
-AUTOCORR_PATTERNS: list[str] = ["raw/*_scan*.autocorr.png"]
-CROSSCORR_PATTERNS: list[str] = ["raw/*_scan*.spectrum.png"]
+#: ``<code>.raw_ant<ANT>.<kind>.png`` (one figure per antenna, a panel per scan); ``..._scan<N>...`` from older runs.
+AUTOCORR_PATTERNS: list[str] = ["raw/*_ant*.autocorr.png", "raw/*_scan*.autocorr.png"]
+CROSSCORR_PATTERNS: list[str] = ["raw/*_ant*.spectrum.png", "raw/*_scan*.spectrum.png"]
 #: ``<code>.raw.time_evolution.ref<ANT>.spw<N>.png``: one figure per reference antenna and subband.
 TIME_EVOLUTION_PATTERNS: list[str] = ["raw/*.time_evolution.*.png"]
+
+#: Title of the calibration group of the fringe-SNR matrices, which are shown in one sub-tab per source.
+SNR_SURVEY_TITLE = "Fringe-SNR survey"
 
 #: Calibration-table plot groups: (title, blurb, glob patterns relative to <work_dir>/plots).
 CALIBRATION_GROUPS: list[tuple[str, str, list[str]]] = [
@@ -78,7 +82,8 @@ CALIBRATION_GROUPS: list[tuple[str, str, list[str]]] = [
      ["caltables/*.mbd.*.png", "caltables/*.mbd2.*.png",
       "caltables/*.mbd_smooth.*.png", "caltables/*.mbd2_smooth.*.png"]),
     ("Scalar bandpass", "One amplitude level per antenna and subband.", ["caltables/*scalar_bp*amp*.png"]),
-    ("Fringe-SNR survey", "Scan x antenna fringe SNR on the calibrators.", ["raw/*snr_matrix*.png"]),
+    (SNR_SURVEY_TITLE, "Scan x antenna fringe SNR, one sub-tab per source: only the scans of that source, one after "
+     "the other, on a colour scale shared by all the sources.", ["raw/*snr_matrix*.png"]),
     ("Calibrator amplitude and phase", "Calibrated amplitude and phase versus frequency and time for every fringe finder, phase calibrator and check source.",
      ["calibrated/*.calibrated_*.spectrum.png", "calibrated/*.calibrated_*.timeseries.png"]),
     ("Subband phase jumps", "Phase of every subband relative to the first, per calibrator scan and baseline to the reference antenna.",
@@ -88,11 +93,14 @@ CALIBRATION_GROUPS: list[tuple[str, str, list[str]]] = [
 #: Final-data plot groups: (title, blurb, glob patterns, fallback patterns).
 FINAL_GROUPS: list[tuple[str, str, list[str], list[str]]] = [
     ("UV coverage", "uv-plane sampling per source.", ["raw/*uv_coverage*.png"], []),
-    ("Amplitude/phase vs uv distance", "Calibrated visibilities vs baseline length; the model is drawn as a line.",
+    ("Amplitude/phase vs uv distance", "Calibrated visibilities vs baseline length; the source model, averaged "
+     "like the data, is the grey dashed line (its phases the grey points).",
      ["calibrated/*.final.radplot.*.png"], ["calibrated/*.calibrated.radplot.*.png"]),
-    ("Calibrated spectrum", "Amplitude and phase vs frequency on baselines to the reference antenna.",
+    ("Calibrated spectrum", "Amplitude and phase vs frequency on baselines to the reference antenna; the grey dashed "
+     "line is what the source model predicts for the same average.",
      ["calibrated/*final_*.spectrum.png"], ["calibrated/*.calibrated.spectrum.png"]),
-    ("Light curve per baseline", "Amplitude and phase vs time per baseline.",
+    ("Light curve per baseline", "Amplitude and phase vs time per baseline; the grey dashed line is what the source "
+     "model predicts for the same average.",
      ["calibrated/*final_*.timeseries.png"], ["calibrated/*calibrated_*.timeseries.png"]),
     ("Total-amplitude light curve", "Coherent sum of all baselines at several time averagings.",
      ["calibrated/*lightcurve*.png"], []),
@@ -251,6 +259,22 @@ def scan_number_from_name(path: Path) -> Optional[int]:
     return int(match.group(1)) if match else None
 
 
+def antenna_figure_key(path: Path) -> Optional[str]:
+    """Antenna of a per-antenna diagnostic figure (:func:`vlbipy.plotting.antenna_scan_filename`), else None."""
+    match = re.search(r"_ant([A-Za-z0-9_+-]+)\.(?:autocorr|spectrum)\.png$", path.name)
+    return match.group(1) if match else None
+
+
+def snr_matrix_key(path: Path) -> tuple[str, str]:
+    """``(source, polarization)`` of an SNR-matrix file (:func:`vlbipy.plotting.snr_matrix_filename`).
+
+    The source is ``""`` for the single all-source matrix of older runs (``<code>.snr_matrix.<pol>.png``).
+    """
+    tail = path.name.split(".snr_matrix.", 1)[-1].removesuffix(".png")
+    source, _, polarization = tail.rpartition(".")
+    return source, polarization
+
+
 def time_evolution_key(path: Path) -> Optional[tuple[str, int]]:
     """Reference antenna and subband encoded as ``.time_evolution.ref<ANT>.spw<N>.png`` (None when absent)."""
     match = re.search(r"\.time_evolution\.ref([^.]+)\.spw(\d+)\.png$", path.name)
@@ -265,6 +289,20 @@ def _primary_observation(obs):
         return obs
     primary = obs._primary
     return primary() if callable(primary) else primary
+
+
+def geodetic_position(position) -> tuple[Optional[float], Optional[float]]:
+    """``(latitude, longitude)`` in degrees (WGS84) of an ITRF position in metres; ``(None, None)`` when unknown."""
+    try:
+        x, y, z = (float(v) for v in position)
+    except (TypeError, ValueError):
+        return None, None
+    if not all(math.isfinite(v) for v in (x, y, z)) or math.hypot(x, y, z) < 1e6:
+        return None, None
+    from astropy.coordinates import EarthLocation
+    import astropy.units as u
+    geodetic = EarthLocation.from_geocentric(x, y, z, unit=u.m).to_geodetic()
+    return float(geodetic.lat.deg), float(geodetic.lon.deg)
 
 
 def _source_rows(observation, metadata) -> list[dict]:
@@ -818,7 +856,8 @@ def _source_results(work_dir: Path, project_code: str, sources: list[dict]) -> l
         ``{"source", "role", "search", "images"}`` per source that has either: ``search`` is None or a dict
         with ``detected``, ``recentred`` (bool) and ``snr``, ``peak``, ``rms``, ``fov_mas``, ``offset_mas``,
         ``offset_beams`` (float or None); ``images`` is a list of ``{"robust", "peak", "rms",
-        "dynamic_range"}`` ordered by robust.
+        "dynamic_range", "model_flux"}`` ordered by robust: from the self-calibration report of a calibrator,
+        else from the search record of the final imaging (``images/<code>_<source>.search.json``).
     """
     results = []
     for source in sources:
@@ -832,11 +871,13 @@ def _source_results(work_dir: Path, project_code: str, sources: list[dict]) -> l
                       **{key: _finite_or_none(search.get(key)) for key in numbers}}
         else:
             search = None
-        recorded = report.get("images") if isinstance(report.get("images"), dict) else {}
+        # Calibrators are imaged by the self-calibration, the other sources by the final imaging step.
+        recorded = next((images for images in (report.get("images"), found.get("images"))
+                         if isinstance(images, dict) and images), {})
         measured = [info for info in recorded.values()
                     if isinstance(info, dict) and _finite_or_none(info.get("peak")) is not None]
-        images = [{key: _finite_or_none(info.get(key)) for key in ("robust", "peak", "rms", "dynamic_range")}
-                  for info in measured]
+        images = [{key: _finite_or_none(info.get(key))
+                   for key in ("robust", "peak", "rms", "dynamic_range", "model_flux")} for info in measured]
         if search is None and not images:
             continue
         results.append({"source": name, "role": source.get("type", "other"), "search": search,
@@ -887,7 +928,11 @@ def collect(obs, *, flag_statistics: Optional[dict] = None) -> dict:
     antennas = []
     for ant_id, (name, ant) in enumerate((metadata.antennas if metadata else {}).items()):
         ant_stats = (stats.get("antenna", {}).get(name) or {}) if stats else {}
+        latitude, longitude = geodetic_position(getattr(ant, "position", None))
         antennas.append({"id": ant_id, "name": name, "observed": bool(ant.observed),
+                         "fullname": str(getattr(ant, "fullname", "") or ""),
+                         "diameter": _finite_or_none(getattr(ant, "diameter", None)),
+                         "lat_deg": latitude, "lon_deg": longitude,
                          "subbands": list(ant.subbands or ()), "n_scans": int(ant.n_scans or 0),
                          "flagged": _finite_or_none(ant_stats.get("flagged")),
                          "observable": _finite_or_none(ant_stats.get("observable")),
@@ -956,11 +1001,11 @@ def collect(obs, *, flag_statistics: Optional[dict] = None) -> dict:
 CSS = """
 :root{--ground:#f5f8fa;--panel:#fff;--panel2:#eef3f6;--border:#d7e0e6;--ink:#15222c;--muted:#5b6b78;
   --accent:#0c8f96;--accent-ink:#0a6b70;--good:#158a63;--warn:#a5741a;--crit:#c0384a;--mid:#c9a400;--role-ff:#c0303f;--role-pc:#2463c9;--role-tg:#d2690f;
-  --role-cs:#7a55c2;--role-pl:#c2468a;
+  --role-cs:#7a55c2;--role-pl:#c2468a;--land:#d2dce2;--land-edge:#b3c2cb;--offant:#f2a3ae;
   --shadow:0 1px 2px rgba(20,40,55,.06),0 8px 24px rgba(20,40,55,.06)}
 :root[data-theme="dark"]{--ground:#080d12;--panel:#101922;--panel2:#0b141c;--border:#1d2b37;--ink:#d9e6ee;
   --muted:#7f94a3;--accent:#37d3d9;--accent-ink:#8ff0f3;--good:#3ad39a;--warn:#e7b755;--crit:#e5586b;--mid:#e8d64b;--role-ff:#ff6b7a;--role-pc:#6aa5ff;--role-tg:#ffa24a;
-  --role-cs:#b9a0ff;--role-pl:#ff8ec4;
+  --role-cs:#b9a0ff;--role-pl:#ff8ec4;--land:#1c2a35;--land-edge:#2c3d4a;--offant:#ff9aa8;
   --shadow:0 1px 0 rgba(0,0,0,.4),0 12px 32px rgba(0,0,0,.35)}
 *{box-sizing:border-box}
 body{margin:0;background:var(--ground);color:var(--ink);line-height:1.5;
@@ -1008,6 +1053,65 @@ section:first-of-type{border-top:0;padding-top:8px}
 .fact .k{font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
 .fact .v{font-size:15px;font-weight:600;margin-top:2px}
 .tablewrap{overflow-x:auto;border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow);margin-top:8px}
+.tablewrap.compact{display:inline-block;max-width:100%;vertical-align:top}
+.tablewrap.compact table{width:auto}
+.split{display:flex;flex-wrap:wrap;gap:18px;align-items:flex-start}
+.split-main{flex:1 1 520px;min-width:0}
+.split-side{flex:0 1 400px;min-width:min(100%,280px);max-width:520px;margin-top:8px}
+.split-side .skymap{max-width:none;margin:0}
+tr.hl td{background:var(--panel2);background:color-mix(in srgb,var(--accent) 14%,transparent)}
+.worldmap{margin:0;position:relative;background:var(--panel);border:1px solid var(--border);border-radius:12px;
+  overflow:hidden;box-shadow:var(--shadow)}
+.worldmap svg{display:block;width:100%;height:auto;aspect-ratio:1/1;background:var(--panel2);cursor:grab;touch-action:none}
+.worldmap svg.dragging{cursor:grabbing}
+.worldmap .ocean{fill:var(--panel2)}
+.worldmap .land{fill:var(--land);stroke:var(--land-edge);stroke-width:.7px}
+.worldmap .grat{stroke:var(--border);stroke-width:.6px}
+.worldmap .ant circle{stroke:var(--panel);stroke-width:1.3px;vector-effect:non-scaling-stroke}
+.worldmap .ant.ok circle{fill:var(--accent)}
+.worldmap .ant.off circle{fill:var(--offant)}
+.worldmap .ant text{fill:var(--ink);font-weight:600;paint-order:stroke;stroke:var(--panel2);stroke-width:.28em;
+  stroke-linejoin:round;font-family:ui-monospace,Menlo,monospace}
+.worldmap .ant.off text{fill:var(--muted)}
+.worldmap .ant.hl circle{stroke:var(--ink);stroke-width:2.5px}
+.worldmap .ant.hl text{fill:var(--accent-ink)}
+.worldmap figcaption{padding:8px 12px}
+.worldmap figcaption .d{color:var(--muted);font-size:12px}
+.mapbar{position:absolute;top:8px;right:8px;display:flex;gap:4px;z-index:1}
+.mapbar button{border:1px solid var(--border);background:var(--panel);color:var(--ink);border-radius:6px;padding:3px 10px;
+  font-size:12px;cursor:pointer}
+.mapbar button.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+.legend .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin:0 2px 0 6px;vertical-align:-1px}
+.legend .dot.ok{background:var(--accent)} .legend .dot.off{background:var(--offant)}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(270px,100%),1fr));gap:12px;margin-top:10px}
+.card{border:1px solid var(--border);border-radius:12px;padding:12px 15px 13px;background:var(--panel);
+  box-shadow:var(--shadow);display:flex;flex-direction:column;gap:3px;min-width:0}
+.card .kicker{display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:10.5px;
+  letter-spacing:.12em;text-transform:uppercase;color:var(--muted);font-weight:700}
+.card .kicker .chip{letter-spacing:.04em;margin:0}
+.card .big{font-size:34px;font-weight:700;line-height:1.15;font-variant-numeric:tabular-nums;margin-top:2px}
+.card .big.word{font-size:22px}
+.card .big .unit{font-size:15px;font-weight:600;color:var(--muted);margin:0 2px}
+.card .sub{color:var(--muted);font-size:12.5px}
+.card .srctitle{font-size:15px;margin:2px 0}
+.card .text{margin:6px 0 0;font-size:12.5px;color:var(--muted);line-height:1.45}
+.card .kv{display:grid;grid-template-columns:auto 1fr;gap:2px 12px;margin:6px 0 0;font-size:12.5px}
+.card .kv dt{color:var(--muted)}
+.card .kv dd{margin:0;font-weight:600;min-width:0}
+.card .muted{color:var(--muted);font-weight:400}
+.card.note{background:var(--panel);background:color-mix(in srgb,var(--accent) 6%,var(--panel));
+  border-color:var(--border);border-color:color-mix(in srgb,var(--accent) 30%,var(--border))}
+.card.note .kicker{color:var(--accent-ink)}
+.card.warning{background:var(--panel2);background:color-mix(in srgb,var(--warn) 13%,var(--panel));
+  border-color:var(--warn);border-color:color-mix(in srgb,var(--warn) 55%,var(--border));
+  color:var(--warn);color:color-mix(in srgb,var(--warn) 50%,var(--ink))}
+.card.warning .kicker,.card.warning .big{color:var(--warn)}
+.card.problem{background:var(--panel2);background:color-mix(in srgb,var(--crit) 12%,var(--panel));
+  border-color:var(--crit);border-color:color-mix(in srgb,var(--crit) 55%,var(--border));
+  color:var(--crit);color:color-mix(in srgb,var(--crit) 50%,var(--ink))}
+.card.problem .kicker,.card.problem .big{color:var(--crit)}
+.card.warning .text,.card.problem .text,.card.warning .sub,.card.problem .sub,.card.warning .kv dt,
+.card.problem .kv dt{color:inherit;opacity:.85}
 table{border-collapse:collapse;width:100%;font-size:13.5px}
 th,td{text-align:left;padding:7px 12px;white-space:nowrap;vertical-align:middle}
 thead th{background:var(--panel2);color:var(--muted);font-weight:600;font-size:11px;letter-spacing:.08em;
@@ -1046,10 +1150,10 @@ td.num{font-variant-numeric:tabular-nums;text-align:right}
 .badge.checksource{background:var(--panel2);background:color-mix(in srgb,var(--role-cs) 20%,transparent);color:var(--role-cs)}
 .badge.polcal{background:var(--panel2);background:color-mix(in srgb,var(--role-pl) 20%,transparent);color:var(--role-pl)}
 .badge.other{background:var(--panel2);color:var(--muted)}
-.sbbar{display:inline-flex;gap:2px;height:10px;width:160px;vertical-align:middle}
+.sbbar{display:inline-flex;gap:2px;height:10px;width:120px;vertical-align:middle}
 .sbbar i{flex:1;border-radius:2px;background:var(--panel2);border:1px solid var(--border)}
 .sbbar i.on{background:var(--accent);border-color:var(--accent)}
-.hbar{position:relative;display:inline-block;width:120px;height:9px;border-radius:5px;background:var(--panel2);
+.hbar{position:relative;display:inline-block;width:90px;height:9px;border-radius:5px;background:var(--panel2);
   overflow:hidden;vertical-align:middle}
 .hbar>i{position:absolute;top:0;left:0;bottom:0;border-radius:5px}
 .hbar>i.good{background:var(--good)} .hbar>i.warn{background:var(--warn)} .hbar>i.crit{background:var(--crit)}
@@ -1141,10 +1245,35 @@ document.querySelectorAll('.subtabs').forEach(group=>{
   group.addEventListener('click',e=>{
     const btn=e.target.closest('button');if(!btn||!group.contains(btn))return;
     const wrap=group.closest('.subtabs-wrap')||group.parentElement;
-    wrap.querySelectorAll('.subtabs button').forEach(b=>b.classList.toggle('active',b===btn));
-    wrap.querySelectorAll('.subpanel').forEach(p=>{
+    wrap.querySelectorAll(':scope>.subtabs button').forEach(b=>b.classList.toggle('active',b===btn));
+    wrap.querySelectorAll(':scope>.subpanel').forEach(p=>{
       const on=p.id===btn.dataset.panel;p.classList.toggle('active',on);
       if(on)vlbipyShowPanel(p);});});});
+document.querySelectorAll('.worldmap').forEach(function(fig){
+  const svg=fig.querySelector('svg'),ants=svg&&svg.querySelector('.ants');if(!ants)return;
+  const parse=s=>s.split(' ').map(Number),views={array:parse(svg.dataset.array),world:parse(svg.dataset.world)};
+  const font=+ants.dataset.font,radius=+ants.dataset.r,base=views.array[2];let vb=views.array.slice(),drag=null;
+  function show(){svg.setAttribute('viewBox',vb.join(' '));const k=vb[2]/base;ants.setAttribute('font-size',font*k);
+    ants.querySelectorAll('circle').forEach(c=>c.setAttribute('r',radius*k));}
+  function setView(name){vb=views[name].slice();
+    fig.querySelectorAll('.mapbar button').forEach(b=>b.classList.toggle('active',b.dataset.view===name));show();}
+  fig.querySelectorAll('.mapbar button').forEach(b=>b.addEventListener('click',()=>setView(b.dataset.view)));
+  function scale(){const r=svg.getBoundingClientRect();return Math.max(vb[2]/r.width,vb[3]/r.height);}
+  svg.addEventListener('wheel',e=>{e.preventDefault();const r=svg.getBoundingClientRect(),k=scale();
+    const ux=vb[0]+(vb[2]-r.width*k)/2+(e.clientX-r.left)*k,uy=vb[1]+(vb[3]-r.height*k)/2+(e.clientY-r.top)*k;
+    const f=Math.min(4,Math.max(0.25,Math.exp(e.deltaY*0.0015))),w=Math.min(720,Math.max(1,vb[2]*f)),s=w/vb[2];
+    vb=[ux-(ux-vb[0])*s,uy-(uy-vb[1])*s,w,vb[3]*s];
+    fig.querySelectorAll('.mapbar button').forEach(b=>b.classList.remove('active'));show();},{passive:false});
+  svg.addEventListener('pointerdown',e=>{drag={x:e.clientX,y:e.clientY,vb:vb.slice(),k:scale()};
+    svg.setPointerCapture(e.pointerId);svg.classList.add('dragging');});
+  svg.addEventListener('pointermove',e=>{if(!drag)return;
+    vb=[drag.vb[0]-(e.clientX-drag.x)*drag.k,drag.vb[1]-(e.clientY-drag.y)*drag.k,drag.vb[2],drag.vb[3]];show();});
+  ['pointerup','pointercancel'].forEach(t=>svg.addEventListener(t,()=>{drag=null;svg.classList.remove('dragging');}));
+  const rows=[...document.querySelectorAll('tr[data-ant]')],marks=[...fig.querySelectorAll('.ant')];
+  function mark(name,on){marks.concat(rows).forEach(el=>{if(el.dataset.ant===name)el.classList.toggle('hl',on);});}
+  marks.concat(rows).forEach(el=>{el.addEventListener('mouseenter',()=>mark(el.dataset.ant,true));
+    el.addEventListener('mouseleave',()=>mark(el.dataset.ant,false));});
+  setView('array');});
 const stored=vlbipyStorageGet('vlbipy-theme');
 if(stored)document.documentElement.setAttribute('data-theme',stored);
 else if(matchMedia('(prefers-color-scheme:dark)').matches)document.documentElement.setAttribute('data-theme','dark');
@@ -1177,10 +1306,11 @@ def _section(anchor: str, title: str, body: str, blurb: str = "", count: str = "
     return f'<section id="{anchor}"><h2>{escape(title)}{badge}</h2>{sub}{body}</section>'
 
 
-def _table(headers: list[str], rows: list[str]) -> str:
-    """HTML table from header labels and pre-rendered ``<tr>`` rows."""
+def _table(headers: list[str], rows: list[str], compact: bool = False) -> str:
+    """HTML table from header labels and pre-rendered ``<tr>`` rows; ``compact`` sizes it to its content."""
     head = "".join(f"<th>{escape(h)}</th>" for h in headers)
-    return f'<div class="tablewrap"><table><thead><tr>{head}</tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
+    wrap = "tablewrap compact" if compact else "tablewrap"
+    return f'<div class="{wrap}"><table><thead><tr>{head}</tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
 
 
 def _panel_ids(prefix: str, names: list[str]) -> list[str]:
@@ -1264,34 +1394,34 @@ def _comment_item(comment: dict) -> str:
 
 
 def _comment_count(comments: Optional[list]) -> str:
-    """Tally of the comments per severity for the section heading, e.g. ``"1 problem(s) · 4 warning(s)"``.
+    """Tally of the antenna and pipeline comments per severity for the section heading, e.g.
+    ``"1 problem(s) · 4 warning(s)"``.
 
     The closing line of the antenna group ("Nothing to report for ...") is not a finding and is left out.
     """
-    findings = [c for c in comments or [] if c.get("category") != "antenna" or c.get("antenna")]
+    findings = [c for c in comments or [] if c.get("category") in ("antenna", "pipeline")
+                and (c.get("category") != "antenna" or c.get("antenna"))]
     tally = [(sum(1 for c in findings if c.get("severity") == severity), severity) for severity in COMMENT_CHIP_CLASSES]
     return " · ".join(f"{count} {severity}(s)" for count, severity in tally if count)
 
 
 def _comments_section(ctx: dict) -> str:
-    """Body of the "General comments" section of the Overview page.
+    """Body of the "Comments" section of the Overview page.
 
-    Renders ``ctx["comments"]`` (:func:`vlbipy.comments.build_comments`) grouped as the plain-text block of
-    ``summary.md`` is: calibration and results, one block per antenna with something to say (closed by the
-    line naming the antennas with nothing to report), then the warnings the pipeline raised. A context
-    saved before the comments existed has no such key and gets a notice instead.
+    Renders the antenna and pipeline part of ``ctx["comments"]`` (:func:`vlbipy.comments.build_comments`) as
+    ``summary.md`` lists them: one block per antenna with something to say (closed by the line naming the
+    antennas with nothing to report), then the warnings the pipeline raised. The calibration and result
+    comments are the boxes of their own sections (:func:`_calibration_section`, :func:`_results_section`). A
+    context saved before the comments existed has no such key and gets a notice instead.
     """
     comments = ctx.get("comments")
     if comments is None:
         return ('<p class="empty">This report was collected before the general comments existed; '
                 'rebuild it with <code>vlbipy report</code>.</p>')
     groups = group_comments(comments)
-    if not any(groups.values()):
+    if not any(groups[key] for key in ("antennas", "antenna_notes", "pipeline")):
         return '<p class="empty">Nothing to report.</p>'
     parts = []
-    if groups["general"]:
-        items = "".join(_comment_item(comment) for comment in groups["general"])
-        parts.append(f'<h3>Calibration and results</h3><ul class="comments">{items}</ul>')
     if groups["antennas"] or groups["antenna_notes"]:
         parts.append("<h3>Antennas</h3>")
         for name, antenna_comments in groups["antennas"]:
@@ -1461,6 +1591,237 @@ def _sky_map(sources: list[dict]) -> str:
             f'<figcaption>{legend}<div class="d">{escape(caption)}</div></figcaption></figure>')
 
 
+#: Smallest and largest side (degrees) of the square the antenna map opens on, and the margin around the array
+#: as a fraction of its extent.
+ANTENNA_MAP_MIN_SPAN_DEG = 24.0
+ANTENNA_MAP_MAX_SPAN_DEG = 180.0
+ANTENNA_MAP_MARGIN = 0.3
+#: Size (pixels) the label placement of the antenna map assumes for the map, and the font size it assumes.
+ANTENNA_MAP_PIXELS = 400.0
+ANTENNA_MAP_FONT_PX = 11.0
+
+
+def _world_land_path() -> str:
+    """SVG path of the land masses in the map's equirectangular frame (see ``data/world_land.json``)."""
+    global _WORLD_LAND
+    if _WORLD_LAND is None:
+        try:
+            _WORLD_LAND = json.loads((Path(__file__).parent / "data" / "world_land.json").read_text())["path"]
+        except (OSError, ValueError, KeyError) as exc:
+            logger.debug("dashboard: no world outline ({})", exc)
+            _WORLD_LAND = ""
+    return _WORLD_LAND
+
+
+_WORLD_LAND: Optional[str] = None
+
+
+def _unwrapped_longitudes(longitudes: list[float]) -> list[float]:
+    """Longitudes shifted by whole turns so that the array is contiguous: the largest gap between antennas
+    (around the globe) is where the map is cut, so an array across the date line stays in one piece."""
+    order = sorted(longitudes)
+    gaps = [(order[(i + 1) % len(order)] - order[i]) % 360.0 for i in range(len(order))]
+    start = order[(max(range(len(gaps)), key=gaps.__getitem__) + 1) % len(order)] if len(order) > 1 else order[0]
+    return [start + (lon - start) % 360.0 for lon in longitudes]
+
+
+def antenna_map_status(antenna: dict) -> str:
+    """``"ok"`` for an antenna with usable data, ``"off"`` for one without (no data, or everything flagged)."""
+    fraction = antenna.get("flagged_fraction")
+    if not antenna.get("observed", True) or (fraction is not None and fraction >= NO_DATA_FLAGGED_FRACTION):
+        return "off"
+    return "ok"
+
+
+def _antenna_map(antennas: list[dict]) -> str:
+    """Interactive SVG world map of the antenna positions (empty when no antenna has a known position).
+
+    An equirectangular map in a square frame that opens on the array; the land is drawn three times, a turn
+    apart, so panning never runs off its edge. Antennas with usable data are drawn in the accent colour, the
+    others (no data, or everything flagged) in light red. Without JavaScript it is a static map; with it the
+    wheel zooms, a drag pans, the buttons switch between the array and the whole world, and pointing at an
+    antenna highlights its row of the table (and the other way round).
+    """
+    placed = [a for a in antennas if isinstance(a.get("lat_deg"), (int, float)) and isinstance(a.get("lon_deg"), (int, float))]
+    land = _world_land_path()
+    if not placed:
+        return ""
+    xs = [lon + 180.0 for lon in _unwrapped_longitudes([a["lon_deg"] for a in placed])]
+    ys = [90.0 - a["lat_deg"] for a in placed]
+    span = max(max(xs) - min(xs), max(ys) - min(ys))
+    size = min(ANTENNA_MAP_MAX_SPAN_DEG, max(ANTENNA_MAP_MIN_SPAN_DEG, span * (1.0 + 2.0 * ANTENNA_MAP_MARGIN)))
+    cx, cy = (max(xs) + min(xs)) / 2.0, (max(ys) + min(ys)) / 2.0
+    top = min(max(cy - size / 2.0, 0.0), max(0.0, 180.0 - size))
+    array_view = (cx - size / 2.0, top, size, size)
+    world_view = (cx - 180.0, 0.0, 360.0, 180.0)
+    scale = ANTENNA_MAP_PIXELS / size                                # pixels per degree in the opening view
+    pixels = [((x - array_view[0]) * scale, (y - array_view[1]) * scale) for x, y in zip(xs, ys)]
+    labels = _sky_map_labels([a["name"] for a in placed], pixels, ANTENNA_MAP_PIXELS * 0.72)
+    font, radius = ANTENNA_MAP_FONT_PX / scale, 4.5 / scale
+
+    def view(box) -> str:
+        return " ".join(f"{v:.3f}" for v in box)
+
+    parts = ['<rect class="ocean" x="-360" y="0" width="1440" height="180"/>']
+    if land:
+        parts.append(f'<path id="vlbipy-land" class="land" d="{land}" vector-effect="non-scaling-stroke"/>')
+        parts += [f'<use href="#vlbipy-land" x="{offset}"/>' for offset in (-360, 360)]
+    for lon in range(-360, 1081, 30):
+        parts.append(f'<line class="grat" x1="{lon}" y1="0" x2="{lon}" y2="180" vector-effect="non-scaling-stroke"/>')
+    for lat in range(30, 180, 30):
+        parts.append(f'<line class="grat" x1="-360" y1="{lat}" x2="1080" y2="{lat}" vector-effect="non-scaling-stroke"/>')
+    markers = []
+    for antenna, x, y, (px, py), (lx, ly, anchor) in zip(placed, xs, ys, pixels, labels):
+        status = antenna_map_status(antenna)
+        name = str(antenna["name"])
+        where = f'{abs(antenna["lat_deg"]):.2f}°{"N" if antenna["lat_deg"] >= 0 else "S"}, ' \
+                f'{abs(antenna["lon_deg"]):.2f}°{"E" if antenna["lon_deg"] >= 0 else "W"}'
+        state = "observed" if status == "ok" else ("no data" if not antenna.get("observed", True)
+                                                    else "no usable signal")
+        full = f' ({antenna["fullname"]})' if antenna.get("fullname") and antenna["fullname"] != name else ""
+        tip = f"{name}{full}: {where}; {state}"
+        dx, dy = (lx - px) / ANTENNA_MAP_FONT_PX, (ly - py) / ANTENNA_MAP_FONT_PX
+        markers.append(f'<g class="ant {status}" data-ant="{escape(name, quote=True)}"><title>{escape(tip)}</title>'
+                       f'<circle cx="{x:.3f}" cy="{y:.3f}" r="{radius:.4f}"/>'
+                       f'<text x="{x:.3f}" y="{y:.3f}" dx="{dx:.2f}em" dy="{dy:.2f}em" text-anchor="{anchor}">'
+                       f'{escape(name)}</text></g>')
+    parts.append(f'<g class="ants" font-size="{font:.4f}" data-font="{font:.4f}" data-r="{radius:.4f}">'
+                 + "".join(markers) + "</g>")
+    n_off = sum(1 for a in placed if antenna_map_status(a) == "off")
+    legend = ('<div class="legend"><span class="dot ok"></span>observed'
+              + ('<span class="dot off"></span>no data / no usable signal' if n_off else "") + "</div>")
+    buttons = ('<div class="mapbar"><button type="button" data-view="array">Array</button>'
+               '<button type="button" data-view="world">World</button></div>')
+    return (f'<figure class="worldmap">{buttons}<svg viewBox="{view(array_view)}" data-array="{view(array_view)}" '
+            f'data-world="{view(world_view)}" preserveAspectRatio="xMidYMid meet" role="img" '
+            f'aria-label="Positions of the antennas on Earth">{"".join(parts)}</svg>'
+            f'<figcaption>{legend}<div class="d">Antenna positions (equirectangular). Scroll to zoom, drag to '
+            'pan; point at an antenna to find it in the table.</div></figcaption></figure>')
+
+
+def _side_by_side(main: str, side: str) -> str:
+    """A table with a figure in a square column on its right; one above the other when the page is narrow."""
+    if not side:
+        return main
+    return f'<div class="split"><div class="split-main">{main}</div><div class="split-side">{side}</div></div>'
+
+
+#: Labels of the comment severities on the boxes of the Overview page.
+CARD_SEVERITY_LABELS = {"problem": "error", "warning": "warning", "note": ""}
+
+
+def _card(severity: str, kicker: str, body: str, extra: str = "") -> str:
+    """One box of the Calibration / Results sections, coloured by severity (note, warning, problem)."""
+    severity = severity if severity in CARD_SEVERITY_LABELS else "note"
+    label = CARD_SEVERITY_LABELS[severity]
+    chip = f'<span class="chip {COMMENT_CHIP_CLASSES[severity]}">{label}</span>' if label else ""
+    return (f'<div class="card {severity}{(" " + extra) if extra else ""}"><div class="kicker">'
+            f'<span>{kicker}</span>{chip}</div>{body}</div>')
+
+
+def _key_values(pairs: list[tuple[str, str]]) -> str:
+    """A small two-column list of ``(label, value as HTML)`` rows (empty values left out)."""
+    rows = "".join(f"<dt>{escape(k)}</dt><dd>{v}</dd>" for k, v in pairs if v)
+    return f'<dl class="kv">{rows}</dl>' if rows else ""
+
+
+def _source_chip(name: str, role: str) -> str:
+    """Source name with its role badge."""
+    badge = f'<span class="badge {escape(role or "other", quote=True)}">{escape(role or "other")}</span>'
+    return f'<span class="srcchip">{badge} <b>{escape(name)}</b></span>' if name else ""
+
+
+def _calibration_card(comment: dict, roles: dict) -> str:
+    """The box of one calibration comment: big number and key facts when the comment carries them; ``roles``
+    (``{source: role}``) gives the sources their badge."""
+    data, severity, text = comment.get("data") or {}, comment.get("severity", "note"), str(comment.get("text", ""))
+    kind = data.get("kind")
+    if kind == "flagging":
+        fraction = _finite_or_none(data.get("fraction"))
+        without = _finite_or_none(data.get("without"))
+        excluded = ", ".join(data.get("excluded") or [])
+        body = (f'<div class="big">{100 * fraction:.1f}<span class="unit">%</span></div>'
+                '<div class="sub">of the cross-correlation data flagged</div>'
+                + _key_values([("Without dead antennas",
+                                f"{100 * without:.1f}% <span class=\"muted\">(excluding {escape(excluded)})</span>"
+                                if without is not None else "")]))
+        return _card(severity, "Flagged data", body)
+    if kind == "instrumental_delay":
+        stage = int(data.get("stage") or 1)
+        kicker = "Instrumental delay" + (f" · stage {stage}" if stage > 1 else "")
+        body = (f'<div class="big"><span class="unit">scan</span> {escape(str(data.get("scan", "?")))}</div>'
+                f'<div class="sub">{_source_chip(str(data.get("source") or ""), roles.get(data.get("source"), ""))}</div>'
+                + _key_values([("Reference antenna", f'<span class="mono">{escape(str(data.get("refant") or "-"))}</span>'),
+                               ("Applied to", f'<span class="mono">{escape(str(data.get("antennas") or "-"))}</span>')])
+                + f'<p class="text">{escape(text)}</p>')
+        return _card(severity, kicker, body)
+    if kind == "selfcal":
+        source = str(data.get("source") or "")
+        sentence = text.removeprefix(f"Amplitude self-calibration of {source}: ")
+        sentence = sentence[:1].upper() + sentence[1:]
+        return _card(severity, "Amplitude self-calibration",
+                     f'<div class="sub">{_source_chip(source, roles.get(source, ""))}</div>'
+                     f'<p class="text">{escape(sentence)}</p>')
+    if kind == "table":
+        snr = _finite_or_none(data.get("snr"))
+        body = ((f'<div class="big">{snr:.1f}</div><div class="sub">median solution SNR</div>' if snr is not None else "")
+                + f'<p class="text">{escape(text)}</p>')
+        return _card(severity, f'Calibration table · {escape(str(data.get("table") or ""))}', body)
+    return _card(severity, "Calibration", f'<p class="text">{escape(text)}</p>')
+
+
+def _result_card(comment: dict, roles: dict) -> str:
+    """The box of one source: name and role, the SNR (dynamic range) and the estimated flux density."""
+    data, severity, text = comment.get("data") or {}, comment.get("severity", "note"), str(comment.get("text", ""))
+    if data.get("kind") != "source":
+        return _card(severity, "Result", f'<p class="text">{escape(text)}</p>')
+    name, role = str(data.get("source") or ""), str(data.get("role") or roles.get(data.get("source"), "other"))
+    snr, flux = _finite_or_none(data.get("snr")), _finite_or_none(data.get("flux"))
+    if data.get("detected") is False:
+        figure = '<div class="big word">not detected</div>'
+    elif snr is not None:
+        figure = f'<div class="big">{snr:.0f}</div><div class="sub">{escape(str(data.get("snr_label") or "SNR"))}</div>'
+    else:
+        figure = ""
+    flux_label = str(data.get("flux_label") or "")
+    per_beam = "/beam" if "beam" in flux_label else ""
+    flux_text = (f'{escape(format_flux(flux))}{per_beam} <span class="muted">({escape(flux_label.split(" (")[0])})</span>'
+                 if flux is not None and data.get("detected") is not False else "")
+    offset = _finite_or_none(data.get("offset_mas"))
+    body = (f'<div class="srctitle">{_source_chip(name, role)}</div>{figure}'
+            + _key_values([("Estimated flux density", flux_text),
+                           ("Offset from the phase centre", f"{offset:.1f} mas" if offset else "")])
+            + f'<p class="text">{escape(text)}</p>')
+    return _card(severity, "Source", body, extra="result")
+
+
+def _calibration_section(ctx: dict) -> str:
+    """Boxes of the calibration comments (and the flagged fraction); a notice for an old context."""
+    comments = ctx.get("comments")
+    if comments is None:
+        return ('<p class="empty">This report was collected before the general comments existed; '
+                'rebuild it with <code>vlbipy report</code>.</p>')
+    general = group_comments(comments)["general"]
+    roles = {s["name"]: s.get("type", "other") for s in ctx.get("sources") or []}
+    cards = [_calibration_card(c, roles) for c in general if (c.get("data") or {}).get("kind") != "source"
+             and (c.get("category") == "calibration" or (c.get("data") or {}).get("kind") == "flagging")]
+    return f'<div class="cards">{"".join(cards)}</div>' if cards else '<p class="empty">Nothing to report.</p>'
+
+
+def _results_section(ctx: dict) -> str:
+    """One box per source with a result, in the order of the source table."""
+    comments = ctx.get("comments") or []
+    roles = {s["name"]: s.get("type", "other") for s in ctx.get("sources") or []}
+    order = list(roles)
+    results = [c for c in group_comments(comments)["general"]
+               if c.get("category") == "result" and (c.get("data") or {}).get("kind") != "flagging"]
+    results.sort(key=lambda c: order.index((c.get("data") or {}).get("source"))
+                 if (c.get("data") or {}).get("source") in order else len(order))
+    cards = [_result_card(c, roles) for c in results]
+    return (f'<div class="cards results">{"".join(cards)}</div>' if cards
+            else '<p class="empty">No source has been imaged yet.</p>')
+
+
 def render_overview(ctx: dict, html_dir: Path) -> str:
     """Overview tab: observation facts, general comments, antennas, sources and scan table."""
     obs = ctx["observation"]
@@ -1492,14 +1853,15 @@ def render_overview(ctx: dict, html_dir: Path) -> str:
             else:
                 kept = max(0.0, 100 * (1 - frac))
                 cls = "crit" if frac >= 0.95 else ("warn" if frac >= 0.7 else "good")
-                health = (f'<span class="hbar"><i class="{cls}" style="width:{kept:.0f}%"></i></span> '
-                          f'<span class="count">{kept:.0f}% kept / {100 * frac:.1f}% flagged</span>')
-        ant_rows.append(f'<tr><td class="num">{ant["id"]}</td>'
+                health = (f'<span class="hbar" title="{kept:.0f}% kept, {100 * frac:.1f}% flagged">'
+                          f'<i class="{cls}" style="width:{kept:.0f}%"></i></span> '
+                          f'<span class="count">{kept:.0f}% kept</span>')
+        ant_rows.append(f'<tr data-ant="{escape(ant["name"], quote=True)}"><td class="num">{ant["id"]}</td>'
                         f'<td class="mono"><b>{escape(ant["name"])}</b></td>'
                         f'<td><span class="sbbar">{segs}</span> <span class="count">{len(ant["subbands"])}/{n_sb}</span></td>'
                         f'<td class="num">{ant["n_scans"]}</td>'
                         f'<td>{status}</td><td>{health}</td></tr>')
-    antenna_table = _table(["ID", "Antenna", "Subbands observed / total bandwidth", "Scans", "Status", "Data health"], ant_rows)
+    antenna_table = _table(["ID", "Antenna", "Subbands", "Scans", "Status", "Data health"], ant_rows, compact=True)
 
     frac = ctx["flagging"]["fraction"]
     excluding = ctx["flagging"].get("excluding_dead")
@@ -1522,7 +1884,7 @@ def render_overview(ctx: dict, html_dir: Path) -> str:
                 f'<td><b>{escape(s["name"])}</b></td><td class="mono">{escape(str(s["id"]))}</td>'
                 f'<td class="mono">{escape(s["ra"])}</td><td class="mono">{escape(s["dec"])}</td>'
                 f'<td class="num">{s["n_scans"]}</td></tr>' for s in ctx["sources"]]
-    source_table = _table(["Type", "Source", "ID", "RA (J2000)", "Dec (J2000)", "Scans"], src_rows)
+    source_table = _table(["Type", "Source", "ID", "RA (J2000)", "Dec (J2000)", "Scans"], src_rows, compact=True)
 
     scan_rows = []
     for scan in ctx["scans"]:
@@ -1561,15 +1923,21 @@ def render_overview(ctx: dict, html_dir: Path) -> str:
 
     body = (_section("observation", "Observation", f'<div class="facts">{fact_html}</div>',
                      "Setup of the observation and the calibration run.")
-            + _section("comments", "General comments", _comments_section(ctx),
-                       "Issues, decisions and results of this reduction, derived from the calibration products "
-                       "on disk. The same list opens summary.md.", count=_comment_count(ctx.get("comments")))
-            + _section("antennas", "Antennas", antenna_table, summary)
-            + _section("sources", "Sources", _sky_map(ctx["sources"]) + source_table,
+            + _section("calibration", "Calibration", _calibration_section(ctx),
+                       "What the calibration was solved on and how much of the data survived it.")
+            + _section("results", "Results", _results_section(ctx),
+                       "Every imaged source: the signal-to-noise of its image (the dynamic range of the CLEAN image, "
+                       "else the peak SNR of the search map) and the estimated flux density.")
+            + _section("comments", "Comments", _comments_section(ctx),
+                       "Issues per antenna and the warnings of the pipeline, derived from the calibration products on "
+                       "disk. The same list, with the calibration and results above, opens summary.md.",
+                       count=_comment_count(ctx.get("comments")))
+            + _section("antennas", "Antennas", _side_by_side(antenna_table, _antenna_map(ctx["antennas"])), summary)
+            + _section("sources", "Sources", _side_by_side(source_table, _sky_map(ctx["sources"])),
                        count=f'{len(ctx["sources"])}')
             + _section("scans", "Scans", scan_table, count=f'{len(ctx["scans"])}'))
-    sections = [("observation", "Observation"), ("comments", "General comments"), ("antennas", "Antennas"),
-                ("sources", "Sources"), ("scans", "Scans")]
+    sections = [("observation", "Observation"), ("calibration", "Calibration"), ("results", "Results"),
+                ("comments", "Comments"), ("antennas", "Antennas"), ("sources", "Sources"), ("scans", "Scans")]
     return _page(ctx, "index", "Overview", sections, body)
 
 
@@ -1625,8 +1993,6 @@ def render_diagnostics(ctx: dict, html_dir: Path, plot_root: Path) -> str:
     scan_source = {s["number"]: s["source"] for s in ctx["scans"]}
 
     def per_scan(paths: list[Path], caption: str) -> str:
-        if not paths:
-            return '<p class="empty">No plots available for this section.</p>'
         groups: dict[int, list[Path]] = {}
         for p in paths:
             groups.setdefault(scan_number_from_name(p) or 0, []).append(p)
@@ -1636,16 +2002,33 @@ def render_diagnostics(ctx: dict, html_dir: Path, plot_root: Path) -> str:
             out.append(f"<h3>{escape(label)}</h3>" + _plot_grid(groups[number], html_dir, code, caption, wide=True))
         return "".join(out)
 
+    def per_antenna(paths: list[Path], caption: str, prefix: str) -> str:
+        """One sub-tab per antenna (array order); the per-scan figures of older runs when there are no others."""
+        if not paths:
+            return '<p class="empty">No plots available for this section.</p>'
+        figures = {antenna_figure_key(p): p for p in paths if antenna_figure_key(p)}
+        if not figures:
+            return per_scan(paths, caption)
+        order = [a["name"] for a in ctx.get("antennas") or []]
+        names = sorted(figures, key=lambda name: (name not in order, order.index(name) if name in order else 0, name))
+        ids = _panel_ids(prefix, names)
+        return _subtabs([(pid, f'<span class="mono">{escape(name)}</span>',
+                          f'<div class="grid wide">{_figure(figures[name], html_dir, name, caption)}</div>')
+                         for pid, name in zip(ids, names)])
+
     refants = [name for name in str(ctx.get("refant") or "").split(",") if name]
     tabs = [
         ("diag-autocorr", "Auto-correlations",
-         _section("autocorr", "Auto-correlations", per_scan(auto, "Amplitude vs frequency per antenna (raw data)."),
-                  "Auto-correlation spectra per antenna on the fringe-finder scans (phase calibrator when no fringe "
-                  "finder was observed).")),
+         _section("autocorr", "Auto-correlations",
+                  per_antenna(auto, "Amplitude vs frequency on every diagnostic scan (raw data).", "auto"),
+                  "Auto-correlation spectra of each antenna, one panel per scan, on the fringe-finder scans (phase "
+                  "calibrator when no fringe finder was observed); the panels share the amplitude scale.")),
         ("diag-crosscorr", "Cross-correlations",
          _section("crosscorr", "Cross-correlations to the reference antenna",
-                  per_scan(cross, "Amplitude and phase vs frequency per baseline to the reference antenna (raw data)."),
-                  "Raw cross-correlation spectra per baseline to the reference antenna of each scan.")),
+                  per_antenna(cross, "Amplitude and phase vs frequency on the baseline to the reference antenna "
+                              "of every diagnostic scan (raw data).", "cross"),
+                  "Raw cross-correlation spectra of each antenna on its baseline to the reference antenna, one panel "
+                  "per scan. The reference antenna has no figure of its own: its baselines are in all the others.")),
         ("diag-time-evolution", "Time evolution",
          _section("time-evolution", "Time evolution", _time_evolution_panel(evolution, html_dir, code, refants),
                   "Raw amplitude and phase versus time over the whole observation for every baseline to a reference "
@@ -1779,6 +2162,34 @@ def _gain_section(ctx: dict) -> str:
                                       for pid, label, entry in zip(ids, labels, entries)])
 
 
+def _source_tab_label(name: str, role: str) -> str:
+    """Sub-tab button of one source: its role badge and its name."""
+    badge = f'<span class="badge {escape(role, quote=True)}">{escape(role)}</span> ' if role else ""
+    return f"{badge}{escape(name)}"
+
+
+def _snr_matrix_tabs(ctx: dict, paths: list[Path], html_dir: Path) -> str:
+    """The fringe-SNR matrices in one sub-tab per source (sources in the order of the source table)."""
+    if not paths:
+        return '<p class="empty">No plots available for this section.</p>'
+    groups: dict[str, list[tuple[str, Path]]] = {}
+    for path in paths:
+        source, polarization = snr_matrix_key(path)
+        groups.setdefault(source, []).append((polarization, path))
+    roles = {s["name"]: s.get("type", "") for s in ctx.get("sources") or []}
+    order = list(roles)
+    names = sorted(groups, key=lambda name: (name not in order, order.index(name) if name in order else 0, name))
+    ids = _panel_ids("snr", [name or "all" for name in names])
+    tabs = []
+    for panel_id, name in zip(ids, names):
+        figures = "".join(_figure(path, html_dir, f"{name or 'All sources'} · {polarization}",
+                                  "Fringe SNR per scan of this source (rows) and antenna (columns).")
+                          for polarization, path in sorted(groups[name]))
+        tabs.append((panel_id, _source_tab_label(name or "All sources", roles.get(name, "")),
+                     f'<div class="grid">{figures}</div>'))
+    return _subtabs(tabs)
+
+
 def render_calibration(ctx: dict, html_dir: Path, plot_root: Path) -> str:
     """Calibration tab: chain table, amplitude corrections, calibration-table plot groups and corner plots."""
     code = ctx["project"]
@@ -1793,7 +2204,9 @@ def render_calibration(ctx: dict, html_dir: Path, plot_root: Path) -> str:
         anchor = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
         paths = find_plots(plot_root, patterns)
         sections.append((anchor, title))
-        body += _section(anchor, title, _plot_grid(paths, html_dir, code, wide=len(paths) <= 2), blurb)
+        content = (_snr_matrix_tabs(ctx, paths, html_dir) if title == SNR_SURVEY_TITLE
+                   else _plot_grid(paths, html_dir, code, wide=len(paths) <= 2))
+        body += _section(anchor, title, content, blurb)
     corner_paths = find_plots(plot_root, ["calibrated/*corner*.png"])
     by_source: dict[str, list[Path]] = {}
     names = sorted((s["name"] for s in ctx["sources"]), key=len, reverse=True)

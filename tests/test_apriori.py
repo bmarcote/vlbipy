@@ -1,7 +1,9 @@
 """Tests for the a-priori amplitude calibration step (Tsys + GC gencal, EOP for VLBA/LBA)."""
 from __future__ import annotations
 
+import numpy as np
 import pytest
+from test_phaseref import CHAN_FREQ, T0, three_field_ms  # noqa: F401 - three_field_ms is a fixture
 
 from vlbipy import VLBIObs, load_config, tools
 from vlbipy.observation import Observation
@@ -141,6 +143,7 @@ JB_GAIN_CURVE = [-0.396588307618, 0.319842329619, -0.0305994179281, 0.0015552742
 
 def test_refit_polynomial_reproduces_a_nine_term_gain_curve_with_at_most_eight():
     import numpy as np
+
     from vlbipy.backends.casa import refit_polynomial
     coefficients, deviation = refit_polynomial(JB_GAIN_CURVE, 15.0, 63.0)
     assert len(coefficients) <= 8 and deviation <= 1e-3
@@ -154,6 +157,7 @@ def test_refit_polynomial_reproduces_a_nine_term_gain_curve_with_at_most_eight()
 
 def test_refit_polynomial_keeps_a_short_polynomial_exactly():
     import numpy as np
+
     from vlbipy.backends.casa import refit_polynomial
     coefficients, deviation = refit_polynomial([1.0434, -1.9066e-3, 2.7559e-5, -2.1536e-7], 10.0, 80.0, tolerance=1e-9)
     assert len(coefficients) == 4 and deviation < 1e-9
@@ -200,6 +204,7 @@ def _write_gain_curve_subtables(ms, rows, names):
     """
     import casatools
     import numpy as np
+
     from vlbipy.solvers import caltable as ct
     tb = casatools.table()
     tb.create(str(ms / "ANTENNA"), {"NAME": ct._scalar_column("string")})
@@ -222,6 +227,7 @@ def _write_gain_curve_caltable(path, names, coefficients):
     """Write a minimal EPowerCurve caltable: one row per antenna with ``coefficients[name]`` (16 values each)."""
     import casatools
     import numpy as np
+
     from vlbipy.solvers import caltable as ct
     desc = ct.main_table_desc()
     tb = casatools.table()
@@ -245,6 +251,7 @@ def test_gain_curve_dpfu_record_is_written_beside_the_table_and_read_back(tmp_pa
     """gencal folds the DPFU into the gain-curve table; the record keeps it, per antenna and subband."""
     pytest.importorskip("casatools")
     import json
+
     from vlbipy.backends import casa
     backend = casa.CasaBackend(work_dir=str(tmp_path))
     ms = tmp_path / "x.ms"
@@ -271,7 +278,9 @@ def test_gain_curve_plot_works_from_the_table_alone_and_uses_the_record(tmp_path
     """No measurement set, no metadata: still a plot. With the DPFU record the curves are divided by the DPFU."""
     pytest.importorskip("casatools")
     import json
+
     import matplotlib.pyplot as plt
+
     from vlbipy.backends import casa
     backend = casa.CasaBackend(work_dir=str(tmp_path))
     table = backend.caldir() / "x.gcal"
@@ -307,3 +316,35 @@ def test_second_pass_keeps_every_apriori_table(monkeypatch):
     monkeypatch.setattr(CalibrateNamespace, "instrumental", lambda self, **kwargs: [])
     obs.calibrate.second_pass(force=True, plot=False)
     assert [t.cal_type for t in observation.gaintables] == ["accor", "tsys", "gc", "eop"]
+
+
+def test_tsys_is_smoothed_per_source(three_field_ms, tmp_path):
+    """Each source keeps its own Tsys level: the running median never blends a calibrator into the target, a
+    spike is removed and the noise drops."""
+    from vlbipy.backends.casa import CasaBackend
+    from vlbipy.models import CalTable
+    from vlbipy.solvers import caltable
+
+    ms = three_field_ms
+    rng = np.random.default_rng(1)
+    times = T0 + np.arange(0.0, 1800.0, 10.0)
+    fields = np.where((times - T0 >= 600) & (times - T0 < 1200), 1, 0)       # 0, then 1, then 0 again
+    level = np.where(fields == 1, 150.0, 50.0)
+    values = level[:, None] + rng.normal(0.0, 2.0, (times.size, 2))
+    values[20] = 400.0                                                        # a spike on source 0
+    path = tmp_path / "test.tsys"
+    caltable.write_jones_table(path, ms, viscal="B TSYS", times=times, field_ids=fields,
+                               spw_ids=np.zeros(times.size, int), antenna_ids=np.ones(times.size, int),
+                               scan_numbers=np.ones(times.size, int), fparam=values[:, None, :],
+                               flag=np.zeros((times.size, 1, 2), bool), snr=np.ones((times.size, 1, 2)),
+                               spw_chan_freq=CHAN_FREQ[:1], spw_chan_width=np.array([16e6]))
+    backend = CasaBackend(work_dir=str(tmp_path))
+    backend.calibrate.smooth("TEST", CalTable(cal_type="tsys", path=str(path)), time_window=600.0)
+    handle = backend.tools.table()
+    handle.open(str(path))
+    smoothed = np.asarray(handle.getcol("FPARAM"))[:, 0, :].T                 # (nrow, npol)
+    handle.close()
+    for field, expected in ((0, 50.0), (1, 150.0)):
+        rows = fields == field
+        assert np.all(np.abs(smoothed[rows] - expected) < 4.0)               # no blending, no spike left
+        assert smoothed[rows].std() < values[rows & (np.arange(times.size) != 20)].std()

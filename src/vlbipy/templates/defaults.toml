@@ -94,7 +94,7 @@ ionos = true                 # solve the dispersive delay in the fringe fit belo
 ionos_max_ghz = 8.0          # the ionosphere matters below this observing frequency
 snr_max_scans = 24           # cap on scans fringe-fitted by the survey (0 = all);
                              # it only needs relative SNR, so a sample suffices
-smooth_tsys = true           # de-spike the Tsys table after gencal
+smooth_tsys = true           # de-spike and smooth the Tsys table after gencal, per source
 tsys_outlier_sigma = 6.0     # MAD sigmas beyond which a Tsys solution is an outlier
 tsys_smooth_passes = 3       # maximum de-spiking passes
 detection_snr = 7.0          # fringe SNR above which an antenna counts as detected
@@ -202,6 +202,9 @@ smoothtime = 1800.0          # smoothcal filter width in seconds (0 = apply the 
 
 [calibration.tsys_smooth]
 window = 5                   # running-median window, in solutions, used to de-spike Tsys
+time_window = 600.0          # then a running median over this many seconds, per antenna, subband,
+                             # polarization and source (each source has its own Tsys level); 0 = only de-spike
+min_points = 3               # solutions of the same source a window needs before it smooths
 
 [calibration.snr_survey]
 minsnr = 0.0                 # keep every solution so weak antennas still appear in the survey

@@ -123,8 +123,10 @@ STEP_INFO: dict[str, tuple[str, str, str]] = {
 #: The fringe tables are listed by name because the solved table leaves the chain when its time-smoothed copy
 #: (``<code>.mbd_smooth``) is the one applied: both are plotted, and only the applied one is in ``obs.gaintables``.
 STEP_PLOTS: dict[str, list[tuple[str, ...]]] = {
-    "plot_raw": [("plots/raw/{code}.snr_matrix.*.png",), ("plots/raw/{code}.raw_scan*.autocorr.png",),
-                 ("plots/raw/{code}.raw_scan*.spectrum.png",), ("plots/raw/{code}.raw_*.spectrum.png",),
+    "plot_raw": [("plots/raw/{code}.snr_matrix.*.png",),
+                 ("plots/raw/{code}.raw_ant*.autocorr.png", "plots/raw/{code}.raw_scan*.autocorr.png"),
+                 ("plots/raw/{code}.raw_ant*.spectrum.png", "plots/raw/{code}.raw_scan*.spectrum.png"),
+                 ("plots/raw/{code}.raw_*.spectrum.png",),
                  ("plots/raw/{code}.raw_*.timeseries.png",), ("plots/raw/{code}.raw.radplot.*.png",),
                  ("plots/raw/{code}.raw_*.corner.*.png",)],
     "scan_snr": [("plots/raw/{code}.snr_matrix.*.png",)],

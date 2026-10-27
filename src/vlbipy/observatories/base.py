@@ -55,6 +55,8 @@ class ObservatoryHandler:
     name: str = "base"
     #: Whether the archive supports automated downloads.
     auto_download: bool = False
+    #: Name of the archive the data are retrieved from, for the messages of a download.
+    archive_name: str = ""
     #: Whether Earth-orientation-parameter corrections apply.
     needs_eop: bool = False
     #: Whether ACCOR (correlator amplitude) corrections apply.

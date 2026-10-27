@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import Optional
 
 from .. import fitsidi, tools
-from ..logging_utils import get_logger, warnings
+from ..logging_utils import get_logger, headline, warnings
+from ..progress import track_downloads
 from .base import ObservatoryHandler
 
 logger = get_logger()
@@ -48,9 +49,26 @@ def _import_casavlbitools():
         return None
 
 
+def _size_text(n_bytes: float) -> str:
+    """A byte count for a log line, e.g. ``"1.8 GB"``."""
+    for unit in ("B", "kB", "MB", "GB"):
+        if n_bytes < 1000 or unit == "GB":
+            return f"{n_bytes:.0f} {unit}" if unit == "B" else f"{n_bytes:.1f} {unit}"
+        n_bytes /= 1000.0
+    return f"{n_bytes:.1f} TB"
+
+
+def _name_range(names: list[str]) -> str:
+    """The files of a download in a few words: every name up to three, else the first and the last."""
+    if len(names) <= 3:
+        return ", ".join(names)
+    return f"{names[0]} ... {names[-1]}"
+
+
 class EVNObservatory(ObservatoryHandler):
     """European VLBI Network. Supports automated archive downloads."""
     name = "EVN"
+    archive_name = "EVN Data Archive"
     auto_download = True
     needs_eop = False
     needs_accor = False
@@ -131,7 +149,7 @@ class EVNObservatory(ObservatoryHandler):
         base_url = f"{EVN_ARCHIVE_URL}/{project_code.upper()}_{obsdate}"
         code = project_code.lower()
 
-        logger.info("downloading EVN data for {} from {}/fits/", project_code, base_url)
+        logger.info("listing the {} files of {} at {}/fits/", self.archive_name, project_code, base_url)
         listing = tools.fetch_url_text(f"{base_url}/fits/", username, password)
         entries = re.findall(r'href="([^"?/]+)"', listing)
         wanted = sorted({e for e in entries if e.lower().startswith(code)}, key=tools.natsort_key)
@@ -139,35 +157,38 @@ class EVNObservatory(ObservatoryHandler):
             raise Exception(f"no files for {project_code} found at {base_url}/fits/ "
                               "(wrong project code or observing date?)")
 
-        # Separate files already on disk from those that need downloading
-        to_download = []
-        for filename in wanted:
-            dest = directory_path / filename
-            if dest.is_file():
-                logger.info("  {} already present; skipping", filename)
-            else:
-                to_download.append((filename, dest))
-
-        # Download missing files in parallel (up to 4 concurrent)
+        present = [name for name in wanted if (directory_path / name).is_file()]
+        to_download = [(name, directory_path / name) for name in wanted if name not in present]
+        if present:
+            logger.info("{} of the {} archive file(s) already in {}: {}", len(present), len(wanted), directory,
+                        ", ".join(present))
         if to_download:
-            logger.info("Fetching {} file(s) in parallel...", len(to_download))
-            with ThreadPoolExecutor(max_workers=4) as executor:
+            names = [name for name, _ in to_download]
+            headline("import_data: retrieving {} file(s) of {} from the {} ({}/fits/): {}", len(names),
+                     project_code, self.archive_name, base_url, _name_range(names))
+            # Up to four at a time: the archive serves each transfer well below the link speed.
+            with track_downloads(f"{project_code} from the {self.archive_name}", names) as tracker, \
+                    ThreadPoolExecutor(max_workers=4) as executor:
                 futures = {
-                    executor.submit(tools.download_file, f"{base_url}/fits/{filename}",
-                                    dest, username, password): filename
+                    executor.submit(tools.download_file, f"{base_url}/fits/{filename}", dest, username, password,
+                                    progress=tracker.callback(filename)): filename
                     for filename, dest in to_download
                 }
                 for future in as_completed(futures):
                     filename = futures[future]
                     try:
                         future.result()
-                        logger.info("  {} downloaded", filename)
                     except Exception as exc:
                         raise Exception(f"failed to download {filename}: {exc}") from exc
+                    tracker.finished(filename)
+                    logger.info("  {} downloaded ({})", filename, _size_text((directory_path / filename).stat().st_size))
+        else:
+            logger.info("all {} archive file(s) of {} are already in {}", len(wanted), project_code, directory)
 
         checksum_file = directory_path / f"{code}.checksum"
         if checksum_file.is_file():
-            logger.info("verifying MD5 checksums...")
+            headline("import_data: verifying the MD5 checksums of the {} file(s) against {}", len(wanted),
+                     checksum_file.name)
             self._verify_checksums(checksum_file, directory_path, base_url, username, password)
         else:
             warnings.warn(f"{project_code}: no checksum file in the archive; skipping verification")
@@ -178,7 +199,7 @@ class EVNObservatory(ObservatoryHandler):
         files = self.find_data_files(project_code, directory)
         if not files:
             raise Exception(f"download finished but no FITS-IDI files found in {directory}")
-        logger.info("EVN download complete: {} FITS-IDI file(s)", len(files))
+        headline("import_data: {} FITS-IDI file(s) of {} ready in {}", len(files), project_code, directory)
         return files
 
     def fetch_apriori_files(self, project_code: str, directory: str, *,
@@ -213,7 +234,7 @@ class EVNObservatory(ObservatoryHandler):
                 continue
             dest = directory_path / filename
             try:
-                logger.info("fetching {}/pipe/{}", base_url, filename)
+                headline("import_data: retrieving {} from the {} ({}/pipe/)", filename, self.archive_name, base_url)
                 tools.download_file(f"{base_url}/pipe/{filename}", dest, username, password)
                 if filename.endswith(".gz"):
                     tools.gunzip(dest)

@@ -349,25 +349,29 @@ class DaskMsPlotReads:
 
     def read_uvdistance(self, project_code: str, *, field: str = "", column: str = "corrected",
                         time_bin: float = 10.0, with_model: bool = False,
-                        metadata: Optional[ObsMetadata] = None) -> dict:
+                        metadata: Optional[ObsMetadata] = None, model: Optional[list] = None) -> dict:
+        """Amplitude/phase against uv distance, read in parallel; ``model`` (components) is averaged alongside
+        in place of the MODEL_DATA column of ``with_model``."""
         from ..solvers.plot_read import read_uvdistance
+        from ..solvers.skymodel import usable
         from .casa import parallel_hand_indices
         meta = metadata or self.get_metadata(project_code, [], "")
         pol_indices, pol_labels = parallel_hand_indices(meta)
         ms_path = self.backend.ms_path(project_code)
-        with_model = with_model and self._has_column(ms_path, "MODEL_DATA")
+        model = usable(model) or None
+        with_model = bool(model) or (with_model and self._has_column(ms_path, "MODEL_DATA"))
         wanted = [f for f in field.split(",") if f]
         starts = {s.scan_number: s.time_start for s in meta.scans if not wanted or s.source in wanted}
         result = read_uvdistance(ms_path, fields=wanted or None,
                                  column={"corrected": "CORRECTED_DATA", "data": "DATA"}[column],
                                  corrs=list(pol_indices), time_bin=time_bin, scan_starts=starts,
-                                 with_model=with_model)
+                                 with_model=with_model, model=model)
         logger.info("read_uvdistance[dask-ms]: {} averaged point(s) on {} ({} s bins, per subband{}) in {:.1f}s",
                     result["uvdist_mlambda"].size, field or "all fields", time_bin,
                     ", with model" if with_model else "", result["seconds"])
         out = {"uvdist_mlambda": result["uvdist_mlambda"], "values": result["values"], "polarizations": pol_labels,
                "field": field, "column": column, "time_bin": time_bin}
-        if with_model:
+        if with_model and result["model"] is not None:
             out["model"] = {"uvdist_mlambda": result["uvdist_mlambda"], "values": result["model"]}
         return out
 
@@ -451,9 +455,10 @@ class DaskMsPlotReads:
 
     def read_timeseries(self, project_code: str, *, field: str = "", scans: Optional[list] = None,
                         refant: str = "", column: str = "corrected", max_time_bins: int = 300,
-                        metadata: Optional[ObsMetadata] = None) -> dict:
+                        metadata: Optional[ObsMetadata] = None, model: Optional[list] = None) -> dict:
         """Amplitude/phase against time of the baselines to ``refant``, read in parallel (same output as
-        :meth:`CasaDataOps.read_timeseries`, which reads every subband through the ``ms`` tool)."""
+        :meth:`CasaDataOps.read_timeseries`, which reads every subband through the ``ms`` tool). With ``model``
+        (components) the model averaged the same way is returned under ``model_baselines``."""
         from ..solvers.plot_read import read_timeseries
         from .casa import parallel_hand_indices
         meta = metadata or self.get_metadata(project_code, [], "")
@@ -481,13 +486,17 @@ class DaskMsPlotReads:
         result = read_timeseries(self.backend.ms_path(project_code), fields=wanted or None,
                                  scans=sorted(wanted_scans) or None,
                                  column={"corrected": "CORRECTED_DATA", "data": "DATA"}[column],
-                                 corrs=list(pol_indices), refant=antenna_names.index(refant), edges=edges)
+                                 corrs=list(pol_indices), refant=antenna_names.index(refant), edges=edges,
+                                 model=model)
         baselines = {f"{refant}-{antenna_names[other]}": values for other, values in result["baselines"].items()
                      if other < len(antenna_names)}
+        model_baselines = {f"{refant}-{antenna_names[other]}": values
+                           for other, values in result["model_baselines"].items() if other < len(antenna_names)}
         logger.info("read_timeseries[dask-ms]: {} baseline(s) to {} over {} time bins in {:.1f}s",
                     len(baselines), refant, len(edges) - 1, result["seconds"])
         return {"baselines": dict(sorted(baselines.items())), "times": ((edges[:-1] + edges[1:]) / 2.0).tolist(),
-                "polarizations": pol_labels, "refant": refant, "field": field, "column": column}
+                "polarizations": pol_labels, "refant": refant, "field": field, "column": column,
+                "model_baselines": model_baselines}
 
     # The CASA readers below read the corrected column through the ``ms`` tool: a deferred calibration
     # (vlbipy.solvers.corrected) is written first.
@@ -503,9 +512,10 @@ class DaskMsPlotReads:
 
     def read_spectrum(self, project_code: str, *, field: str = "", scans: Optional[list] = None,
                       refant: str = "", column: str = "corrected", all_pols: bool = False,
-                      metadata: Optional[ObsMetadata] = None) -> dict:
+                      metadata: Optional[ObsMetadata] = None, model: Optional[list] = None) -> dict:
         """Time-averaged spectra of the baselines to ``refant``, read in parallel (same output as
-        :meth:`CasaDataOps.read_spectrum`, which reads through the ``ms`` tool)."""
+        :meth:`CasaDataOps.read_spectrum`, which reads through the ``ms`` tool). With ``model`` (components)
+        the model averaged the same way is returned under ``model_spectra``."""
         self._corrected_written(project_code, column)
         from ..solvers.plot_read import read_spectrum
         from .casa import parallel_hand_indices
@@ -525,14 +535,15 @@ class DaskMsPlotReads:
                                scans=numbers or None,
                                column={"corrected": "CORRECTED_DATA", "data": "DATA",
                                        "model": "MODEL_DATA"}[column],
-                               corrs=list(pol_indices), refant=antenna_names.index(refant))
+                               corrs=list(pol_indices), refant=antenna_names.index(refant), model=model)
         spectra = {antenna_names[k]: v for k, v in result["spectra"].items() if k < len(antenna_names)}
+        model_spectra = {antenna_names[k]: v for k, v in result["model_spectra"].items() if k < len(antenna_names)}
         logger.info("read_spectrum[dask-ms]: {} baseline(s) to {} from the {} column ({} x {} channels) in {:.1f}s",
                     len(spectra), refant, column, n_spw, n_chan, result["seconds"])
         return {"antennas": sorted(spectra), "spectra": spectra, "refant": refant,
                 "n_spw": n_spw, "n_channels": n_chan, "polarizations": pol_labels,
                 "frequencies_ghz": [meta.freq_setup.frequencies_ghz(s) for s in range(n_spw)],
-                "column": column, "field": field, "scans": list(scans or [])}
+                "column": column, "field": field, "scans": list(scans or []), "model_spectra": model_spectra}
 
     def read_autocorr_spectrum(self, project_code: str, *, field: str = "", scans: Optional[list] = None,
                                column: str = "data", metadata: Optional[ObsMetadata] = None) -> dict:

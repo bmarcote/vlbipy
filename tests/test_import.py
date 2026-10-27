@@ -123,9 +123,12 @@ def fake_archive(monkeypatch, tmp_path):
             return pages[url]
         raise ConnectionError(f"HTTP 404 fetching {url}")
 
-    def fake_download(url, dest, username=None, password=None, timeout=600.0):
+    def fake_download(url, dest, username=None, password=None, timeout=600.0, progress=None):
         name = url.rsplit("/", 1)[-1]
         if url.startswith(f"{base}/fits/") and name in archive_files:
+            if progress is not None:
+                progress(0, len(archive_files[name]))
+                progress(len(archive_files[name]), None)
             Path(dest).write_bytes(archive_files[name])
             downloads.append(name)
             return Path(dest)
@@ -144,6 +147,35 @@ def test_evn_download(fake_archive):
     assert (fake_archive["dir"] / f"{PROJECT}_1_1.IDI1").read_bytes() == b"idi-one"
     # obsdate was auto-resolved from the archive index (no explicit obsdate given).
     assert f"{PROJECT}_1_1.IDI1" in fake_archive["downloads"]
+
+
+def test_download_file_reports_progress(tmp_path):
+    """The progress callback gets the announced size first, then every block written."""
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"x" * 3_000_000)
+    calls = []
+    tools.download_file(source.as_uri(), tmp_path / "copy.bin", progress=lambda n, size: calls.append((n, size)))
+    assert calls[0] == (0, 3_000_000)
+    assert sum(n for n, _ in calls[1:]) == 3_000_000 and len(calls) > 2
+    assert (tmp_path / "copy.bin").read_bytes() == source.read_bytes()
+
+
+def test_download_tracker_counts_bytes_and_files():
+    """The overall bar counts bytes over every file (the ones not started at the mean size) and the files done."""
+    from rich.progress import Progress
+
+    from vlbipy.progress import DownloadTracker
+    progress = Progress(disable=True)
+    tracker = DownloadTracker(progress, "EB032 from the EVN Data Archive", ["a", "b", "c", "d"])
+    update = tracker.callback("a")
+    update(0, 100)
+    update(60, None)
+    task = progress.tasks[0]
+    assert task.total == 400 and task.completed == 60
+    update(40, None)
+    tracker.finished("a")
+    assert "(1/4 files)" in progress.tasks[0].description
+    assert len(progress.tasks) == 1                 # the bar of the finished file is gone
 
 
 def test_evn_download_detects_corruption(fake_archive, monkeypatch):
@@ -183,6 +215,7 @@ def test_uvflg_ending_with_a_station_section_without_flags():
     """The JIVE archive's .uvflg can end with the header lines of a station that has no flag (no '/'): AIPS
     never acts on them, and reading the file must not fail on them."""
     from io import StringIO
+
     from vlbipy.casavlbitools import key
     text = ("opcode='FLAG'\ndtimrang = 1   timeoff=0\n"
             "ant_name='TR' timerang=309,12,53,19, 309,12,53,57 reason='Antenna off source' /\n"
