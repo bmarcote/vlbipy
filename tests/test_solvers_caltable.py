@@ -323,3 +323,20 @@ def test_fringe_smoothing_can_be_switched_off_in_the_configuration():
     obs.import_data()
     table = obs["RSM07"].calibrate.fringefit(plot=False)
     assert not table.path.endswith("_smooth")
+
+
+def test_outliers_in_time_flags_a_false_detection_but_not_a_slow_drift():
+    import numpy as np
+
+    from vlbipy.statistics import outliers_in_time
+
+    times = np.arange(20) * 600.0
+    drift = 0.1 + 0.05 * np.arange(20) + 0.01 * np.random.default_rng(1).standard_normal(20)
+    values = drift.copy()
+    values[7] = 10.0                                  # a wrong fringe peak, ~10 ns away
+    mask = outliers_in_time(values, times, window=7200.0, threshold=5.0, min_points=4, floor=2.0)
+    assert mask.tolist() == [i == 7 for i in range(20)]
+    # The drift alone reads as many sigmas on such a precise series; the floor keeps it.
+    assert not outliers_in_time(drift, times, window=7200.0, threshold=5.0, min_points=4, floor=2.0).any()
+    # Too few neighbours: nothing is judged.
+    assert not outliers_in_time(values, times, window=1000.0, threshold=5.0, min_points=4).any()

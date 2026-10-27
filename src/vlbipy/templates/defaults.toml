@@ -154,15 +154,21 @@ max_delay_step = 0.0         # ...and only if its delays are consistent: median 
 # (<code>.mbd_smooth) is what gets applied; the solved table stays on disk and is plotted
 # next to it. The phase is never smoothed — it wraps.
 [calibration.mbd_smooth]
-window = 900.0               # full width of the centred time window in seconds (0 = apply unsmoothed).
-                             # With solint = "inf" there is one solution per scan, so this spans
-                             # window / cycle-time solutions: ~3 on a 5-minute phase-reference cycle.
-                             # Raise it (1800-3600) to average more noise down, as long as the
-                             # residual delay still drifts more slowly than that; a centred window
-                             # leaves a linear drift unbiased either way.
+window = 7200.0              # full width of the centred time window in seconds (0 = apply unsmoothed).
+                             # Solutions are grouped per field, so the window must span several
+                             # scans *of the same source*: with two phase calibrators observed in
+                             # alternating blocks those come in pairs ~25 min apart, and 2 h holds
+                             # ~8; the fringe finder, every ~30 min, ~4. A centred window leaves a
+                             # linear drift unbiased.
 smoothtype = "median"        # "median" (robust: also removes a single bad solution) or "mean"
 parameters = ["delay", "rate"]   # Fringe Jones parameters to smooth; "dispersive" may be added
-min_points = 3               # leave a solution alone when its window holds fewer than this
+min_points = 4               # leave a solution alone when its window holds fewer than this
+outlier_sigma = 5.0          # flag a solution whose delay or rate departs from the others in its
+                             # window by more than this (robust sigmas): a false fringe detection,
+                             # not noise. 0 disables.
+outlier_floor = { delay = 2.0, rate = 1e-12 }   # ...and by more than this (ns, s/s): precise
+                             # solutions scatter so little that a real atmospheric drift can read
+                             # as 5 sigma; a false fringe peak lands several ns away.
 
 # Reweighting (statwt) after the full chain is applied; the pipeline then flags outliers
 # again and re-solves everything (third pass). Set enabled = false to skip.

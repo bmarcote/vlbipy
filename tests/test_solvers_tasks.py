@@ -498,6 +498,7 @@ def test_statwt_weights_rows_like_casa(sim):
     flag[1, :5, 0] = True
     tb.putcol("FLAG", np.asfortranarray(flag.T))
     tb.close()
+    old_weight, = _columns(sim["ms"], "WEIGHT")
     report = statwt(sim["ms"], column="CORRECTED_DATA", minsamp=2, workers=2)
     weight, new_flag, flag_row = _columns(sim["ms"], "WEIGHT", "FLAG", "FLAG_ROW")
     values = sim["data"][1, 5:, 0]
@@ -509,7 +510,24 @@ def test_statwt_weights_rows_like_casa(sim):
     assert starved[0].all() and not starved[1:].any()
     np.testing.assert_allclose(w[1, 0], expected, rtol=1e-5)
     np.testing.assert_allclose(weight, row_weights(sim["data"], new_flag, 2)[0], rtol=1e-6)
+    # SIGMA follows the new weights, so an applycal that rebuilds them from SIGMA keeps them.
+    sigma, = _columns(sim["ms"], "SIGMA")
+    usable = weight > 0
+    np.testing.assert_allclose(sigma[usable], SIGMA * np.sqrt(old_weight[usable] / weight[usable]), rtol=1e-5)
+    np.testing.assert_allclose(sigma[~usable], SIGMA, rtol=1e-6)
     workers.close_pool()
+
+
+def test_rescaled_sigma_leaves_unweighted_cells_alone():
+    from vlbipy.solvers.statwt import rescaled_sigma
+    sigma = np.full((2, 3, 2), 0.5, dtype=np.float32)
+    old = np.array([[4.0, 4.0], [0.0, 1.0]])
+    new = np.array([[1.0, 0.0], [2.0, 4.0]])
+    out = rescaled_sigma(sigma, old, new)
+    np.testing.assert_allclose(out[0, :, 0], 1.0)            # 4x less weight: twice the sigma
+    np.testing.assert_allclose(out[0, :, 1], 0.5)            # new weight 0: unchanged
+    np.testing.assert_allclose(out[1, :, 0], 0.5)            # old weight 0: unchanged
+    np.testing.assert_allclose(out[1, :, 1], 0.25)
 
 
 def _split_reference(ms, column, chanbin, timebin):

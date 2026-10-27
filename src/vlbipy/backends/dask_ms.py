@@ -322,11 +322,13 @@ class DaskMsPlotReads:
                                       corrs=list(pol_indices), edges=edges, stokes_i=stokes_i)
         names = list(meta.antennas)
         spectra = {(names[a], names[b]): grid for (a, b), grid in result["spectra"].items()}
+        counts = {(names[a], names[b]): grid for (a, b), grid in result["counts"].items()}
         present = sorted({name for pair in spectra for name in pair}, key=names.index)
         logger.info("read_dynamic_spectra[dask-ms]: {} baseline(s) over {} time bins x {} channels ({}) in {:.1f}s",
                     len(spectra), n_time, meta.freq_setup.n_subbands * meta.freq_setup.n_channels,
                     "Stokes I" if stokes_i else ",".join(pol_labels), result["seconds"])
-        return {"baselines": spectra, "antennas": present, "times": ((edges[:-1] + edges[1:]) / 2.0).tolist(),
+        return {"baselines": spectra, "counts": counts, "antennas": present,
+                "times": ((edges[:-1] + edges[1:]) / 2.0).tolist(),
                 "frequencies_ghz": meta.freq_setup.frequencies_ghz(), "field": field, "column": column,
                 "stokes_i": stokes_i}
 

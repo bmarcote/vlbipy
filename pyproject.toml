@@ -23,11 +23,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-daskms = ["dask-ms[xarray,zarr]", "difmapy", "numba"]
+# dask-ms (0.2.32) writes zarr stores with the zarr 2 API (zarr.convenience, gone in zarr 3) and
+# pins zarr<3 / numcodecs<0.16 through its own [zarr] extra. Repeated here so that an upgrade of
+# the environment (pip/uv --upgrade) cannot pull zarr 3 in and break xds_to_zarr.
+daskms = ["dask-ms[xarray,zarr]", "zarr>=2.18,<3", "numcodecs>=0.13,<0.16", "difmapy", "numba"]
 aips = ["parseltongue"]
 difmap = ["difmapy"]
 notebook = ["nbformat", "ipykernel", "jupyterlab", "ipywidgets", "plotly", "anywidget"]
-all = ["casatools", "casatasks", "parseltongue", "dask-ms[xarray,zarr]", "difmapy", "numba",
+all = ["casatools", "casatasks", "parseltongue", "dask-ms[xarray,zarr]", "zarr>=2.18,<3",
+       "numcodecs>=0.13,<0.16", "difmapy", "numba",
        "nbformat", "ipykernel", "jupyterlab", "ipywidgets", "plotly", "anywidget"]
 dev = ["pytest", "ruff"]
 

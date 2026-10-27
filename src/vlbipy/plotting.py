@@ -26,6 +26,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import LogNorm
 from matplotlib.lines import Line2D
+from matplotlib.patches import Ellipse
 
 from .logging_utils import get_logger
 from .models import ScanSNRSurvey
@@ -1166,17 +1167,18 @@ def plot_subband_phase_jumps(data: dict, plot_dir: Union[str, Path], project_cod
     return str(outfile)
 
 
-#: Half-width of the image preview in synthesised beams: the panel spans 7 times the
+#: Half-width of the image preview in synthesised beams: the panel spans 14 times the
 #: restoring beam's major axis when the FITS header carries BMAJ.
-IMAGE_ZOOM_BEAMS = 3.5
+IMAGE_ZOOM_BEAMS = 7.0
 
 
-def _read_image_plane(fits_path: Union[str, Path]) -> tuple[np.ndarray, float]:
-    """Return the first 2D plane of a FITS image (in mJy/beam) and its pixel size in mas.
+def _read_image_plane(fits_path: Union[str, Path]) -> tuple[np.ndarray, float, tuple[float, float, float]]:
+    """Return the first 2D plane of a FITS image (in mJy/beam), its pixel size and its beam.
 
     When the header has a restoring beam the plane is cut to a square of
-    7 * BMAJ (+-IMAGE_ZOOM_BEAMS half-width) around the peak, so a VLBI source
-    is visible in a wide field.
+    14 * BMAJ (+-IMAGE_ZOOM_BEAMS half-width) around the peak, so a VLBI source
+    is visible in a wide field. The beam is ``(bmaj_mas, bmin_mas, bpa_deg)``,
+    all zero when the header carries none.
     """
     from astropy.io import fits
     with fits.open(str(fits_path)) as hdul:
@@ -1187,6 +1189,7 @@ def _read_image_plane(fits_path: Union[str, Path]) -> tuple[np.ndarray, float]:
     scale = 1.0 if unit.startswith("mjy") else 1e3
     pixel_mas = abs(float(header.get("CDELT1", header.get("CDELT2", 1.0)))) * 3.6e6
     bmaj_mas = float(header.get("BMAJ", 0.0)) * 3.6e6
+    beam = (bmaj_mas, float(header.get("BMIN", 0.0)) * 3.6e6, float(header.get("BPA", 0.0)))
     if bmaj_mas > 0 and pixel_mas > 0:
         half = int(round(IMAGE_ZOOM_BEAMS * bmaj_mas / pixel_mas))
         ny, nx = plane.shape
@@ -1195,7 +1198,7 @@ def _read_image_plane(fits_path: Union[str, Path]) -> tuple[np.ndarray, float]:
             iy, ix = np.unravel_index(int(np.argmax(finite)), plane.shape)
             y0, x0 = min(max(iy - half, 0), ny - 2 * half), min(max(ix - half, 0), nx - 2 * half)
             plane = plane[y0:y0 + 2 * half, x0:x0 + 2 * half]
-    return plane * scale, pixel_mas
+    return plane * scale, pixel_mas, beam
 
 
 def plot_image_grid(images: dict, plot_dir: Union[str, Path], project_code: str = "",
@@ -1228,7 +1231,7 @@ def plot_image_grid(images: dict, plot_dir: Union[str, Path], project_code: str 
         figure, axes = plt.subplots(1, len(entries), figsize=(4.2 * len(entries), 4.2), squeeze=False,
                                     layout="constrained")
         for axis, (robust, path) in zip(axes[0], entries):
-            plane, pixel_mas = _read_image_plane(path)
+            plane, pixel_mas, beam = _read_image_plane(path)
             ny, nx = plane.shape
             border = np.ones(plane.shape, dtype=bool)
             border[int(0.2 * ny):ny - int(0.2 * ny), int(0.2 * nx):nx - int(0.2 * nx)] = False
@@ -1246,6 +1249,14 @@ def plot_image_grid(images: dict, plot_dir: Union[str, Path], project_code: str 
                 levels = 5 * rms * np.sqrt(2) ** np.arange(n_levels)
                 axis.contour(plane, levels=levels, extent=extent, colors="w",
                              linewidths=0.7, alpha=0.85)
+            # Restoring beam in the bottom-left corner. The x data axis is relative RA (east
+            # is +x, drawn on the left), so a position angle east of north is angle = -BPA.
+            bmaj, bmin, bpa = beam
+            if bmaj > 0 and bmin > 0:
+                centre = (extent[0] - 0.08 * (extent[0] - extent[1]) - bmaj / 2,
+                          extent[2] + 0.08 * (extent[3] - extent[2]) + bmaj / 2)
+                axis.add_patch(Ellipse(centre, width=bmin, height=bmaj, angle=-bpa,
+                                       facecolor="0.6", edgecolor="0.85", linewidth=0.6, alpha=0.9))
             axis.set_title(f"robust {robust:g}  peak {peak:.2f} mJy/beam  rms {rms:.3f} mJy/beam",
                            fontsize=8)
             axis.set_xlabel("relative RA (mas)", fontsize=8)

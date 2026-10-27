@@ -184,6 +184,58 @@ def smooth_in_time(values: np.ndarray, times: np.ndarray, *, window: float = 900
     return smoothed, changed
 
 
+def outliers_in_time(values: np.ndarray, times: np.ndarray, *, window: float = 7200.0,
+                     threshold: float = 5.0, min_points: int = 4, floor: float = 0.0) -> np.ndarray:
+    """Return a mask of the points that depart from their neighbours in time by > ``threshold`` sigma.
+
+    Each point is compared with the median of the *other* usable points within
+    a centred time window, in units of their MAD-based scatter. Leaving the point
+    itself out keeps a wild value from inflating the very scatter it is judged
+    against, which is what lets a single false fringe-fit detection stand out.
+
+    Parameters
+    ----------
+    values : numpy.ndarray
+        Series to test (1-D); ``nan`` marks unusable points, never marked.
+    times : numpy.ndarray
+        Time of each point, same length as ``values``, any consistent unit.
+    window : float
+        Full width of the window in the units of ``times``; <= 0 marks nothing.
+    threshold : float
+        Departure in robust sigmas beyond which a point is an outlier; <= 0 marks nothing.
+    min_points : int
+        Leave a point unjudged when fewer than this many *other* usable points
+        share its window: too few neighbours give no trustworthy reference.
+    floor : float
+        Smallest departure ever marked, in the units of ``values``. Precise
+        solutions have a tiny scatter, so a genuine slow drift can read as many
+        sigmas; the floor keeps only departures that are physically implausible.
+
+    Returns
+    -------
+    numpy.ndarray
+        Boolean mask, True where the point is an outlier.
+    """
+    series = np.asarray(values, dtype=float)
+    stamps = np.asarray(times, dtype=float)
+    mask = np.zeros(series.shape, dtype=bool)
+    if window <= 0 or threshold <= 0 or series.size == 0:
+        return mask
+    usable = np.isfinite(series)
+    half = 0.5 * float(window)
+    for index in np.flatnonzero(usable):
+        inside = usable & (np.abs(stamps - stamps[index]) <= half)
+        inside[index] = False
+        if int(inside.sum()) < max(1, int(min_points)):
+            continue
+        sigma = mad_sigma(series[inside])
+        if not np.isfinite(sigma) or sigma <= 0.0:
+            continue
+        departure = abs(series[index] - np.median(series[inside]))
+        mask[index] = departure > max(threshold * sigma, float(floor))
+    return mask
+
+
 def find_flat_range(profile: np.ndarray, *, threshold: float = 6.0,
                     max_edge_fraction: float = 0.25) -> tuple[int, int]:
     """Return the ``(first, last)`` indices of the flat interior of a bandpass-like profile.

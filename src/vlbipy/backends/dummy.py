@@ -341,7 +341,7 @@ class DummyCalibrationOps(CalibrationOps):
         _log("smooth", project=project_code, caltable=table.cal_type, **kwargs)
         return table
 
-    def smooth_fringe(self, project_code: str, table: CalTable, *, window: float = 900.0,
+    def smooth_fringe(self, project_code: str, table: CalTable, *, window: float = 7200.0,
                       **kwargs) -> CalTable:
         """Return a table standing in for the time-smoothed fringe solutions.
 

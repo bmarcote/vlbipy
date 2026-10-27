@@ -7,9 +7,17 @@ the data column give the population variances of the real and imaginary parts,
 and the weight is ``2 / (var_re + var_im)``. A row/correlation with fewer than
 ``minsamp`` unflagged channels gets weight 0 and is flagged. WEIGHT_SPECTRUM
 (when present) holds the weight on every channel, WEIGHT the same value per
-correlation, FLAG_ROW whether a row is now entirely flagged; SIGMA is left
-alone, as statwt does for the corrected column. Checked against CASA on GL048
-(relative difference 6e-8).
+correlation, FLAG_ROW whether a row is now entirely flagged. Checked against
+CASA on GL048 (relative difference 6e-8).
+
+Unlike CASA, SIGMA (and SIGMA_SPECTRUM) is updated too, by the ratio of the old
+to the new weight: ``sigma * sqrt(w_old / w_new)``. Every later applycal
+rebuilds the weights from SIGMA, so CASA's statwt on the corrected column only
+lasts until the chain is applied again — and the pipeline re-solves and applies
+after reweighting (third pass, self-calibration). Carrying the measured excess
+noise in SIGMA instead keeps it through any later chain: an antenna noisier than
+its Tsys says (V589A KE, x6 off) otherwise returns to its nominal weight and
+dominates the faint-target image with its noise.
 
 Every row is independent, so the parts of a Multi-MS are processed by parallel
 worker processes, each reading and writing its own table. When the calibration
@@ -25,6 +33,7 @@ from typing import Optional
 import numpy as np
 
 from ..logging_utils import get_logger
+from .calblock import sigma_to_weight
 from .corrected import view as corrected_view, weights_set
 from .msio import open_table, read_layout, table_engine
 from .workers import run_jobs
@@ -59,21 +68,41 @@ def row_weights(values: np.ndarray, flags: np.ndarray, minsamp: int = 2) -> tupl
     return weight.astype(np.float32), starved
 
 
+def rescaled_sigma(sigma: np.ndarray, old: np.ndarray, new: np.ndarray) -> np.ndarray:
+    """``sigma * sqrt(old / new)`` where both weights are positive, ``sigma`` unchanged elsewhere.
+
+    ``sigma`` is (nrow, ncorr) or (nrow, nchan, ncorr); ``old`` and ``new`` are (nrow, ncorr).
+    """
+    sigma = np.asarray(sigma, dtype=np.float32)
+    old, new = np.asarray(old, dtype=np.float64), np.asarray(new, dtype=np.float64)
+    usable = (old > 0) & (new > 0)
+    factor = np.sqrt(np.divide(old, new, out=np.ones_like(old), where=usable))
+    if sigma.ndim == 3:
+        factor = factor[:, None, :]
+    return (sigma * factor).astype(np.float32)
+
+
 def statwt_part_job(*, path: str, segments: list[dict], engine: str, column: str, minsamp: int,
-                    has_weight_spectrum: bool, chunk_rows: int, view: Optional[dict] = None) -> dict:
+                    has_weight_spectrum: bool, chunk_rows: int, view: Optional[dict] = None,
+                    has_sigma_spectrum: bool = False) -> dict:
     """Worker job: reweight the row ranges ``segments`` of one table part in place.
 
     With ``view`` (:func:`vlbipy.solvers.corrected.view`), the segments of its fields are read from DATA and
-    corrected as applycal would have written CORRECTED_DATA.
+    corrected as applycal would have written CORRECTED_DATA. SIGMA (and SIGMA_SPECTRUM) is rescaled by the
+    ratio of the weights before and after (:func:`rescaled_sigma`).
     """
     from .applycal import corrected_chunks
     stats = {"rows": 0, "flagged_before": 0, "flagged_after": 0, "samples": 0,
              "wsum": 0.0, "wsum2": 0.0, "wcount": 0}
     live = set(view["entries_by_field"]) if view is not None else set()
 
-    def reweight(start: int, nrow: int, values: np.ndarray, flags: np.ndarray) -> None:
+    def reweight(start: int, nrow: int, values: np.ndarray, flags: np.ndarray, old: np.ndarray) -> None:
         before = int(np.count_nonzero(flags))
         weight, starved = row_weights(values, flags, minsamp)
+        handle.putcol("SIGMA", rescaled_sigma(handle.getcol("SIGMA", start, nrow), old, weight), start)
+        if has_sigma_spectrum:
+            handle.putcol("SIGMA_SPECTRUM",
+                          rescaled_sigma(handle.getcol("SIGMA_SPECTRUM", start, nrow), old, weight), start)
         flags |= starved[:, None, :]
         after = int(np.count_nonzero(flags))
         if after != before:
@@ -103,14 +132,23 @@ def statwt_part_job(*, path: str, segments: list[dict], engine: str, column: str
             for offset in range(0, segment["nrow"], chunk_rows):
                 start, nrow = segment["start"] + offset, min(chunk_rows, segment["nrow"] - offset)
                 reweight(start, nrow, handle.getcol(column, start, nrow),
-                         np.asarray(handle.getcol("FLAG", start, nrow), dtype=bool))
+                         np.asarray(handle.getcol("FLAG", start, nrow), dtype=bool),
+                         np.asarray(handle.getcol("WEIGHT", start, nrow), dtype=np.float32))
         corrected = [s for s in segments if int(s.get("field", -1)) in live]
         if corrected:
-            for start, nrow, vis, flag, *_ in corrected_chunks(
+            sigma_column = "SIGMA_SPECTRUM" if has_sigma_spectrum else "SIGMA"
+            for start, nrow, vis, flag, cube, weighted, _ in corrected_chunks(
                     handle, corrected, entries_by_field=view["entries_by_field"], setup=view["setup"],
-                    columns=view["columns"], parang=view["parang"], chunk_rows=chunk_rows, weights=None,
+                    columns=view["columns"], parang=view["parang"], chunk_rows=chunk_rows, weights="sigma",
                     calflags=view["write_flags"]):
-                reweight(start, nrow, vis, flag)
+                # The weights the deferred applycal would write: calibrated where its chain scales them,
+                # rebuilt from SIGMA elsewhere.
+                old = sigma_to_weight(handle.getcol(sigma_column, start, nrow))
+                old = old.mean(axis=1) if old.ndim == 3 else old
+                if cube is not None:
+                    rows = slice(None) if weighted is None else np.asarray(weighted, dtype=bool)
+                    old[rows] = cube.mean(axis=1)[rows]
+                reweight(start, nrow, vis, flag, old)
     finally:
         handle.close()
     return stats
@@ -119,6 +157,9 @@ def statwt_part_job(*, path: str, segments: list[dict], engine: str, column: str
 def statwt(ms, *, column: str = "CORRECTED_DATA", minsamp: int = 2, workers: Optional[int] = None,
               chunk_rows: int = STATWT_ROWS) -> dict:
     """Recompute WEIGHT (and WEIGHT_SPECTRUM) of every row of ``ms`` from the scatter of ``column``.
+
+    SIGMA (and SIGMA_SPECTRUM) is rescaled to match, so that the weights a later applycal rebuilds from it
+    keep the measured noise (see the module docstring).
 
     Returns
     -------
@@ -143,6 +184,7 @@ def statwt(ms, *, column: str = "CORRECTED_DATA", minsamp: int = 2, workers: Opt
             continue
         jobs.append({"path": path, "engine": engine, "column": column, "minsamp": int(minsamp),
                      "has_weight_spectrum": "WEIGHT_SPECTRUM" in layout["columns"], "chunk_rows": int(chunk_rows),
+                     "has_sigma_spectrum": "SIGMA_SPECTRUM" in layout["columns"],
                      "segments": [{"start": int(layout["start"][i]), "nrow": int(layout["nrow"][i]),
                                    "field": int(layout["field"][i]), "ddid": int(layout["ddid"][i])} for i in runs],
                      "view": view})

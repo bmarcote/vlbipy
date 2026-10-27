@@ -1641,19 +1641,17 @@ def render_diagnostics(ctx: dict, html_dir: Path, plot_root: Path) -> str:
         ("diag-autocorr", "Auto-correlations",
          _section("autocorr", "Auto-correlations", per_scan(auto, "Amplitude vs frequency per antenna (raw data)."),
                   "Auto-correlation spectra per antenna on the fringe-finder scans (phase calibrator when no fringe "
-                  "finder was observed).", count=f"{len(auto)} plot(s)")),
+                  "finder was observed).")),
         ("diag-crosscorr", "Cross-correlations",
          _section("crosscorr", "Cross-correlations to the reference antenna",
                   per_scan(cross, "Amplitude and phase vs frequency per baseline to the reference antenna (raw data)."),
-                  "Raw cross-correlation spectra per baseline to the reference antenna of each scan.",
-                  count=f"{len(cross)} plot(s)")),
+                  "Raw cross-correlation spectra per baseline to the reference antenna of each scan.")),
         ("diag-time-evolution", "Time evolution",
          _section("time-evolution", "Time evolution", _time_evolution_panel(evolution, html_dir, code, refants),
                   "Raw amplitude and phase versus time over the whole observation for every baseline to a reference "
                   "antenna, coloured by source and vector-averaged over the central channels of one subband. A further "
                   "reference antenna is added when the first one did not observe the whole run or had problems during "
-                  "part of it, and a further subband when not every antenna recorded the first one.",
-                  count=f"{len(evolution)} plot(s)")),
+                  "part of it, and a further subband when not every antenna recorded the first one.")),
     ]
     # The sections live in sub-tabs, so there are no in-page anchors for the side navigation.
     return _page(ctx, "diagnostics", "Diagnostics", [], _subtabs(tabs))
@@ -1866,13 +1864,11 @@ def _final_source_panel(ctx: dict, html_dir: Path, slug: str, entries: list[dict
         if not paths:
             continue
         anchor = f'{slug}-{re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")}'
-        parts.append(_section(anchor, title, _plot_grid(paths, html_dir, code, wide=len(paths) <= 2), blurb,
-                              count=f"{len(paths)} plot(s)"))
+        parts.append(_section(anchor, title, _plot_grid(paths, html_dir, code, wide=len(paths) <= 2), blurb))
     if images:
         parts.append(_section(f"{slug}-images", "Images",
                               _plot_grid(images, html_dir, code, "CLEAN images at robust -2 (uniform), 0 and 2 (natural).", wide=True),
-                              "CLEAN images with Briggs robust -2 (uniform), 0 and +2 (natural) weighting.",
-                              count=f"{len(images)} plot(s)"))
+                              "CLEAN images with Briggs robust -2 (uniform), 0 and +2 (natural) weighting."))
     return "".join(parts)
 
 

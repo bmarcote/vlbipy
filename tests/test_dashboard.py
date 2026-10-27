@@ -658,11 +658,11 @@ def test_diagnostics_page_has_three_horizontal_subtabs(tmp_path):
     bodies = dict(zip(ids, re.split(r'<div class="subpanel[^"]*" id="[^"]+">', page)[1:]))
     auto, cross, evolution = (bodies[i] for i in ids)
 
-    # Every file lands in its own sub-tab only, each with its blurb and plot count.
+    # Every file lands in its own sub-tab only, each with its blurb.
     assert "db01.raw_scan1.autocorr.png" in auto and "spectrum.png" not in auto and "time_evolution" not in auto
     assert "db01.raw_scan1.spectrum.png" in cross and "autocorr.png" not in cross and "time_evolution" not in cross
     assert "autocorr.png" not in evolution and "spectrum.png" not in evolution
-    assert "1 plot(s)" in auto and "1 plot(s)" in cross and "4 plot(s)" in evolution
+    assert "plot(s)" not in auto + cross + evolution
     assert "Auto-correlation spectra per antenna" in auto and "vector-averaged over the central channels" in evolution
     # The observation's reference antenna (EF) leads although AR sorts first; subbands in numeric order;
     # a file that does not follow the naming convention is still shown, last.

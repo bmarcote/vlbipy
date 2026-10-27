@@ -100,7 +100,8 @@ def read_dynamic_spectra(ms, *, fields: Optional[list[str]], column: str, corrs:
     -------
     dict
         ``spectra`` (``{(a, b): complex (n_time, nddid * nchan)}``, antenna indices, ``nan`` where no sample),
-        ``ddid_to_spw`` and ``seconds``.
+        ``counts`` (same keys and shape, the number of samples averaged into each cell), ``ddid_to_spw`` and
+        ``seconds``.
     """
     started = _time.perf_counter()
     engine = table_engine()
@@ -130,7 +131,8 @@ def read_dynamic_spectra(ms, *, fields: Optional[list[str]], column: str, corrs:
     for baseline, total in sums.items():
         with np.errstate(invalid="ignore", divide="ignore"):
             spectra[baseline] = np.where(counts[baseline] > 0, total / np.maximum(counts[baseline], 1), np.nan)
-    return {"spectra": spectra, "ddid_to_spw": setup["ddid_to_spw"], "seconds": _time.perf_counter() - started}
+    return {"spectra": spectra, "counts": counts, "ddid_to_spw": setup["ddid_to_spw"],
+            "seconds": _time.perf_counter() - started}
 
 
 # ---------------------------------------------------------------------------

@@ -838,3 +838,23 @@ def test_median_delay_step_ignores_too_short_series():
     from vlbipy.backends.casa import CasaCalibrationOps
     assert CasaCalibrationOps._median_delay_step({("A", 0): [(0.0, 1.0), (1.0, 9.0)]}) == float("inf")
     assert abs(CasaCalibrationOps._median_delay_step({("A", 0): [(2.0, 1.2), (0.0, 1.0), (1.0, 1.1)]}) - 0.1) < 1e-9
+
+
+def test_noise_departures_ignore_sample_count_and_catch_excess_noise():
+    import numpy as np
+
+    from vlbipy.backends.casa import CasaFlagOps
+
+    rng = np.random.default_rng(3)
+    n_time, n_chan = 200, 32
+    # Pure noise whose bins average 1 to 9 samples: the amplitude level swings by 3x with the count alone.
+    counts = rng.integers(1, 10, size=(n_time, 1)) * np.ones((1, n_chan), dtype=int)
+    noise = (rng.standard_normal((n_time, n_chan)) + 1j * rng.standard_normal((n_time, n_chan))) / np.sqrt(counts)
+    noise[[40, 120]] *= 6.0                       # two bins far noisier than their samples allow
+    amplitude = np.abs(noise)
+    ops = _casa_ops_without_backend(CasaFlagOps)
+    bins = ops._noise_departures(amplitude, counts, np.isfinite(amplitude), 5.0, 9)
+    assert set(bins.tolist()) == {40, 120}
+    # The level-based test, on the same baseline, condemns bins for their sample count.
+    spikes, _ = ops._spike_departures(amplitude, np.isfinite(amplitude), 5.0, 9)
+    assert len(spikes) > 2

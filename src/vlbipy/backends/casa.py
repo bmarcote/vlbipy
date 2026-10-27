@@ -51,6 +51,12 @@ FRINGE_PARAMETERS = {"phase": 0, "delay": 1, "rate": 2, "dispersive": 3}
 #: and a mean of values either side of a 2-pi jump is meaningless.
 FRINGE_SMOOTH_PARAMETERS = ("delay", "rate")
 
+#: Smallest departure from its neighbours for which a fringe solution is flagged, per
+#: parameter in the table's units (delay in ns, rate in s/s). The residual atmosphere
+#: moves the delay by ~1 ns and the rate by ~1e-13 s/s over a run, while a false fringe
+#: peak lands a sizeable fraction of 1/bandwidth (several ns) or of 1/scan away.
+FRINGE_OUTLIER_FLOOR = {"delay": 2.0, "rate": 1e-12}
+
 #: Parallel-hand polarization pairs, by correlation basis.
 _PARALLEL_HANDS = {Stokes.RR: "RR", Stokes.LL: "LL", Stokes.XX: "XX", Stokes.YY: "YY"}
 
@@ -1136,7 +1142,7 @@ class CasaDataOps(DataOps):
                          key=lambda n: antenna_names.index(n))
         logger.info("read_dynamic_spectra: {} baseline(s) over {} time bins x {} channels ({})",
                     len(spectra), n_time, n_freq, "Stokes I" if stokes_i else ",".join(pol_labels))
-        return {"baselines": spectra, "antennas": present, "times": centres.tolist(),
+        return {"baselines": spectra, "counts": counts, "antennas": present, "times": centres.tolist(),
                 "frequencies_ghz": meta.freq_setup.frequencies_ghz(), "field": field,
                 "column": column, "stokes_i": stokes_i}
 
@@ -2433,9 +2439,11 @@ class CasaCalibrationOps(CalibrationOps):
                           "solutions had to be de-spiked; check the table plot")
         return table
 
-    def smooth_fringe(self, project_code: str, table: CalTable, *, window: float = 900.0,
+    def smooth_fringe(self, project_code: str, table: CalTable, *, window: float = 7200.0,
                       smoothtype: str = "median", parameters: tuple = FRINGE_SMOOTH_PARAMETERS,
-                      min_points: int = 3, metadata: Optional[ObsMetadata] = None,
+                      min_points: int = 4, outlier_sigma: float = 5.0,
+                      outlier_floor: Optional[dict] = None,
+                      metadata: Optional[ObsMetadata] = None,
                       **kwargs) -> CalTable:
         """Smooth a fringe table's delay and rate in time; return the smoothed copy.
 
@@ -2456,6 +2464,13 @@ class CasaCalibrationOps(CalibrationOps):
         them — and the original table is left untouched on disk so both can be
         plotted and compared.
 
+        Before smoothing, a solution whose delay or rate departs from the other
+        solutions in its window by more than ``outlier_sigma`` robust sigmas, and
+        by more than ``outlier_floor``, is flagged (:func:`~vlbipy.statistics.outliers_in_time`), all of its
+        parameters for that polarization. Such a solution is a false detection —
+        a wrong fringe peak on a weak antenna, typically — not noise, and a
+        median would still let it leak into the interpolation onto the target.
+
         Parameters
         ----------
         project_code : str
@@ -2464,7 +2479,9 @@ class CasaCalibrationOps(CalibrationOps):
             The fringe table to smooth; not modified.
         window : float
             Full width of the smoothing window in seconds; <= 0 returns ``table``
-            unchanged (``[calibration.mbd_smooth].window``).
+            unchanged (``[calibration.mbd_smooth].window``). It must span several
+            solutions *of the same field*: with two phase calibrators observed in
+            alternating blocks, those are much sparser than the cycle time.
         smoothtype : str
             ``"median"`` (robust, default) or ``"mean"``.
         parameters : tuple of str
@@ -2472,7 +2489,14 @@ class CasaCalibrationOps(CalibrationOps):
             :data:`FRINGE_PARAMETERS`. Defaults to the delay and the rate.
         min_points : int
             Leave a solution untouched when its window holds fewer than this many
-            usable solutions, so an isolated scan is never "smoothed" with itself.
+            usable solutions, so an isolated scan is never "smoothed" with itself;
+            likewise the outlier test needs this many other solutions.
+        outlier_sigma : float
+            Flag solutions departing by more than this many robust sigmas from
+            their window; <= 0 disables the rejection.
+        outlier_floor : dict, optional
+            Minimum departure flagged, per parameter name; overrides
+            :data:`FRINGE_OUTLIER_FLOOR` key by key.
         metadata : ObsMetadata, optional
             Unused; accepted so the call site can forward it like the other steps.
 
@@ -2483,7 +2507,7 @@ class CasaCalibrationOps(CalibrationOps):
             carrying over the field mapping, interpolation and spw map of the
             input. The input table is returned unchanged when nothing was smoothed.
         """
-        from ..statistics import smooth_in_time
+        from ..statistics import outliers_in_time, smooth_in_time
 
         source = Path(table.path)
         if not source.is_dir():
@@ -2515,7 +2539,8 @@ class CasaCalibrationOps(CalibrationOps):
             n_param = values.shape[0]
             stride = 4 if n_param % 4 == 0 else n_param
             n_pol = max(1, n_param // stride)
-            n_changed, n_total = 0, 0
+            floors = {**FRINGE_OUTLIER_FLOOR, **(outlier_floor or {})}
+            n_changed, n_total, n_rejected = 0, 0, 0
             for antenna in np.unique(antenna_ids):
                 for spw in np.unique(spw_ids):
                     for field in np.unique(field_ids):
@@ -2525,6 +2550,22 @@ class CasaCalibrationOps(CalibrationOps):
                             continue
                         order = rows[np.argsort(times[rows])]
                         for pol in range(n_pol):
+                            first, last = pol * stride, min(n_param, (pol + 1) * stride)
+                            for channel in range(values.shape[1]):
+                                bad = np.zeros(order.size, dtype=bool)
+                                for name in parameters:
+                                    index = pol * stride + FRINGE_PARAMETERS[name]
+                                    if index >= n_param:
+                                        continue
+                                    series = np.where(flags[index, channel, order], np.nan,
+                                                      values[index, channel, order])
+                                    bad |= outliers_in_time(series, times[order], window=window,
+                                                            threshold=outlier_sigma,
+                                                            min_points=min_points,
+                                                            floor=floors.get(name, 0.0))
+                                if bad.any():
+                                    flags[first:last, channel, order[bad]] = True
+                                    n_rejected += int(bad.sum())
                             for offset in offsets:
                                 index = pol * stride + offset
                                 if index >= n_param:
@@ -2540,13 +2581,15 @@ class CasaCalibrationOps(CalibrationOps):
                                     n_changed += int(moved.sum())
                                     n_total += int(np.isfinite(series).sum())
             handle.putcol("FPARAM", values)
+            handle.putcol("FLAG", flags)
             handle.flush()
         finally:
             handle.close()
 
-        logger.info("smooth_fringe[{}]: {} of {} {} solution(s) smoothed with a {:g} s centred "
-                    "{} -> {}", table.cal_type, n_changed, n_total, "/".join(parameters), window,
-                    smoothtype, target.name)
+        logger.info("smooth_fringe[{}]: {} outlier solution(s) flagged (> {:g} sigma); {} of {} {} "
+                    "solution(s) smoothed with a {:g} s centred {} -> {}", table.cal_type, n_rejected,
+                    outlier_sigma, n_changed, n_total, "/".join(parameters), window, smoothtype,
+                    target.name)
         if not n_total:
             warnings.warn(f"{project_code}: the {table.cal_type} table has no unflagged solution to "
                           "smooth; applying it unsmoothed")
@@ -4453,6 +4496,52 @@ class CasaFlagOps(FlagOps):
             return empty[0], relative
         return np.where(usable & (np.abs(relative) > threshold * sigma))[0], relative
 
+    def _noise_departures(self, amplitude: np.ndarray, counts: np.ndarray, finite: np.ndarray,
+                          threshold: float, smooth_bins: int) -> np.ndarray:
+        """Return the time bins where a noise-dominated baseline is noisier than its own sample count allows.
+
+        On a baseline that is mostly noise — a faint target — a bin's amplitude is set by
+        how many samples went into it, |V| ~ sigma / sqrt(n), so the level of
+        :meth:`_spike_departures` swings with the flagging and the bin width and that test
+        sees a tenth of a perfectly good baseline as anomalous. Multiplying each channel
+        by ``sqrt(n)`` removes that dependence: what is left is the per-sample noise,
+        which only drifts slowly (Tsys, elevation) and is tracked by a running median. A
+        bin that rises above it by more than ``threshold`` robust sigmas carries noise or
+        interference the weights do not account for. Only rises are flagged: a quieter
+        bin is not a defect.
+
+        Parameters
+        ----------
+        amplitude, counts : numpy.ndarray
+            Amplitude and number of averaged samples, time x frequency.
+        finite : numpy.ndarray
+            Boolean mask of usable samples.
+        threshold : float
+            Robust-sigma cut on the fractional rise above the local per-sample noise.
+        smooth_bins : int
+            Window, in time bins, of the running median of the per-sample noise.
+
+        Returns
+        -------
+        numpy.ndarray
+            Indices of the offending time bins.
+        """
+        from ..statistics import mad_sigma, running_median
+
+        usable = finite & (counts > 0)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            noise = np.nanmedian(np.where(usable, amplitude * np.sqrt(counts), np.nan), axis=1)
+            level = running_median(noise, window=smooth_bins)
+            level = np.where(np.isfinite(level) & (level > 0.0), level, np.nan)
+            relative = noise / level - 1.0
+        ok = np.isfinite(relative)
+        if ok.sum() < 5:
+            return np.zeros(0, dtype=int)
+        sigma = mad_sigma(relative[ok])
+        if not np.isfinite(sigma) or sigma <= 0.0:
+            return np.zeros(0, dtype=int)
+        return np.where(ok & (relative > threshold * sigma))[0]
+
     @staticmethod
     def _baseline_coherence(values: np.ndarray) -> float:
         """How much of a baseline's amplitude is signal: 1 for a strong source, towards 0 for noise.
@@ -4537,13 +4626,21 @@ class CasaFlagOps(FlagOps):
             times = np.asarray(spectra["times"], dtype=float)
             half = (times[1] - times[0]) / 2.0 if times.size > 1 else 1.0
             stamp = "%Y/%m/%d/%H:%M:%S.%f"
+            sample_counts = spectra.get("counts") or {}
             for (first, second), values in spectra["baselines"].items():
                 amplitude = np.abs(values)
                 finite = np.isfinite(amplitude)
                 if finite.sum() < 20:
                     continue
                 total_points += int(finite.sum())
-                bad_bins, relative = self._spike_departures(amplitude, finite, threshold, smooth_bins)
+                counts = sample_counts.get((first, second))
+                noise_test = counts is not None and self._baseline_coherence(values) < gross_min_coherence
+                if noise_test:
+                    # Mostly noise: judge the per-sample noise, not the amplitude level (see _noise_departures).
+                    bad_bins = self._noise_departures(amplitude, np.asarray(counts), finite, threshold, smooth_bins)
+                    relative = None
+                else:
+                    bad_bins, relative = self._spike_departures(amplitude, finite, threshold, smooth_bins)
                 bad_bins = bad_bins[bad_bins < times.size]
                 if not bad_bins.size:
                     continue
@@ -4553,6 +4650,11 @@ class CasaFlagOps(FlagOps):
                 # verdict is how good antennas get erased from the calibration scan.
                 # Report the baseline instead of gutting it.
                 share = float(finite[bad_bins].sum()) / float(finite.sum())
+                if share > max_baseline_fraction and noise_test:
+                    logger.info("outliers: {} {}&{} is {:.0%} noisier than its sample count allows — too much "
+                                "to be spikes; leaving it untouched", name, first, second, share)
+                    suspect.append((f"{name} {first}&{second}", share))
+                    continue
                 if share > max_baseline_fraction:
                     # Too many for the sigma cut to be trusted - but on a well-sampled baseline the
                     # bins that sit far from the local level in absolute terms (an antenna still
