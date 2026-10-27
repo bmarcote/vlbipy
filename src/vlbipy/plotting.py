@@ -1246,7 +1246,7 @@ def plot_image_grid(images: dict, plot_dir: Union[str, Path], project_code: str 
             # Contours at 5 sigma, up by sqrt(2): the lowest meaningful signal upward.
             if rms > 0 and peak > 5 * rms:
                 n_levels = int(np.log(peak / (5 * rms)) / np.log(np.sqrt(2))) + 1
-                levels = 5 * rms * np.sqrt(2) ** np.arange(n_levels)
+                levels = 4 * rms * np.sqrt(2) ** np.arange(n_levels)
                 axis.contour(plane, levels=levels, extent=extent, colors="w",
                              linewidths=0.7, alpha=0.85)
             # Restoring beam in the bottom-left corner. The x data axis is relative RA (east
