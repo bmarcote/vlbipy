@@ -972,9 +972,11 @@ class CalibrateNamespace(Namespace):
         cfg = dict(obs.config.get("calibration", {}).get("reweight", {}))
         cfg.pop("enabled", None)
         cfg.update(kwargs)
-        # statwt reads the corrected column; materialize it once instead of recomputing the
-        # deferred calibration on every read.
-        obs.calibrate.write_corrected()
+        # statwt reads the corrected column. A backend whose statwt corrects the data as it reads them
+        # writes the column in that same pass; otherwise materialize it once first. Either way it is
+        # written afterwards, for the outlier pass that follows.
+        if not getattr(self._backend.calibrate, "reweight_writes_corrected", False):
+            obs.calibrate.write_corrected()
         report = self._backend.calibrate.reweight(self._code, **cfg)
         obs._state.mark_complete("reweight", outputs=[f"mean={report.get('mean')}"])
         return report
@@ -1636,9 +1638,11 @@ class FlagNamespace(Namespace):
         # but one antenna pulling all of its baselines down. Found once, on the first pass: the typical
         # times given to the faint fields count from each antenna's first unflagged sample, so a second
         # application would move that sample and flag again.
-        # The outlier passes below read the corrected column per baseline: materialize it once
-        # rather than let every read recompute the whole deferred calibration chain.
-        obs.calibrate.write_corrected()
+        # The outlier passes read the corrected column per field. On the first pass the chain is about to
+        # be re-solved, so a written column would be thrown away: read it through the deferred calibration
+        # (7.5 s against 12.8 s with the write on an LBA epoch). After reweighting it is already written.
+        if step != "flag_outliers":
+            obs.calibrate.write_corrected()
         if step == "flag_outliers" and not field and cfg.get("flag_off_source", True):
             self.off_source(dry_run=dry_run)
         report = self._backend.flag.outliers(

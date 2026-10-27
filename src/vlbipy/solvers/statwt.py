@@ -34,7 +34,7 @@ import numpy as np
 
 from ..logging_utils import get_logger
 from .calblock import sigma_to_weight
-from .corrected import view as corrected_view, weights_set
+from .corrected import begin_write, mark_written, view as corrected_view, weights_set
 from .msio import open_table, read_layout, table_engine
 from .workers import run_jobs
 
@@ -84,20 +84,26 @@ def rescaled_sigma(sigma: np.ndarray, old: np.ndarray, new: np.ndarray) -> np.nd
 
 def statwt_part_job(*, path: str, segments: list[dict], engine: str, column: str, minsamp: int,
                     has_weight_spectrum: bool, chunk_rows: int, view: Optional[dict] = None,
-                    has_sigma_spectrum: bool = False) -> dict:
+                    has_sigma_spectrum: bool = False, write_corrected: bool = False,
+                    keep_flags: bool = False) -> dict:
     """Worker job: reweight the row ranges ``segments`` of one table part in place.
 
     With ``view`` (:func:`vlbipy.solvers.corrected.view`), the segments of its fields are read from DATA and
-    corrected as applycal would have written CORRECTED_DATA. SIGMA (and SIGMA_SPECTRUM) is rescaled by the
-    ratio of the weights before and after (:func:`rescaled_sigma`).
+    corrected as applycal would have written CORRECTED_DATA; with ``write_corrected`` they are also written
+    there (and their calibration flags to FLAG), so the column holds the chain afterwards. SIGMA (and
+    SIGMA_SPECTRUM) is rescaled by the ratio of the weights before and after (:func:`rescaled_sigma`).
+    With ``keep_flags``, the stored FLAG and FLAG_ROW of every chunk whose flags change are returned under
+    ``originals`` (``[(start, flag, flag_row)]``), for the flag version (see :func:`statwt`).
     """
     from .applycal import corrected_chunks
     stats = {"rows": 0, "flagged_before": 0, "flagged_after": 0, "samples": 0,
-             "wsum": 0.0, "wsum2": 0.0, "wcount": 0}
+             "wsum": 0.0, "wsum2": 0.0, "wcount": 0, "originals": []}
     live = set(view["entries_by_field"]) if view is not None else set()
 
-    def reweight(start: int, nrow: int, values: np.ndarray, flags: np.ndarray, old: np.ndarray) -> None:
-        before = int(np.count_nonzero(flags))
+    def reweight(start: int, nrow: int, values: np.ndarray, flags: np.ndarray, old: np.ndarray,
+                 on_disk: Optional[int] = None) -> None:
+        """``on_disk``: flagged samples of the chunk as stored, when ``flags`` may already differ from it."""
+        before = int(np.count_nonzero(flags)) if on_disk is None else int(on_disk)
         weight, starved = row_weights(values, flags, minsamp)
         handle.putcol("SIGMA", rescaled_sigma(handle.getcol("SIGMA", start, nrow), old, weight), start)
         if has_sigma_spectrum:
@@ -105,9 +111,16 @@ def statwt_part_job(*, path: str, segments: list[dict], engine: str, column: str
                           rescaled_sigma(handle.getcol("SIGMA_SPECTRUM", start, nrow), old, weight), start)
         flags |= starved[:, None, :]
         after = int(np.count_nonzero(flags))
+        flag_row = flags.all(axis=(1, 2))
+        stored_row = np.asarray(handle.getcol("FLAG_ROW", start, nrow), dtype=bool)
+        row_changed = not np.array_equal(flag_row, stored_row)
+        if keep_flags and (after != before or row_changed):
+            stats["originals"].append((start, np.asarray(handle.getcol("FLAG", start, nrow), dtype=bool),
+                                       stored_row))
         if after != before:
             handle.putcol("FLAG", flags, start)
-        handle.putcol("FLAG_ROW", flags.all(axis=(1, 2)), start)
+        if row_changed:
+            handle.putcol("FLAG_ROW", flag_row, start)
         handle.putcol("WEIGHT", weight, start)
         if has_weight_spectrum:
             handle.putcol("WEIGHT_SPECTRUM", np.ascontiguousarray(np.broadcast_to(weight[:, None, :], flags.shape)),
@@ -137,7 +150,7 @@ def statwt_part_job(*, path: str, segments: list[dict], engine: str, column: str
         corrected = [s for s in segments if int(s.get("field", -1)) in live]
         if corrected:
             sigma_column = "SIGMA_SPECTRUM" if has_sigma_spectrum else "SIGMA"
-            for start, nrow, vis, flag, cube, weighted, _ in corrected_chunks(
+            for start, nrow, vis, flag, cube, weighted, flagged_before in corrected_chunks(
                     handle, corrected, entries_by_field=view["entries_by_field"], setup=view["setup"],
                     columns=view["columns"], parang=view["parang"], chunk_rows=chunk_rows, weights="sigma",
                     calflags=view["write_flags"]):
@@ -148,18 +161,55 @@ def statwt_part_job(*, path: str, segments: list[dict], engine: str, column: str
                 if cube is not None:
                     rows = slice(None) if weighted is None else np.asarray(weighted, dtype=bool)
                     old[rows] = cube.mean(axis=1)[rows]
-                reweight(start, nrow, vis, flag, old)
+                if write_corrected:
+                    handle.putcol("CORRECTED_DATA", vis, start)
+                reweight(start, nrow, vis, flag, old, on_disk=flagged_before if write_corrected else None)
     finally:
         handle.close()
     return stats
 
 
+def _save_flags_before(ms, versionname: str, originals_by_part: list) -> None:
+    """Save flag version ``versionname`` as the flags were before statwt changed the ``originals`` rows.
+
+    ``originals_by_part``: ``[(part path, [(start, flag, flag_row), ...]), ...]`` from the jobs.
+    """
+    from ..casacore_format.table import Table
+    from .flagmanager import _parts, save_version
+    changed = [(path, item) for path, items in originals_by_part for item in items]
+    if not changed:
+        logger.info("statwt: no flag changed; flag version {!r} not needed", versionname)
+        return
+    # A version table holds the rows of every part in the order of the set: each part follows the previous ones.
+    offsets, row = {}, 0
+    for part in _parts(ms):
+        offsets[str(Path(part).resolve())] = row
+        with Table(part) as table:
+            row += table.nrows()
+    target = save_version(ms, versionname, comment="flags before statwt")
+    with Table(target, readonly=False) as table:
+        for path, (start, flag, flag_row) in changed:
+            first = offsets[str(Path(path).resolve())] + int(start)
+            table.putcol("FLAG", flag, first)
+            table.putcol("FLAG_ROW", flag_row, first)
+
+
 def statwt(ms, *, column: str = "CORRECTED_DATA", minsamp: int = 2, workers: Optional[int] = None,
-              chunk_rows: int = STATWT_ROWS) -> dict:
+              chunk_rows: int = STATWT_ROWS, write_corrected: bool = False,
+              flagbackup: Optional[str] = None) -> dict:
     """Recompute WEIGHT (and WEIGHT_SPECTRUM) of every row of ``ms`` from the scatter of ``column``.
 
     SIGMA (and SIGMA_SPECTRUM) is rescaled to match, so that the weights a later applycal rebuilds from it
     keep the measured noise (see the module docstring).
+
+    ``write_corrected``: the fields whose calibration is deferred (:mod:`vlbipy.solvers.corrected`) are
+    corrected while read anyway; write that to CORRECTED_DATA in the same pass. Writing the column first and
+    reading it back for statwt moved the whole data set through the disk twice more (and wrote calibrated
+    weights only to overwrite them): 17 s -> ~10 s for the reweighting of an LBA epoch.
+
+    ``flagbackup``: the name of a flag version holding the flags as they were before (as CASA's ``statwt``
+    saves). It is only written when statwt changed a flag — usually it changes none, and copying the whole
+    FLAG column for nothing cost 2 s an epoch — from the current flags with the changed rows put back.
 
     Returns
     -------
@@ -177,6 +227,11 @@ def statwt(ms, *, column: str = "CORRECTED_DATA", minsamp: int = 2, workers: Opt
     if column not in layout["columns"] and (view is None or set(np.unique(layout["field"]).tolist())
                                             - set(view["entries_by_field"])):
         raise RuntimeError(f"{Path(ms).name} has no {column} column")
+    write_through = bool(write_corrected) and view is not None and column == "CORRECTED_DATA"
+    if write_through:
+        from .applycal import ensure_column
+        ensure_column(ms, "CORRECTED_DATA", "DATA", engine=engine)
+        begin_write(ms, list(view["entries_by_field"]))
     jobs = []
     for part_index, path in enumerate(layout["parts"]):
         runs = np.flatnonzero(layout["part"] == part_index)
@@ -184,11 +239,18 @@ def statwt(ms, *, column: str = "CORRECTED_DATA", minsamp: int = 2, workers: Opt
             continue
         jobs.append({"path": path, "engine": engine, "column": column, "minsamp": int(minsamp),
                      "has_weight_spectrum": "WEIGHT_SPECTRUM" in layout["columns"], "chunk_rows": int(chunk_rows),
-                     "has_sigma_spectrum": "SIGMA_SPECTRUM" in layout["columns"],
+                     "has_sigma_spectrum": "SIGMA_SPECTRUM" in layout["columns"], "write_corrected": write_through,
+                     "keep_flags": bool(flagbackup),
                      "segments": [{"start": int(layout["start"][i]), "nrow": int(layout["nrow"][i]),
                                    "field": int(layout["field"][i]), "ddid": int(layout["ddid"][i])} for i in runs],
                      "view": view})
     results = run_jobs("vlbipy.solvers.statwt:statwt_part_job", jobs, workers)
+    if write_through:
+        mark_written(ms, list(view["entries_by_field"]))
+    if flagbackup:
+        _save_flags_before(ms, flagbackup, [(job["path"], r.pop("originals")) for job, r in zip(jobs, results)])
+    for result in results:
+        result.pop("originals", None)
     # A deferred calibration (vlbipy.solvers.corrected) now weighs its data with these weights, as an applycal
     # written before statwt would.
     weights_set(ms, np.unique(layout["field"]).tolist())

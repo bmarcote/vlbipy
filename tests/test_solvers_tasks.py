@@ -767,6 +767,31 @@ def test_deferred_application_reads_exactly_like_the_written_one(sim, tmp_path):
     workers.close_pool()
 
 
+
+def test_statwt_writes_a_deferred_calibration_in_the_same_pass(sim, tmp_path):
+    """statwt(write_corrected=True) on a deferred chain leaves what applycal + statwt leave."""
+    import shutil
+    from vlbipy.solvers import corrected
+    from vlbipy.solvers.applycal import apply_to_ms, defer_to_ms
+    from vlbipy.solvers.statwt import statwt
+    pytest.importorskip("casacore.tables")
+    _add_split_columns(sim["ms"], np.random.default_rng(5))
+    entries = _chain(sim["ms"], tmp_path)
+    written, fused = tmp_path / "written.ms", tmp_path / "fused.ms"
+    shutil.copytree(sim["ms"], written)
+    shutil.copytree(sim["ms"], fused)
+    apply_to_ms(written, {0: entries}, parang=True, workers=2)
+    statwt(written, column="CORRECTED_DATA", workers=2)
+    defer_to_ms(fused, {0: entries}, parang=True, workers=2)
+    statwt(fused, column="CORRECTED_DATA", workers=2, write_corrected=True)
+    assert not corrected.pending(fused)
+    for name in ("CORRECTED_DATA", "FLAG", "FLAG_ROW", "WEIGHT", "SIGMA"):
+        _assert_same(*(_columns(ms, name)[0] for ms in (written, fused)))
+    # Nothing is left to write, and a later write of the same chain changes nothing.
+    assert corrected.write_pending(fused) == []
+    workers.close_pool()
+
+
 def _main_columns(ms):
     tb = casatools.table()
     tb.open(str(ms))
@@ -1008,4 +1033,31 @@ def test_combined_spw_map_points_at_the_subband_the_solutions_were_stored_in(sim
     ops._backend = SimpleNamespace(tools=SimpleNamespace(table=casatools.table))
     meta = SimpleNamespace(freq_setup=SimpleNamespace(n_subbands=NSPW))
     assert ops._combined_spwmap(path, meta) == [1] * NSPW
+    workers.close_pool()
+
+
+def test_statwt_saves_the_flags_it_changes_and_only_then(sim, tmp_path):
+    import shutil
+    from vlbipy.solvers import flagmanager
+    from vlbipy.solvers.statwt import statwt
+    tb = casatools.table()
+    tb.open(str(sim["ms"]), nomodify=False)
+    tb.addcols({"CORRECTED_DATA": _array("complex", [NCORR, NCHAN])})
+    tb.putcol("CORRECTED_DATA", np.asfortranarray(sim["data"].T))
+    flag = np.zeros(sim["data"].shape, dtype=bool)
+    flag[3, 1:, :] = True                                          # row 3: one channel left -> statwt flags it
+    tb.putcol("FLAG", np.asfortranarray(flag.T))
+    tb.close()
+    untouched = tmp_path / "untouched.ms"
+    shutil.copytree(sim["ms"], untouched)
+    statwt(sim["ms"], column="CORRECTED_DATA", minsamp=2, workers=2, flagbackup="statwt_1")
+    assert [name for name, _ in flagmanager.list_versions(sim["ms"])] == ["statwt_1"]
+    # The version is the flags as they were: restoring it gives back the row statwt flagged.
+    flagmanager.flagmanager(vis=str(sim["ms"]), mode="restore", versionname="statwt_1")
+    _assert_same(*(_columns(ms, "FLAG")[0] for ms in (sim["ms"], untouched)))
+    _assert_same(*(_columns(ms, "FLAG_ROW")[0] for ms in (sim["ms"], untouched)))
+    # Run again: every starved row is flagged already, nothing changes, no version is written.
+    statwt(sim["ms"], column="CORRECTED_DATA", minsamp=2, workers=2, flagbackup="statwt_1")
+    statwt(sim["ms"], column="CORRECTED_DATA", minsamp=2, workers=2, flagbackup="statwt_2")
+    assert [name for name, _ in flagmanager.list_versions(sim["ms"])][-1] != "statwt_2"
     workers.close_pool()

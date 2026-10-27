@@ -1003,6 +1003,9 @@ class DaskMsCalibrationOps(CasaCalibrationOps):
         from ..solvers.corrected import write_pending
         return write_pending(self.backend.ms_path(project_code))
 
+    #: :meth:`reweight` writes a deferred calibration to CORRECTED_DATA itself, in its own pass over the data.
+    reweight_writes_corrected = True
+
     def reweight(self, project_code: str, *, column: str = "corrected", timebin: str = "",
                  minsamp: int = 2, flagbackup: bool = True, **kwargs) -> dict:
         """statwt with its default binning (one integration, a whole spw), computed natively in parallel.
@@ -1019,16 +1022,17 @@ class DaskMsCalibrationOps(CasaCalibrationOps):
                                     flagbackup=flagbackup, **kwargs)
         ms = self.backend.ms_path(project_code)
         logger.info("statwt[dask-ms]: datacolumn={!r} minsamp={} flagbackup={}", column, minsamp, flagbackup)
+        backup = None
         if flagbackup:
-            # CASA's statwt names its backups statwt_1, statwt_2, ...
+            # CASA's statwt names its backups statwt_1, statwt_2, ...; written only if statwt changes a flag.
             listing = Path(f"{ms}.flagversions") / "FLAG_VERSION_LIST"
             names = [line.split(":")[0].strip() for line in listing.read_text().splitlines()] if listing.is_file() else []
             number = 1 + max([int(n.split("_")[1]) for n in names if n.startswith("statwt_") and n[7:].isdigit()],
                              default=0)
-            self.backend.tasks.flagmanager(vis=str(ms), mode="save", versionname=f"statwt_{number}")
+            backup = f"statwt_{number}"
         try:
             report = statwt(ms, column={"corrected": "CORRECTED_DATA", "data": "DATA"}[column],
-                               minsamp=int(minsamp))
+                               minsamp=int(minsamp), write_corrected=True, flagbackup=backup)
         except RuntimeError as exc:
             raise BackendError(f"{project_code}: statwt failed: {exc}") from exc
         logger.info("statwt: new weights mean={} variance={}", report.get("mean"), report.get("variance"))
