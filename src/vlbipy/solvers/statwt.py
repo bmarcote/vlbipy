@@ -114,7 +114,10 @@ def statwt_part_job(*, path: str, segments: list[dict], engine: str, column: str
         flag_row = flags.all(axis=(1, 2))
         stored_row = np.asarray(handle.getcol("FLAG_ROW", start, nrow), dtype=bool)
         row_changed = not np.array_equal(flag_row, stored_row)
-        if keep_flags and (after != before or row_changed):
+        # Only a change of FLAG calls for the backup: a FLAG_ROW brought in line with FLAG (writers that set
+        # FLAG alone leave fully flagged rows unmarked) changes no visibility's flag, and on an LBA epoch it
+        # made every chunk look changed — a full flag version and the whole FLAG column sent back for nothing.
+        if keep_flags and after != before:
             stats["originals"].append((start, np.asarray(handle.getcol("FLAG", start, nrow), dtype=bool),
                                        stored_row))
         if after != before:

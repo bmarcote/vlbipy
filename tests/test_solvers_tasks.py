@@ -1056,6 +1056,15 @@ def test_statwt_saves_the_flags_it_changes_and_only_then(sim, tmp_path):
     flagmanager.flagmanager(vis=str(sim["ms"]), mode="restore", versionname="statwt_1")
     _assert_same(*(_columns(ms, "FLAG")[0] for ms in (sim["ms"], untouched)))
     _assert_same(*(_columns(ms, "FLAG_ROW")[0] for ms in (sim["ms"], untouched)))
+    # A FLAG_ROW out of step with FLAG is put right, but that changes no flag: no version for it.
+    statwt(sim["ms"], column="CORRECTED_DATA", minsamp=2, workers=2)       # row 3 flagged again, as before
+    tb = casatools.table()
+    tb.open(str(sim["ms"]), nomodify=False)
+    tb.putcell("FLAG_ROW", 3, False)
+    tb.close()
+    statwt(sim["ms"], column="CORRECTED_DATA", minsamp=2, workers=2, flagbackup="statwt_9")
+    assert "statwt_9" not in [name for name, _ in flagmanager.list_versions(sim["ms"])]
+    assert _columns(sim["ms"], "FLAG_ROW")[0][3]
     # Run again: every starved row is flagged already, nothing changes, no version is written.
     statwt(sim["ms"], column="CORRECTED_DATA", minsamp=2, workers=2, flagbackup="statwt_1")
     statwt(sim["ms"], column="CORRECTED_DATA", minsamp=2, workers=2, flagbackup="statwt_2")
