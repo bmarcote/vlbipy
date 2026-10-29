@@ -300,3 +300,21 @@ def test_tiled_column_without_defined_cells_opens_in_casacore(tmp_path):
         assert np.asarray(tb.getcol("DATA")).shape == (2, 8, 3)
     finally:
         tb.close()
+
+
+def test_tiled_header_records_files_and_offsets_beyond_4_gib(tmp_path):
+    from vlbipy.casacore_format.tsm import Cube, TiledManager, write_header
+    columns = [scalar_column("TIME", "double"), array_column("DATA", "complex", ndim=2)]
+    create_table(tmp_path / "t.ms", columns, 3, {"TIME": np.arange(3.0)}, tiled={"DATA": (8, 2)})
+    with Table(tmp_path / "t.ms") as table:
+        desc = table.coldesc("DATA")
+        manager = table._manager(desc.seqnr)
+        big_endian = table.dat.big_endian
+    # Lengths/offsets past 2 GiB take casacore's 64-bit version-2 records (a 5 GiB EVN part overflowed the uInt).
+    files = {1: 5 * 2 ** 30, 2: 1000}
+    cubes = [Cube((), (), -1, 0), Cube((2, 8, 3), (2, 8, 3), 1, 0, True), Cube((2, 8, 3), (2, 8, 3), 2, 3 * 2 ** 30)]
+    write_header(tmp_path / "t.ms", desc.seqnr, "TiledShapeStMan", [desc], big_endian, 3, cubes, files,
+                 desc.dm_group, manager.default_tile_shape, manager.row_map, manager.cube_map, manager.pos_map)
+    reread = TiledManager(tmp_path / "t.ms", desc.seqnr, "TiledShapeStMan", [desc], big_endian, 3)
+    assert reread.files == files
+    assert [cube.offset for cube in reread.cubes] == [0, 0, 3 * 2 ** 30]

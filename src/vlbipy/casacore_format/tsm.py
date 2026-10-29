@@ -29,6 +29,9 @@ from .aipsio import SCALAR_DTYPES, TP_BOOL, TP_UINT, AipsReader, AipsWriter
 from .tabledat import ColumnDesc, UnsupportedTable
 
 TILED_TYPES = ("TiledShapeStMan", "TiledColumnStMan", "TiledCellStMan")
+# casacore (TSMFile/TSMCube::putObject) writes a tile-file length or cube offset as a version-1 uInt below 2 GiB
+# and as a version-2 Int64 from there on; the 32-bit field overflows for files of 4 GiB (large EVN parts).
+LARGE_FILE_BYTES = 2 ** 31
 
 
 @dataclass
@@ -373,23 +376,31 @@ def write_header(table_path, seqnr: int, type_name: str, columns: list[ColumnDes
     nfile = max(files) + 1 if files else 0
     writer.u32(nfile)
     for index in range(nfile):
-        if index in files:
-            writer.bool(True)
-            writer.u32(1)
-            writer.u32(index)
-            writer.u32(int(files[index]))
-        else:
+        if index not in files:
             writer.bool(False)
+            continue
+        length = int(files[index])
+        writer.bool(True)
+        writer.u32(1 if length < LARGE_FILE_BYTES else 2)
+        writer.u32(index)
+        if length < LARGE_FILE_BYTES:
+            writer.u32(length)
+        else:
+            writer.i64(length)
     writer.u32(len(cubes))
     for cube in cubes:
-        writer.i32(1)
+        offset = int(cube.offset)
+        writer.i32(1 if offset < LARGE_FILE_BYTES else 2)
         writer.record(cube.values or {})
         writer.bool(cube.extensible)
         writer.u32(len(cube.shape) if cube.shape else 0)
         writer.ipos(cube.shape)
         writer.ipos(cube.tile_shape)
         writer.i32(cube.file_seqnr)
-        writer.u32(int(cube.offset))
+        if offset < LARGE_FILE_BYTES:
+            writer.u32(offset)
+        else:
+            writer.i64(offset)
     writer.end()
     if type_name == "TiledShapeStMan":
         writer.ipos(default_tile_shape)
