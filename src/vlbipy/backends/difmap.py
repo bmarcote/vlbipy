@@ -131,7 +131,7 @@ def fit_starting_model(obs) -> dict:
     component at the residual peak (``seed_model``) and ``modelfit`` refines it.
     """
     obs.clrmod()
-    result = _checked_modelfit(obs.modelfit(quiet=True))
+    result = _checked_modelfit(obs.modelfit(quiet=False, verbose=False))
     comp = result["components"][0]
     logger.info("difmapy modelfit: {:.3f} Jy circular Gaussian, FWHM {:.2f} mas at ({:+.2f}, {:+.2f}) mas, "
                 "rchisq {:.3g}, converged={}", comp.get("flux", float("nan")), comp.get("major", float("nan")),
@@ -168,7 +168,7 @@ def phase_selfcal(obs, solints: list[str], *, min_improvement: float = 0.002,
     rounds: list[dict] = []
     for solint in solints:
         trial = obs.copy()
-        report = trial.selfcal(phase=True, amp=False, solint=solint, quiet=True)
+        report = trial.selfcal(phase=True, amp=False, solint=solint, quiet=False, verbose=False)
         before, after = float(report["fit_before"]["chisq"]), float(report["fit_after"]["chisq"])
         improvement = (before - after) / before if before > 0 else 0.0
         bad = _bad_fraction(report)
@@ -183,7 +183,7 @@ def phase_selfcal(obs, solints: list[str], *, min_improvement: float = 0.002,
             break
         if refit:
             try:
-                _checked_modelfit(trial.modelfit(quiet=True))
+                _checked_modelfit(trial.modelfit(quiet=False, verbose=False))
             except BackendError:
                 rounds[-1].update(accepted=False, reason="modelfit refit failed")
                 logger.warning("difmapy selfcal phase solint={}: model refit failed; keeping the previous round", solint)
@@ -205,7 +205,8 @@ def amplitude_calibration(obs, prefix: str, parent_ms: str, *, models=("current"
         models = tuple(model for model in models if not str(getattr(model, "kind", model)).strip().lower().startswith("clean"))
         models = models or ("current", "gauss1", "gauss2", "gauss3")
     result = obs.bayes_gscale(models=models, prior_sigma=prior_sigma, prefix=str(prefix),
-                              outformat="CASA", ms=str(parent_ms), workers=workers, plot=False, quiet=True)
+                              outformat="CASA", ms=str(parent_ms), workers=workers, plot=False, quiet=False,
+                              verbose=False)
     raw_files = dict(getattr(result, "files", {}) or {})
     files = {k: [str(x) for x in v] if isinstance(v, (list, tuple)) else str(v) for k, v in raw_files.items()}
     table = files.get("caltable") or files.get("casa") or f"{prefix}.G"
@@ -266,7 +267,7 @@ def write_gain_record(obs, path: str, amplitude: Optional[dict] = None) -> dict:
 
 def export_phase_table(obs, path: str, parent_ms: str, since) -> dict:
     """Write the gains accumulated since ``since`` (the phase self-cal) as a CASA table for ``parent_ms``."""
-    info = obs.savecaltable(str(path), outformat="CASA", ms=str(parent_ms), since=since, quiet=True)
+    info = obs.savecaltable(str(path), outformat="CASA", ms=str(parent_ms), since=since, quiet=False, verbose=False)
     logger.info("difmapy: phase self-cal table {} ({} rows)", info.get("path", path), info.get("nrows"))
     return dict(info)
 
@@ -286,13 +287,13 @@ def clean_image(obs, fits_path: str, *, robust: float, niter: int = 4000, gain: 
     """
     obs.clrmod()
     obs.uvweight(robust=float(robust))
-    obs.invert()
+    obs.invert(verbose=False)
     done = 0
     rms = float(obs.imstat().get("rms", 0.0))
     stopped = ""
     while done < niter:
         checkpoint = obs.copy()
-        obs.clean(min(batch, niter - done), gain, quiet=True)
+        obs.clean(min(batch, niter - done), gain, verbose=False)
         stats = obs.imstat()
         new_rms = float(stats.get("rms", 0.0))
         # Unwindowed Hogbom CLEAN on sparse VLBI coverage can run away: once the
@@ -313,7 +314,7 @@ def clean_image(obs, fits_path: str, *, robust: float, niter: int = 4000, gain: 
         if rms > 0 and abs(float(stats.get("max", 0.0))) < threshold_sigma * rms and not still_falling:
             stopped = f"residual peak below {threshold_sigma:g} sigma"
             break
-    obs.restore()
+    obs.restore(verbose=False)
     obs.wmap(str(fits_path), overwrite=True)
     _crop_to_valid(fits_path, obs.valid_slice)
     valid = obs.valid_slice
@@ -366,10 +367,10 @@ def fit_image_model(obs, *, max_components: int = 1, component_sigma: float = 5.
     """Fit one Gaussian first; add components only above noise and float32 visibility precision, with fit gains."""
     if int(max_components) < 1 or component_sigma <= 0 or not 0 <= component_improvement < 1:
         raise ValueError("invalid modelfit component limit, significance or improvement threshold")
-    fit = _checked_modelfit(obs.modelfit(quiet=True))
+    fit = _checked_modelfit(obs.modelfit(quiet=False, verbose=False))
     stopped = "component limit reached"
     while len(obs.model) < int(max_components):
-        obs.invert()
+        obs.invert(verbose=False)
         rms = float(obs.noise_stats().get("rms", 0.0))
         _, peak = obs.peak_offset()
         floor = MODEL_RESIDUAL_PRECISION * abs(float(obs.model_flux))
@@ -379,7 +380,7 @@ def fit_image_model(obs, *, max_components: int = 1, component_sigma: float = 5.
         trial = obs.copy()
         trial.seed_model(type="gauss", free=("flux", "pos", "major"))
         try:
-            candidate = _checked_modelfit(trial.modelfit(quiet=True))
+            candidate = _checked_modelfit(trial.modelfit(quiet=False, verbose=False))
         except BackendError:
             stopped = "additional component fit rejected"
             break
@@ -402,10 +403,10 @@ def modelfit_image(obs, fits_path: str, *, robust: float, model_report: Optional
         obs, model_report = fit_image_model(obs, max_components=max_components, component_sigma=component_sigma,
                                             component_improvement=component_improvement)
     obs.uvweight(robust=float(robust))
-    obs.invert()
+    obs.invert(verbose=False)
     stats = obs.imstat()
     noise = float(obs.noise_stats().get("rms", stats.get("rms", 0.0)))
-    obs.restore(no_residual=False)
+    obs.restore(no_residual=False, verbose=False)
     obs.wmap(str(fits_path), overwrite=True)
     _crop_to_valid(fits_path, obs.valid_slice)
     peak = float(np.nanmax(np.asarray(obs.restored_map)[obs.valid_slice]))
@@ -474,7 +475,7 @@ def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_value
     fixed = [known[n] for n in (a.lower() for a in fixed_antennas) if n in known]
     deferred = [known[n] for n in (a.lower() for a in deferred_antennas) if n in known]
     if fixed:
-        obs.selfant(fixed, fix=True, quiet=True)
+        obs.selfant(fixed, fix=True, verbose=False)
         logger.info("difmapy: {} fixed in self-calibration (a-priori amplitudes held)", ", ".join(fixed))
     search, shift = locate_source(obs, imagename or prefix, search_fov_mas=search_fov_mas, search_sigma=search_sigma,
                                   recentre_min_beams=recentre_min_beams)
@@ -491,17 +492,17 @@ def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_value
     rounds += stage1
     if deferred and len(deferred) < len(obs.antennas):
         obs.unignore(*deferred)
-        obs.modelfit(quiet=True)               # the model now has to describe the long baselines too
+        obs.modelfit(verbose=False)            # the model now has to describe the long baselines too
         if fix_stage1:
             stage1_names = [a for a in obs.antennas if a not in deferred]
-            obs.selfant(stage1_names, fix=True, quiet=True)
+            obs.selfant(stage1_names, fix=True, verbose=False)
         obs, stage2 = phase_selfcal(obs, ladder, min_improvement=min_improvement,
                                     max_bad_fraction=max_bad_fraction)
         for r in stage2:
             r["stage"] = "long-baselines"
         rounds += stage2
         if fix_stage1:
-            obs.selfant(stage1_names, fix=False, quiet=True)
+            obs.selfant(stage1_names, fix=False, verbose=False)
     phase_table = export_phase_table(obs, f"{prefix}.phase", parent_ms, snapshot) if any(r["accepted"] for r in rounds) \
         else {}
     amplitude = amplitude_calibration(obs, f"{prefix}.amp", parent_ms, models=bayes_models, prior_sigma=prior_sigma,
@@ -512,7 +513,7 @@ def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_value
     accumulated = ""
     try:
         info = obs.savecaltable(f"{prefix}.all", outformat="CASA", ms=str(parent_ms), since=snapshot,
-                                quiet=True)
+                                quiet=False, verbose=False)
         accumulated = str(info.get("path", f"{prefix}.all"))
     except Exception as exc:  # noqa: BLE001 - the separate phase/amp tables still cover it
         logger.warning("difmapy: could not export the accumulated gain table ({})", exc)
@@ -662,7 +663,8 @@ def refine_against_model(split_ms: str, parent_ms: str, prefix: str, model_path:
         before = float(trial.moddif()["chisq"])
         result = trial.bayes_gscale(models=("current",), prior_sigma=prior_sigma, outlier_sigma=outlier_sigma,
                                      model_sigma=model_sigma, workers=workers, nloop=0, apply=True,
-                                     prefix=f"{prefix}.amp", outformat="CASA", ms=str(parent_ms), plot=False, quiet=True)
+                                     prefix=f"{prefix}.amp", outformat="CASA", ms=str(parent_ms), plot=False, quiet=False,
+                                     verbose=False)
         amplitude_files = dict(getattr(result, "files", {}) or {})
         after = float(trial.moddif()["chisq"])
         accepted = math.isfinite(after) and before > 0 and (before - after) / before >= min_improvement
@@ -674,7 +676,8 @@ def refine_against_model(split_ms: str, parent_ms: str, prefix: str, model_path:
                      if row.get("has_data") and math.isfinite(float(row.get("correction", math.nan)))}
     table = ""
     if gains or any(r["accepted"] for r in rounds):
-        info = obs.savecaltable(f"{prefix}", outformat="CASA", ms=str(parent_ms), since=snapshot, quiet=True)
+        info = obs.savecaltable(f"{prefix}", outformat="CASA", ms=str(parent_ms), since=snapshot, quiet=False,
+                                verbose=False)
         table = str(info.get("path", f"{prefix}"))
     report = {"source": obs.source, "split_ms": str(split_ms), "model": str(model_path), "caltable": table,
               "ladder": ladder, "rounds": rounds, "amplitude": gains, "amplitude_files": amplitude_files,
@@ -716,7 +719,7 @@ def find_peak(obs, *, fov_mas: float = 1000.0, threshold_sigma: float = 10.0, fi
     obs.clrmod()
     obs.uvweight(robust=2.0)
     obs.mapsize(npix, cell)
-    obs.invert()
+    obs.invert(verbose=False)
     (x, y), peak = obs.peak_offset()
     dirty, beam = np.asarray(obs.dmap), np.asarray(obs.dbeam)
     iy, ix = int(round(y / cell)) + npix // 2, int(round(x / cell)) + npix // 2

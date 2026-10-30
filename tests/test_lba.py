@@ -80,6 +80,16 @@ def test_uvflg_records_of_hours_are_reported_not_applied(tmp_path):
     assert result["written"] == 1 and len(result["too_long"]) == 1 and "12.3 h" in result["too_long"][0]
 
 
+def test_uvflg_record_with_an_unreadable_time_range_is_not_applied(tmp_path):
+    """A garbled timerang must not become a whole-run flag; a missing one is AIPS's "all times"."""
+    path = tmp_path / "x.uvflg"
+    path.write_text("ant_name='AT' timerang=82,10,00,00 82,10,01,46 reason='SLEWING' /\n"
+                    "ant_name='PA' reason='DISH STOWED' /\n")
+    result = uvflg_to_casa(path, tmp_path / "x.flag", 2020, antennas=["AT", "PA"])
+    assert result["malformed"] == ["antenna='AT' timerang=[82.0, 10.0, 0.0, 0.0]"]
+    assert (tmp_path / "x.flag").read_text() == "antenna='PA' reason='DISH_STOWED'\n"
+
+
 def test_campaign_report_is_outdated_by_a_recalibrated_epoch(tmp_path):
     import os
     from types import SimpleNamespace

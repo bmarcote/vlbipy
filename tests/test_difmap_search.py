@@ -24,7 +24,7 @@ class StubObservation:
     def mapsize(self, npix, cell):
         self.npix, self.cell = int(npix), float(cell)
 
-    def invert(self):
+    def invert(self, verbose=True):
         n = self.npix
         yy, xx = np.mgrid[:n, :n]
         self.dbeam = np.exp(-((xx - n // 2) ** 2 + (yy - n // 2) ** 2) / 8.0)

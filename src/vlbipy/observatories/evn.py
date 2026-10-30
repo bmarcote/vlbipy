@@ -8,8 +8,8 @@ using urllib + hashlib (via :mod:`vlbipy.tools`) instead of wget/md5sum:
 * download FITS-IDI + ``.antab`` + ``.uvflg`` from https://archive.jive.eu,
   verifying the archive MD5 checksum file and retrying failed files once,
 * pre-import preparation: append Tsys/gain-curve tables from the ``.antab``
-  file and convert AIPS ``.uvflg`` flags to a CASA-style ``.flag`` file
-  (both via the external ``casavlbitools`` package, when installed).
+  file (via the vendored ``casavlbitools``) and convert AIPS ``.uvflg`` flags
+  to a CASA-style ``.flag`` file (via the tolerant :mod:`vlbipy.uvflg` reader).
 """
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from typing import Optional
 from .. import fitsidi, tools
 from ..logging_utils import get_logger, headline, warnings
 from ..progress import track_downloads
+from ..uvflg import uvflg_to_casa
 from .base import ObservatoryHandler
 
 logger = get_logger()
@@ -44,8 +45,7 @@ def _import_casavlbitools():
         from casavlbitools import fitsidi as cvt_fitsidi
         return cvt_fitsidi
     except ImportError:
-        warnings.warn("casavlbitools could not be imported: cannot append Tsys/GC to FITS-IDI "
-                      "or convert .uvflg flags.")
+        warnings.warn("casavlbitools could not be imported: cannot append Tsys/GC to FITS-IDI.")
         return None
 
 
@@ -292,19 +292,33 @@ class EVNObservatory(ObservatoryHandler):
         uvflg = Path(directory) / f"{project_code.lower()}.uvflg"
         flagfile = Path(directory) / f"{project_code.lower()}.flag"
         if uvflg.is_file() and not flagfile.is_file():
-            cvt = _import_casavlbitools()
-            if cvt is not None:
-                logger.info("converting AIPS flags {} -> {}", uvflg.name, flagfile.name)
-                # Written aside and renamed once complete: a conversion that fails must not leave an empty
-                # flag file behind, which the next run would take for the converted flags.
-                partial = flagfile.with_name(flagfile.name + ".partial")
-                try:
-                    with open(partial, "w") as out:
-                        cvt.convert_flags(infile=str(uvflg), idifiles=files, outfp=out)
-                    partial.replace(flagfile)
-                finally:
-                    partial.unlink(missing_ok=True)
+            self._convert_flags(files, uvflg, flagfile, project_code)
         return list(files)
+
+    def _convert_flags(self, files: list[str], uvflg: Path, flagfile: Path, project_code: str) -> None:
+        """Convert the AIPS ``uvflg`` file into the CASA flag-command file ``flagfile``.
+
+        Uses the tolerant :func:`vlbipy.uvflg.uvflg_to_casa`, not the strict SCHED key-file parser: the
+        ``.uvflg`` of a global experiment carries the sections of non-EVN stations in their own dialect
+        (``ant_name ='PA', timerang=...``), which the strict parser rejects. Flags of stations absent from
+        the FITS-IDI ANTENNA list are dropped (one unknown antenna makes ``flagdata`` reject the whole list).
+        Nothing is written when the observing date cannot be read from ``files[0]``.
+        """
+        meta = fitsidi.inspect_fitsidi(files[0], project_code)
+        if meta.obs_date is None:
+            warnings.warn(f"{project_code}: cannot date {Path(files[0]).name}; a-priori flags not converted")
+            return
+        logger.info("converting AIPS flags {} -> {}", uvflg.name, flagfile.name)
+        # Written aside and renamed once complete: a conversion that fails must not leave an empty
+        # flag file behind, which the next run would take for the converted flags.
+        partial = flagfile.with_name(flagfile.name + ".partial")
+        try:
+            result = uvflg_to_casa(uvflg, partial, meta.obs_date.year, antennas=list(meta.antennas) or None)
+            partial.replace(flagfile)
+        finally:
+            partial.unlink(missing_ok=True)
+        if not result["written"]:
+            warnings.warn(f"{project_code}: {uvflg.name} holds no usable flag")
 
     def manual_download_instructions(self) -> str:
         return ("EVN data are retrieved from the JIVE archive at https://archive.jive.eu/ "

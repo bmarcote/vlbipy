@@ -226,17 +226,37 @@ def test_uvflg_ending_with_a_station_section_without_flags():
 
 
 def test_evn_flag_conversion_that_fails_leaves_no_flag_file(idi_dir, monkeypatch):
-    from vlbipy.casavlbitools import fitsidi as cvt_fitsidi
-    monkeypatch.setattr(cvt_fitsidi, "find_first_dobs", lambda idifiles: dt.datetime(2024, 3, 1))
+    from vlbipy.observatories import evn
+
+    def crash(path, outfile, year, **kwargs):
+        Path(outfile).write_text("antenna='EF'\n")
+        raise OSError("disk full")
+
     files = [str(path) for path in sorted(idi_dir.glob(f"{PROJECT}_1_1.IDI*"))]
     uvflg, flag = idi_dir / f"{PROJECT}.uvflg", idi_dir / f"{PROJECT}.flag"
-    uvflg.write_text("ant_name='EF' timerang=61,10,00,00, 61,10,01,00 reason='x' /\nant_name='EF' = = /\n")
-    with pytest.raises(RuntimeError):
+    uvflg.write_text("opcode='FLAG'\nant_name='EF' timerang=61,10,00,00, 61,10,01,00 reason='x' /\n")
+    monkeypatch.setattr(evn, "uvflg_to_casa", crash)
+    with pytest.raises(OSError):
         EVNObservatory().prepare_for_import(files, str(idi_dir), project_code=PROJECT)
     assert not flag.exists() and not list(idi_dir.glob("*.partial"))
-    uvflg.write_text("opcode='FLAG'\nant_name='EF' timerang=61,10,00,00, 61,10,01,00 reason='x' /\n")
+    monkeypatch.undo()
     EVNObservatory().prepare_for_import(files, str(idi_dir), project_code=PROJECT)
     assert flag.read_text().startswith("antenna='EF' timerange='2024/03/01/10:00:00~2024/03/01/10:01:00'")
+
+
+def test_evn_flag_conversion_reads_the_station_dialects_of_a_global_experiment(idi_dir):
+    """A global experiment's .uvflg (GG087A) appends LBA-written sections (``ant_name ='PA', timerang=...``)
+    to the JIVE records; the strict SCHED key parser failed on them with "Expected key token"."""
+    files = [str(path) for path in sorted(idi_dir.glob(f"{PROJECT}_1_1.IDI*"))]
+    (idi_dir / f"{PROJECT}.uvflg").write_text(
+        "opcode='FLAG'\ndtimrang = 1   timeoff=0\n"
+        "ant_name='EF' timerang=61,10,00,00, 61,10,01,00 reason='Antenna off source' /\n"
+        "ant_name ='O8', timerang=061,10,05,00, 061,10,05,30 reason='DISH IS STOPPING' / \n"
+        "ant_name='XX' timerang=61,10,00,00, 61,10,01,00 reason='not in the data' /\n")
+    EVNObservatory().prepare_for_import(files, str(idi_dir), project_code=PROJECT)
+    assert (idi_dir / f"{PROJECT}.flag").read_text().splitlines() == [
+        "antenna='EF' timerange='2024/03/01/10:00:00~2024/03/01/10:01:00' reason='Antenna_off_source'",
+        "antenna='O8' timerange='2024/03/01/10:05:00~2024/03/01/10:05:30' reason='DISH_IS_STOPPING'"]
 
 
 # -- import_data namespace orchestration --

@@ -82,10 +82,14 @@ def parse_uvflg(path: Union[str, Path]) -> list[dict]:
 def _timerange(values, year: int) -> Optional[str]:
     """Return a CASA time range for an AIPS ``d,h,m,s, d,h,m,s`` range (days are day-of-year).
 
-    ``""`` means the whole observation, ``None`` a range that selects nothing.
+    ``""`` means the whole observation (no ``timerang``, as in AIPS, or ``0,0,0,0, 400,...``), ``None`` a
+    range that selects nothing. A ``timerang`` that is not 8 numbers raises ``ValueError``: taken for the
+    whole observation, a garbled record would flag its antenna for the entire run.
     """
-    if not isinstance(values, list) or len(values) != 8:
+    if values is None:
         return ""
+    if not isinstance(values, list) or len(values) != 8:
+        raise ValueError(f"unreadable timerang {values!r}")
     if values[:4] == [0.0] * 4 and values[4] >= 400.0:
         return ""
     start_of_year = dt.datetime(year, 1, 1)
@@ -123,8 +127,9 @@ def uvflg_to_casa(path: Union[str, Path], outfile: Union[str, Path], year: int, 
     dict
         ``written`` (number of commands), ``per_antenna`` (commands per antenna),
         ``unknown`` (stations dropped), ``empty`` (zero-length ranges dropped),
-        ``seconds`` (total flagged time per antenna) and ``too_long`` (the commands
-        left out for exceeding ``max_seconds``).
+        ``seconds`` (total flagged time per antenna), ``too_long`` (the commands
+        left out for exceeding ``max_seconds``) and ``malformed`` (records left out
+        because their ``timerang`` is not 8 numbers).
     """
     known = {name.upper(): name for name in antennas} if antennas is not None else None
     per_antenna: dict[str, int] = {}
@@ -133,6 +138,7 @@ def uvflg_to_casa(path: Union[str, Path], outfile: Union[str, Path], year: int, 
     empty = 0
     lines = []
     too_long: list[str] = []
+    malformed: list[str] = []
     for record in parse_uvflg(path):
         name = str(record["ANT_NAME"]).upper()
         if known is not None:
@@ -140,7 +146,11 @@ def uvflg_to_casa(path: Union[str, Path], outfile: Union[str, Path], year: int, 
                 unknown.add(name)
                 continue
             name = known[name]
-        timerange = _timerange(record.get("TIMERANG"), year)
+        try:
+            timerange = _timerange(record.get("TIMERANG"), year)
+        except ValueError:
+            malformed.append(f"antenna='{name}' timerang={record['TIMERANG']!r}")
+            continue
         if timerange is None:
             empty += 1
             continue
@@ -169,7 +179,10 @@ def uvflg_to_casa(path: Union[str, Path], outfile: Union[str, Path], year: int, 
     if unknown:
         logger.warning("{}: flags for station(s) not in the data were dropped: {}", Path(path).name,
                        ", ".join(sorted(unknown)))
+    if malformed:
+        logger.warning("{}: {} record(s) with an unreadable time range were not applied: {}", Path(path).name,
+                       len(malformed), "; ".join(malformed[:5]) + (" ..." if len(malformed) > 5 else ""))
     logger.info("{} -> {}: {} flag command(s) ({})", Path(path).name, Path(outfile).name, len(lines),
                 ", ".join(f"{name} {count}" for name, count in sorted(per_antenna.items())) or "none")
     return {"written": len(lines), "per_antenna": per_antenna, "unknown": sorted(unknown), "empty": empty,
-            "seconds": seconds, "too_long": too_long}
+            "seconds": seconds, "too_long": too_long, "malformed": malformed}
