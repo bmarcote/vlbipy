@@ -33,6 +33,9 @@ logger = get_logger()
 #: File-name suffixes (lower case) a DiFX FITS-IDI file of an LBA experiment may carry.
 _DATA_SUFFIXES = (".fits", ".fitsidi", ".idifits", ".idi")
 
+# FTP server where the SCHED-related files are found, and log files from stations
+LBA_FTP_SERVER: str = "ftp.atnf.csiro.au/pub/people/vlbi/"
+
 
 class LBAObservatory(ObservatoryHandler):
     """Australian Long Baseline Array. No automated downloads; needs EOP corrections."""

@@ -43,7 +43,7 @@ class ModelfitObservation:
         clone.calls = self.calls
         return clone
 
-    def modelfit(self, quiet=True):
+    def modelfit(self, quiet=True, verbose=True):
         self.calls["modelfit"] += 1
         result = self.fit_results.pop(0)
         self.model = list(result.get("components", self.model))
@@ -55,7 +55,7 @@ class ModelfitObservation:
     def clrmod(self):
         self.calls["clrmod"] += 1
 
-    def invert(self):
+    def invert(self, verbose=True):
         self.calls["invert"] += 1
 
     def uvweight(self, robust=None):
@@ -78,7 +78,7 @@ class ModelfitObservation:
     def peak_offset(self):
         return (0.0, 0.0), self.residual_peak
 
-    def restore(self, no_residual=False):
+    def restore(self, no_residual=False, verbose=True):
         self.calls["restore"].append(no_residual)
         self.restored_map = np.ones((self.npix, self.npix))
 
