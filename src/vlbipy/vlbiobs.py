@@ -148,6 +148,7 @@ class VLBIObs:
         self._reject_unknown_overrides(overrides)
 
         base_work = Path(work_dir) if work_dir else None
+        self._adopt_saved_sources(codes, base_work)
         self._observations: list[Observation] = []
         for code in codes:
             obs_work = (base_work / code) if base_work and len(codes) > 1 else base_work
@@ -180,6 +181,39 @@ class VLBIObs:
                 {"projects": codes, "config": saved, "work_dir": str(root)}, indent=2, default=str))
         except OSError as exc:
             logger.warning("could not write {}: {}", root / self.PROJECT_FILENAME, exc)
+
+    def _project_root(self, codes: list[str], base_work) -> Path:
+        """Where :meth:`_save_project` keeps the project file (the same rule, before the observations exist)."""
+        if base_work:
+            return Path(base_work)
+        first = Path(self.config.get("global", {}).get("work_dir", "") or Path.cwd() / codes[0])
+        return first.parent if len(codes) > 1 else first
+
+    def _adopt_saved_sources(self, codes: list[str], base_work) -> None:
+        """Reuse the source roles of the previous run of the same projects when none are declared.
+
+        Roles given on the command line live only in the configuration this process builds, so resuming without
+        them (``--from-step``) would calibrate with no fringe finder or phase calibrator - and then save that
+        empty set over the one the earlier run recorded.
+        """
+        if any(self.config.get("sources", {}).get(key) for key in
+               ("fringe_finders", "phase_calibrators", "targets", "check_sources")):
+            return
+        path = self._project_root(codes, base_work) / self.PROJECT_FILENAME
+        try:
+            saved = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return
+        if list(saved.get("projects") or []) != list(codes):
+            return
+        sources = (saved.get("config") or {}).get("sources") or {}
+        if not any(sources.get(key) for key in ("fringe_finders", "phase_calibrators", "targets", "check_sources")):
+            return
+        self.config["sources"] = {**self.config.get("sources", {}), **sources}
+        if (saved.get("config") or {}).get("phase_referencing"):
+            self.config["phase_referencing"] = saved["config"]["phase_referencing"]
+        logger.info("no source roles given: using those of the previous run ({})",
+                    ", ".join(f"{key} {', '.join(value)}" for key, value in sources.items() if value))
 
     @classmethod
     def load(cls, work_dir) -> "VLBIObs":

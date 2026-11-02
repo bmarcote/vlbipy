@@ -99,7 +99,11 @@ before the re-solve and the flagging is redone afterwards: they were judged agai
 calibration, and on EB104G they removed every TR baseline of a delay scan, which left TR without a single delay
 solution once the chain was re-derived on them. Before/after figures of merit: `<work_dir>/ai/<code>.model_pass.json`.
 On EB104G (phase calibrator compact, forced pass) nothing changed beyond the noise: check source 69.25 -> 69.29
-mJy/beam, target 9.8σ both times.
+mJy/beam, target 9.8σ both times. On EB104D, where it triggers by itself (phase calibrator J1031+7441: three
+Gaussians, model phase p90 8.9°), the check source gained 1.9% in peak (85.1 -> 86.7 mJy/beam) at the same dynamic
+range (231 -> 230), the phase calibrator's dynamic range rose 1238 -> 1337 and the target stayed at 5.4σ: a few
+degrees of structure phase cost little coherence, and the pass is worth its time only for calibrators with tens of
+degrees.
 
 **`ai.postdiagnose`** writes the residual antenna gains over time, subband offsets and hand ratios of the
 calibrated calibrators (`<code>.postdiagnostic.json`, `plots/ai/<code>.ai.postdiagnostic_*.png`).
@@ -130,20 +134,21 @@ about a millisecond per prediction, no GPU and no dependency beyond numpy - it r
 The annotated training sets ship in `vlbipy/data/ai/*.features.jsonl`; adding an experiment is running the
 pre-diagnostic on it, correcting the labels that are wrong, and dropping the file there before `vlbipy ai train`.
 
-### The model that ships (2026-11-01)
+### The model that ships (2026-11-03)
 
-Trained on 1729 rows from six experiments: EB104G (reviewed against the PI's review and the raw data) and EB104B,
-EB104D, EK053A, EK053B (EVN, 1.6 and 5 GHz) and GL048 (global, 22 GHz, 28 antennas), reduced from scratch with the
-current pipeline and labelled by the rules, read-only. 80 trees of depth 6 per stage.
+Trained on 2465 rows from eight experiments: EB104G (reviewed against the PI's review and the raw data) and EB104B,
+EB104D, EK053A, EK053B, em163, EM148 (EVN, 1.6 and 5 GHz; em163 and EM148 with e-MERLIN) and GL048 (global, 22 GHz,
+28 antennas), reduced from scratch with the current pipeline and labelled by the rules, read-only. 80 trees of
+depth 6 per stage.
 
 | stage | rows | stratified 5-fold (balanced) | leave one experiment out (balanced) |
 |---|---|---|---|
-| Tsys series | 1186 | 91% (84%) | 59% (58%) |
-| antenna on a calibrator | 83 | 81% (76%) | 70% (59%) |
-| calibrated baseline | 460 | 100% (100%) | 99% (99%) |
+| Tsys series | 1566 | 89% (94%) | 79% (75%) |
+| antenna on a calibrator | 109 | 85% (80%) | 73% (52%) |
+| calibrated baseline | 790 | 99% (100%) | 99% (100%) |
 
-Held out one experiment at a time (trained on the others, predicting the rules' labels of the one left out; the
-EVN rows are from the five-experiment model, before GL048 was added):
+Held out one experiment at a time (trained on the others, predicting the rules' labels of the one left out; each
+row is from the model of the day it was added, so the first four rows had four experiments to learn from):
 
 | experiment | Tsys series | antenna on a calibrator | calibrated baseline |
 |---|---|---|---|
@@ -152,12 +157,15 @@ EVN rows are from the five-experiment model, before GL048 was added):
 | EK053A | 65% | 100% | 95% |
 | EK053B | 79% | 71% | 100% |
 | GL048 (22 GHz) | 40% | 26% | 98% |
+| em163 (1.6 GHz, 18 antennas) | 75% | 88% | 99% |
+| EM148 (5 GHz) | 86% | 100% | 100% |
 
 The calibrated-baseline stage carries over to a new band; the Tsys and antenna stages do not: at 22 GHz the Tsys
 swings with elevation and weather, and a model that has only seen 1.6-5 GHz calls most of those series
 under-correcting or not real (`ok -> tsys_undercorrects`, `ok -> tsys_variation_real`). That is also why the
-leave-one-experiment-out Tsys score fell once GL048 joined (it is the one fold with no band like it): the model
-needs reviewed experiments in every band (or band-aware features), not more capacity. Within a band the recurring
+leave-one-experiment-out Tsys score fell once GL048 joined (59%, it is the one fold with no band like it) and rose
+again with em163 and EM148 (79%): the model needs experiments in every band (or band-aware features), not more
+capacity. Within a band the recurring
 Tsys confusion is "fluctuations the raw data do not show" against `unphysical_tsys` / noisy hand, the borderline of
 a smoothing choice. The rules remain the decision-maker in the pipeline and the model's labels are reported next to
 theirs (`vlbipy ai predict`).
