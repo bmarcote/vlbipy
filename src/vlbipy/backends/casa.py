@@ -3096,6 +3096,11 @@ class CasaCalibrationOps(CalibrationOps):
                   "field": field, "solint": solint, "combine": combine, "solnorm": solnorm,
                   "refant": self.refant_chain(meta, refant), "minsnr": minsnr, "bandtype": bandtype,
                   "corrdepflags": True, "parang": True, "fillgaps": int(fillgaps)}
+        minblperant = meta.min_baselines_per_antenna()
+        if minblperant < 4:
+            params["minblperant"] = minblperant
+            logger.info("bandpass: minblperant={} (some subbands were recorded by only {} antennas)",
+                        minblperant, minblperant + 1)
         if scans:
             params["scan"] = ",".join(str(s) for s in scans)
         params.update(self._prior_callib(project_code, gaintable, new_path,
@@ -3477,7 +3482,7 @@ class CasaCalibrationOps(CalibrationOps):
                           gaintable: Optional[list] = None, solint: str = "inf",
                           combine: str = "scan", minsnr: float = 3.0, max_factor: float = 2.0,
                           fill_unsolved: bool = True, metadata: Optional[ObsMetadata] = None,
-                          callib: bool = False, **kwargs) -> CalTable:
+                          callib: bool = False, level_hands: bool = True, **kwargs) -> CalTable:
         """Solve one amplitude gain per antenna and subband (a "scalar bandpass").
 
         Even after the bandpass, the subbands of an antenna can sit at slightly
@@ -3488,9 +3493,16 @@ class CasaCalibrationOps(CalibrationOps):
 
         Amplitude only (``calmode='a'``), one solution per antenna per subband
         for the whole observation. The solutions are then normalised **per
-        antenna and polarization across its subbands** (median = 1), so the table
-        only levels the subbands of each antenna and the flux scale the a-priori
-        calibration gave that antenna is untouched.
+        antenna across its subbands and both hands** (``level_hands``, the default:
+        the geometric mean of the two hands' medians is 1), so the table levels the
+        subbands of each antenna *and its two hands* while the Stokes I flux scale
+        the a-priori calibration gave that antenna is untouched. The calibrators are
+        unpolarized in circular hands (``|RR| = |LL|``), so the ratio of the two hands'
+        solutions is the station's own RCP/LCP amplitude ratio - a wrong Tsys or DPFU
+        of one receptor (EB104G: UR -8..-15%, O8 -4..-7%, SR up to 9%). Nothing else
+        in the chain can correct it: difmap solves one gain per station for both
+        hands. ``level_hands=False`` normalises each hand on its own (the former
+        behaviour: subband steps only).
 
         CASA's own ``solnorm`` must not be used for this: it normalises each
         subband across the *antennas*. That keeps each antenna's absolute level
@@ -3521,6 +3533,9 @@ class CasaCalibrationOps(CalibrationOps):
         fill_unsolved : bool
             Set unsolved antenna/subband solutions to 1 instead of leaving them
             flagged (which would flag the data on apply).
+        level_hands : bool
+            Normalise both hands of an antenna together, so the table also corrects
+            the RCP/LCP amplitude ratio (``[calibration.scalar_bandpass].level_hands``).
         callib : bool
             Use a CASA cal-library file for the on-the-fly priors instead of
             explicit parallel lists.
@@ -3542,6 +3557,8 @@ class CasaCalibrationOps(CalibrationOps):
                   "field": field, "solint": solint, "combine": combine, "gaintype": "G",
                   "calmode": "a", "solnorm": False, "minsnr": minsnr, "parang": True,
                   "refant": self.refant_chain(meta, refant)}
+        if meta.min_baselines_per_antenna() < 4:
+            params["minblperant"] = meta.min_baselines_per_antenna()
         params.update(self._prior_callib(project_code, gaintable, new_path,
                                            field=field, callib=callib))
         logger.info("scalar_bandpass: gaincal calmode='a' field={} solint={} combine={} "
@@ -3564,7 +3581,7 @@ class CasaCalibrationOps(CalibrationOps):
         (self.backend.caldir() / f"{project_code}.scalar_bp.hands.json").write_text(
             json.dumps(self._hand_levels(table_path), indent=1))
         dropped, filled = self._normalise_per_antenna(table_path, max_factor=max_factor,
-                                                      fill_unsolved=fill_unsolved)
+                                                      fill_unsolved=fill_unsolved, level_hands=level_hands)
         if filled:
             logger.info("scalar_bandpass: {} unsolved antenna/subband solution(s) left at gain 1 (not levelled, "
                         "not flagged): {}", len(filled), self._summarise_labels(filled))
@@ -3578,7 +3595,7 @@ class CasaCalibrationOps(CalibrationOps):
                         interp="nearest", snr=self._median_table_snr(table_path))
 
     def _normalise_per_antenna(self, table_path: Path, *, max_factor: float = 2.0,
-                               fill_unsolved: bool = False) -> tuple[list[str], list[str]]:
+                               fill_unsolved: bool = False, level_hands: bool = True) -> tuple[list[str], list[str]]:
         """Level each antenna/polarization across its subbands and merge the calibrators into one solution.
 
         gaincal solves every calibrator field on its own (``combine`` has no
@@ -3619,6 +3636,21 @@ class CasaCalibrationOps(CalibrationOps):
             for antenna in np.unique(antennas):
                 rows = np.where(antennas == antenna)[0]
                 name = names[int(antenna)] if int(antenna) < len(names) else f"#{int(antenna)}"
+                # The level each solution is measured against: the antenna's median over its subbands, in each
+                # field - over both hands together with ``level_hands``, so the table also brings RR and LL to
+                # one level (an unpolarized calibrator has |RR| = |LL|) while the Stokes I level is untouched.
+                all_amp = np.abs(gains[:, 0, rows])
+                all_solved = ~flags[:, 0, rows] & np.isfinite(all_amp) & (all_amp > 0)
+                joint = {}
+                if level_hands and gains.shape[0] > 1:
+                    for field in np.unique(fields[rows]):
+                        in_field = all_solved & (fields[rows] == field)[None, :]
+                        # Each hand's own median first, then their geometric mean: a hand with fewer solved
+                        # subbands must not pull the level towards itself.
+                        hand_levels = [np.median(all_amp[p][in_field[p]]) for p in range(gains.shape[0])
+                                       if in_field[p].any()]
+                        if hand_levels:
+                            joint[field] = float(np.exp(np.mean(np.log(hand_levels))))
                 for pol in range(gains.shape[0]):
                     amplitude = np.abs(gains[pol, 0, rows])
                     solved = ~flags[pol, 0, rows] & np.isfinite(amplitude) & (amplitude > 0)
@@ -3628,7 +3660,8 @@ class CasaCalibrationOps(CalibrationOps):
                         in_field = solved & (fields[rows] == field)
                         if not in_field.any():
                             continue
-                        relative[in_field] = amplitude[in_field] / float(np.median(amplitude[in_field]))
+                        level = joint.get(field, float(np.median(amplitude[in_field])))
+                        relative[in_field] = amplitude[in_field] / level
                         usable[in_field] = (relative[in_field] <= max_factor) & \
                                            (relative[in_field] >= 1.0 / max_factor)
                     for spw in np.unique(spws[rows]):

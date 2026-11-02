@@ -249,6 +249,11 @@ class VLBIObs:
         """Plotting namespace, fanned out across all observations."""
         return _Fanout([o.plot for o in self._observations])
 
+    @property
+    def ai(self) -> _Fanout:
+        """AI-mode namespace (diagnostics, Tsys repair, distribution flagging), fanned out across all observations."""
+        return _Fanout([o.ai for o in self._observations])
+
     # -- delegated namespaces (post-merge / single target) --
     @property
     def _per_epoch_products(self) -> bool:
@@ -442,6 +447,9 @@ class VLBIObs:
         self._split_frequency_bands(force=force)                       # multi-band (S/X): one pipeline per band
         self.notebook()                                                # first notebook: what is there so far
         self.flag.apriori(force=force)                                 # step 4
+        # AI mode: what the raw data (a-priori flags only) say about every antenna and Tsys series; the Tsys
+        # repair of the next step follows its plan.
+        self.ai.prediagnose(force=force)
         self.calibrate.a_priori(force=force)                           # steps 5-6 (EOP, Tsys, GC)
         self.plot.diagnostics(column="data", label="raw", force=force)  # step 7
         self.flag.quack(force=force)                                   # step 7 (slewing)
@@ -482,6 +490,11 @@ class VLBIObs:
         for obs in self._observations:
             if obs.calibrate.emerlin_scale(force=force):
                 obs.calibrate.apply(force=True, defer=True)
+        # AI mode: whatever the calibrated data show outside the noise distribution (Rice amplitudes, von Mises
+        # phases, one level for every subband) is flagged before self-calibration and imaging see it.
+        for obs in self._observations:
+            if obs.ai.enabled and obs.config.get("ai", {}).get("flag_distribution", True):
+                obs.ai.flag_distribution(force=force)
         self._survey_all_sources()                                      # final calibrated SNR coverage
         if self._per_epoch_products:
             images = self._finish_campaign(force=force)
@@ -501,6 +514,15 @@ class VLBIObs:
             self._calibrated_diagnostics()                                 # step 15
             images = self._image_all(force=force)                          # step 17b
             self._final_plots()                                            # step 18
+            # A structured phase calibrator: its model goes into the fringe fit, and everything after it is
+            # derived again (and self-calibrated against that model).
+            images = self._model_calibration(force=force) or images
+        for obs in self._observations:
+            if obs.ai.enabled:
+                try:
+                    obs.ai.postdiagnose()                              # residual antenna gains of the result
+                except Exception as exc:  # noqa: BLE001 - a report never fails the run
+                    warnings.warn(f"{obs.project_code}: AI post-diagnostic failed: {exc}")
         self.report()
         summary = warnings.summary()
         logs = ", ".join(str(path) for path in run_logs()) or "the run log"
@@ -511,6 +533,95 @@ class VLBIObs:
                 logger.warning("  - {}", item)
 
         return images
+
+    def _model_calibration(self, obs: Optional[Observation] = None, *, force: bool = False) -> dict:
+        """The model pass: re-derive the calibration with the calibrators' structure models in the solves.
+
+        The first pass takes every calibrator as a point source in the fringe fit, and self-calibrates it against
+        one Gaussian. When the phase calibrator turns out to be structured (its structure model, fitted at the end
+        of its self-calibration, has visibility phases of ``[calibration.model_mbd].min_phase_deg`` or more on its
+        baselines), its structure phase went into the delays and rates - and the phase self-cal - transferred to
+        the targets. Then the calibrators' models are written to MODEL_DATA, the chain is solved again from the
+        delays on (:meth:`CalibrateNamespace.model_pass`), the calibrators are self-calibrated against their
+        structure models (``model_components``), and every source is imaged again. The first pass's figures of
+        merit and the new ones are written side by side to ``<work_dir>/ai/<code>.model_pass.json``.
+
+        ``[calibration.model_mbd].enabled``: ``"auto"`` (the default: only for a structured phase calibrator),
+        ``true`` (always, with whatever models there are) or ``false``. Returns the new images, or ``{}`` when the
+        pass did not run.
+        """
+        obs = obs or self._imaging_target()
+        cfg = obs.config.get("calibration", {}).get("model_mbd", {})
+        mode = str(cfg.get("enabled", "auto")).strip().lower()
+        if mode in ("false", "0", "no", "off", "") or not obs._backend.requires_data_files:
+            return {}
+        if not obs._state.should_run("model_pass", force=force):
+            return {}
+        try:
+            structure = obs.calibrate.calibrator_structure()
+        except Exception as exc:  # noqa: BLE001 - the first pass is complete and stands without it
+            warnings.warn(f"{obs.project_code}: could not measure the calibrators' structure ({exc}); "
+                          "no model pass")
+            return {}
+        phasecals = {n: v for n, v in structure.items() if v["role"] == "phasecal"}
+        if mode == "auto" and not any(v["structured"] for v in phasecals.values()):
+            logger.info("model_mbd: no structured phase calibrator ({}); the point-source fringe fit stands",
+                        ", ".join(f"{n}: {v['phase_p90']:.1f} deg" for n, v in phasecals.items()) or "no model")
+            obs._state.mark_complete("model_pass", outputs=["not needed"])
+            return {}
+        models = {n: v["components"] for n, v in structure.items()
+                  if mode != "auto" or v["structured"] or v["role"] == "phasecal"}
+        if not models:
+            return {}
+        headline("model pass: {} in the fringe fit and the self-calibration",
+                 ", ".join(f"{n} ({len(c)} components)" for n, c in models.items()))
+        before = self._figures_of_merit(obs)
+        components = int(cfg.get("components", 3))
+        obs.calibrate.model_pass(models, force=True)
+        obs.selfcal.run_all(force=True, model_components=components)
+        self._calibrated_diagnostics(obs)
+        images = self._image_all(obs, force=True)
+        self._final_plots(obs)
+        after = self._figures_of_merit(obs)
+        record = {"structure": {n: {k: v for k, v in s.items() if k != "components"} | {"ncomp": len(s["components"])}
+                                for n, s in structure.items()},
+                  "models": {n: c for n, c in models.items()}, "before": before, "after": after}
+        out = Path(obs.work_dir) / "ai" / f"{obs.project_code}.model_pass.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(record, indent=2, default=str), encoding="utf-8")
+        for name in sorted(set(before) & set(after)):
+            b, a = before[name], after[name]
+            logger.info("model pass: {} peak {} -> {} Jy/beam, rms {} -> {} Jy/beam, dynamic range {} -> {}", name,
+                        _num(b.get("peak")), _num(a.get("peak")), _num(b.get("rms")), _num(a.get("rms")),
+                        _num(b.get("dynamic_range")), _num(a.get("dynamic_range")))
+        return images
+
+    @staticmethod
+    def _figures_of_merit(obs: Observation) -> dict:
+        """Peak, rms and dynamic range of every source's robust-0 image (from the imaging records), and the
+        reduced chi-squared of the calibrators' self-calibrated models."""
+        work = Path(obs.work_dir)
+        out: dict = {}
+        for path in sorted((work / "images").glob(f"{obs.project_code}_*.search.json")):
+            name = path.name[len(obs.project_code) + 1:-len(".search.json")]
+            try:
+                record = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            images = record.get("images") or {}
+            image = images.get("0.0") or images.get("0") or next(iter(images.values()), {}) \
+                if isinstance(images, dict) else {}
+            search = record.get("search") or {}
+            out[name] = {"peak": image.get("peak"), "rms": image.get("rms"),
+                         "dynamic_range": image.get("dynamic_range"), "search_snr": search.get("snr"),
+                         "search_peak": search.get("peak"),
+                         "model_rchisq": (image.get("model") or {}).get("rchisq") if isinstance(image, dict) else None}
+        for name, result in obs._selfcal_results.items():
+            report = getattr(result, "report", None) or {}
+            entry = out.setdefault(name, {})
+            entry["model_rchisq"] = (report.get("image_model") or {}).get("rchisq")
+            entry["ncomp"] = len((report.get("image_model") or {}).get("components") or [])
+        return out
 
     def _split_frequency_bands(self, *, force: bool = False) -> None:
         """Expand every multi-band observation into one observation per band.
@@ -764,3 +875,11 @@ class VLBIObs:
     def __repr__(self) -> str:
         codes = ", ".join(o.project_code for o in self._observations)
         return f"VLBIObs([{codes}], backend={self._primary()._backend.kind})"
+
+
+def _num(value) -> str:
+    """A figure of merit for the log, or ``-``."""
+    try:
+        return f"{float(value):.4g}"
+    except (TypeError, ValueError):
+        return "-"

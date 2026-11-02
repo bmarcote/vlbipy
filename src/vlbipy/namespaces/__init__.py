@@ -22,6 +22,8 @@ import shutil
 from pathlib import Path
 from typing import Optional, Union
 
+import numpy as np
+
 from ..diagnostics import write_summary
 from ..errors import BackendError, StepError
 from ..logging_utils import get_logger, headline, warnings
@@ -326,6 +328,14 @@ class ImportDataNamespace(Namespace):
         return obs._metadata
 
 
+def _fmt(value) -> str:
+    """A number for the log, or ``-``."""
+    try:
+        return f"{float(value):.4g}"
+    except (TypeError, ValueError):
+        return "-"
+
+
 class CalibrateNamespace(Namespace):
     """Calibration: a-priori, single-band delay, bandpass, global fringe fit, apply."""
 
@@ -391,7 +401,15 @@ class CalibrateNamespace(Namespace):
         return tables
 
     def _smooth_table(self, table: CalTable, cal_cfg: dict) -> CalTable:
-        """De-spike one a-priori table, leaving it untouched if the backend cannot smooth."""
+        """De-spike one a-priori table, leaving it untouched if the backend cannot smooth.
+
+        With the AI mode on and a pre-diagnostic on disk, the Tsys table is repaired instead
+        (:meth:`vlbipy.ai.namespace.AINamespace.repair_tsys`): noisy hands follow their partner, spurious
+        subband levels are rescaled, an absorbing atmosphere is accounted for, and each series is smoothed
+        with the window its raw-data check calls for, across fields unless the source raises the Tsys.
+        """
+        if table.cal_type == "tsys" and self._obs.ai.repair_tsys(table) is not None:
+            return table
         if table.cal_type != "tsys" or not self._backend.supports("calibrate", "smooth"):
             return table
         smooth_cfg = {"threshold": cal_cfg.get("tsys_outlier_sigma", 6.0),
@@ -870,10 +888,19 @@ class CalibrateNamespace(Namespace):
             ``[bandpass, refined SBD, refined MBD]`` — what stays in the chain.
         """
         obs = self._obs
+        # A resumed run that finds the whole pass done keeps it: re-solving only the refined delays would solve
+        # them through a chain that already holds them (and the scalar bandpass after them), which on EB104G lost
+        # every TR solution and flagged the antenna on the next apply.
+        state = obs._state
+        names = ("initial_calibration", "fringefit", "bandpass", "initial_calibration_sbd2", "fringefit_mbd2")
+        if not force and all(state.status(name) == "done" for name in names):
+            for name in names:
+                state.should_run(name)                      # logs "skipping"
+            logger.info("instrumental: already done; chain is {}", " -> ".join(t.cal_type for t in obs.gaintables))
+            return [obs._table(suffix) for suffix in ("sbd", "mbd", "bpass", "sbd2", "mbd2")]
         antennas, scans = self.select_calibration_data()
         logger.info("instrumental calibration: {} antenna(s) {} on scan(s) {}",
                     len(antennas), ",".join(antennas), scans)
-
         # Pass 1: rough delays, so the bandpass is solved on delay-corrected data.
         first_sbd = self.initial_calibration(force=force, scans=scans, antennas=antennas)
         first_mbd = self.fringefit(force=force, plot=False)
@@ -1032,6 +1059,102 @@ class CalibrateNamespace(Namespace):
             obs.plot.caltable(table)
         obs._state.mark_complete("scalar_bandpass", outputs=["scalar_bp"])
         return table
+
+    def calibrator_structure(self) -> dict:
+        """How structured every calibrator the fringe fit solves on is, from its self-calibration session.
+
+        Reads the structure model each difmapy session fits at its end (``[selfcal].structure_components``, up to
+        three Gaussians by default; its brightest ``[calibration.model_mbd].components`` are kept) and
+        measures it on the calibrator's own baselines (:func:`vlbipy.solvers.skymodel.structure_metrics`): the 90th
+        percentile of the model phase - what a point-source fringe fit puts into the delays and rates transferred
+        to the targets - and the fit improvement over the model the session used. A source is ``structured`` when
+        that phase reaches ``[calibration.model_mbd].min_phase_deg``.
+
+        Returns
+        -------
+        dict
+            ``{source: {"components", "phase_p90", "amp_p10", "rchisq", "used_rchisq", "structured", "role"}}``.
+        """
+        from ..solvers.msio import read_layout, read_runs, read_setup, run_specs, select_runs, table_engine
+        from ..solvers.skymodel import shifted, structure_metrics, usable
+        obs = self._obs
+        cfg = obs.config.get("calibration", {}).get("model_mbd", {})
+        min_phase = float(cfg.get("min_phase_deg", 5.0))
+        limit = max(1, int(cfg.get("components", 3)))
+        freq = (obs.metadata.freq_setup.freq_ghz if obs.metadata and obs.metadata.freq_setup else 0.0) * 1e9
+        ms = str(self._backend.ms_path(self._code))
+        engine = table_engine()
+        layout = read_layout(ms, engine=engine)
+        field_names = list(read_setup(ms, engine=engine)["field_names"])
+        out: dict = {}
+        roles = [(s.name, "fringefinder") for s in obs.sources.fringe_finders] + \
+            [(s.name, "phasecal") for s in obs.sources.phase_calibrators]
+        for name, role in roles:
+            result = obs._selfcal_results.get(name)
+            report = result.report if result is not None and getattr(result, "report", None) else {}
+            if not report:
+                path = Path(obs.work_dir) / "selfcal" / f"{self._code}.{name}.json"
+                try:
+                    report = json.loads(path.read_text())
+                except (OSError, ValueError):
+                    continue
+            structure = report.get("structure_model") or {}
+            components = shifted(usable(structure.get("components") or []), report.get("shift_mas"))
+            if len(components) > limit:
+                # A model fitted with more components than the model pass uses: its brightest ones stand for it.
+                components = sorted(components, key=lambda c: -abs(float(c["flux"])))[:limit]
+            if not components or name not in field_names:
+                continue
+            runs = select_runs(layout, fields={field_names.index(name)})
+            runs = runs[np.linspace(0, runs.size - 1, min(runs.size, 60)).astype(int)] if runs.size else runs
+            uvw = read_runs(run_specs(layout, runs), ["UVW"], engine=engine).get("UVW") if runs.size else None
+            metrics = structure_metrics(components, uvw if uvw is not None else np.zeros((0, 3)), freq)
+            out[name] = {"role": role, "components": components, **metrics,
+                         "rchisq": structure.get("rchisq"), "used_rchisq": structure.get("used_rchisq"),
+                         "structured": metrics["phase_p90"] >= min_phase}
+            logger.info("model_mbd: {} ({}) {}-component model: model phase p90 {:.1f} deg, amplitude p10 {:.2f} "
+                        "of the total, rchisq {} vs {} with the model in use -> {}", name, role, len(components),
+                        metrics["phase_p90"], metrics["amp_p10"], _fmt(structure.get("rchisq")),
+                        _fmt(structure.get("used_rchisq")), "structured" if out[name]["structured"] else "compact")
+        return out
+
+    def model_pass(self, models: dict, *, force: bool = False) -> list[CalTable]:
+        """Re-solve the instrumental and fringe calibration with the calibrators' models in MODEL_DATA.
+
+        ``models`` maps a calibrator to its components. They are written into MODEL_DATA (every other field gets
+        a unit model), and every solve from the delays on divides by them - the fringe fits and the bandpass as in
+        CASA - so the structure phase of a calibrator stays out of the delays, rates and bandpasses transferred to
+        the targets. Then the chain after the a-priori tables is re-derived as in the third pass: SBD, MBD,
+        bandpass, SBD, MBD, band edges, scalar bandpass, applied (deferred).
+
+        The solves run on the flags from before the AI distribution flagging, which is redone on the new
+        calibration afterwards. That flagging judges baselines against the first-pass calibration and the
+        single-Gaussian models; re-solving on it removed every baseline of a weak antenna (Tr in EB104G) on the
+        delay scan, and the antenna lost all its solutions.
+        """
+        from ..solvers.flagmanager import delete_version, list_versions, restore_version
+        from ..solvers.setjy import write_component_models
+        obs = self._obs
+        if not obs._state.should_run("model_pass", force=force):
+            return obs.gaintables
+        ms = self._backend.ms_path(self._code)
+        before_ai = "before_ai_flag_distribution"
+        redo_ai = before_ai in {name for name, _ in list_versions(ms)}
+        if redo_ai:
+            restore_version(ms, before_ai)
+            delete_version(ms, before_ai)  # saved again when the flagging is redone
+            logger.info("model pass: restored the flags from before the AI distribution flagging ({})", before_ai)
+        report = write_component_models(ms, models)
+        obs._model_written = dict(models)
+        self.second_pass(force=True, step="model_pass")
+        obs.flag.edges(force=True, step="flag_edges_final")
+        self.scalar_bandpass(force=True)
+        self.apply(force=True, defer=True)
+        if redo_ai:
+            obs.ai.flag_distribution(force=True)
+        obs._state.mark_complete("model_pass", outputs=[f"{name}: {len(c)} components" for name, c in models.items()]
+                                 + [f"rows={report['rows']}"])
+        return obs.gaintables
 
     #: e-MERLIN outstations (antenna names as they appear in the data); Jb is the trusted reference.
     EMERLIN_OUTSTATIONS = ("Cm", "Da", "De", "Kn", "Pi")
@@ -2715,6 +2838,11 @@ def _image_from_difmap(source: str, info: dict, weighting: str = "briggs") -> Im
                  paths={"fits": info["fits"]}, stats=metrics)
 
 
+def finders_set(obs) -> set:
+    """Names of the fringe finders of ``obs``."""
+    return {s.name for s in obs.sources.fringe_finders}
+
+
 class SelfcalNamespace(Namespace):
     """Self-calibration with difmapy: modelfit, phase ladder, Bayesian amplitude gains.
 
@@ -2805,15 +2933,32 @@ class SelfcalNamespace(Namespace):
             prior_sigma=float(cfg.get("prior_sigma", 0.1)), workers=cfg.get("workers") or None,
             imagename=str(image_dir / f"{self._code}_{src}"), **settings,
             fixed_antennas=tuple(fixed), deferred_antennas=tuple(deferred),
-            fix_stage1=bool(cfg.get("fix_stage1", True)),
+            fix_stage1=bool(cfg.get("fix_stage1", True)), bayes_per_if=bool(cfg.get("bayes_per_if", False)),
+            time_amplitude=str(cfg.get("time_amplitude", "scan") or ""),
+            time_amplitude_min_improvement=float(cfg.get("time_amplitude_min_improvement", 0.01)),
+            model_components=int(kwargs.pop("model_components", cfg.get("model_components", 1)) or 1),
+            structure_components=int(cfg.get("structure_components", 3) or 0),
             **{**_search_settings(img_cfg), **kwargs})
         _write_search_report(image_dir / f"{self._code}_{src}.search.json", report, settings)
         apply_to = self._apply_to(src)
+        # The time-dependent amplitude curve of a calibrator corrects that calibrator. It goes to the fields it
+        # serves only with [selfcal].time_amplitude_transfer: solved per scan against the calibrator's own model,
+        # it carries some of that source's structure (EB104G: the check source got worse with it - reduced
+        # chi-squared 28.9 -> 34.9, image SNR 204 -> 180 - as T6's curve was x4.6 on the phase calibrator and
+        # x2.1 on the check source). A fringe finder's never leaves it.
+        time_table = (report.get("time_amplitude") or {}).get("table") or ""
+        time_entry = None
+        if time_table and Path(time_table).is_dir():
+            transfer_time = bool(cfg.get("time_amplitude_transfer", False)) and src not in finders_set(obs)
+            time_entry = CalTable(cal_type=f"selfampt_{src}", path=time_table, field=src, gainfield=src,
+                                  interp="linear", apply_to=apply_to if transfer_time else src, snr=0.0)
         accumulated = report.get("accumulated_table") or ""
         if accumulated and Path(accumulated).is_dir():
             # Single table carrying phase + amplitude corrections accumulated by the difmapy session.
             obs.add_gaintable(CalTable(cal_type=f"selfcal_{src}", path=accumulated, field=src, gainfield=src,
                                        interp="linear", apply_to=apply_to, snr=0.0), step)
+            if time_entry is not None:
+                obs.add_gaintable(time_entry, step)
             _write_search_report(image_dir / f"{self._code}_{src}.search.json", report, settings)
             images = [_image_from_difmap(src, info) for info in report["images"].values()]
             rounds = [dict(r, mode="phase") for r in report["rounds"]]
@@ -2832,6 +2977,8 @@ class SelfcalNamespace(Namespace):
         if amp_path and Path(amp_path).is_dir():
             obs.add_gaintable(CalTable(cal_type=f"selfamp_{src}", path=amp_path, field=src, gainfield=src,
                                        interp="nearest", apply_to=apply_to, snr=0.0), step)
+        if time_entry is not None:
+            obs.add_gaintable(time_entry, step)
         if transfer and report.get("phase_table") and Path(report["phase_table"]).is_dir():
             obs.add_gaintable(CalTable(cal_type=f"selfphase_{src}", path=report["phase_table"], field=src,
                                        gainfield=src, interp="linear", apply_to=apply_to, snr=0.0), step)
@@ -2860,7 +3007,7 @@ class SelfcalNamespace(Namespace):
         except Exception as exc:  # noqa: BLE001 - a preview must not fail the calibration
             warnings.warn(f"{self._code}: image preview of {src} failed ({exc})")
 
-    def run_all(self, *, force: bool = False) -> dict[str, SelfcalResult]:
+    def run_all(self, *, force: bool = False, **overrides) -> dict[str, SelfcalResult]:
         """The pipeline's self-calibration stage.
 
         1. fringe finder(s), one after the other: difmapy sequence; the amplitude table
@@ -2875,6 +3022,8 @@ class SelfcalNamespace(Namespace):
         Each calibrator is re-calibrated and re-split on its own just before its
         session, so it sees the gains of the ones before it: its table is then a
         refinement on top of theirs rather than a second copy of the same correction.
+
+        ``overrides`` go to every :meth:`calibrator` session (the model pass sets ``model_components``).
         """
         obs = self._obs
         results: dict[str, SelfcalResult] = {}
@@ -2894,7 +3043,7 @@ class SelfcalNamespace(Namespace):
                 # Deferred: only the split reads it, and calibrates while it reads (dask-ms).
                 obs.calibrate.apply(force=True, field=name, defer=True)
                 obs.clean.split_ms(name, force=True)
-            results[name] = self.calibrator(name, force=force)
+            results[name] = self.calibrator(name, force=force, **overrides)
         if results:
             obs.calibrate.apply(force=True)
             obs.export.per_source(force=True)

@@ -1,0 +1,31 @@
+{
+ "experiment": "EB104G",
+ "reviewer": "PI review of the first EB104G calibration (2026-10-30), verified against the raw data by the AI mode",
+ "notes": {
+  "T6": "sensitivity drops along the observation on both phasecal and fringe finder (x2.5-5); nominal Tsys",
+  "JB": "amplitudes more scattered than other antennas on the phasecal; nominal Tsys",
+  "YS": "drop in the last 1.5 h; Tsys rises (real) but under-corrects it: absorption",
+  "SR": "RCP Tsys scattered, LCP stable: use LCP time dependence for both hands",
+  "UR": "RCP Tsys scattered (every subband), LCP stable",
+  "WB": "much higher Tsys in some subbands: not real (raw amplitudes are not lower)",
+  "EF": "spw6 LCP Tsys high: real (raw amplitudes lower by the matching sqrt)",
+  "O8": "raw trend followed by its Tsys"
+ },
+ "labels": {
+  "tsys/SR:5:R": "noisy_tsys_hand",
+  "tsys/SR:6:R": "noisy_tsys_hand",
+  "tsys/SR:7:R": "noisy_tsys_hand",
+  "tsys/UR:*:R": "noisy_tsys_hand",
+  "tsys/WB:6:R": "spurious_high_tsys",
+  "tsys/WB:7:L": "spurious_high_tsys",
+  "tsys/EF:6:L": "real_high_tsys",
+  "tsys/YS:*": "tsys_undercorrects",
+  "tsys/JB:*": "nominal_tsys",
+  "tsys/T6:*": "nominal_tsys",
+  "prediagnostic/T6@*": "antenna_sensitivity_trend",
+  "prediagnostic/JB@J1031+7441": "antenna_amplitude_scatter",
+  "prediagnostic/YS@*": "antenna_sensitivity_trend",
+  "prediagnostic/UR@J1031+7441": "antenna_sensitivity_trend",
+  "prediagnostic/O8@*": "trend_explained_by_tsys"
+ }
+}

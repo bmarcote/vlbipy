@@ -17,6 +17,7 @@ nav = [
         { "Full pipeline" = "usage/pipeline.md" },
         { "Command line" = "usage/cli.md" },
         { "Interactive Python" = "usage/python.md" },
+        { "AI mode" = "usage/ai.md" },
         { "Status" = "usage/status.md" },
     ]},
     { "Scientific Background" = "science.md" },

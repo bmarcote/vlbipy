@@ -372,6 +372,44 @@ def _base_rows(selection: dict, meta: dict, ddid_to_spw: np.ndarray) -> np.ndarr
     return rows
 
 
+class _ScanBaselineIndex:
+    """Rows of a part grouped by (scan, baseline), built on first use: the distribution flagging writes tens of
+    thousands of commands of one scan and one baseline each, which a full-part scan per command makes take hours."""
+
+    def __init__(self, meta: dict):
+        self._meta = meta
+        self._order = self._starts = self._keys = None
+
+    @staticmethod
+    def applies(selection: dict) -> bool:
+        return (selection["scans"] is not None and bool(selection["baselines"]) and not selection["antennas"]
+                and not selection["autocorr"] and selection["fields"] is None and selection["times"] is None
+                and selection["quack"] is None)
+
+    def rows(self, selection: dict, ddid_to_spw: np.ndarray) -> np.ndarray:
+        """Sorted row indices of a selection for which :meth:`applies` holds (same rows as :func:`_base_rows`)."""
+        meta = self._meta
+        if self._order is None:
+            ant1, ant2 = meta["ant1"], meta["ant2"]
+            keys = (meta["scan"] * 100_000 + np.minimum(ant1, ant2)) * 100_000 + np.maximum(ant1, ant2)
+            keys[ant1 == ant2] = -1                          # autocorrelations are never in a baseline selection
+            self._order = np.argsort(keys, kind="stable")
+            self._keys, self._starts = np.unique(keys[self._order], return_index=True)
+            self._starts = np.append(self._starts, keys.size)
+        wanted = np.array(sorted({(scan * 100_000 + min(a, b)) * 100_000 + max(a, b)
+                                  for scan in selection["scans"] for a, b in selection["baselines"]}), dtype=np.int64)
+        slot = np.searchsorted(self._keys, wanted)
+        found = slot < self._keys.size
+        found[found] = self._keys[slot[found]] == wanted[found]
+        if not found.any():
+            return np.zeros(0, dtype=np.int64)
+        rows = np.sort(np.concatenate([self._order[self._starts[i]:self._starts[i + 1]] for i in slot[found]]))
+        if selection["spw"] is not None:
+            allowed = [ddid for ddid, spw in enumerate(ddid_to_spw) if int(spw) in selection["spw"]]
+            rows = rows[np.isin(meta["ddid"][rows], allowed)]
+        return rows
+
+
 def _quack_keys(meta: dict, rows: np.ndarray) -> np.ndarray:
     """One integer per row identifying its (scan, field, data description) chunk."""
     return (meta["scan"][rows] * 10_000 + meta["field"][rows]) * 10_000 + meta["ddid"][rows]
@@ -427,9 +465,18 @@ def flag_part_job(*, path: str, selections: list[dict], setup: dict, engine: str
         has_flag_row = "FLAG_ROW" in handle.colnames()
         ncorr = int(setup["ncorr"])
         nchan = int(setup["chan_freq"].shape[1])
-        # Each step: (unflag?, row mask, cell mask or None)
+        # Each step: (unflag?, sorted row indices, cell mask or None). Indices, not a row mask per command: an
+        # a-priori flag file holds thousands of commands, each touching a few rows of a part of millions.
         steps = []
+        index_type = np.int32 if nrows < np.iinfo(np.int32).max else np.int64
+        index = _ScanBaselineIndex(meta)
         for selection in selections:
+            if index.applies(selection):
+                found = index.rows(selection, ddid_to_spw)
+                if found.size:
+                    steps.append((selection["unflag"], found.astype(index_type),
+                                  _cell_mask(selection, ddid_to_spw, nchan, ncorr)))
+                continue
             rows = _base_rows(selection, meta, ddid_to_spw)
             if selection["quack"] is not None:
                 candidates = np.flatnonzero(rows)
@@ -438,12 +485,13 @@ def flag_part_job(*, path: str, selections: list[dict], setup: dict, engine: str
                 first = np.array([starts.get(int(k), np.inf) for k in keys]) if keys.size else np.zeros(0)
                 rows[candidates] = meta["time"][candidates] <= first + selection["quack"]
             if rows.any():
-                steps.append((selection["unflag"], rows, _cell_mask(selection, ddid_to_spw, nchan, ncorr)))
+                steps.append((selection["unflag"], np.flatnonzero(rows).astype(index_type),
+                              _cell_mask(selection, ddid_to_spw, nchan, ncorr)))
         if not steps:
             return stats
         touched = np.zeros(nrows, dtype=bool)
         for _, rows, _ in steps:
-            touched |= rows
+            touched[rows] = True
         stats["rows_touched"] = int(touched.sum())
         for start in range(0, nrows, chunk_rows):
             stop = min(nrows, start + chunk_rows)
@@ -454,7 +502,7 @@ def flag_part_job(*, path: str, selections: list[dict], setup: dict, engine: str
             row_flag = row_before = None
             ddid = meta["ddid"][start:stop]
             for unflag, rows, cells in steps:
-                local = np.flatnonzero(rows[start:stop])
+                local = rows[np.searchsorted(rows, start):np.searchsorted(rows, stop)] - start
                 if not local.size:
                     continue
                 if cells is None:

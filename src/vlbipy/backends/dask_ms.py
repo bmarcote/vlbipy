@@ -678,7 +678,8 @@ class DaskMsDataOps(DaskMsPlotReads, CasaDataOps):
         target = self.work_dir / f"{project_code}.mms"
         plain_ms = self.work_dir / f"{project_code}.ms"
         if mms and files and (delete or not (target.exists() or plain_ms.is_dir())):
-            for stale in (target, plain_ms):
+            # A previous MMS's flag versions too: they would be restorable over the new import's rows.
+            for stale in (target, plain_ms, target.with_name(f"{target.name}.flagversions")):
                 if stale.exists():
                     # A leftover plain MS must not divert a fresh import to the CASA partition path
                     # (it may be an interrupted import's corrupt remain); re-import from the files.

@@ -15,7 +15,10 @@ Differences from CASA that are deliberate:
 * the SNR column holds the AIPS FRING estimate of the FFT stage (the one ``minsnr`` is applied to);
   CASA writes a value that scales with the square root of the weights instead, so the two columns
   agree on what is detected but not on the numbers;
-* the MODEL_DATA column is ignored (calibrators are treated as point sources, as the pipeline does);
+* the MODEL_DATA column, when the measurement set has one, is divided out as in CASA, but normalised per scan to
+  its median amplitude: the fit, its weights and its SNR stay those of the data (``V / M`` with weights
+  ``w |M|^2``), only the structure phase of the source no longer goes into the solutions. Without the column the
+  calibrators are point sources;
 * ``docallib=True`` (cal-library files) is not supported: pass the explicit parallel lists.
 """
 from __future__ import annotations
@@ -323,11 +326,38 @@ def solve_scan_job(*, specs: list[dict], setup: dict, engine: str, columns: list
     from .calblock import load_block
     block = load_block(specs, setup=setup, engine=engine, columns=columns, data_column=data_column, chans=spw_sel,
                        parallel_hands=True, timerange=timerange, antennas=antennas, among=among, parang=parang,
-                       priors=priors)
+                       priors=priors, model=True)
     if block is None:
         return []
+    divide_by_model(block)
     return _solve_block(block, setup, spw_sel, spw_groups, refant_chain, solint_sec, solve_kwargs, block["field"],
                         int(specs[0]["scan"]), fringe_priors=fringe_priors, prior_window=prior_window)
+
+
+def divide_by_model(block: dict) -> bool:
+    """Divide the visibilities of a read ``block`` by its MODEL_DATA, in place; True when a model was divided out.
+
+    The model is scaled to median amplitude 1 over the block's usable samples first, so the data keep their flux
+    scale and the weights (``w |M|^2``) their size: a scan of a structured source then counts as much as before, and
+    only the phase and amplitude pattern of the structure is removed. A model of 1 everywhere (a field without one)
+    and samples whose model is (nearly) zero - flagged rather than divided - are handled; the ``model`` entry is
+    dropped afterwards.
+    """
+    model = block.pop("model", None)
+    if model is None:
+        return False
+    model = np.asarray(model)
+    amplitude = np.abs(model)
+    usable = ~block["flag"] & np.isfinite(model) & (amplitude > 0)
+    if not usable.any() or np.allclose(model[usable], 1.0):
+        return False
+    scale = float(np.median(amplitude[usable]))
+    unit = model / scale
+    weak = ~usable | (amplitude < 1e-3 * float(amplitude[usable].max()))
+    block["vis"] = np.where(weak, block["vis"], block["vis"] / np.where(weak, 1.0, unit))
+    block["weight"] = np.where(weak, 0.0, block["weight"] * np.abs(unit) ** 2)
+    block["flag"] = block["flag"] | weak
+    return True
 
 
 def fringefit(vis: str, caltable: str, *, field="", spw="", scan="", timerange="", antenna="",

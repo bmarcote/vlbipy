@@ -193,18 +193,24 @@ def phase_selfcal(obs, solints: list[str], *, min_improvement: float = 0.002,
 
 
 def amplitude_calibration(obs, prefix: str, parent_ms: str, *, models=("current", "gauss1", "gauss2", "gauss3"),
-                          prior_sigma: float = 0.1, workers: Optional[int] = None, allow_clean: bool = False) -> dict:
+                          prior_sigma: float = 0.1, workers: Optional[int] = None, allow_clean: bool = False,
+                          per_if: bool = False) -> dict:
     """Bayesian station amplitude calibration; writes ``<prefix>.json``, ``.png`` and the CASA table.
 
     The table refers to ``parent_ms`` (the multi-source measurement set), so
     CASA can apply the corrections to every field. Returns the JSON-able summary
     with the table path under ``"caltable"``.
+
+    ``per_if=False`` (the default) solves one correction per station: the subband levels are the scalar
+    bandpass's job, solved on every scan and both hands of the calibrator at high SNR, while a per-IF Bayesian
+    estimate on a weak station is noise that the table would carry to every field (EB104G: T6 on the fringe
+    finder, 5.3-7.6 across IFs, and up to 18% subband steps on that source afterwards).
     """
     models = tuple(models)
     if not allow_clean:
         models = tuple(model for model in models if not str(getattr(model, "kind", model)).strip().lower().startswith("clean"))
         models = models or ("current", "gauss1", "gauss2", "gauss3")
-    result = obs.bayes_gscale(models=models, prior_sigma=prior_sigma, prefix=str(prefix),
+    result = obs.bayes_gscale(models=models, prior_sigma=prior_sigma, prefix=str(prefix), per_if=per_if,
                               outformat="CASA", ms=str(parent_ms), workers=workers, plot=False, quiet=False,
                               verbose=False)
     raw_files = dict(getattr(result, "files", {}) or {})
@@ -219,6 +225,78 @@ def amplitude_calibration(obs, prefix: str, parent_ms: str, *, models=("current"
         summary["report"] = {}
     logger.info("difmapy bayes_gscale: best model {}; table {}", summary["best_model"], table)
     return summary
+
+
+#: A time-dependent amplitude correction more than this factor from the station's median flags the data instead:
+#: the station had (almost) no signal then (EB104G: T6 asked for x124 in its weakest scans).
+TIME_AMPLITUDE_MAX = 5.0
+
+
+def time_amplitude_selfcal(obs, prefix: str, parent_ms: str, *, solint: str = "scan", min_improvement: float = 0.01,
+                           max_factor: float = TIME_AMPLITUDE_MAX, max_bad_fraction: float = 0.25) -> tuple[object, dict]:
+    """Amplitude self-calibration in time, normalised so that only the time dependence is corrected.
+
+    The Bayesian gscale (:func:`amplitude_calibration`) gives every station one level for the whole run, which is
+    right for a station whose a-priori calibration is merely scaled wrong, and wrong for one whose sensitivity
+    changes during the run in a way its Tsys does not follow: a nominal Tsys (EB104G: T6 fell x4 on both
+    calibrators, JB wandered +-30% and jumped 9-11% from scan to scan), an elevation-dependent gain the gain curve
+    misses (UR -30% over the track), an absorbing atmosphere (YS, last 1.5 h). This step solves amplitude gains per
+    ``solint`` against the converged model, keeps them only when the fit improves by ``min_improvement``, and then
+    reduces them to one curve per station (median over the IFs, which the scalar bandpass has levelled) divided by
+    its own median over time - so the level stays the Bayesian one and only the shape is added. A correction more
+    than ``max_factor`` from that median is written flagged: the station had no usable signal then.
+
+    The solve lets the flux scale float (``float_scale=True``): difmap otherwise holds the *mean* gain of every IF
+    at one, so a station that needs a large correction drags all the others with it - on EB104G T6 (median x2.8,
+    up to x12.7) pulled every other station to x0.65-0.8 and the fit got 60x worse. The median normalisation per
+    station makes the scale irrelevant anyway.
+
+    Returns
+    -------
+    (observation, report)
+        The observation with the corrections applied when accepted (else the input), and ``table`` (CASA table of
+        the normalised corrections, or ""), ``accepted``, ``improvement``, ``range`` (per station: lowest and
+        highest correction).
+    """
+    from difmapy.io.solutions import from_gain_table
+    snapshot = obs.gain_snapshot()
+    trial = obs.copy()
+    result = trial.selfcal(amp=True, phase=False, solint=solint, float_scale=True, quiet=False, verbose=False)
+    before, after = float(result["fit_before"]["chisq"]), float(result["fit_after"]["chisq"])
+    improvement = (before - after) / before if before > 0 else 0.0
+    bad = _bad_fraction(result)
+    accepted = improvement >= min_improvement and bad <= max_bad_fraction and math.isfinite(after)
+    logger.info("difmapy selfcal amplitude solint={}: chisq {:.4g} -> {:.4g} ({:+.1%}), {} bad of {} bins -> {}",
+                solint, before, after, -improvement, int(result.get("nbadsol", 0)), int(result.get("nbins", 0)),
+                "accepted" if accepted else "rejected")
+    report = {"solint": solint, "accepted": accepted, "improvement": improvement, "table": "", "range": {}}
+    if not accepted:
+        return obs, report
+    sol = from_gain_table(trial, since=snapshot)
+    amp = np.where(sol.used & ~sol.bad & (sol.amp > 0), sol.amp, np.nan)            # (ntime, nif, nant)
+    with np.errstate(invalid="ignore"):
+        curve = np.nanmedian(amp, axis=1)                                              # (ntime, nant)
+        level = np.nanmedian(curve, axis=0)                                            # (nant,)
+        curve = curve / np.where(np.isfinite(level) & (level > 0), level, 1.0)[None, :]
+    curve = np.where(np.isfinite(curve), curve, 1.0)
+    dead = (curve > max_factor) | (curve < 1.0 / max_factor)
+    sol.amp = np.repeat(np.where(dead, 1.0, curve)[:, None, :], amp.shape[1], axis=1)
+    sol.phs = np.zeros_like(sol.phs)
+    sol.bad = sol.bad | np.repeat(dead[:, None, :], amp.shape[1], axis=1)
+    curve = np.where(dead, np.nan, curve)
+    info = trial.savecaltable(f"{prefix}.ampt", outformat="CASA", ms=str(parent_ms), solutions=sol, quiet=False,
+                              verbose=False)
+    names = list(trial.antennas)
+    report["table"] = str(info.get("path", f"{prefix}.ampt"))
+    report["range"] = {names[a]: [float(np.nanmin(curve[:, a])), float(np.nanmax(curve[:, a]))]
+                       for a in range(min(len(names), curve.shape[1]))
+                       if np.isfinite(curve[:, a]).any() and np.nanmax(curve[:, a]) - np.nanmin(curve[:, a]) > 0.02}
+    report["flagged"] = {names[a]: int(dead[:, a].sum()) for a in range(min(len(names), dead.shape[1])) if dead[:, a].any()}
+    logger.info("difmapy: time-dependent amplitude corrections -> {} ({}){}", Path(report["table"]).name,
+                ", ".join(f"{n} {lo:.2f}-{hi:.2f}" for n, (lo, hi) in report["range"].items()) or "all within 2%",
+                "; flagged (no signal): " + ", ".join(f"{n} {k} integration(s)" for n, k in report["flagged"].items())
+                if report["flagged"] else "")
+    return trial, report
 
 
 def write_gain_record(obs, path: str, amplitude: Optional[dict] = None) -> dict:
@@ -367,7 +445,16 @@ def fit_image_model(obs, *, max_components: int = 1, component_sigma: float = 5.
     """Fit one Gaussian first; add components only above noise and float32 visibility precision, with fit gains."""
     if int(max_components) < 1 or component_sigma <= 0 or not 0 <= component_improvement < 1:
         raise ValueError("invalid modelfit component limit, significance or improvement threshold")
-    fit = _checked_modelfit(obs.modelfit(quiet=False, verbose=False))
+    try:
+        fit = _checked_modelfit(obs.modelfit(quiet=False, verbose=False))
+    except BackendError:
+        # A multi-component model carried over from an earlier stage can turn nonphysical once the gains have
+        # changed (amplitude self-calibration); rebuild it from one Gaussian rather than give up on the source.
+        if len(obs.model) <= 1:
+            raise
+        logger.warning("difmapy modelfit: the {}-component model no longer fits; starting again from one Gaussian",
+                       len(obs.model))
+        fit = fit_starting_model(obs)
     stopped = "component limit reached"
     while len(obs.model) < int(max_components):
         obs.invert(verbose=False)
@@ -447,13 +534,39 @@ def image_all_robust(obs, imagename: str, robust_values, *, method: str = "model
     return images
 
 
+def measure_structure(obs, max_components: int, images: dict, imaging_kwargs: dict) -> dict:
+    """Fit up to ``max_components`` Gaussians to the self-calibrated data, on a copy: how structured the source is.
+
+    Returns ``components``, ``rchisq``, ``stopped`` and ``used_rchisq`` (the reduced chi-squared of the model the
+    session used, from its images), or ``{}`` when not asked for or the fit fails. A model that already has that
+    many components is reported as it is.
+    """
+    if int(max_components) < 2:
+        return {}
+    used = next(iter(images.values()), {}).get("model") or {}
+    try:
+        if len(obs.model) >= int(max_components):
+            fit = {"components": list(obs.model), "rchisq": used.get("rchisq"), "stopped": "model in use"}
+        else:
+            component_keys = {k: imaging_kwargs[k] for k in ("component_sigma", "component_improvement")
+                              if k in imaging_kwargs}
+            _, fit = fit_image_model(obs.copy(), max_components=int(max_components), **component_keys)
+    except BackendError as exc:
+        logger.warning("difmapy: structure model fit failed ({})", exc)
+        return {}
+    return {"components": [dict(c) for c in fit["components"]], "rchisq": fit.get("rchisq"),
+            "stopped": fit.get("stopped", ""), "used_rchisq": used.get("rchisq")}
+
+
 def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_values=(-2.0, 0.0, 2.0),
                      solints: Optional[list[str]] = None, min_improvement: float = 0.002,
                      max_bad_fraction: float = 0.25, bayes_models=("current", "gauss1", "gauss2", "gauss3"),
                      prior_sigma: float = 0.1, workers: Optional[int] = None, imagename: Optional[str] = None,
                      search_fov_mas: float = 0.0, search_sigma: float = 10.0, recentre_min_beams: float = 10.0,
                      mapsize: int = IMAGE_PIXELS, fixed_antennas: tuple = (), deferred_antennas: tuple = (),
-                     fix_stage1: bool = True, **imaging_kwargs) -> dict:
+                     fix_stage1: bool = True, bayes_per_if: bool = False, time_amplitude: str = "scan",
+                     time_amplitude_min_improvement: float = 0.01, model_components: int = 1,
+                     structure_components: int = 0, **imaging_kwargs) -> dict:
     """Full difmapy calibrator sequence: model, phase ladder, amplitude gains, images, tables.
 
     Products (``prefix`` is a path stem, e.g. ``<work_dir>/selfcal/<code>.<source>``):
@@ -469,6 +582,12 @@ def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_value
     a calibrator sits at the phase centre, so nothing is lost. The source is
     located first (:func:`locate_source`) and re-centred only when it lies far
     from the phase centre.
+
+    ``model_components`` > 1 self-calibrates against a structured model: once the phase ladder has run against the
+    single Gaussian, up to that many components are fitted (:func:`fit_image_model`) and the ladder runs again
+    against them, so the phases (and the amplitude gains after them) no longer absorb the structure of the source.
+    ``structure_components`` > 1 fits such a model at the end without using it, as a measurement of the structure
+    (``report["structure_model"]``: its components, reduced chi-squared and that of the model used).
     """
     obs = load(split_ms, average_channels=True)
     known = {a.lower(): a for a in obs.antennas}
@@ -503,10 +622,21 @@ def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_value
         rounds += stage2
         if fix_stage1:
             obs.selfant(stage1_names, fix=False, verbose=False)
+    if int(model_components) > 1:
+        component_keys = {k: imaging_kwargs[k] for k in ("component_sigma", "component_improvement")
+                          if k in imaging_kwargs}
+        obs, structured = fit_image_model(obs, max_components=int(model_components), **component_keys)
+        obs, stage3 = phase_selfcal(obs, ladder, min_improvement=min_improvement, max_bad_fraction=max_bad_fraction)
+        for r in stage3:
+            r["stage"] = "structured model"
+        rounds += stage3
+        logger.info("difmapy: self-calibrated against a {}-component model (rchisq {:.4g})",
+                    len(obs.model), float(structured["rchisq"]))
     phase_table = export_phase_table(obs, f"{prefix}.phase", parent_ms, snapshot) if any(r["accepted"] for r in rounds) \
         else {}
     amplitude = amplitude_calibration(obs, f"{prefix}.amp", parent_ms, models=bayes_models, prior_sigma=prior_sigma,
-                                      workers=workers, allow_clean=imaging_kwargs.get("method", "modelfit") == "clean")
+                                      workers=workers, allow_clean=imaging_kwargs.get("method", "modelfit") == "clean",
+                                      per_if=bayes_per_if)
     gains = write_gain_record(obs, f"{prefix}.gains.json", amplitude)
     # One accumulated table (phase + amplitude corrections since the first model) is what
     # gets transferred to the targets and check sources.
@@ -517,19 +647,29 @@ def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_value
         accumulated = str(info.get("path", f"{prefix}.all"))
     except Exception as exc:  # noqa: BLE001 - the separate phase/amp tables still cover it
         logger.warning("difmapy: could not export the accumulated gain table ({})", exc)
+    time_amp = {"accepted": False, "table": ""}
+    if time_amplitude:
+        try:
+            obs.modelfit(verbose=False)
+            obs, time_amp = time_amplitude_selfcal(obs, prefix, parent_ms, solint=time_amplitude,
+                                                   min_improvement=time_amplitude_min_improvement)
+        except Exception as exc:  # noqa: BLE001 - the constant amplitude calibration stands without it
+            logger.warning("difmapy: time-dependent amplitude self-calibration failed ({})", exc)
     obs.auto_mapsize(npix=int(mapsize))
     images = image_all_robust(obs, imagename or prefix, robust_values, **imaging_kwargs)
     if any(shift):
         for info in images.values():
             _record_shift(info["fits"], shift[0], shift[1])
+    structure = measure_structure(obs, int(structure_components), images, imaging_kwargs)
     report = {"source": obs.source, "split_ms": str(split_ms), "model": model.get("components", []),
               "search": search, "shift_mas": list(shift),
               "model_rchisq": model.get("rchisq"), "ladder": ladder, "rounds": rounds,
               "phase_table": phase_table.get("path", ""), "amplitude": amplitude, "images": images,
-              "accumulated_table": accumulated,
+              "accumulated_table": accumulated, "time_amplitude": time_amp,
               "image_model": next(iter(images.values()), {}).get("model", {}),
               "station_gains": {k: float(v) for k, v in obs.station_gains().items()},
-              "station_gains_per_if": gains["gain_per_if"], "gains_file": f"{prefix}.gains.json"}
+              "station_gains_per_if": gains["gain_per_if"], "gains_file": f"{prefix}.gains.json",
+              "structure_model": structure}
     Path(f"{prefix}.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     return report
 

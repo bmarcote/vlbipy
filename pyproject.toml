@@ -42,7 +42,7 @@ vlbipy = "vlbipy.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-vlbipy = ["templates/*.toml", "data/*.fits", "data/*.json"]
+vlbipy = ["templates/*.toml", "data/*.fits", "data/*.json", "data/ai/*.json", "data/ai/*.jsonl"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

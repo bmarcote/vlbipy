@@ -44,13 +44,13 @@ PROJECT_FILENAME = ".project.json"
 #: everything after it, so this must match the order :meth:`VLBIObs.run` runs them
 #: in and use the same names the steps record themselves under.
 STEP_ORDER = [
-    "import_data", "a_priori", "flag_apriori", "flag_from_file", "flag_autocorr",
+    "import_data", "ai_prediagnostic", "a_priori", "flag_apriori", "flag_from_file", "flag_autocorr",
     "plot_raw", "flag_quack", "flag_tfcrop",
     "scan_snr", "initial_calibration", "fringefit", "bandpass",
     "initial_calibration_sbd2", "fringefit_mbd2", "flag_edges",
     "apply", "flag_aoflagger", "flag_outliers",
     "second_pass", "scalar_bandpass", "reweight", "flag_outliers_reweighted", "third_pass",
-    "flag_edges_final", "emerlin_scale", "split",
+    "flag_edges_final", "emerlin_scale", "ai_flag_distribution", "split", "model_pass",
 ]
 
 
@@ -118,6 +118,8 @@ class Observation:
         self.clean = CleanNamespace(self)
         self.selfcal = SelfcalNamespace(self)
         self.export = ExportNamespace(self)
+        from .ai.namespace import AINamespace
+        self.ai = AINamespace(self)
 
     # -- the calibration chain --
     @property

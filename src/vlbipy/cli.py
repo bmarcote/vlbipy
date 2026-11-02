@@ -47,12 +47,17 @@ PLOT_KINDS: list[str] = ["caltables", "caltable", "tplot", "uv_coverage", "diagn
                          "baseline_corner", "subband_phases", "lightcurve", "final_data"]
 
 #: Known subcommand names (used to route the no-subcommand form to ``pipeline``).
-COMMANDS: list[str] = ["pipeline", "import", "calibrate", "flag", "image", "plot", "applycal", "summary", "export", "report"]
+COMMANDS: list[str] = ["pipeline", "import", "calibrate", "flag", "image", "plot", "applycal", "summary", "export",
+                       "report", "ai"]
+
+#: AI-mode actions selectable via ``vlbipy ai`` (positional).
+AI_ACTIONS: list[str] = ["prediagnose", "tsys", "calibrated", "flag", "rules", "train", "predict"]
 
 #: Positional selector per subcommand: attribute name and its valid values.
 _SELECTORS: dict[str, tuple[str, list[str]]] = {"calibrate": ("steps", CALIBRATE_STEPS),
                                                "flag": ("steps", FLAG_STEPS),
-                                               "plot": ("kinds", PLOT_KINDS)}
+                                               "plot": ("kinds", PLOT_KINDS),
+                                               "ai": ("actions", AI_ACTIONS)}
 
 
 def _relocate_selectors(args: argparse.Namespace) -> argparse.Namespace:
@@ -290,6 +295,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Build the HTML dashboard (<work_dir>/html/index.html) from the plots and state on disk"
     )
     p_rep.add_argument("--open", action="store_true", help="Open the dashboard in the default browser")
+    p_ai = sub.add_parser(
+        "ai", parents=[common], formatter_class=RichHelpFormatter,
+        help="AI mode: pre-diagnostic of the raw data, Tsys assessment, distribution tests of the calibrated data, "
+             "the expert rules, and the small model (train / predict)"
+    )
+    p_ai.add_argument("actions", nargs="*", choices=AI_ACTIONS + [[]], default=[], metavar="ACTION",
+                      help="prediagnose (raw data + Tsys, needs only the import and the a-priori flags), tsys (the "
+                           "Tsys plan), calibrated (residual antenna gains of the corrected data), flag (distribution "
+                           "flags; with --dry-run only the list), rules (print the rule base), train (fit the model "
+                           "on the shipped + this project's annotated features), predict (model labels for this "
+                           "project's features). Default: prediagnose")
+    p_ai.add_argument("--dry-run", action="store_true", help="ai flag: write the flag list and report, apply nothing")
+    p_ai.add_argument("--features", nargs="*", default=[], help="ai train: extra feature files (JSONL)")
     p_comb = sub.add_parser(
         "combine", parents=[common], formatter_class=RichHelpFormatter,
         help="Combine the calibrated epochs of a campaign (several -p codes): joint phase-calibrator model, "
@@ -709,13 +727,67 @@ def _cmd_report(obs: VLBIObs, args: argparse.Namespace) -> int:
     return 0
 
 
+def _model_summary(stage: str, info: dict) -> str:
+    """One line per trained forest: rows, balanced accuracy of both validations, classes."""
+    def fmt(scores):
+        return "-" if scores.get("balanced") is None else f"{scores['accuracy']:.0%} (balanced {scores['balanced']:.0%})"
+    return (f"{stage:14s} {info['rows']:5d} rows; 5-fold {fmt(info['kfold'])}; leave-one-experiment-out "
+            f"{fmt(info['loeo'])}; classes {info['classes']}")
+
+
+def _cmd_ai(obs: VLBIObs, args: argparse.Namespace) -> int:
+    """AI-mode actions on one project (see :mod:`vlbipy.ai`)."""
+    from .ai import knowledge, model
+    from .ai.features import read_rows
+    actions = list(getattr(args, "actions", None) or ["prediagnose"])
+    if "rules" in actions:
+        print(knowledge.describe())
+        actions.remove("rules")
+    if not actions:
+        return 0
+    if obs is None:                      # train on the shipped sets (and --features) only
+        summary = model.train(model.training_files([p for p in args.features if Path(p).is_file()]))
+        for stage, info in summary.items():
+            print(_model_summary(stage, info))
+        return 0
+    for observation in obs.observations:
+        ai = observation.ai
+        if any(a in actions for a in ("prediagnose", "tsys", "calibrated", "flag")):
+            obs.import_data(force=False)
+        if "prediagnose" in actions or "tsys" in actions:
+            report = ai.prediagnose(force=args.force or "tsys" in actions)
+            for key, decision in report.get("tsys", {}).get("decisions", {}).items():
+                if decision["action"] != "keep" or decision.get("exponent") or decision["window"] != 600.0:
+                    print(f"tsys {key:10s} {decision['action']:10s} window {decision['window']:6.0f} s  "
+                          f"{decision['reason']}")
+        if "calibrated" in actions:
+            ai.postdiagnose()
+        if "flag" in actions:
+            report = ai.flag_distribution(force=True, apply=not args.dry_run)
+            print(f"{report.get('commands', 0)} flag command(s) ({report.get('outlier_bins', 0)} outlier bins); "
+                  f"list in {ai.dir}")
+        if "train" in actions:
+            extra = list(args.features) + [str(ai.dir / f"{observation.project_code}.features.jsonl")]
+            summary = model.train(model.training_files([p for p in extra if Path(p).is_file()]))
+            for stage, info in summary.items():
+                print(_model_summary(stage, info))
+        if "predict" in actions:
+            path = ai.dir / f"{observation.project_code}.features.jsonl"
+            rows = model.predict_rows(read_rows(path)) if path.is_file() else []
+            for row in rows:
+                if row.get("model_label", "ok") not in ("ok", "healthy") or row.get("label") not in ("ok", "healthy"):
+                    print(f"{row['stage']:14s} {row['unit']:24s} rules={row['label']:30s} "
+                          f"model={row.get('model_label', '-')} ({row.get('model_p', 0):.2f})")
+    return 0
+
+
 #: Dispatch table mapping subcommand name -> handler(obs, args) -> exit code.
 #: "run" stays as a hidden alias of "pipeline".
 _HANDLERS = {"pipeline": _cmd_pipeline, "run": _cmd_pipeline, "import": _cmd_import,
              "calibrate": _cmd_calibrate, "flag": _cmd_flag,
              "image": _cmd_image, "plot": _cmd_plot, "applycal": _cmd_applycal,
              "summary": _cmd_summary, "export": _cmd_export, "report": _cmd_report,
-             "notebook": _cmd_notebook, "combine": _cmd_combine}
+             "notebook": _cmd_notebook, "combine": _cmd_combine, "ai": _cmd_ai}
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -747,6 +819,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     _validate_args(parser, args)
     configure_logging("DEBUG" if args.verbose else "INFO")
 
+    if args.command == "ai" and args.actions and set(args.actions) <= {"rules", "train"}:
+        return _cmd_ai(None, args)       # the rule base and the shipped training sets need no project
     obs = None if args.command == "applycal" or (args.command == "plot" and args.ms) else _build_obs(args)
     try:
         return _HANDLERS[args.command](obs, args)
