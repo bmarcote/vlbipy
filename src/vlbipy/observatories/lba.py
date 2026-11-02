@@ -34,7 +34,7 @@ logger = get_logger()
 _DATA_SUFFIXES = (".fits", ".fitsidi", ".idifits", ".idi")
 
 # FTP server where the SCHED-related files are found, and log files from stations
-LBA_FTP_SERVER: str = "ftp.atnf.csiro.au/pub/people/vlbi/"
+LBA_FTP_SERVER: str = "ftp.atnf.csiro.au/pub/people/vlbi/"  # project-name/epoch-name
 
 
 class LBAObservatory(ObservatoryHandler):
