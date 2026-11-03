@@ -1367,6 +1367,30 @@ class DaskMsExportOps(CasaExportOps):
             logger.debug("could not snapshot the flags of {}: {}", target, exc)
         return str(target)
 
+    def merge(self, project_codes: list[str], source_names: list[str], *, inputs: Optional[list[str]] = None,
+              outputvis: str = "", scales: Optional[list[float]] = None, **kwargs) -> str:
+        """Concatenate the per-epoch splits natively (:func:`vlbipy.solvers.concat.concat`), as casatasks.concat
+        would; inputs or settings it does not reproduce (Multi-MS, differing setups) go to CASA."""
+        from ..solvers.concat import concat
+        if not inputs or not outputvis:
+            raise BackendError("merge needs the per-epoch measurement sets and an output path")
+        missing = [path for path in inputs if not Path(path).is_dir()]
+        if missing:
+            raise BackendError(f"merge: measurement set(s) not found: {', '.join(missing)}")
+        try:
+            Path(outputvis).parent.mkdir(parents=True, exist_ok=True)
+            report = concat(inputs, outputvis, scales=scales)
+        except NotImplementedError as exc:
+            logger.info("concat[dask-ms]: {}; using CASA", exc)
+            return super().merge(project_codes, source_names, inputs=inputs, outputvis=outputvis, scales=scales,
+                                 **kwargs)
+        except (RuntimeError, ValueError, OSError) as exc:
+            raise BackendError(f"concat of {', '.join(source_names)} failed: {exc}") from exc
+        logger.info("concat[dask-ms]: {} [{}] -> {} ({} rows{}) in {:.1f}s", ",".join(source_names),
+                    ", ".join(project_codes), Path(outputvis).name, report["rows"],
+                    ", epochs scaled" if report.get("scaled") else "", report["seconds"])
+        return str(outputvis)
+
 
 class DaskMsBackend(CasaBackend):
     """CASA backend with numpy/dask-ms calibration (fringe fits, bandpass, gains, applycal) and difmapy imaging.
