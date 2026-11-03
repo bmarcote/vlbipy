@@ -137,7 +137,7 @@ def setjy(vis, field: str, image, *, flux_total: Optional[float] = None,
                 phase = -2.0 * np.pi * (u_l[:, :, None] * l + v_l[:, :, None] * m)
                 values = (flux * np.exp(1j * phase)).sum(axis=2).astype(np.complex64)
                 out[sel] = values[:, :, None] * parallel.astype(np.complex64)[None, None, :]
-            handle.putcol("MODEL_DATA", out, start=start, nrow=nrow)
+            handle.putcol("MODEL_DATA", out, start=start)
             rows_written += nrow
         finally:
             handle.close()
@@ -147,3 +147,69 @@ def setjy(vis, field: str, image, *, flux_total: Optional[float] = None,
                 Path(vis).name, field, Path(image).name, flux.size, flux.sum(), rows_written,
                 report["seconds"])
     return report
+
+
+def write_component_models(vis, models: dict, *, engine: Optional[str] = None) -> dict:
+    """Write MODEL_DATA from component models: ``models`` maps field name -> difmap(y) components.
+
+    The components are evaluated with :func:`vlbipy.solvers.skymodel.predict` (the convention difmap fits them
+    with) for the parallel hands; the cross hands get 0. Every other field gets a unit model (1 in the parallel
+    hands), so a solve that divides by MODEL_DATA treats it as a point source, as CASA does after ``clearcal``.
+    MODEL_DATA is created when missing. Returns ``{"rows", "fields": {name: rows}, "seconds"}``.
+    """
+    from .skymodel import usable
+
+    started = _time.perf_counter()
+    vis = str(vis)
+    engine = engine or table_engine()
+    setup = read_setup(vis, engine=engine)
+    layout = read_layout(vis, engine=engine)
+    names = setup["field_names"]
+    unknown = [name for name in models if name not in names]
+    if unknown:
+        raise ValueError(f"{Path(vis).name} has no field(s) {', '.join(unknown)}")
+    by_id = {names.index(name): usable(components) for name, components in models.items()}
+    parallel = _corr_parallel(setup.get("corr_types"), int(setup["ncorr"])).astype(np.complex64)
+    ensure_column(vis, "MODEL_DATA", "DATA", engine=engine)
+    counts: dict = {}
+    rows_written = 0
+    for part_index, part in enumerate(layout["parts"]):
+        runs = np.flatnonzero(layout["part"] == part_index)
+        if not runs.size:
+            continue
+        handle = open_table(part, engine=engine, readonly=False)
+        try:
+            for index in runs:
+                rows_written += _write_run_model(handle, layout, int(index), by_id, setup, parallel, counts, names)
+        finally:
+            handle.close()
+    report = {"rows": int(rows_written), "fields": {name: int(counts.get(name, 0)) for name in models},
+              "seconds": _time.perf_counter() - started}
+    logger.info("model[native]: {} MODEL_DATA <- {} ({} rows, unit model elsewhere) in {:.1f}s", Path(vis).name,
+                ", ".join(f"{name} ({len(by_id[names.index(name)])} components)" for name in models),
+                rows_written, report["seconds"])
+    return report
+
+
+def _write_run_model(handle, layout: dict, index: int, by_id: dict, setup: dict, parallel: np.ndarray,
+                     counts: dict, names: list) -> int:
+    """Write MODEL_DATA of one run (rows of one field, scan and subband) of an open table; returns its rows."""
+    from .skymodel import predict
+
+    field_id = int(layout["field"][index])
+    start, nrow = int(layout["start"][index]), int(layout["nrow"][index])
+    chan_freq = setup["chan_freq"]
+    components = by_id.get(field_id)
+    out = np.empty((nrow, chan_freq.shape[1], parallel.size), dtype=np.complex64)
+    if components:
+        ddids = np.asarray(handle.getcol("DATA_DESC_ID", start=start, nrow=nrow), dtype=np.int64)
+        uvw = np.asarray(handle.getcol("UVW", start=start, nrow=nrow), dtype=np.float64)
+        for ddid in np.unique(ddids):
+            sel = np.flatnonzero(ddids == ddid)
+            values = predict(components, uvw[sel], chan_freq[int(setup["ddid_to_spw"][int(ddid)])])
+            out[sel] = values.astype(np.complex64)[:, :, None] * parallel[None, None, :]
+    else:
+        out[:] = parallel[None, None, :]
+    handle.putcol("MODEL_DATA", out, start=start)
+    counts[names[field_id]] = counts.get(names[field_id], 0) + nrow
+    return nrow

@@ -277,6 +277,22 @@ def test_credentials_reach_the_import_config_but_not_the_project_file(tmp_path):
     assert obs.config["import"]["password"] == "secret"            # the running process keeps it
 
 
+def test_a_resume_without_source_flags_keeps_the_previous_roles(tmp_path):
+    """--from-step without -t/--phasecal/... uses the roles the earlier run saved instead of none."""
+    import json
+
+    from vlbipy.cli import _build_obs
+    sources = {"fringe_finders": ["FF"], "phase_calibrators": ["PC"], "targets": ["SRC"], "check_sources": []}
+    (tmp_path / ".project.json").write_text(json.dumps({"projects": ["TS01"], "config": {"sources": sources}}))
+    obs = _build_obs(parse(["pipeline", "-p", "TS01", "--backend", "dummy", "--config", _dummy_config(tmp_path)]))
+    assert obs.config["sources"]["phase_calibrators"] == ["PC"]
+    assert [s.name for s in obs._observations[0].sources.phase_calibrators] == ["PC"]
+    declared = _build_obs(parse(["pipeline", "-p", "TS01", "--backend", "dummy", "-t", "OTHER",
+                                 "--config", _dummy_config(tmp_path)]))
+    assert declared.config["sources"]["targets"] == ["OTHER"]          # declared roles win
+    assert not declared.config["sources"].get("phase_calibrators")
+
+
 def test_obsdate_is_a_common_option():
     """--obsdate matters wherever a download can happen, so every pipeline subcommand takes it."""
     for command in ("pipeline", "import", "calibrate", "summary"):

@@ -1070,3 +1070,41 @@ def test_statwt_saves_the_flags_it_changes_and_only_then(sim, tmp_path):
     statwt(sim["ms"], column="CORRECTED_DATA", minsamp=2, workers=2, flagbackup="statwt_2")
     assert [name for name, _ in flagmanager.list_versions(sim["ms"])][-1] != "statwt_2"
     workers.close_pool()
+
+
+def test_fringefit_divides_by_the_component_model_written_to_model_data(sim, tmp_path):
+    """A structured calibrator: the fringe fit recovers the delays only once its model is in MODEL_DATA."""
+    from vlbipy.solvers.setjy import write_component_models
+    from vlbipy.solvers.skymodel import predict
+
+    ms = sim["ms"]
+    positions = 6.371e6 * np.array([[np.cos(0.1 * i), np.sin(0.1 * i), 0.5] for i in range(NANT)])
+    uvw = positions[sim["ant2"]] - positions[sim["ant1"]]
+    components = [{"type": "delta", "flux": 1.0, "x": 0.0, "y": 0.0, "major": 0.0},
+                  {"type": "gauss", "flux": 0.7, "x": 40.0, "y": -25.0, "major": 2.0}]
+    model = predict(components, uvw, CHAN_FREQ[sim["spw"]])                       # (nrow, nchan)
+    tb = casatools.table()
+    tb.open(str(ms), nomodify=False)
+    tb.addcols({"UVW": dict(_array("double", [3]), dataManagerType="StandardStMan", dataManagerGroup="UVW")})
+    tb.putcol("UVW", np.asfortranarray(uvw.T))
+    tb.putcol("DATA", np.asfortranarray((sim["data"] * model[:, :, None]).astype(np.complex64).T))
+    tb.close()
+
+    def worst_residual(table):
+        param, flag, _, ant, spw, _ = _read_table(table)
+        centre = CHAN_FREQ.mean(axis=1)
+        worst = 0.0
+        for hand in range(2):
+            truth = sim["gains"][ant, spw][:, :, hand]
+            fit = np.exp(1j * (param[:, 0, 4 * hand, None] + 2 * np.pi * param[:, 0, 4 * hand + 1, None] * 1e-9 *
+                               (CHAN_FREQ[spw] - centre[spw][:, None])))
+            worst = max(worst, float(np.max(np.abs(np.angle(np.mean(truth / np.abs(truth) * np.conj(fit), axis=1))))))
+        return worst
+
+    kwargs = {"field": "CAL", "scan": "1", "solint": "inf", "refant": "A0", "minsnr": 5.0, "zerorates": True,
+              "workers": 1}
+    point = worst_residual(fringefit(str(ms), str(tmp_path / "point.sbd"), **kwargs))
+    report = write_component_models(ms, {"CAL": components})
+    assert report["fields"] == {"CAL": len(sim["ant1"])}
+    modelled = worst_residual(fringefit(str(ms), str(tmp_path / "model.sbd"), **kwargs))
+    assert modelled < 0.05 < point

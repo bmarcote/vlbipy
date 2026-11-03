@@ -131,3 +131,26 @@ def recorded_model(work_dir, project_code: str, source: str) -> list[dict]:
             if isinstance(components, list) and usable(components):
                 return shifted(usable(components), record.get("shift_mas"))
     return []
+
+
+def structure_metrics(components: list[dict], uvw: np.ndarray, frequency: float) -> dict:
+    """How far ``components`` are from a point source on the baselines ``uvw`` [m] at ``frequency`` [Hz].
+
+    Returns ``phase_p90`` (degrees): the 90th percentile of the model's visibility phase, what a fringe fit that
+    takes the source as a point puts into its solutions; ``amp_p10``: the 10th percentile of the amplitude relative
+    to the total flux density (how resolved the source is); ``n``: the number of uv points. The model is measured
+    from its brightest component (a source merely off the phase centre is not structure), and a symmetric source
+    has no phase, however resolved.
+    """
+    good = usable(components)
+    if good:
+        peak = max(good, key=lambda c: abs(float(c["flux"])))
+        good = shifted(good, (-float(peak.get("x", 0.0)), -float(peak.get("y", 0.0))))
+    uvw = np.asarray(uvw, dtype=np.float64).reshape(-1, 3)
+    if not good or not uvw.size:
+        return {"phase_p90": 0.0, "amp_p10": 1.0, "n": 0}
+    model = predict(good, uvw, np.array([float(frequency)]))[:, 0]
+    total = abs(sum(float(c["flux"]) for c in good)) or 1.0
+    phase = np.degrees(np.abs(np.angle(model)))
+    return {"phase_p90": float(np.percentile(phase, 90)),
+            "amp_p10": float(np.percentile(np.abs(model) / total, 10)), "n": int(model.size)}

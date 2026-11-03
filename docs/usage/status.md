@@ -14,12 +14,13 @@ antennas, 4 × 64 channels) on the CASA backend unless noted.
 | Inspection | antennas, scans, frequency setup, subband participation, baseline geometry |
 | Fringe SNR survey | per scan / antenna / polarization, with a scan × antenna matrix plot |
 | Antenna & scan selection | full-band coverage + SNR; linked covering set when no single scan works |
-| A-priori calibration | Tsys + gain curve, MAD de-spiking, per-antenna plots |
+| A-priori calibration | Tsys + gain curve, per-antenna plots; with the AI mode the Tsys is repaired series by series from the raw data (noisy hands, spurious subbands, absorption, adaptive smoothing) |
+| AI mode | raw-data pre-diagnostic per antenna, Tsys checks against the raw amplitudes, distribution-based flagging of the calibrated data, rule base, numpy decision forest ([AI mode](ai.md)) |
 | Flagging | `.uvflg`, autocorrelations, measured band edges, measured quack, per-baseline outliers |
 | Instrumental calibration | SBD → bandpass → SBD, with solution-coverage verification |
 | Global fringe fit | multi-band delay, with the spw map read back from the table |
 | Second pass | full re-solve on the flagged data |
-| Scalar bandpass | one amplitude per antenna and subband |
+| Scalar bandpass | one amplitude per antenna and subband, both hands levelled together (corrects RCP/LCP offsets) |
 | Apply | via a CASA cal library (`caltables.txt`); each solve declares its own priors in `callibs/` |
 | Export | per-source measurement sets and Difmap-ready UVFITS |
 | Diagnostics | spectrum, time series, per-baseline corner, radplot, all calibration tables |

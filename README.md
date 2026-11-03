@@ -127,6 +127,23 @@ obs["rsm07"]._backend.capabilities()
 Full walkthrough, including the object model and where files are written:
 [Interactive Python](docs/usage/python.md).
 
+## AI mode
+
+The pipeline diagnoses its own data (`vlbipy.ai`, on by default): before calibration it reads the raw data
+with the a-priori flags only and reports per antenna sensitivity drops, scan-to-scan scatter and whether each
+Tsys series is real (checked against the raw amplitudes); it repairs the Tsys table accordingly (noisy hands,
+spurious subband levels, absorption, adaptive smoothing); after calibration it flags whatever departs from the
+noise distribution (Rice amplitudes, von Mises phases, one level per subband). Every decision is a labelled
+feature row; a small numpy decision forest trained on them ships with the package.
+
+```bash
+vlbipy ai -p EB104G                 # pre-diagnostic of the raw data and the Tsys plan
+vlbipy ai flag --dry-run -p EB104G  # distribution flags of the calibrated data, list only
+vlbipy ai rules -p any              # the expert rules and the experiments behind them
+```
+
+See [AI mode](docs/usage/ai.md).
+
 ## Configuration
 
 Configuration uses a three-layer cascade (later overrides earlier):

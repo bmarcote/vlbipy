@@ -128,6 +128,7 @@ combine = "scan"
 minsnr = 3.0
 solnorm = true               # keep the a-priori flux scale; level the subbands only
 fill_unsolved = true         # an unsolved antenna/subband gets gain 1 instead of flagging its data
+level_hands = true           # normalise both hands together: also corrects each antenna's RCP/LCP amplitude ratio
 
 [calibration.mbd]
 solint = "inf"
@@ -206,6 +207,16 @@ time_window = 600.0          # then a running median over this many seconds, per
                              # polarization and source (each source has its own Tsys level); 0 = only de-spike
 min_points = 3               # solutions of the same source a window needs before it smooths
 
+[calibration.model_mbd]
+# Model pass: when the phase calibrator is structured, the calibrators' structure models (fitted at the end of
+# their self-calibration) go into MODEL_DATA, the chain is solved again from the delays on (the fringe fits and
+# the bandpass divide by the model), the calibrators are self-calibrated against those models and every source is
+# imaged again. Before/after figures of merit: <work_dir>/ai/<code>.model_pass.json.
+enabled = "auto"             # "auto" (only for a structured phase calibrator) | true (always) | false
+min_phase_deg = 5.0          # structured: the model's visibility phase reaches this (90th percentile, degrees)
+components = 3               # Gaussian components of the model the calibrators are self-calibrated against
+                             # (default 3: a calibrator is nearly always one Gaussian, a core-jet two or three)
+
 [calibration.snr_survey]
 minsnr = 0.0                 # keep every solution so weak antennas still appear in the survey
 
@@ -228,6 +239,19 @@ joint_amplitude = false      # multi-epoch stage: also re-solve the station ampl
 workers = 0                  # threads for bayes_gscale (0 = difmapy's default)
 fix_stage1 = true            # hold the short/intermediate-baseline antennas' gains while the
                              # long-baseline antennas are added and solved in selfcal stage 2
+bayes_per_if = false         # one Bayesian gscale correction per station (the scalar bandpass levels the
+                             # subbands); per-IF estimates of a weak station are noise carried to every field
+time_amplitude = "scan"      # amplitude self-cal interval for the time dependence the Tsys cannot follow
+                             # (nominal Tsys, gain-curve errors, absorption); normalised to median 1 per
+                             # station so the Bayesian level stays. "" disables it
+time_amplitude_min_improvement = 0.01   # ... kept only when the model fit improves by this fraction
+structure_components = 3     # after each session, fit up to this many Gaussians (default 3) to measure the
+                             # structure (the model pass decides on it); 0 = do not measure
+model_components = 1         # components of the model the calibrators are self-calibrated against (the model
+                             # pass raises it to [calibration.model_mbd].components)
+time_amplitude_transfer = false   # also apply a phase calibrator's time curve to its targets/check sources (off:
+                                  # solved against its own model it carries some of its structure; on EB104G it
+                                  # made the check source worse)
 
 # Antennas on the longest baselines, ignored until the model has converged on the rest of the
 # array; they join for a second selfcal loop against the improved model. Per network.
@@ -259,6 +283,19 @@ recentre_min_beams = 10.0    # ... and the map is re-centred on it only when it 
 sources = "all"              # "all" (targets + calibrators) | "targets"
 produce_fits = true
 produce_png = true
+
+[ai]
+# AI mode (vlbipy.ai): data-driven diagnostics and decisions; see docs/usage/ai.md.
+enabled = true
+binsec = 30.0                # time bin of the raw-data statistics cube (pre-diagnostic)
+calibrated_binsec = 10.0     # time bin of the calibrated cube the distribution tests read
+repair_tsys = true           # repair the Tsys table from the pre-diagnostic (noisy hands, spurious subbands,
+                             # opacity, adaptive smoothing) instead of the uniform per-field smoothing
+flag_distribution = true     # flag calibrated data that departs from the noise distribution (before selfcal)
+flag_targets = true          # ... on the targets and check sources too (noise-dominated: Rayleigh/uniform)
+apply_flags = true           # apply the distribution flags (false: only write the list and the report)
+p_outlier = 1e-7             # probability below which one bin is an outlier (|z|^2 > 16.1)
+model = true                 # add the small model's predictions to the reports when a trained model ships
 
 [export]
 split_per_source = true

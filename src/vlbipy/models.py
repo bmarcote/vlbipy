@@ -830,6 +830,17 @@ class ObsMetadata:
         """
         return tuple(spw for spw, names in self.antennas_per_subband().items() if len(names) >= 2)
 
+    def min_baselines_per_antenna(self, default: int = 4) -> int:
+        """``minblperant`` a gain or bandpass solve can afford in every usable subband.
+
+        CASA's default of 4 baselines per antenna cannot be met in a subband fewer than five
+        antennas recorded, and a single ``minblperant`` applies to every subband of the solve: on a
+        heterogeneous array the default silently leaves those subbands without a solution, and
+        applying the table then flags them for everyone. Returns ``default`` on a homogeneous array.
+        """
+        counts = [len(names) for spw, names in self.antennas_per_subband().items() if spw in self.usable_subbands]
+        return max(1, min([int(default)] + [count - 1 for count in counts]))
+
     @property
     def unusable_subbands(self) -> tuple[int, ...]:
         """Subbands fewer than two antennas recorded (no baseline); empty for a homogeneous array."""

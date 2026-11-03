@@ -101,3 +101,13 @@ def test_an_antenna_outside_the_usable_band_is_not_the_preferred_reference():
     meta = metadata(EK053B)
     # MC then WB are the next two of REFANT_PRIORITY; EF and T6 fall to the end, in their old order.
     assert rank_reference_antennas(meta) == ["MC", "WB", "JB", "EF", "T6"]
+
+
+def test_baselines_per_antenna_follow_the_sparsest_usable_subband():
+    """EK053A: subbands 0-1 only EF and TR; the CASA default of 4 would flag 5 of its 8 subbands."""
+    ek053a = {"EF": tuple(range(8)), "TR": tuple(range(8)), "WB": (2, 3, 4, 5), "NT": (2, 3, 4, 5, 6, 7),
+              "MC": (3, 4, 5, 6)}
+    assert metadata(ek053a).min_baselines_per_antenna() == 1
+    assert metadata({name: tuple(range(8)) for name in ("EF", "WB", "JB", "MC", "T6")}).min_baselines_per_antenna() == 4
+    # A subband recorded by one antenna has no baseline and does not lower the requirement.
+    assert metadata(EK053B).min_baselines_per_antenna() == 1  # subband 6: WB and JB only
