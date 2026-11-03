@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .logging_utils import attach_logging, get_logger, logging_setup, warnings
-from .resources import available_memory, usable_cpus
+from .resources import available_memory, default_parallel_jobs, usable_cpus
 
 logger = get_logger()
 
@@ -94,12 +94,13 @@ def job_cost(job: PlotJob) -> float:
                      if (not fields or scan.source in fields) and (not scans or scan.scan_number in scans)))
 
 
-def plot_workers(setting) -> int:
-    """Most plots drawn at once for a ``[plotting].workers`` setting: ``"auto"`` (or 0) = every CPU this
-    process may use (:func:`vlbipy.tools.usable_cpus`), a number = at most that many. The memory
+def plot_workers(setting, path=".") -> int:
+    """Most plots drawn at once for a ``[plotting].workers`` setting: ``"auto"`` (or 0) = half of the CPUs
+    this process may use, no more than the disk holding ``path`` sustains
+    (:func:`vlbipy.resources.default_parallel_jobs`); a number = at most that many. The memory
     estimate of each plot set then lowers it where they would not fit (:func:`plan_workers`)."""
     if setting is None or str(setting).strip().lower() in ("auto", "", "0"):
-        return usable_cpus()
+        return default_parallel_jobs(path)
     return max(1, int(setting))
 
 

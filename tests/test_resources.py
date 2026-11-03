@@ -136,6 +136,32 @@ def test_pool_size_overrides(fake_host, monkeypatch):
 
 def test_plot_workers_setting(monkeypatch):
     import vlbipy.plot_jobs as plot_jobs
-    monkeypatch.setattr(plot_jobs, "usable_cpus", lambda: 12)
-    assert plot_workers("auto") == 12 and plot_workers(0) == 12 and plot_workers(None) == 12
+    monkeypatch.setattr(resources, "usable_cpus", lambda: 12)
+    monkeypatch.setattr(resources, "storage_kind", lambda path: "nvme")
+    assert plot_workers("auto") == 6 and plot_workers(0) == 6 and plot_workers(None) == 6   # half of the CPUs
     assert plot_workers(3) == 3 and plot_workers("4") == 4
+    monkeypatch.setattr(resources, "usable_cpus", lambda: 64)
+    assert plot_workers("auto") == resources.IO_WORKERS_NVME                                # capped by the disk
+    monkeypatch.setattr(resources, "storage_kind", lambda path: "hdd")
+    assert plot_workers("auto") == resources.IO_WORKERS_HDD
+    monkeypatch.setattr(resources, "usable_cpus", lambda: 1)
+    assert plot_workers("auto") == 1
+
+
+def test_storage_kind(tmp_path, monkeypatch):
+    import os
+    device = os.stat(tmp_path).st_dev
+    sys_root = tmp_path / "sys"
+    disk = sys_root / "devices" / "nvme0n1"
+    part = disk / "nvme0n1p2"
+    (disk / "queue").mkdir(parents=True)
+    part.mkdir()
+    (sys_root / "dev" / "block").mkdir(parents=True)
+    (sys_root / "dev" / "block" / f"{os.major(device)}:{os.minor(device)}").symlink_to(part)
+    monkeypatch.setattr(resources, "_SYS_ROOT", sys_root)
+    (disk / "queue" / "rotational").write_text("0\n")
+    assert resources.storage_kind(tmp_path) == "nvme"
+    (disk / "queue" / "rotational").write_text("1\n")
+    assert resources.storage_kind(tmp_path) == "hdd" and resources.io_workers(tmp_path) == 2
+    monkeypatch.setattr(resources, "_SYS_ROOT", tmp_path / "missing")
+    assert resources.storage_kind(tmp_path) == "unknown"

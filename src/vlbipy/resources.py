@@ -31,6 +31,7 @@ logger = get_logger()
 #: Roots of the files read here (tests point them at a fake tree).
 _PROC_ROOT = Path("/proc")
 _CGROUP_ROOT = Path("/sys/fs/cgroup")
+_SYS_ROOT = Path("/sys")
 
 #: A cgroup v1 memory limit at or above this means "no limit" (the kernel reports ~2**63 rounded to pages).
 _V1_UNLIMITED = 1 << 60
@@ -218,6 +219,44 @@ def usable_cpus() -> int:
     if quota is not None:
         cpus = min(cpus, max(1, math.floor(quota)))
     return max(1, cpus)
+
+
+#: Plots (or other jobs) reading the same disk at once that it sustains before they only wait for each other.
+IO_WORKERS_HDD, IO_WORKERS_SSD, IO_WORKERS_NVME, IO_WORKERS_UNKNOWN = 2, 6, 8, 4
+
+
+def storage_kind(path) -> str:
+    """``"hdd"``, ``"ssd"``, ``"nvme"`` or ``"unknown"`` for the disk holding ``path`` (Linux ``/sys/block``;
+    network and virtual file systems, and other platforms, are unknown)."""
+    try:
+        device = os.stat(path).st_dev
+    except OSError:
+        return "unknown"
+    node = _SYS_ROOT / "dev" / "block" / f"{os.major(device)}:{os.minor(device)}"
+    try:
+        node = node.resolve(strict=True)
+    except OSError:
+        return "unknown"
+    for candidate in (node, node.parent):                                # a partition keeps it in its parent
+        flag = _int(_read(candidate / "queue" / "rotational"))
+        if flag is not None:
+            if flag:
+                return "hdd"
+            return "nvme" if candidate.name.startswith("nvme") else "ssd"
+    return "unknown"
+
+
+def io_workers(path) -> int:
+    """Parallel readers the disk holding ``path`` handles without throttling: few on a spinning disk (seeks),
+    more on an SSD, most on NVMe, a middle value when the kind is unknown."""
+    return {"hdd": IO_WORKERS_HDD, "ssd": IO_WORKERS_SSD, "nvme": IO_WORKERS_NVME}.get(storage_kind(path),
+                                                                                         IO_WORKERS_UNKNOWN)
+
+
+def default_parallel_jobs(path=".") -> int:
+    """A sensible number of parallel jobs for a host: half of the usable CPUs (the other half is for the main
+    process, CASA threads and the rest of the machine), and no more than the disk holding ``path`` sustains."""
+    return max(1, min(max(1, usable_cpus() // 2), io_workers(path)))
 
 
 def describe() -> str:
