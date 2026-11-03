@@ -29,23 +29,32 @@ logger = get_logger()
 _FITSIDI_PATTERNS = ("{code}_*_1.IDI*", "{code}_*.IDI*", "{code}*.IDI*")
 
 
+def search_dirs(directory: Union[str, Path]) -> list[Path]:
+    """Directories searched for the raw files of a project, nearest first.
+
+    The working directory, its ``input_data/`` and its parent: ``vlbipy -p CODE`` run where the files were
+    downloaded by hand creates ``./CODE`` as its working directory, so the files sit one level up.
+    """
+    root = Path(directory)
+    return [d for d in (root, root / "input_data", root.resolve().parent) if d.is_dir()]
+
+
 def find_fitsidi_files(directory: Union[str, Path], project_code: str) -> list[str]:
     """Return the naturally-sorted FITS-IDI files for a project in a directory.
 
     Tries both lower- and upper-case project-code spellings of the standard EVN
-    naming scheme (``<code>_<pass>_1.IDI<n>``). Returns an empty list if none.
+    naming scheme (``<code>_<pass>_1.IDI<n>``) in each of :func:`search_dirs`;
+    the nearest directory holding any wins. Returns an empty list if none.
     """
-    directory = Path(directory)
-    found: set[str] = set()
-    # The raw files may sit in the working directory or in its input_data/ subdirectory
-    # (where the pipeline files them at import time); look in both.
-    search_dirs = [directory, directory / "input_data"]
-    for search_dir in search_dirs:
+    for search_dir in search_dirs(directory):
+        found: set[str] = set()
         for code in (project_code.lower(), project_code.upper()):
             for pattern in _FITSIDI_PATTERNS:
                 found.update(glob.glob(str(search_dir / pattern.format(code=code))))
-    files = [f for f in found if not f.endswith((".checksum", ".gz"))]
-    return sorted(files, key=natsort_key)
+        files = [f for f in found if not f.endswith((".checksum", ".gz"))]
+        if files:
+            return sorted(files, key=natsort_key)
+    return []
 
 
 def _common_header(hdulist: fits.HDUList) -> fits.Header:

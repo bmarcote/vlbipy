@@ -78,6 +78,21 @@ def test_find_fitsidi_files_empty(tmp_path):
     assert fitsidi.find_fitsidi_files(tmp_path, PROJECT) == []
 
 
+def test_find_fitsidi_files_in_parent_of_work_dir(tmp_path):
+    """``vlbipy -p CODE`` run where the files were downloaded creates ./CODE: the files are one level up."""
+    make_fitsidi(tmp_path / f"{PROJECT}_1_1.IDI1")
+    (tmp_path / f"{PROJECT}.antab").write_text("x")
+    (tmp_path / f"{PROJECT}.uvflg").write_text("x")
+    work = tmp_path / PROJECT.upper()
+    work.mkdir()
+    assert fitsidi.find_fitsidi_files(work, PROJECT) == [str(tmp_path / f"{PROJECT}_1_1.IDI1")]
+    evn = EVNObservatory()
+    assert evn.get_antab_file(PROJECT, str(work)) == str(tmp_path / f"{PROJECT}.antab")
+    assert evn.get_flag_file(PROJECT, str(work)) == str(tmp_path / f"{PROJECT}.uvflg")
+    (work / f"{PROJECT}.flag").write_text("x")
+    assert evn.get_flag_file(PROJECT, str(work)) == str(work / f"{PROJECT}.flag")
+
+
 def test_inspect_fitsidi(idi_dir):
     files = fitsidi.find_fitsidi_files(idi_dir, PROJECT)
     meta = fitsidi.inspect_fitsidi(files, project_code=PROJECT)

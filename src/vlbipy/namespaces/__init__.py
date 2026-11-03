@@ -272,7 +272,7 @@ class ImportDataNamespace(Namespace):
         handler = obs._observatory_handler
         found = handler.find_data_files(self._code, obs.work_dir)
         if found:
-            logger.info("import_data: found {} raw data file(s) in {}", len(found), obs.work_dir)
+            logger.info("import_data: found {} raw data file(s) in {}", len(found), Path(found[0]).parent)
             return found
         if not handler.auto_download:
             raise Exception(f"no raw data found in {obs.work_dir} and {handler.name} has no "

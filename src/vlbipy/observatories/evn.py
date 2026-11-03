@@ -228,9 +228,9 @@ class EVNObservatory(ObservatoryHandler):
         obsdate = obsdate or self.resolve_obsdate(project_code, directory)
         base_url = f"{EVN_ARCHIVE_URL}/{project_code.upper()}_{obsdate}"
         for filename in (f"{code}.antab.gz", f"{code}.uvflg"):
-            plain = directory_path / filename.removesuffix(".gz")
-            if plain.is_file():
-                logger.info("{} already present", plain.name)
+            present = self._find_file(project_code, directory, Path(filename.removesuffix(".gz")).suffix)
+            if present:
+                logger.info("{} already present", present)
                 continue
             dest = directory_path / filename
             try:
@@ -243,22 +243,21 @@ class EVNObservatory(ObservatoryHandler):
         return {"antab": self.get_antab_file(project_code, directory),
                 "uvflg": self.get_flag_file(project_code, directory)}
 
-    def get_antab_file(self, project_code: str, directory: str) -> Optional[str]:
-        """Return the .antab (Tsys/gain-curve) file for the project, if present."""
-        for search_dir in (Path(directory), Path(directory) / "input_data"):
-            matches = sorted(search_dir.glob(f"{project_code.lower()}*.antab"))
+    def _find_file(self, project_code: str, directory: str, suffix: str) -> Optional[str]:
+        """Return the first ``<code>*<suffix>`` file in :func:`vlbipy.fitsidi.search_dirs`, nearest first."""
+        for search_dir in fitsidi.search_dirs(directory):
+            matches = sorted(search_dir.glob(f"{project_code.lower()}*{suffix}"))
             if matches:
                 return str(matches[0])
         return None
 
+    def get_antab_file(self, project_code: str, directory: str) -> Optional[str]:
+        """Return the .antab (Tsys/gain-curve) file for the project, if present."""
+        return self._find_file(project_code, directory, ".antab")
+
     def get_flag_file(self, project_code: str, directory: str) -> Optional[str]:
         """Return the a-priori flag file: the CASA-style .flag if present, else the AIPS .uvflg."""
-        for suffix in (".flag", ".uvflg"):
-            for search_dir in (Path(directory), Path(directory) / "input_data"):
-                matches = sorted(search_dir.glob(f"{project_code.lower()}*{suffix}"))
-                if matches:
-                    return str(matches[0])
-        return None
+        return self._find_file(project_code, directory, ".flag") or self._find_file(project_code, directory, ".uvflg")
 
     def prepare_for_import(self, files: list[str], directory: str, *, project_code: str = "",
                            replace_tsys: bool = False, **kwargs) -> list[str]:
@@ -289,10 +288,9 @@ class EVNObservatory(ObservatoryHandler):
             warnings.anomaly(f"{project_code}: no .antab file found and the FITS-IDI files carry "
                              "no Tsys tables — amplitude calibration will be wrong")
 
-        uvflg = Path(directory) / f"{project_code.lower()}.uvflg"
-        flagfile = Path(directory) / f"{project_code.lower()}.flag"
-        if uvflg.is_file() and not flagfile.is_file():
-            self._convert_flags(files, uvflg, flagfile, project_code)
+        existing = self.get_flag_file(project_code, directory)
+        if existing and existing.endswith(".uvflg"):
+            self._convert_flags(files, Path(existing), Path(directory) / f"{project_code.lower()}.flag", project_code)
         return list(files)
 
     def _convert_flags(self, files: list[str], uvflg: Path, flagfile: Path, project_code: str) -> None:

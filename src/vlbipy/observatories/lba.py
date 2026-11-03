@@ -51,8 +51,7 @@ class LBAObservatory(ObservatoryHandler):
 
     def _search_dirs(self, directory: str) -> list[Path]:
         """Directories searched for raw files: the working directory, its input_data/, and its parent."""
-        root = Path(directory)
-        return [d for d in (root, root / "input_data", root.resolve().parent) if d.is_dir()]
+        return fitsidi.search_dirs(directory)
 
     def _find(self, project_code: str, directory: str, suffixes: tuple[str, ...]) -> list[str]:
         """Return the files named ``<code><anything><suffix>`` (case-insensitive), nearest directory first."""

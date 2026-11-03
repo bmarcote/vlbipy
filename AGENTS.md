@@ -5,8 +5,10 @@
 - Editable install in `/home/marcote/.venv` (`uv pip install -e .`); `difmapy` is the sibling checkout.
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests -q` (zarr's auto-loaded pytest plugin breaks start-up
   with an older numpy). The AI mode has its own synthetic-data tests in `tests/test_ai.py`.
-- Run a pipeline from the directory that *contains* the project directory: `vlbipy -p EB104G ...` uses
-  `./EB104G` as its work dir; started inside `EB104G/` it creates `EB104G/EB104G` and downloads the data again.
+- `vlbipy -p EB104G ...` uses `./EB104G` as its work dir. Raw files (FITS-IDI, `.antab`, `.uvflg`) are looked
+  for in the work dir, its `input_data/` and its parent (`fitsidi.search_dirs`, nearest first), so files
+  downloaded by hand into the directory where vlbipy is started are found; the converted `.flag` and all
+  products go into the work dir.
 
 ## AI mode (`src/vlbipy/ai`)
 
