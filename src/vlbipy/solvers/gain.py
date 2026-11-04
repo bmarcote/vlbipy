@@ -119,6 +119,10 @@ def accumulate_job(*, specs: list[dict], setup: dict, engine: str, columns: list
 
 
 # ---------------------------------------------------------------------------
+#: Fewest baselines per antenna a gain solve ever accepts: a closed triangle, the least that separates the antenna
+#: gains (one baseline only constrains their product).
+MIN_BASELINES_PER_ANTENNA = 2
+
 # Parent side: solve the antenna gains from the baseline sums
 # ---------------------------------------------------------------------------
 def solve_antenna_gains(cross: np.ndarray, wsum: np.ndarray, *, mode: str = "ap", minsnr: float = 0.0,
@@ -141,7 +145,9 @@ def solve_antenna_gains(cross: np.ndarray, wsum: np.ndarray, *, mode: str = "ap"
         Solutions below this signal-to-noise are flagged. The signal-to-noise is |g| over its formal error,
         divided by the square root of the reduced chi-square of the fit (CASA's convention).
     minblperant : int
-        Antennas with fewer baselines carrying data are not solved (flagged).
+        Antennas with fewer baselines carrying data are not solved (flagged). Where fewer than ``minblperant + 1``
+        antennas have data in a channel/polarization, the requirement drops to their number minus one, but never
+        below :data:`MIN_BASELINES_PER_ANTENNA`.
     iterations, tolerance : int, float
         Alternating-least-squares limits.
 
@@ -162,11 +168,21 @@ def solve_antenna_gains(cross: np.ndarray, wsum: np.ndarray, *, mode: str = "ap"
         amplitude = np.abs(target)
         target = np.divide(target, amplitude, out=np.zeros_like(target), where=amplitude > 0)
         weight = weight * amplitude ** 2
+    # The baseline requirement follows the antennas that still carry data once the priors are applied: with fewer
+    # than minblperant + 1 of them nothing could be solved at all (RSM06A: three antennas left on the fringe finders,
+    # minblperant 4, a fully flagged bandpass). Never below a triangle, the least that separates the antennas.
+    with_data = (weight > 0).any(axis=1).sum(axis=0)                    # (nchan, npol)
+    required = np.minimum(max(1, int(minblperant)), np.maximum(MIN_BASELINES_PER_ANTENNA, with_data - 1))
+    lowered = int((required < max(1, int(minblperant))).sum())
+    if lowered:
+        logger.info("gain solve: minblperant lowered from {} to as few as {} in {} channel/polarization cell(s), "
+                    "where only that many antennas + 1 have data after the prior tables", int(minblperant),
+                    int(required.min()), lowered)
     # Drop antennas with too few baselines, repeatedly: removing one can leave another short.
     active = np.ones((nant,) + cross.shape[2:], dtype=bool)
     for _ in range(nant):
         linked = weight * active[None, :] * active[:, None]
-        short = active & ((linked > 0).sum(axis=1) < max(1, int(minblperant)))
+        short = active & ((linked > 0).sum(axis=1) < required[None])
         if not short.any():
             break
         active &= ~short

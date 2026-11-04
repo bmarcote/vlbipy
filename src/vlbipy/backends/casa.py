@@ -4025,7 +4025,8 @@ class CasaCalibrationOps(CalibrationOps):
         column : str
             Data column the scatter is measured on (``"corrected"`` after applycal).
         timebin : str
-            Time window per weight estimate (empty = per scan/subband default).
+            Time window per weight estimate; empty keeps CASA statwt's default, one integration (the variance is
+            taken across the channels of each row and correlation).
         minsamp : int
             Minimum number of unflagged visibilities per estimate.
         flagbackup : bool

@@ -1108,3 +1108,37 @@ def test_fringefit_divides_by_the_component_model_written_to_model_data(sim, tmp
     assert report["fields"] == {"CAL": len(sim["ant1"])}
     modelled = worst_residual(fringefit(str(ms), str(tmp_path / "model.sbd"), **kwargs))
     assert modelled < 0.05 < point
+
+
+def test_statwt_flags_cells_without_scatter():
+    """A cell with no scatter (constant or zero-filled channels) gets weight 0 and is flagged, like a starved one, so
+    a later weight rebuilt from SIGMA cannot bring it back."""
+    import numpy as np
+    from vlbipy.solvers.statwt import row_weights
+    rng = np.random.default_rng(1)
+    values = (rng.standard_normal((2, 16, 2)) + 1j * rng.standard_normal((2, 16, 2))).astype(np.complex64)
+    values[1, :, 0] = 0.0                                    # row 1, corr 0: zero-filled
+    weight, starved = row_weights(values, np.zeros(values.shape, bool))
+    assert weight[1, 0] == 0.0 and starved[1, 0]
+    assert weight[0, 0] > 0 and not starved[0, 0] and not starved[1, 1]
+
+
+def test_gain_solve_follows_the_antennas_left_with_data():
+    """RSM06A: three antennas left with data and minblperant 4 must still be solved (as a triangle); two cannot."""
+    import numpy as np
+    from vlbipy.solvers.gain import solve_antenna_gains
+    nant = 5
+    true = np.array([1.0, 1.2, 0.8, 1.0, 1.0])
+    cross = np.zeros((nant, nant, 1, 1), complex)
+    wsum = np.zeros((nant, nant, 1, 1))
+    for i in range(3):                                   # only antennas 0, 1, 2 carry data
+        for j in range(i + 1, 3):
+            cross[i, j] = true[i] * true[j] * 10.0
+            wsum[i, j] = 10.0
+    gains, flags, _ = solve_antenna_gains(cross, wsum, mode="a", minblperant=4)
+    assert not flags[:3].any() and flags[3:].all()
+    assert np.allclose(np.abs(gains[:3, 0, 0]), true[:3], rtol=1e-3)
+    pair = wsum.copy()
+    pair[0, 2] = pair[1, 2] = 0.0                        # only the 0-1 baseline left
+    _, flags, _ = solve_antenna_gains(np.where(pair > 0, cross, 0), pair, mode="a", minblperant=4)
+    assert flags.all()

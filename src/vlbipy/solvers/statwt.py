@@ -51,7 +51,7 @@ def row_weights(values: np.ndarray, flags: np.ndarray, minsamp: int = 2) -> tupl
     -------
     (weight, starved)
         ``weight`` float32 (nrow, ncorr), 0 where there are fewer than ``minsamp`` unflagged channels or no
-        scatter; ``starved`` bool (nrow, ncorr), the cells with fewer than ``minsamp`` unflagged channels.
+        scatter; ``starved`` bool (nrow, ncorr), those same cells (to be flagged).
     """
     good = ~flags
     count = good.sum(axis=1)
@@ -62,7 +62,9 @@ def row_weights(values: np.ndarray, flags: np.ndarray, minsamp: int = 2) -> tupl
     for part in (real, imag):
         mean = part.sum(axis=1) / safe
         variance += (np.where(good, part - mean[:, None, :], 0) ** 2).sum(axis=1) / safe
-    starved = count < int(minsamp)
+    # No scatter (e.g. constant or zero-filled channels) cannot be weighted either: flagged like too few samples,
+    # since a weight of 0 alone is undone by a later step that rebuilds the weight from SIGMA.
+    starved = (count < int(minsamp)) | (variance <= 0)
     with np.errstate(divide="ignore"):
         weight = np.where(starved | (variance <= 0), 0.0, 2.0 / np.where(variance > 0, variance, 1.0))
     return weight.astype(np.float32), starved
