@@ -25,7 +25,7 @@ from typing import Optional, Union
 import numpy as np
 
 from ..diagnostics import write_summary
-from ..errors import BackendError, StepError
+from ..errors import BackendError, EmptySelectionError, StepError
 from ..logging_utils import get_logger, headline, warnings
 from ..models import CalTable, QualityMetrics
 from ..plot_jobs import PlotJob, draw, plot_workers, run_plot_jobs
@@ -793,32 +793,130 @@ class CalibrateNamespace(Namespace):
         # makes the delay a single time-constant solution per antenna; without a plan
         # (explicit scans from the caller) every scan is solved in one stage.
         stages = obs.cal_stages if obs.cal_stages and [st["scan"] for st in obs.cal_stages] == list(scans) else []
-        # Preserve exactly what each instrumental solve saw.  A staged SBD may use a
-        # different scan and reference antenna at every stage; plotting the combined
-        # field with the observation-wide refant hides missing or weak stage links.
-        plot_stages = stages or [{"scan": scan, "refant": (antennas or [obs.refant])[0]}
-                                 for scan in scans]
-        # Before the first applycal there is no corrected column to read: the first
-        # instrumental solve sees the raw data.
-        stage_column = "corrected" if obs._state.status("apply") == "done" else "data"
-        for stage_index, stage in enumerate(plot_stages, start=1):
-            scan_number = int(stage["scan"])
-            scan = next((s for s in obs.metadata.scans if s.scan_number == scan_number), None)
-            if scan is None:
-                continue
-            try:
-                obs.plot.timeseries(field=scan.source, scans=[scan_number], column=stage_column,
-                                    refant=str(stage["refant"]),
-                                    label=f"{suffix}_stage{stage_index}_scan{scan_number}")
-            except Exception as exc:  # noqa: BLE001 - reporting must not prevent calibration
-                warnings.warn(f"{self._code}: SBD stage {stage_index} data plot failed ({exc})")
-        table = self._backend.calibrate.initial_calibration(
-            self._code, self._field_for_scans(scans), ",".join(antennas or []) or obs.refant,
-            scans=scans, stages=stages, gaintable=list(obs.gaintables), metadata=obs.metadata,
-            suffix=suffix, callib=cal_cfg.get("callib", False), **settings)
+        table = self._solve_sbd(antennas, list(scans), stages, suffix, settings, cal_cfg)
+        if suffix == "sbd":
+            # The raw data of the scans the instrumental delay was solved on; "after" follows the apply step.
+            self.plot_sbd_stages("before", antennas=antennas)
         obs.add_gaintable(table, step)
         obs._state.mark_complete(step, outputs=[suffix])
         return table
+
+    def _solve_sbd(self, antennas: Optional[list], scans: list, stages: list[dict], suffix: str, settings: dict,
+                   cal_cfg: dict) -> CalTable:
+        """Solve the single-band delay, moving off any stage scan that turns out to hold no usable data.
+
+        The stage scans are chosen from the fringe-SNR survey, but the solve sees the data through the calibration
+        chain so far: the flags added since the survey, and any prior whose solutions are flagged on that scan, can
+        leave a planned scan with nothing at all (RSM06A, sbd2 on scan 1 of J1512-0905). Such a scan is taken out
+        of the survey and the stages are planned again, for as long as there are candidate scans; the new plan is
+        persisted, so later passes solve on it too. Only when no scan is left does the step fail.
+
+        Returns
+        -------
+        CalTable
+            The solved table.
+        """
+        obs = self._obs
+        excluded: list[int] = []
+        while True:
+            try:
+                return self._backend.calibrate.initial_calibration(
+                    self._code, self._field_for_scans(scans), ",".join(antennas or []) or obs.refant,
+                    scans=scans, stages=stages, gaintable=list(obs.gaintables), metadata=obs.metadata,
+                    suffix=suffix, callib=cal_cfg.get("callib", False), **settings)
+            except EmptySelectionError as exc:
+                failed = exc.scan if exc.scan is not None else (int(scans[0]) if len(scans) == 1 else None)
+                if failed is None or failed in excluded or not antennas:
+                    raise
+                excluded.append(int(failed))
+                replanned = self._replan_without_scans(list(antennas), list(scans), excluded)
+                if replanned is None:
+                    raise StepError(f"initial_calibration_{suffix}",
+                                    f"{self._code}: no usable data left in scan(s) {excluded} for the {suffix} "
+                                    f"solve, and no other scan detects the antennas ({exc})") from exc
+                warnings.warn(f"{self._code}: the {suffix} solve found no usable data in scan {failed}; solving on "
+                              f"scan(s) {replanned[1]} instead ({exc})")
+                antennas, scans = replanned
+                stages = obs.cal_stages
+
+    def _replan_without_scans(self, antennas: list[str], scans: list[int],
+                              excluded: list[int]) -> Optional[tuple[list[str], list[int]]]:
+        """Plan the single-band-delay stages again without the ``excluded`` scans, and persist the plan.
+
+        The source group of the scans in use is tried first, then the other groups in the usual fallback order.
+
+        Returns
+        -------
+        tuple or None
+            ``(antennas, scans)`` of the new plan; None when no scan outside ``excluded`` covers any antenna.
+        """
+        from ..selection import plan_sbd_stages, without_scans, without_weak_detections
+
+        obs = self._obs
+        threshold = obs.config.get("calibration", {}).get("detection_snr", 7.0)
+        source_of = {scan.scan_number: scan.source for scan in obs.metadata.scans} if obs.metadata else {}
+        used = {source_of.get(int(scan)) for scan in scans}
+        groups = self._calibration_source_groups()
+        for names in [g for g in groups if used & set(g)] + [g for g in groups if not used & set(g)]:
+            survey = self.scan_snr(field=",".join(names))
+            survey, _ = without_weak_detections(survey, self._weak_in_scans(names, survey), min_snr=threshold)
+            stages = plan_sbd_stages(without_scans(survey, excluded), antennas, min_snr=threshold, sources=names,
+                                     metadata=obs.metadata)
+            if stages:
+                new_scans = [stage["scan"] for stage in stages]
+                obs.set_cal_selection(antennas, new_scans, stages)
+                logger.info("select_calibration_data: instrumental selection re-planned without scan(s) {} — "
+                            "{} antenna(s) on scan(s) {}", excluded, len(antennas), new_scans)
+                return antennas, new_scans
+        return None
+
+    def plot_sbd_stages(self, when: str, *, antennas: Optional[list] = None) -> list[str]:
+        """Amplitude and phase vs time on the scans the single-band delay was solved on, before or after calibration.
+
+        One figure per stage (``obs.cal_stages``, else every scan of the instrumental selection), on the baselines
+        to that stage's reference antenna, named ``<code>.sbd_<when>_stage<N>_scan<S>.timeseries.png``: ``"before"``
+        reads the raw data (``plots/raw``), ``"after"`` the calibrated data (``plots/calibrated``). Figures of an
+        earlier plan that this one does not redraw are deleted, so the report never mixes two plans.
+
+        Parameters
+        ----------
+        when : str
+            ``"before"`` or ``"after"``.
+        antennas : list of str, optional
+            Antennas of the selection; the first is the reference of an unstaged selection.
+
+        Returns
+        -------
+        list of str
+            The figures written.
+        """
+        obs = self._obs
+        stages = obs.cal_stages
+        if not stages and obs.cal_selection is not None:
+            names, scans = obs.cal_selection
+            reference = (antennas or names or [obs.refant])[0]
+            stages = [{"scan": scan, "refant": reference} for scan in scans]
+        if obs.metadata is None or not stages:
+            return []
+        column, heading = ("data", "before calibration") if when == "before" else ("corrected", "after calibration")
+        written: list[str] = []
+        for index, stage in enumerate(stages, start=1):
+            number = int(stage["scan"])
+            scan = next((s for s in obs.metadata.scans if s.scan_number == number), None)
+            if scan is None:
+                continue
+            try:
+                written += obs.plot.timeseries(field=scan.source, scans=[number], column=column,
+                                               refant=str(stage["refant"]), heading=heading,
+                                               label=f"sbd_{when}_stage{index}_scan{number}")
+            except Exception as exc:  # noqa: BLE001 - reporting must not prevent calibration
+                warnings.warn(f"{self._code}: SBD stage {index} plot ({when} calibration) failed ({exc})")
+        keep = {Path(path).name for path in written}
+        for directory in {Path(path).parent for path in written}:
+            for stale in directory.glob(f"{self._code}.sbd_{when}_stage*.timeseries.png"):
+                if stale.name not in keep:
+                    stale.unlink(missing_ok=True)
+        return written
 
     def bandpass(self, *, force: bool = False, scans: Optional[list] = None,
                  antennas: Optional[list] = None) -> CalTable:
@@ -1436,6 +1534,8 @@ class CalibrateNamespace(Namespace):
             self._code, field, self.transfer_chain(),
             callib=cal_cfg.get("callib", False), **options)
         self._obs._state.mark_complete("apply")
+        if not field:
+            self.plot_sbd_stages("after")
 
     def transfer_chain(self) -> list[CalTable]:
         """The apply chain with the phase-reference transfer resolved (:func:`vlbipy.phaseref.transfer_chain`).
@@ -2751,7 +2851,7 @@ def _search_settings(img_cfg: dict) -> dict:
     """difmapy keywords from ``[imaging]``: map width, and the search field, significance and re-centring distance."""
     return {"mapsize": int(img_cfg.get("mapsize", 8192)),
             "search_fov_mas": float(img_cfg.get("search_fov", 1000.0)),
-            "search_sigma": float(img_cfg.get("search_sigma", 10.0)),
+            "search_sigma": float(img_cfg.get("search_sigma", 8.0)),
             "recentre_min_beams": float(img_cfg.get("recentre_min_beams", 10.0))}
 
 

@@ -9,6 +9,23 @@ fact.
 class BackendError(Exception):
     """Raised when a backend cannot be instantiated or is misconfigured."""
 
+
+class EmptySelectionError(BackendError):
+    """Raised when a solve finds no usable (unflagged) data in its selection.
+
+    Parameters
+    ----------
+    message : str
+        Human-readable description of the failure.
+    scan : int, optional
+        The single scan the solve was restricted to (None when it covered several or none).
+    """
+
+    def __init__(self, message: str, scan: int | None = None) -> None:
+        self.scan: int | None = scan
+        super().__init__(message)
+
+
 class ConfigError(Exception):
     """Raised when configuration is missing, unreadable, or invalid."""
 

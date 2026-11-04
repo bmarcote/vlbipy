@@ -356,8 +356,8 @@ def test_source_results_combine_the_search_and_the_clean_image():
         "TGT (target): detected at 27 sigma in the search map (dirty-map peak 136 uJy/beam), 120.0 mas (41.0 beams) "
         "from the phase centre and re-centred on the peak.",
         "PC (phasecal): detected at 425 sigma in the search map, at the phase centre; CLEAN image (robust 0): peak "
-        "136 mJy/beam, rms 62.3 uJy/beam, dynamic range 2175.",
-        "FF (fringefinder): CLEAN image (robust 0): peak 3.24 mJy/beam, rms 147 uJy/beam, dynamic range 22 - low for "
+        "136 mJy/beam, rms 62.3 uJy/beam, SNR 2175.",
+        "FF (fringefinder): CLEAN image (robust 0): peak 3.24 mJy/beam, rms 147 uJy/beam, SNR 22 - low for "
         "a calibrator, check its calibration and model.",
         "CHK (checksource): not detected in the 1000 mas search map (brightest peak at 4.2 sigma)."]
     assert [c["severity"] for c in comments] == ["note", "note", "warning", "warning"]

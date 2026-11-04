@@ -8,8 +8,9 @@ referenced relatively (``../plots/...``, ``../images/...``), so the ``html/``
 folder must travel together with the rest of the project directory.
 
 The context also carries the general comments of the reduction
-(:func:`vlbipy.comments.build_comments`): the Overview page shows them and
-``build_dashboard`` rewrites ``<work_dir>/summary.md`` with the same list on top.
+(:func:`vlbipy.comments.build_comments`): the Diagnostics page lists the antenna and pipeline comments, the
+Calibration and Final-results pages open with the boxes of theirs, and ``build_dashboard`` rewrites
+``<work_dir>/summary.md`` with the same list on top.
 """
 from __future__ import annotations
 
@@ -47,6 +48,25 @@ SCAN_CHIP_STATES: dict[str, tuple[str, str]] = {
     "unsurveyed": ("snr-none", "scan not surveyed"),
 }
 
+#: Cells of the scan overview grid coloured by fringe SNR: (upper bound, css class).
+SCAN_CELL_CLASSES: list[tuple[float, str]] = [(FRINGE_DETECTION_SNR, "sg-bad"), (10.0, "sg-mid"), (math.inf, "sg-good")]
+#: Cells of the scan overview grid without an SNR: state -> (css class, tooltip text). An antenna that is not in the
+#: scan, or has no data in it, leaves its cell empty; a missing fringe solution counts as no detection.
+SCAN_CELL_STATES: dict[str, tuple[str, str]] = {
+    "absent": ("sg-empty", "not in this scan"),
+    "nodata": ("sg-empty", "no data (fully flagged)"),
+    "refant": ("sg-ref", "reference antenna of the fringe search (no SNR of its own)"),
+    "nofringe": ("sg-bad", "no fringe solution"),
+    "unsurveyed": ("sg-data", "data, no fringe search on this scan"),
+}
+
+#: Peak-to-noise ratio in the search map from which a source counts as detected.
+SOURCE_DETECTION_SIGMA = 8.0
+
+#: Display names of the source roles (``SourceType`` values), used as card titles.
+ROLE_TITLES: dict[str, str] = {"target": "Target", "phasecal": "Phase calibrator", "fringefinder": "Fringe finder",
+                               "checksource": "Check source", "polcal": "Polarization calibrator", "other": "Source"}
+
 #: Amplitude-correction cells: (largest ``|gain - 1|`` of the class, css class). ``gain-none`` (no
 #: solution) is assigned by :func:`gain_class` and is deliberately absent from this list. The bounds
 #: (and ``GAIN_DECIMALS``, the decimals a correction is shown and judged with) come from
@@ -66,6 +86,14 @@ TIME_EVOLUTION_PATTERNS: list[str] = ["raw/*.time_evolution.*.png"]
 
 #: Title of the calibration group of the fringe-SNR matrices, which are shown in one sub-tab per source.
 SNR_SURVEY_TITLE = "Fringe-SNR survey"
+#: Title of the calibration group of the SBD-stage data, shown as before/after pairs per stage.
+SBD_DATA_TITLE = "SBD selected-scan data"
+#: ``<code>.sbd_<when>_stage<N>_scan<S>.timeseries.png`` (``CalibrateNamespace.plot_sbd_stages``), per moment.
+SBD_DATA_PATTERNS: dict[str, list[str]] = {"before": ["raw/*.sbd_before_stage*_scan*.timeseries.png"],
+                                           "after": ["calibrated/*.sbd_after_stage*_scan*.timeseries.png"]}
+#: The same figures as older runs named them (``sbd``/``sbd2`` stage plots, raw or calibrated).
+SBD_DATA_LEGACY_PATTERNS: list[str] = ["calibrated/*.sbd_stage*_scan*.timeseries.png",
+                                       "raw/*.sbd_stage*_scan*.timeseries.png"]
 
 #: Calibration-table plot groups: (title, blurb, glob patterns relative to <work_dir>/plots).
 CALIBRATION_GROUPS: list[tuple[str, str, list[str]]] = [
@@ -73,17 +101,21 @@ CALIBRATION_GROUPS: list[tuple[str, str, list[str]]] = [
      "against elevation; the shaded band marks the elevations observed.", ["caltables/*gcal*.png"]),
     ("System temperature", "Tsys vs time per antenna (one colour per polarization).", ["caltables/*tsys*.png"]),
     ("Bandpass", "Amplitude and phase vs frequency per antenna.", ["caltables/*.bpass*.png"]),
-    ("SBD selected-scan data", "Amplitude and phase versus time for each selected SBD stage, one baseline to that stage's reference antenna per panel.",
-     ["calibrated/*.sbd*_scan*.timeseries.png", "raw/*.sbd*_scan*.timeseries.png"]),
-    ("Single-band delay (SBD)", "Instrumental phase, delay and rate solutions versus frequency/subband.", ["caltables/*.sbd.*.png", "caltables/*.sbd2.*.png"]),
+    (SBD_DATA_TITLE, "Amplitude and phase versus time on the scan of every SBD stage, one baseline to that stage's "
+     "reference antenna per panel: the raw data before the calibration (left) and the calibrated data after it "
+     "(right).", SBD_DATA_PATTERNS["before"] + SBD_DATA_PATTERNS["after"]),
+    ("Single-band delay (SBD)", "Instrumental phase and delay solutions versus frequency/subband (the rates are not "
+     "fitted).", ["caltables/*.sbd.*.png", "caltables/*.sbd2.*.png"]),
     ("Multi-band delay (MBD)",
      "Global fringe-fit delay/phase/rate solutions, as solved and after the time smoothing that is "
      "what actually gets applied (<code>_smooth</code>).",
      ["caltables/*.mbd.*.png", "caltables/*.mbd2.*.png",
       "caltables/*.mbd_smooth.*.png", "caltables/*.mbd2_smooth.*.png"]),
-    ("Scalar bandpass", "One amplitude level per antenna and subband.", ["caltables/*scalar_bp*amp*.png"]),
+    ("Scalar bandpass", "One amplitude level per antenna, subband and polarization for the whole observation (solved "
+     "on every scan of the phase-reference sources together), against frequency.", ["caltables/*scalar_bp*amp*.png"]),
     (SNR_SURVEY_TITLE, "Scan x antenna fringe SNR, one sub-tab per source: only the scans of that source, one after "
-     "the other, on a colour scale shared by all the sources.", ["raw/*snr_matrix*.png"]),
+     "the other, on a colour scale shared by all the sources; red marks SNR below 3 (no detection).",
+     ["raw/*snr_matrix*.png"]),
     ("Calibrator amplitude and phase", "Calibrated amplitude and phase versus frequency and time for every fringe finder, phase calibrator and check source.",
      ["calibrated/*.calibrated_*.spectrum.png", "calibrated/*.calibrated_*.timeseries.png"]),
     ("Subband phase jumps", "Phase of every subband relative to the first, per calibrator scan and baseline to the reference antenna.",
@@ -839,7 +871,7 @@ def _source_results(work_dir: Path, project_code: str, sources: list[dict]) -> l
 
     Reads ``images/<code>_<source>.search.json`` (written for every source difmapy imaged) and the
     self-calibration report ``selfcal/<code>.<source>.json`` (calibrators only), whose ``images`` hold the
-    peak, rms and dynamic range per robust value. The images themselves are never opened.
+    peak, rms and SNR (peak / rms, ``dynamic_range``) per robust value. The images themselves are never opened.
 
     Parameters
     ----------
@@ -869,6 +901,9 @@ def _source_results(work_dir: Path, project_code: str, sources: list[dict]) -> l
             numbers = ("snr", "peak", "rms", "fov_mas", "offset_mas", "offset_beams")
             search = {"detected": bool(search.get("detected")), "recentred": bool(search.get("recentred")),
                       **{key: _finite_or_none(search.get(key)) for key in numbers}}
+            # The detection is judged here, at SOURCE_DETECTION_SIGMA, whatever threshold the imaging ran with.
+            if search["snr"] is not None:
+                search["detected"] = search["snr"] >= SOURCE_DETECTION_SIGMA
         else:
             search = None
         # Calibrators are imaged by the self-calibration, the other sources by the final imaging step.
@@ -1035,16 +1070,20 @@ h3{font-size:15px;margin:22px 0 4px}
 .sub{color:var(--muted);margin:0 0 18px;max-width:80ch}
 section{scroll-margin-top:18px;padding:26px 0 8px;border-top:1px solid var(--border)}
 section:first-of-type{border-top:0;padding-top:8px}
-.skymap{max-width:460px;margin-top:8px;margin-bottom:14px}
-.skymap svg{display:block;width:100%;height:auto}
+.skymap{max-width:460px;margin-top:8px;margin-bottom:14px;position:relative;background:var(--panel);
+  border:1px solid var(--border);border-radius:12px;overflow:hidden;box-shadow:var(--shadow)}
+.skymap svg{display:block;width:100%;height:auto;cursor:grab;touch-action:none}
+.skymap svg.dragging{cursor:grabbing}
+.skymap figcaption{padding:8px 12px}
 .skymap .axis,.skymap .ring{fill:none;stroke:var(--border);stroke-width:1}
-.skymap .ringlabel,.skymap .seplabel{fill:var(--muted);font-size:10.5px;font-family:ui-monospace,Menlo,monospace}
-.skymap .compass{fill:var(--muted);font-weight:700;font-size:12px}
+.skymap .ringlabel,.skymap .seplabel{fill:var(--muted);font-family:ui-monospace,Menlo,monospace}
+.skymap .compass{fill:var(--muted);font-weight:700}
 .skymap .pair{stroke:var(--muted);stroke-width:1.2;stroke-dasharray:4 3}
-.skymap .leader{stroke:var(--border);stroke-width:1}
-.skymap .srclabel{fill:var(--ink);font-size:11.5px;font-weight:600}
-.skymap text{paint-order:stroke;stroke:var(--panel);stroke-width:3px;stroke-linejoin:round}
+.skymap .srclabel{fill:var(--ink);font-weight:600}
+.skymap text{paint-order:stroke;stroke:var(--panel);stroke-width:.25em;stroke-linejoin:round}
 .skymap .src{fill:var(--muted);stroke:var(--panel);stroke-width:1.5}
+.skymap .srcmark.hl circle{stroke:var(--ink);stroke-width:2.5}
+.skymap .srcmark.hl text{fill:var(--accent-ink)}
 .skymap .src.fringefinder{fill:var(--role-ff)} .skymap .src.phasecal{fill:var(--role-pc)} .skymap .src.target{fill:var(--role-tg)}
 .skymap .src.checksource{fill:var(--role-cs)} .skymap .src.polcal{fill:var(--role-pl)}
 .facts{display:flex;flex-wrap:wrap;gap:10px;margin:16px 0 8px}
@@ -1136,6 +1175,31 @@ td.num{font-variant-numeric:tabular-nums;text-align:right}
 .chip.snr-nodata{background:var(--panel2);color:var(--muted);border:1px dashed var(--crit);text-decoration:line-through}
 .chip.snr-nofringe{background:var(--panel2);background:color-mix(in srgb,var(--crit) 16%,transparent);color:var(--crit);border:1px solid var(--border)}
 .chip.scan-chip{min-width:34px;height:20px;text-align:center;display:inline-flex;align-items:center;justify-content:center;vertical-align:middle}
+.scangrid-wrap{overflow:auto;max-height:78vh;border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow);
+  margin-top:8px;background:var(--panel)}
+.scangrid{table-layout:fixed;width:100%;border-collapse:collapse;font-size:12.5px}
+.scangrid th,.scangrid td{padding:2px 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.scangrid thead th{position:sticky;top:0;z-index:2;background:var(--panel2)}
+.scangrid tbody tr{border-top:0}
+.scangrid tbody tr:nth-child(odd){background:transparent}
+.scangrid col.sg-num{width:56px} .scangrid col.sg-src{width:150px} .scangrid col.sg-start{width:150px}
+.scangrid col.sg-dur{width:64px}
+.scangrid th.sg-ant{padding:2px 0;text-align:center;font-size:10px;letter-spacing:0;text-transform:none;
+  font-family:ui-monospace,Menlo,monospace}
+.scangrid th.sg-ant.nodata{color:var(--crit)}
+.scangrid td.sg{padding:0;border:1px solid var(--panel)}
+.scangrid td.sg>i{display:block;width:100%;aspect-ratio:1/1}
+.scangrid tr:hover td{background:var(--panel2)}
+.scangrid tr:hover td.sg{background:none}
+.sg-good>i,.sgkey.sg-good{background:var(--good)}
+.sg-mid>i,.sgkey.sg-mid{background:#e07b1a}
+.sg-bad>i,.sgkey.sg-bad{background:var(--crit)}
+.sg-ref>i,.sgkey.sg-ref{background:var(--accent);opacity:.55}
+.sg-data>i,.sgkey.sg-data{background:var(--border)}
+.sg-empty>i{background:transparent}
+.sgkey{display:inline-block;width:12px;height:12px;border-radius:2px;margin:0 3px 0 8px;vertical-align:-2px}
+.role-fringefinder{color:var(--role-ff)} .role-phasecal{color:var(--role-pc)} .role-target{color:var(--role-tg)}
+.role-checksource{color:var(--role-cs)} .role-polcal{color:var(--role-pl)} .role-other{color:var(--muted)}
 .downloads{list-style:none;margin:8px 0 4px;padding:0;display:flex;flex-direction:column;gap:6px}
 .downloads li{display:flex;flex-wrap:wrap;align-items:center;gap:8px;background:var(--panel);
   border:1px solid var(--border);border-radius:10px;padding:8px 12px;box-shadow:var(--shadow)}
@@ -1160,6 +1224,8 @@ td.num{font-variant-numeric:tabular-nums;text-align:right}
 .antlist{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 12px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(380px,100%),1fr));gap:16px;margin-top:14px}
 .grid.wide{grid-template-columns:1fr}
+.grid.pair{grid-template-columns:repeat(auto-fit,minmax(min(420px,100%),1fr))}
+.card .srcname{font-size:16px;font-weight:700;margin:2px 0}
 figure{margin:0;background:var(--panel);border:1px solid var(--border);border-radius:12px;overflow:hidden;
   box-shadow:var(--shadow);display:flex;flex-direction:column}
 figure button.imgbtn{border:0;padding:0;background:#0a1016;cursor:zoom-in;display:block}
@@ -1249,19 +1315,22 @@ document.querySelectorAll('.subtabs').forEach(group=>{
     wrap.querySelectorAll(':scope>.subpanel').forEach(p=>{
       const on=p.id===btn.dataset.panel;p.classList.toggle('active',on);
       if(on)vlbipyShowPanel(p);});});});
-document.querySelectorAll('.worldmap').forEach(function(fig){
-  const svg=fig.querySelector('svg'),ants=svg&&svg.querySelector('.ants');if(!ants)return;
-  const parse=s=>s.split(' ').map(Number),views={array:parse(svg.dataset.array),world:parse(svg.dataset.world)};
-  const font=+ants.dataset.font,radius=+ants.dataset.r,base=views.array[2];let vb=views.array.slice(),drag=null;
-  function show(){svg.setAttribute('viewBox',vb.join(' '));const k=vb[2]/base;ants.setAttribute('font-size',font*k);
-    ants.querySelectorAll('circle').forEach(c=>c.setAttribute('r',radius*k));}
-  function setView(name){vb=views[name].slice();
+document.querySelectorAll('.zoommap').forEach(function(fig){
+  const svg=fig.querySelector('svg');if(!svg||!svg.dataset.home)return;
+  const parse=s=>s.split(' ').map(Number),home=svg.dataset.home;
+  const view=name=>parse(svg.getAttribute('data-view-'+name));
+  const base=view(home)[2],maxw=+(svg.dataset.maxw||4*base),minw=base/200;let vb=view(home),drag=null;
+  const scaled=[...svg.querySelectorAll('[data-font],[data-r]')];
+  function show(){svg.setAttribute('viewBox',vb.join(' '));const k=vb[2]/base;
+    scaled.forEach(g=>{if(g.dataset.font)g.setAttribute('font-size',g.dataset.font*k);
+      if(g.dataset.r)g.querySelectorAll('circle').forEach(c=>c.setAttribute('r',g.dataset.r*k));});}
+  function setView(name){vb=view(name);
     fig.querySelectorAll('.mapbar button').forEach(b=>b.classList.toggle('active',b.dataset.view===name));show();}
   fig.querySelectorAll('.mapbar button').forEach(b=>b.addEventListener('click',()=>setView(b.dataset.view)));
   function scale(){const r=svg.getBoundingClientRect();return Math.max(vb[2]/r.width,vb[3]/r.height);}
   svg.addEventListener('wheel',e=>{e.preventDefault();const r=svg.getBoundingClientRect(),k=scale();
     const ux=vb[0]+(vb[2]-r.width*k)/2+(e.clientX-r.left)*k,uy=vb[1]+(vb[3]-r.height*k)/2+(e.clientY-r.top)*k;
-    const f=Math.min(4,Math.max(0.25,Math.exp(e.deltaY*0.0015))),w=Math.min(720,Math.max(1,vb[2]*f)),s=w/vb[2];
+    const f=Math.min(4,Math.max(0.25,Math.exp(e.deltaY*0.0015))),w=Math.min(maxw,Math.max(minw,vb[2]*f)),s=w/vb[2];
     vb=[ux-(ux-vb[0])*s,uy-(uy-vb[1])*s,w,vb[3]*s];
     fig.querySelectorAll('.mapbar button').forEach(b=>b.classList.remove('active'));show();},{passive:false});
   svg.addEventListener('pointerdown',e=>{drag={x:e.clientX,y:e.clientY,vb:vb.slice(),k:scale()};
@@ -1269,11 +1338,13 @@ document.querySelectorAll('.worldmap').forEach(function(fig){
   svg.addEventListener('pointermove',e=>{if(!drag)return;
     vb=[drag.vb[0]-(e.clientX-drag.x)*drag.k,drag.vb[1]-(e.clientY-drag.y)*drag.k,drag.vb[2],drag.vb[3]];show();});
   ['pointerup','pointercancel'].forEach(t=>svg.addEventListener(t,()=>{drag=null;svg.classList.remove('dragging');}));
-  const rows=[...document.querySelectorAll('tr[data-ant]')],marks=[...fig.querySelectorAll('.ant')];
-  function mark(name,on){marks.concat(rows).forEach(el=>{if(el.dataset.ant===name)el.classList.toggle('hl',on);});}
-  marks.concat(rows).forEach(el=>{el.addEventListener('mouseenter',()=>mark(el.dataset.ant,true));
-    el.addEventListener('mouseleave',()=>mark(el.dataset.ant,false));});
-  setView('array');});
+  ['ant','src'].forEach(function(key){
+    const rows=[...document.querySelectorAll('tr[data-'+key+']')],marks=[...fig.querySelectorAll('g[data-'+key+']')];
+    if(!marks.length)return;
+    function mark(name,on){marks.concat(rows).forEach(el=>{if(el.dataset[key]===name)el.classList.toggle('hl',on);});}
+    marks.concat(rows).forEach(el=>{el.addEventListener('mouseenter',()=>mark(el.dataset[key],true));
+      el.addEventListener('mouseleave',()=>mark(el.dataset[key],false));});});
+  setView(home);});
 const stored=vlbipyStorageGet('vlbipy-theme');
 if(stored)document.documentElement.setAttribute('data-theme',stored);
 else if(matchMedia('(prefers-color-scheme:dark)').matches)document.documentElement.setAttribute('data-theme','dark');
@@ -1393,20 +1464,8 @@ def _comment_item(comment: dict) -> str:
             f'<span>{escape(str(comment.get("text", "")))}{when}</span></li>')
 
 
-def _comment_count(comments: Optional[list]) -> str:
-    """Tally of the antenna and pipeline comments per severity for the section heading, e.g.
-    ``"1 problem(s) · 4 warning(s)"``.
-
-    The closing line of the antenna group ("Nothing to report for ...") is not a finding and is left out.
-    """
-    findings = [c for c in comments or [] if c.get("category") in ("antenna", "pipeline")
-                and (c.get("category") != "antenna" or c.get("antenna"))]
-    tally = [(sum(1 for c in findings if c.get("severity") == severity), severity) for severity in COMMENT_CHIP_CLASSES]
-    return " · ".join(f"{count} {severity}(s)" for count, severity in tally if count)
-
-
 def _comments_section(ctx: dict) -> str:
-    """Body of the "Comments" section of the Overview page.
+    """Body of the "Comments" sub-tab of the Diagnostics page.
 
     Renders the antenna and pipeline part of ``ctx["comments"]`` (:func:`vlbipy.comments.build_comments`) as
     ``summary.md`` lists them: one block per antenna with something to say (closed by the line naming the
@@ -1439,6 +1498,8 @@ def _comments_section(ctx: dict) -> str:
 SKY_MAP_MAX_RINGS = 4
 SKY_MAP_RING_STEPS_DEG = (1 / 60, 2 / 60, 5 / 60, 10 / 60, 20 / 60, 30 / 60, 1, 2, 5, 10, 20, 45)
 SKY_MAP_ROLE_ORDER = ("target", "phasecal", "fringefinder", "checksource", "polcal", "other")
+#: Font size (SVG units of the opening view) of the source labels of the sky map.
+SKY_MAP_FONT_PX = 11.5
 
 
 def _unit_vector(ra_deg: float, dec_deg: float) -> tuple[float, float, float]:
@@ -1548,46 +1609,59 @@ def _sky_map(sources: list[dict]) -> str:
     points = [(cx - rho * scale * math.sin(math.radians(pa)), cy - rho * scale * math.cos(math.radians(pa)))
               for rho, pa in offsets]
 
-    parts = [f'<line class="axis" x1="{cx - radius}" y1="{cy}" x2="{cx + radius}" y2="{cy}"/>',
-             f'<line class="axis" x1="{cx}" y1="{cy - radius}" x2="{cx}" y2="{cy + radius}"/>']
+    stroke = 'vector-effect="non-scaling-stroke"'
+    parts = [f'<line class="axis" x1="{cx - radius}" y1="{cy}" x2="{cx + radius}" y2="{cy}" {stroke}/>',
+             f'<line class="axis" x1="{cx}" y1="{cy - radius}" x2="{cx}" y2="{cy + radius}" {stroke}/>']
+    ring_labels = []
     for k in range(1, n_rings + 1):
         r = k * radius / n_rings
-        parts.append(f'<circle class="ring" cx="{cx}" cy="{cy}" r="{r:.1f}"/>')
-        parts.append(f'<text class="ringlabel" x="{cx + r * 0.707 + 3:.1f}" y="{cy - r * 0.707 - 3:.1f}">'
-                     f'{escape(_format_ring(k * step))}</text>')
-    parts.append(f'<text class="compass" x="{cx}" y="{cy - radius - 8}" text-anchor="middle">N</text>')
-    parts.append(f'<text class="compass" x="{cx - radius - 8}" y="{cy + 4}" text-anchor="end">E</text>')
+        parts.append(f'<circle class="ring" cx="{cx}" cy="{cy}" r="{r:.1f}" {stroke}/>')
+        ring_labels.append(f'<text class="ringlabel" x="{cx + r * 0.707 + 3:.1f}" y="{cy - r * 0.707 - 3:.1f}">'
+                           f'{escape(_format_ring(k * step))}</text>')
+    parts.append(f'<g data-font="10.5" font-size="10.5">{"".join(ring_labels)}</g>')
+    parts.append(f'<g data-font="12" font-size="12"><text class="compass" x="{cx}" y="{cy - radius - 8}" '
+                 f'text-anchor="middle">N</text><text class="compass" x="{cx - radius - 8}" y="{cy + 4}" '
+                 'text-anchor="end">E</text></g>')
 
     calibrators = [i for i, s in enumerate(placed) if s.get("type") == "phasecal"]
+    separations = []
     for i, source in enumerate(placed):
         if source.get("type") != "target" or not calibrators:
             continue
         sep, j = min((angular_offset(source["ra_deg"], source["dec_deg"], placed[j]["ra_deg"], placed[j]["dec_deg"])[0], j)
                      for j in calibrators)
         (x1, y1), (x2, y2) = points[i], points[j]
-        parts.append(f'<line class="pair" x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}"/>')
-        parts.append(f'<text class="seplabel" x="{(x1 + x2) / 2:.1f}" y="{(y1 + y2) / 2 - 4:.1f}" '
-                     f'text-anchor="middle">{escape(_format_separation(sep))}</text>')
+        parts.append(f'<line class="pair" x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" {stroke}/>')
+        separations.append(f'<text class="seplabel" x="{(x1 + x2) / 2:.1f}" y="{(y1 + y2) / 2:.1f}" dy="-0.4em" '
+                           f'text-anchor="middle">{escape(_format_separation(sep))}</text>')
+    if separations:
+        parts.append(f'<g data-font="10.5" font-size="10.5">{"".join(separations)}</g>')
     names = [str(s.get("name") or "") for s in placed]
     labels = _sky_map_labels(names, points, cx + radius * 0.4)
+    markers = []
     for name, source, (x, y), (lx, ly, anchor) in zip(names, placed, points, labels):
         role = escape(str(source.get("type") or "other"), quote=True)
         tip = f'{name} ({source.get("ra", "")}, {source.get("dec", "")})'
-        if abs(ly - (y + 4)) > 1:
-            parts.append(f'<line class="leader" x1="{x:.1f}" y1="{y:.1f}" x2="{lx + (2 if anchor == "end" else -2):.1f}" '
-                         f'y2="{ly - 4:.1f}"/>')
-        parts.append(f'<circle class="src {role}" cx="{x:.1f}" cy="{y:.1f}" r="5"><title>{escape(tip)}</title></circle>')
-        parts.append(f'<text class="srclabel" x="{lx:.1f}" y="{ly:.1f}" text-anchor="{anchor}">'
-                     f'{escape(name)}</text>')
+        # The label offset is in em, so it keeps its size on screen when the map is zoomed.
+        dx, dy = (lx - x) / SKY_MAP_FONT_PX, (ly - y) / SKY_MAP_FONT_PX
+        markers.append(f'<g class="srcmark" data-src="{escape(name, quote=True)}"><title>{escape(tip)}</title>'
+                       f'<circle class="src {role}" cx="{x:.2f}" cy="{y:.2f}" r="5" {stroke}/>'
+                       f'<text class="srclabel" x="{x:.2f}" y="{y:.2f}" dx="{dx:.2f}em" dy="{dy:.2f}em" '
+                       f'text-anchor="{anchor}">{escape(name)}</text></g>')
+    parts.append(f'<g data-font="{SKY_MAP_FONT_PX:g}" font-size="{SKY_MAP_FONT_PX:g}" data-r="5">'
+                 + "".join(markers) + "</g>")
     types = sorted({str(s.get("type") or "other") for s in placed},
                    key=lambda t: (SKY_MAP_ROLE_ORDER.index(t) if t in SKY_MAP_ROLE_ORDER else len(SKY_MAP_ROLE_ORDER), t))
     legend = ('<div class="legend">'
               + "".join(f'<span class="badge {escape(t, quote=True)}">{escape(t)}</span>' for t in types) + "</div>")
     caption = (f"Source positions about their mean direction (RA {ra0 / 15:.2f} h, Dec {dec0:+.1f}\u00b0) in an "
                "azimuthal equidistant projection: distances from the centre and directions are true. North up, east "
-               "left; dashed lines join each target to its nearest phase calibrator.")
-    return (f'<figure class="skymap"><svg viewBox="0 0 {width} {height}" role="img" '
-            f'aria-label="Sky positions of the observed sources">{"".join(parts)}</svg>'
+               "left; dashed lines join each target to its nearest phase calibrator. Scroll to zoom, drag to pan; "
+               "point at a source to find it in the table.")
+    home = f"0 0 {width} {height}"
+    return (f'<figure class="skymap zoommap"><div class="mapbar"><button type="button" data-view="all">All</button>'
+            f'</div><svg viewBox="{home}" data-home="all" data-view-all="{home}" preserveAspectRatio="xMidYMid meet" '
+            f'role="img" aria-label="Sky positions of the observed sources">{"".join(parts)}</svg>'
             f'<figcaption>{legend}<div class="d">{escape(caption)}</div></figcaption></figure>')
 
 
@@ -1692,8 +1766,9 @@ def _antenna_map(antennas: list[dict]) -> str:
               + ('<span class="dot off"></span>no data / no usable signal' if n_off else "") + "</div>")
     buttons = ('<div class="mapbar"><button type="button" data-view="array">Array</button>'
                '<button type="button" data-view="world">World</button></div>')
-    return (f'<figure class="worldmap">{buttons}<svg viewBox="{view(array_view)}" data-array="{view(array_view)}" '
-            f'data-world="{view(world_view)}" preserveAspectRatio="xMidYMid meet" role="img" '
+    return (f'<figure class="worldmap zoommap">{buttons}<svg viewBox="{view(array_view)}" data-home="array" '
+            f'data-view-array="{view(array_view)}" data-view-world="{view(world_view)}" data-maxw="720" '
+            f'preserveAspectRatio="xMidYMid meet" role="img" '
             f'aria-label="Positions of the antennas on Earth">{"".join(parts)}</svg>'
             f'<figcaption>{legend}<div class="d">Antenna positions (equirectangular). Scroll to zoom, drag to '
             'pan; point at an antenna to find it in the table.</div></figcaption></figure>')
@@ -1771,40 +1846,52 @@ def _calibration_card(comment: dict, roles: dict) -> str:
 
 
 def _result_card(comment: dict, roles: dict) -> str:
-    """The box of one source: name and role, the SNR (dynamic range) and the estimated flux density."""
+    """The box of one source: its type as the title, its name, the image SNR and the summary sentence.
+
+    The flux density is in the sentence (peak, rms) and not repeated; the offset from the phase centre, when the
+    search map found the source away from it, is a line of its own.
+    """
     data, severity, text = comment.get("data") or {}, comment.get("severity", "note"), str(comment.get("text", ""))
     if data.get("kind") != "source":
         return _card(severity, "Result", f'<p class="text">{escape(text)}</p>')
     name, role = str(data.get("source") or ""), str(data.get("role") or roles.get(data.get("source"), "other"))
-    snr, flux = _finite_or_none(data.get("snr")), _finite_or_none(data.get("flux"))
+    snr = _finite_or_none(data.get("snr"))
     if data.get("detected") is False:
         figure = '<div class="big word">not detected</div>'
     elif snr is not None:
         figure = f'<div class="big">{snr:.0f}</div><div class="sub">{escape(str(data.get("snr_label") or "SNR"))}</div>'
     else:
         figure = ""
-    flux_label = str(data.get("flux_label") or "")
-    per_beam = "/beam" if "beam" in flux_label else ""
-    flux_text = (f'{escape(format_flux(flux))}{per_beam} <span class="muted">({escape(flux_label.split(" (")[0])})</span>'
-                 if flux is not None and data.get("detected") is not False else "")
     offset = _finite_or_none(data.get("offset_mas"))
-    body = (f'<div class="srctitle">{_source_chip(name, role)}</div>{figure}'
-            + _key_values([("Estimated flux density", flux_text),
-                           ("Offset from the phase centre", f"{offset:.1f} mas" if offset else "")])
-            + f'<p class="text">{escape(text)}</p>')
-    return _card(severity, "Source", body, extra="result")
+    where = (f'<div class="sub">{offset:.1f} mas offset from the phase center</div>'
+             if offset and data.get("detected") is not False else "")
+    role_class = escape(role if role in ROLE_TITLES else "other", quote=True)
+    body = (f'<div class="srcname role-{role_class}">{escape(name)}</div>{figure}{where}'
+            f'<p class="text">{escape(text)}</p>')
+    return _card(severity, escape(ROLE_TITLES.get(role, ROLE_TITLES["other"])), body, extra="result")
+
+
+#: Order of the calibration boxes: the instrumental-delay scan(s) and the flagged data first, then the rest.
+CALIBRATION_CARD_ORDER = ("instrumental_delay", "flagging")
 
 
 def _calibration_section(ctx: dict) -> str:
-    """Boxes of the calibration comments (and the flagged fraction); a notice for an old context."""
+    """Boxes of the calibration comments: the instrumental-delay scan(s) and the flagged data first, then the other
+    calibration remarks (self-calibration, poor tables); a notice for an old context."""
     comments = ctx.get("comments")
     if comments is None:
         return ('<p class="empty">This report was collected before the general comments existed; '
                 'rebuild it with <code>vlbipy report</code>.</p>')
     general = group_comments(comments)["general"]
     roles = {s["name"]: s.get("type", "other") for s in ctx.get("sources") or []}
-    cards = [_calibration_card(c, roles) for c in general if (c.get("data") or {}).get("kind") != "source"
-             and (c.get("category") == "calibration" or (c.get("data") or {}).get("kind") == "flagging")]
+    chosen = [c for c in general if (c.get("data") or {}).get("kind") != "source"
+              and (c.get("category") == "calibration" or (c.get("data") or {}).get("kind") == "flagging")]
+
+    def rank(comment: dict) -> int:
+        kind = (comment.get("data") or {}).get("kind")
+        return CALIBRATION_CARD_ORDER.index(kind) if kind in CALIBRATION_CARD_ORDER else len(CALIBRATION_CARD_ORDER)
+
+    cards = [_calibration_card(c, roles) for c in sorted(chosen, key=rank)]
     return f'<div class="cards">{"".join(cards)}</div>' if cards else '<p class="empty">Nothing to report.</p>'
 
 
@@ -1823,7 +1910,7 @@ def _results_section(ctx: dict) -> str:
 
 
 def render_overview(ctx: dict, html_dir: Path) -> str:
-    """Overview tab: observation facts, general comments, antennas, sources and scan table."""
+    """Overview tab: observation facts, antennas (with their map), sources (with their sky map) and the scan grid."""
     obs = ctx["observation"]
     facts = [("Observing date", obs["date"]), ("Start (UTC)", obs["start_utc"]), ("End (UTC)", obs["end_utc"]),
              ("Duration", f'{obs["duration_hours"]} h'), ("Reference frequency", f'{obs["ref_freq_ghz"]} GHz'),
@@ -1880,65 +1967,95 @@ def render_overview(ctx: dict, html_dir: Path) -> str:
                f"{no_data_count} with no data, and {no_signal_count} observed but with no usable signal "
                f"(completely flagged). {flagging_summary}")
 
-    src_rows = [f'<tr><td><span class="badge {escape(s["type"])}">{escape(s["type"])}</span></td>'
+    src_rows = [f'<tr data-src="{escape(s["name"], quote=True)}"><td><span class="badge {escape(s["type"])}">'
+                f'{escape(s["type"])}</span></td>'
                 f'<td><b>{escape(s["name"])}</b></td><td class="mono">{escape(str(s["id"]))}</td>'
                 f'<td class="mono">{escape(s["ra"])}</td><td class="mono">{escape(s["dec"])}</td>'
                 f'<td class="num">{s["n_scans"]}</td></tr>' for s in ctx["sources"]]
     source_table = _table(["Type", "Source", "ID", "RA (J2000)", "Dec (J2000)", "Scans"], src_rows, compact=True)
 
-    scan_rows = []
-    for scan in ctx["scans"]:
-        snrs = scan.get("antenna_snrs", {})
-        states = scan.get("antenna_states", {})
-        role = scan.get("role", "other")
-        present = set(scan.get("antennas", []))
-        chips = []
-        for ant in ctx["antennas"]:
-            name = ant["name"]
-            snr = snrs.get(name)
-            # Old dashboard.json snapshots have no states: fall back to value-or-unsurveyed.
-            state = states.get(name) or ("snr" if snr is not None else
-                                         ("absent" if name not in present else "unsurveyed"))
-            if state == "snr":
-                cls, tip, content = snr_class(snr), f"SNR {snr:.1f}", escape(name)
-            else:
-                cls, tip = SCAN_CHIP_STATES.get(state, SCAN_CHIP_STATES["unsurveyed"])
-                content = "&nbsp;" if state == "absent" else escape(name)
-                if state == "refant":
-                    content += '<i class="refmark">ref</i>'
-            chips.append(f'<span class="chip scan-chip {cls} mono" title="{escape(f"{name}: {tip}")}">{content}</span>')
-        chips_html = "".join(chips)
-        scan_rows.append(f'<tr><td class="num">{scan["number"]}</td>'
-                         f'<td><span class="badge {escape(role)}">{escape(role)}</span> <b>{escape(scan["source"])}</b></td>'
-                         f'<td class="mono">{escape(scan["start_utc"])}</td><td class="num">{scan["duration_sec"]} s</td>'
-                         f'<td style="white-space:normal">{chips_html}</td></tr>')
-    legend = ('<div class="legend">Fringe SNR per antenna: <span class="chip snr-bad">&lt; 3</span>'
-              '<span class="chip snr-low">3 - 6</span><span class="chip snr-mid">6 - 10</span>'
-              '<span class="chip snr-good">&ge; 10</span> · no SNR because: '
-              '<span class="chip snr-ref">reference antenna</span>'
-              '<span class="chip snr-nodata">no data (fully flagged)</span>'
-              '<span class="chip snr-nofringe">no fringe solution</span>'
-              '<span class="chip snr-none">scan not surveyed</span></div>')
-    scan_table = legend + _table(["Scan", "Source", "Start (UTC)", "Duration", "Antennas"], scan_rows)
-
     body = (_section("observation", "Observation", f'<div class="facts">{fact_html}</div>',
                      "Setup of the observation and the calibration run.")
-            + _section("calibration", "Calibration", _calibration_section(ctx),
-                       "What the calibration was solved on and how much of the data survived it.")
-            + _section("results", "Results", _results_section(ctx),
-                       "Every imaged source: the signal-to-noise of its image (the dynamic range of the CLEAN image, "
-                       "else the peak SNR of the search map) and the estimated flux density.")
-            + _section("comments", "Comments", _comments_section(ctx),
-                       "Issues per antenna and the warnings of the pipeline, derived from the calibration products on "
-                       "disk. The same list, with the calibration and results above, opens summary.md.",
-                       count=_comment_count(ctx.get("comments")))
             + _section("antennas", "Antennas", _side_by_side(antenna_table, _antenna_map(ctx["antennas"])), summary)
             + _section("sources", "Sources", _side_by_side(source_table, _sky_map(ctx["sources"])),
                        count=f'{len(ctx["sources"])}')
-            + _section("scans", "Scans", scan_table, count=f'{len(ctx["scans"])}'))
-    sections = [("observation", "Observation"), ("calibration", "Calibration"), ("results", "Results"),
-                ("comments", "Comments"), ("antennas", "Antennas"), ("sources", "Sources"), ("scans", "Scans")]
+            + _section("scans", "Scans", _scan_grid(ctx), count=f'{len(ctx["scans"])}'))
+    sections = [("observation", "Observation"), ("antennas", "Antennas"), ("sources", "Sources"), ("scans", "Scans")]
     return _page(ctx, "index", "Overview", sections, body)
+
+
+def scan_cell(name: str, state: str, snr: Optional[float]) -> tuple[str, str]:
+    """CSS class and tooltip of one (scan, antenna) cell of the scan overview grid.
+
+    Parameters
+    ----------
+    name : str
+        Antenna code (tooltip only).
+    state : str
+        :func:`antenna_scan_state` of the cell.
+    snr : float or None
+        Fringe SNR when ``state`` is ``"snr"``.
+
+    Returns
+    -------
+    (str, str)
+        A class of :data:`SCAN_CELL_CLASSES` for an SNR (``< 3``, ``3 - 10``, ``>= 10``), else the one
+        :data:`SCAN_CELL_STATES` gives the state (empty when the antenna has no data in the scan).
+    """
+    if state == "snr" and snr is not None:
+        return next(cls for bound, cls in SCAN_CELL_CLASSES if snr < bound), f"{name}: SNR {snr:.1f}"
+    cls, tip = SCAN_CELL_STATES.get(state, SCAN_CELL_STATES["unsurveyed"])
+    return cls, f"{name}: {tip}"
+
+
+def _scan_grid(ctx: dict) -> str:
+    """Scan overview: a row per scan (number, source coloured by its type, start, duration), then one square cell per
+    antenna, side by side, coloured by the fringe SNR of that antenna in that scan.
+
+    A cell is empty when the antenna has no data in the scan; an antenna that delivered no data at all has its name
+    in red in the header. Old ``dashboard.json`` snapshots without states fall back to value-or-unsurveyed.
+    """
+    antennas = ctx.get("antennas") or []
+    scans = ctx.get("scans") or []
+    if not scans:
+        return '<p class="empty">No scans recorded.</p>'
+    names = [a["name"] for a in antennas]
+    dead = {a["name"] for a in antennas if antenna_map_status(a) == "off"}
+    head = ['<th>Scan</th><th>Source</th><th>Start (UTC)</th><th>Dur.</th>']
+    for name in names:
+        tip = f"{name}: no data at all" if name in dead else name
+        head.append(f'<th class="sg-ant{" nodata" if name in dead else ""}" title="{escape(tip, quote=True)}">'
+                    f'{escape(name)}</th>')
+    rows = []
+    for scan in scans:
+        snrs, states = scan.get("antenna_snrs") or {}, scan.get("antenna_states") or {}
+        present = set(scan.get("antennas") or [])
+        role = str(scan.get("role") or "other")
+        role_class = escape(role if role in ROLE_TITLES else "other", quote=True)
+        cells = []
+        for name in names:
+            snr = _finite_or_none(snrs.get(name))
+            state = states.get(name) or ("snr" if snr is not None else ("absent" if name not in present else "unsurveyed"))
+            cls, tip = scan_cell(name, state, snr)
+            cells.append(f'<td class="sg {cls}" title="{escape(tip, quote=True)}"><i></i></td>')
+        rows.append(f'<tr><td class="num">{scan["number"]}</td>'
+                    f'<td class="role-{role_class}" title="{escape(role, quote=True)}"><b>{escape(scan["source"])}</b></td>'
+                    f'<td class="mono">{escape(scan["start_utc"])}</td><td class="num">{scan["duration_sec"]} s</td>'
+                    f'{"".join(cells)}</tr>')
+    cols = ('<colgroup><col class="sg-num"><col class="sg-src"><col class="sg-start"><col class="sg-dur">'
+            + '<col class="sg-col">' * len(names) + '</colgroup>')
+    roles = sorted({str(scan.get("role") or "other") for scan in scans},
+                   key=lambda t: (SKY_MAP_ROLE_ORDER.index(t) if t in SKY_MAP_ROLE_ORDER else len(SKY_MAP_ROLE_ORDER), t))
+    legend = ('<div class="legend">Fringe SNR: <span class="sgkey sg-bad"></span>&lt; 3 (or no fringe)'
+              '<span class="sgkey sg-mid"></span>3 - 10<span class="sgkey sg-good"></span>&gt; 10'
+              '<span class="sgkey sg-ref"></span>reference antenna<span class="sgkey sg-data"></span>data, not searched'
+              ' · empty = no data · source type: '
+              + " · ".join(f'<span class="role-{escape(r if r in ROLE_TITLES else "other", quote=True)}">'
+                           f'<b>{escape(ROLE_TITLES.get(r, r))}</b></span>' for r in roles) + '</div>')
+    # The antenna columns share what the first four leave; capped so that a small array does not get huge cells.
+    width = f"max-width:calc(420px + {len(names)} * 44px)"
+    return (legend + f'<div class="scangrid-wrap" style="{width}"><table class="scangrid">{cols}<thead><tr>'
+            f'{"".join(head)}</tr></thead><tbody>{"".join(rows)}</tbody></table></div>')
 
 
 def _time_evolution_panel(paths: list[Path], html_dir: Path, project_code: str, refants: list[str]) -> str:
@@ -1985,7 +2102,7 @@ def _time_evolution_panel(paths: list[Path], html_dir: Path, project_code: str, 
 
 
 def render_diagnostics(ctx: dict, html_dir: Path, plot_root: Path) -> str:
-    """Diagnostics tab: raw auto-correlations, cross-correlations and time evolution, one sub-tab each."""
+    """Diagnostics tab: the comments, raw auto-correlations, cross-correlations and time evolution, one sub-tab each."""
     code = ctx["project"]
     auto = find_plots(plot_root, AUTOCORR_PATTERNS)
     cross = find_plots(plot_root, CROSSCORR_PATTERNS)
@@ -2018,6 +2135,10 @@ def render_diagnostics(ctx: dict, html_dir: Path, plot_root: Path) -> str:
 
     refants = [name for name in str(ctx.get("refant") or "").split(",") if name]
     tabs = [
+        ("diag-comments", "Comments",
+         _section("comments", "Comments", _comments_section(ctx),
+                  "Issues per antenna and the warnings of the pipeline, derived from the calibration products on "
+                  "disk. The same list, with the calibration and the results, opens summary.md.")),
         ("diag-autocorr", "Auto-correlations",
          _section("autocorr", "Auto-correlations",
                   per_antenna(auto, "Amplitude vs frequency on every diagnostic scan (raw data).", "auto"),
@@ -2190,12 +2311,56 @@ def _snr_matrix_tabs(ctx: dict, paths: list[Path], html_dir: Path) -> str:
     return _subtabs(tabs)
 
 
+#: Calibration groups whose figures span the whole observation in one wide column: one figure per row.
+WIDE_CALIBRATION_GROUPS = {"Multi-band delay (MBD)"}
+
+
+def sbd_stage_key(path: Path) -> Optional[tuple[int, int, str]]:
+    """``(stage, scan, "before" | "after")`` of an SBD-stage data figure; None for any other file.
+
+    New names say the moment (``sbd_before_...`` in ``plots/raw``, ``sbd_after_...`` in ``plots/calibrated``); the
+    ``sbd_stage...`` figures of older runs are "before" in ``plots/raw`` and "after" in ``plots/calibrated``.
+    """
+    match = re.search(r"\.sbd(?:_(before|after))?_stage(\d+)_scan(\d+)\.timeseries\.png$", path.name)
+    if not match:
+        return None
+    when = match.group(1) or ("after" if path.parent.name == "calibrated" else "before")
+    return int(match.group(2)), int(match.group(3)), when
+
+
+def _sbd_data_pairs(ctx: dict, plot_root: Path, html_dir: Path) -> str:
+    """The SBD-stage data as one before/after pair of figures per stage (the legacy names when no new one exists)."""
+    paths = find_plots(plot_root, SBD_DATA_PATTERNS["before"] + SBD_DATA_PATTERNS["after"]) \
+        or find_plots(plot_root, SBD_DATA_LEGACY_PATTERNS)
+    stages: dict[tuple[int, int], dict[str, Path]] = {}
+    for path in paths:
+        key = sbd_stage_key(path)
+        if key is not None:
+            stages.setdefault(key[:2], {})[key[2]] = path
+    if not stages:
+        return '<p class="empty">No plots available for this section.</p>'
+    source_of = {scan["number"]: scan["source"] for scan in ctx.get("scans") or []}
+    captions = {"before": "Before calibration: raw data", "after": "After calibration: calibrated data"}
+    out = []
+    for (stage, scan), figures in sorted(stages.items()):
+        label = f"Stage {stage} · scan {scan}" + (f" · {source_of[scan]}" if source_of.get(scan) else "")
+        pair = "".join(_figure(figures[when], html_dir, captions[when], label) if when in figures
+                       else f'<p class="empty">{escape(captions[when])}: not plotted yet.</p>'
+                       for when in ("before", "after"))
+        out.append(f"<h3>{escape(label)}</h3><div class=\"grid pair\">{pair}</div>")
+    return "".join(out)
+
+
 def render_calibration(ctx: dict, html_dir: Path, plot_root: Path) -> str:
     """Calibration tab: chain table, amplitude corrections, calibration-table plot groups and corner plots."""
     code = ctx["project"]
-    sections = [("chain", "Calibration chain"), ("amplitude-corrections", "Amplitude corrections")]
+    sections = [("chain", "Calibration chain"), ("summary", "Instrumental delay and flagging"),
+                ("amplitude-corrections", "Amplitude corrections")]
     body = (_section("chain", "Calibration chain", _chain_table(ctx["caltables"]),
                      "Tables solved and applied in order: tsys -> gc -> sbd -> mbd -> bpass, then re-solved.")
+            + _section("summary", "Instrumental delay and flagging", _calibration_section(ctx),
+                       "The scan(s) the instrumental delay was solved on, how much of the data is flagged, and what "
+                       "else the calibration has to say.")
             + _section("amplitude-corrections", "Amplitude corrections", _gain_section(ctx),
                        "Amplitude factor the difmapy gscale self-calibration applied to the visibilities of every "
                        "antenna and subband (1.00 = unchanged). The last column is the median over the subbands "
@@ -2204,8 +2369,12 @@ def render_calibration(ctx: dict, html_dir: Path, plot_root: Path) -> str:
         anchor = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
         paths = find_plots(plot_root, patterns)
         sections.append((anchor, title))
-        content = (_snr_matrix_tabs(ctx, paths, html_dir) if title == SNR_SURVEY_TITLE
-                   else _plot_grid(paths, html_dir, code, wide=len(paths) <= 2))
+        if title == SNR_SURVEY_TITLE:
+            content = _snr_matrix_tabs(ctx, paths, html_dir)
+        elif title == SBD_DATA_TITLE:
+            content = _sbd_data_pairs(ctx, plot_root, html_dir)
+        else:
+            content = _plot_grid(paths, html_dir, code, wide=len(paths) <= 2 or title in WIDE_CALIBRATION_GROUPS)
         body += _section(anchor, title, content, blurb)
     corner_paths = find_plots(plot_root, ["calibrated/*corner*.png"])
     by_source: dict[str, list[Path]] = {}
@@ -2300,7 +2469,8 @@ _CALIBRATOR_ROLES = {"phasecal", "fringefinder", "calibrator", "phase_calibrator
 
 
 def render_final_data(ctx: dict, html_dir: Path, plot_root: Path, image_root: Path) -> str:
-    """Final-results tab: one sub-tab per source with its plots, images and downloads.
+    """Final-results tab: one box per imaged source (:func:`_results_section`), then one sub-tab per source with its
+    plots, images and downloads.
 
     Plots are attributed to a source by name (longest source name first); the
     ones naming no source land in a trailing "All sources" sub-tab. A source with
@@ -2346,9 +2516,13 @@ def render_final_data(ctx: dict, html_dir: Path, plot_root: Path, image_root: Pa
             tabs.append((name, f'{escape(name)} <span class="badge {role}">{role}</span>'))
     if any(by_source.get(None) for _, _, by_source in grouped) or images_by_source.get(None):
         tabs.append((None, "All sources"))
+    summary = _section("results", "Results", _results_section(ctx),
+                       f"Every imaged source: the SNR of its CLEAN image (peak / rms; else the peak SNR of the search "
+                       f"map), detected above {SOURCE_DETECTION_SIGMA:g} sigma in the search map.")
     if not tabs:
-        body = _section("final", "Per-source products", '<p class="empty">No final data products available yet.</p>',
-                        "Calibrated visibilities, light curves and images per source.")
+        body = summary + _section("final", "Per-source products",
+                                  '<p class="empty">No final data products available yet.</p>',
+                                  "Calibrated visibilities, light curves and images per source.")
         return _page(ctx, "final_data", "Final results", [], body)
 
     panels = []
@@ -2356,7 +2530,7 @@ def render_final_data(ctx: dict, html_dir: Path, plot_root: Path, image_root: Pa
         groups = [(title, blurb, by_source.get(source) or []) for title, blurb, by_source in grouped]
         panels.append((panel_id, label, _final_source_panel(ctx, html_dir, panel_id, downloads.get(source) or [],
                                                            groups, images_by_source.get(source) or [])))
-    return _page(ctx, "final_data", "Final results", [], _subtabs(panels))
+    return _page(ctx, "final_data", "Final results", [], summary + _subtabs(panels))
 
 
 def render_pages(ctx: dict, work_dir: Path) -> Path:

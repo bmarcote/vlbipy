@@ -277,7 +277,7 @@ robust = [-2, 0, 2]          # one image per robust value, shown side by side in
 niter = 4000
 threshold_sigma = 3.0        # clean stops when the residual peak drops below this many rms
 search_fov = 1000.0          # mas; width of the dirty map searched for each source before imaging (0 = off)
-search_sigma = 10.0          # a peak counts as the source only above this many rms
+search_sigma = 8.0           # a peak counts as the source only above this many rms
 recentre_min_beams = 10.0    # ... and the map is re-centred on it only when it lies further than this many
                              # synthesized beams from the phase centre (closer, the regular map already holds it)
 sources = "all"              # "all" (targets + calibrators) | "targets"

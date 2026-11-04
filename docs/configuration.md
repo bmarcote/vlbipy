@@ -84,7 +84,7 @@ pixels_per_beam = 10         # Used to auto-compute cell size if not set
 niter = 4000                 # CLEAN iterations
 threshold_sigma = 3.0        # CLEAN threshold in units of image RMS
 search_fov = 1000.0          # mas; dirty map searched for each source before imaging (0 = off)
-search_sigma = 10.0          # a peak counts as the source only above this many rms
+search_sigma = 8.0           # a peak counts as the source only above this many rms
 recentre_min_beams = 10.0    # re-centre only when it is further than this many beams from the centre
 deconvolver = "hogbom"
 produce_fits = true
@@ -296,7 +296,7 @@ robust values.
 | `threshold_sigma` | float | `3.0` | CLEAN stops when the residual peak is below this many times the residual rms *and* the last batch of components lowered that rms by less than 1% (while it is still falling it is made of the sidelobes of uncleaned flux, not of noise); also when the rms starts to rise, or at `niter` |
 | `deconvolver` | string | `"hogbom"` | CLEAN deconvolution algorithm (`hogbom`, `clark`, `multiscale`) |
 | `search_fov` | float | `1000.0` | Width (mas) of the dirty map searched for each source before difmapy images or self-calibrates it. `0` disables the search. |
-| `search_sigma` | float | `10.0` | A peak in that map counts as the source only above this many rms. |
+| `search_sigma` | float | `8.0` | A peak in that map counts as the source only above this many rms. |
 | `recentre_min_beams` | float | `10.0` | The phase centre is moved onto a detected peak only when it lies further than this many synthesized beams from the centre, i.e. when the regular map could miss it. Applies to targets and calibrators alike. |
 | `produce_fits` | bool | `true` | Export CLEAN images as FITS files |
 | `produce_png` | bool | `true` | Export CLEAN images as PNG thumbnails |

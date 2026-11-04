@@ -22,7 +22,7 @@ from typing import Optional
 
 import numpy as np
 
-from ..errors import BackendError
+from ..errors import BackendError, EmptySelectionError
 from ..logging_utils import get_logger, warnings
 from ..models import (Antenna, CalTable, FreqSetup, ObsMetadata, QualityMetrics, Scan, ScanSNRSurvey,
                       Stokes)
@@ -60,6 +60,11 @@ FRINGE_OUTLIER_FLOOR = {"delay": 2.0, "rate": 1e-12}
 
 #: Fringe-fit keywords of the native solver only (:func:`vlbipy.solvers.fringefit.fringefit`), not of CASA's task.
 NATIVE_FRINGEFIT_KEYS = ("prior_scans", "prior_delay_window_ns", "prior_rate_window")
+
+#: Lower-case fragments of the fringe-fit errors (native solver and CASA task) that mean the selection held no
+#: usable data: the solve is then retried on another scan instead of failing the step.
+EMPTY_SELECTION_PATTERNS = ("no solution interval had data", "no data for field", "selects zero rows",
+                            "nullselection", "no unflagged data", "no data selected")
 
 #: Parallel-hand polarization pairs, by correlation basis.
 _PARALLEL_HANDS = {Stokes.RR: "RR", Stokes.LL: "LL", Stokes.XX: "XX", Stokes.YY: "YY"}
@@ -3776,10 +3781,15 @@ class CasaCalibrationOps(CalibrationOps):
                                            field=field, callib=callib))
         try:
             self._run_fringefit_task(params)
-        except RuntimeError as exc:
-            raise BackendError(f"{project_code}: fringefit failed "
-                               f"(field={params.get('field')!r}, scan={params.get('scan', 'all')}, "
-                               f"refant={params.get('refant')!r}): {exc}") from exc
+        except (RuntimeError, ValueError) as exc:
+            message = (f"{project_code}: fringefit failed (field={params.get('field')!r}, "
+                       f"scan={params.get('scan', 'all')}, refant={params.get('refant')!r}): {exc}")
+            if any(pattern in str(exc).lower() for pattern in EMPTY_SELECTION_PATTERNS):
+                scan = str(params.get("scan", "")).strip()
+                raise EmptySelectionError(message, int(scan) if scan.isdigit() else None) from exc
+            if isinstance(exc, ValueError):
+                raise
+            raise BackendError(message) from exc
         if not table_path.is_dir():
             raise BackendError(f"{project_code}: fringefit produced no table at {table_path}")
 
@@ -6374,14 +6384,14 @@ class CasaPlotOps(PlotOps):
 
     def timeseries(self, project_code: str, *, field: str = "", scans: Optional[list] = None,
                    refant: str = "", column: str = "corrected", label: str = "",
-                   metadata: Optional[ObsMetadata] = None, **kwargs) -> list[str]:
-        """Plot amplitude and phase vs time on baselines to the reference antenna."""
+                   metadata: Optional[ObsMetadata] = None, heading: str = "", **kwargs) -> list[str]:
+        """Plot amplitude and phase vs time on baselines to the reference antenna (``heading`` opens the title)."""
         from ..plotting import plot_baseline_timeseries
         series = self.backend.data.read_timeseries(project_code, field=field, scans=scans,
                                                    refant=refant, column=column,
                                                    metadata=metadata, **kwargs)
         return [str(p) for p in plot_baseline_timeseries(
-            series, self.plot_dir(self.category_for_column(column)), project_code, label=label)]
+            series, self.plot_dir(self.category_for_column(column)), project_code, label=label, heading=heading)]
 
     def time_evolution(self, project_code: str, *, refant: str, subband: int, column: str = "data",
                        label: str = "raw", series: Optional[dict] = None,

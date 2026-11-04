@@ -87,8 +87,8 @@ CONDENSE_FROM_IFS: int = 3
 
 #: Median solution SNR below which a calibration table is pointed out (0 means "not measured").
 POOR_TABLE_SNR: float = 10.0
-#: Dynamic range of the CLEAN image below which a self-calibrated calibrator is pointed out.
-LOW_CALIBRATOR_DYNAMIC_RANGE: float = 50.0
+#: SNR (peak / rms) of the CLEAN image below which a self-calibrated calibrator is pointed out.
+LOW_CALIBRATOR_SNR: float = 50.0
 #: A source found closer than this (mas) to the phase centre in the search map is said to be "at" it.
 CENTRED_OFFSET_MAS: float = 0.05
 
@@ -767,7 +767,7 @@ def source_comments(context: dict) -> list[dict]:
             image = next((i for i in images if _finite(i.get("robust")) == 0.0), images[0])
             peak, rms, dynamic = _finite(image["peak"]), _finite(image.get("rms")), _finite(image.get("dynamic_range"))
             if dynamic is not None:
-                data.update(snr=dynamic, snr_label=f"dynamic range (robust {float(image.get('robust') or 0.0):g})")
+                data.update(snr=dynamic, snr_label=f"SNR (robust {float(image.get('robust') or 0.0):g} image)")
             model_flux = _finite(image.get("model_flux"))
             if model_flux is not None and model_flux > 0:
                 data.update(flux=model_flux, flux_label="total flux density of the model (Jy)")
@@ -776,8 +776,8 @@ def source_comments(context: dict) -> list[dict]:
             text = f"CLEAN image (robust {float(image.get('robust') or 0.0):g}): peak {format_flux(peak)}/beam"
             text += f", rms {format_flux(rms)}/beam" if rms is not None else ""
             if dynamic is not None:
-                text += f", dynamic range {dynamic:.0f}"
-                if role in CALIBRATOR_ROLES and dynamic < LOW_CALIBRATOR_DYNAMIC_RANGE:
+                text += f", SNR {dynamic:.0f}"
+                if role in CALIBRATOR_ROLES and dynamic < LOW_CALIBRATOR_SNR:
                     text += " - low for a calibrator, check its calibration and model"
                     severity = "warning"
             parts.append(text)

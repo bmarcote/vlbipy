@@ -420,6 +420,21 @@ def without_weak_detections(survey: ScanSNRSurvey, weak: dict[int, list[str]], *
     return replace(survey, snr=snr), removed
 
 
+def without_scans(survey: ScanSNRSurvey, scans) -> ScanSNRSurvey:
+    """A copy of ``survey`` without the rows of ``scans`` (scan numbers); the input is left untouched.
+
+    A plan made from it never picks those scans (e.g. ones a solve found empty).
+    """
+    from dataclasses import replace
+
+    dropped = {int(scan) for scan in scans}
+    keep = [row for row, scan in enumerate(survey.scan_numbers) if int(scan) not in dropped]
+    sources = [survey.scan_sources[row] for row in keep] if len(survey.scan_sources) == len(survey.scan_numbers) \
+        else list(survey.scan_sources)
+    return replace(survey, scan_numbers=[survey.scan_numbers[row] for row in keep], scan_sources=sources,
+                   snr={pol: [list(matrix[row]) for row in keep] for pol, matrix in survey.snr.items()})
+
+
 def amend_sbd_stages(stages: list[dict], survey: ScanSNRSurvey, lost: dict[int, list[str]], *,
                      min_snr: float = DEFAULT_MIN_SNR, sources: list[str] | None = None,
                      metadata: ObsMetadata | None = None) -> list[dict]:

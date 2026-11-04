@@ -142,8 +142,8 @@ def test_collect_without_metadata(tmp_path):
     assert Path(index).is_file()
 
 
-def test_scan_chips_fixed_width_slots_and_role_snr_fallback(tmp_path):
-    """Scan chips keep one fixed-width slot per global antenna and use role-aware SNR colouring."""
+def test_scan_grid_has_one_cell_per_antenna_and_scan(tmp_path):
+    """The scan grid keeps one square cell per global antenna in every scan, coloured by SNR where surveyed."""
     obs = make_obs(tmp_path, phasecal="J1848+3219", fringe_finder="3C345")
     # Survey only the calibrators, leaving target scans without significant detections.
     calibrator_names = [s.name for s in obs["db01"].sources if s.source_type.value != "target"]
@@ -156,10 +156,12 @@ def test_scan_chips_fixed_width_slots_and_role_snr_fallback(tmp_path):
 
     n_global = len(obs["db01"].metadata.antennas)
     n_scans = len(obs["db01"].metadata.scans)
-    assert text.count('class="chip scan-chip') == n_global * n_scans
+    assert text.count('<td class="sg ') == n_global * n_scans
     # Calibrator scans have SNR colours; target scans stay neutral because they were not surveyed.
-    assert "snr-good" in text or "snr-mid" in text or "snr-low" in text
-    assert "snr-none" in text
+    assert 'class="sg sg-good"' in text or 'class="sg sg-mid"' in text or 'class="sg sg-bad"' in text
+    assert 'class="sg sg-data"' in text
+    # Sources are coloured by their type instead of a badge; no golden "6 - 10" class any more.
+    assert 'class="role-fringefinder"' in text and "snr-low" not in text
 
 
 def test_calibration_subtabs_are_wrapped_for_scoping(tmp_path):
@@ -264,14 +266,16 @@ def test_scan_chip_states_say_why_there_is_no_snr(tmp_path):
     assert any(v is not None for v in surveyed["antenna_snrs"].values())
 
     text = (html_dir / "index.html").read_text(encoding="utf-8")
-    assert f'snr-ref mono" title="{refant}: reference antenna (no SNR of its own)"' in text
-    assert f'snr-nodata mono" title="{dead}: no data (fully flagged)"' in text
-    assert f'snr-nofringe mono" title="{no_fringe}: no fringe solution"' in text
-    assert f'snr-none mono" title="{no_fringe}: scan not surveyed"' in text
-    assert f'snr-absent mono" title="{absent}: not in this scan"' in text
-    # The legend explains every chip the table can show.
-    for label in ("reference antenna", "no data (fully flagged)", "no fringe solution", "scan not surveyed"):
-        assert f">{label}</span>" in text
+    assert f'sg sg-ref" title="{refant}: reference antenna of the fringe search (no SNR of its own)"' in text
+    assert f'sg sg-empty" title="{dead}: no data (fully flagged)"' in text
+    assert f'sg sg-bad" title="{no_fringe}: no fringe solution"' in text
+    assert f'sg sg-data" title="{no_fringe}: data, no fringe search on this scan"' in text
+    assert f'sg sg-empty" title="{absent}: not in this scan"' in text
+    # An antenna without any data has its name in red in the header.
+    assert f'<th class="sg-ant nodata" title="{dead}: no data at all">{dead}</th>' in text
+    # The legend explains every colour the grid can show.
+    for label in ("reference antenna", "data, not searched", "empty = no data"):
+        assert label in text
 
 
 def test_plot_source_matches_the_longest_source_name_first():
@@ -366,7 +370,7 @@ def test_renderer_tolerates_a_context_without_states_or_downloads(tmp_path):
     index = render_pages(context, out)
     assert Path(index).is_file()
     text = (out / "html" / "index.html").read_text(encoding="utf-8")
-    assert 'class="chip scan-chip' in text
+    assert '<td class="sg ' in text
     assert "Final results" in (out / "html" / "final_data.html").read_text(encoding="utf-8")
 
 
@@ -636,7 +640,7 @@ def test_time_evolution_key_reads_reference_antenna_and_subband():
     assert time_evolution_key(Path("rsm07.raw_3C345.timeseries.png")) is None
 
 
-def test_diagnostics_page_has_three_horizontal_subtabs(tmp_path):
+def test_diagnostics_page_has_the_comments_and_three_plot_subtabs(tmp_path):
     obs = make_obs(tmp_path, phasecal="J1848+3219", fringe_finder="3C345")
     work = Path(obs["db01"].work_dir)
     build_dashboard(obs)
@@ -653,13 +657,13 @@ def test_diagnostics_page_has_three_horizontal_subtabs(tmp_path):
     page = (work / "html" / "diagnostics.html").read_text(encoding="utf-8")
 
     assert re.findall(r'<button class="([^"]*)" data-panel="([^"]+)">([^<]+)</button>', page) == [
-        ("active", "diag-autocorr", "Auto-correlations"), ("", "diag-crosscorr", "Cross-correlations"),
-        ("", "diag-time-evolution", "Time evolution")]
+        ("active", "diag-comments", "Comments"), ("", "diag-autocorr", "Auto-correlations"),
+        ("", "diag-crosscorr", "Cross-correlations"), ("", "diag-time-evolution", "Time evolution")]
     assert page.count('class="subtabs-wrap"') == 1
     ids = re.findall(r'class="subpanel[^"]*" id="([^"]+)"', page)
-    assert ids == ["diag-autocorr", "diag-crosscorr", "diag-time-evolution"]
+    assert ids == ["diag-comments", "diag-autocorr", "diag-crosscorr", "diag-time-evolution"]
     bodies = dict(zip(ids, re.split(r'<div class="subpanel[^"]*" id="[^"]+">', page)[1:]))
-    auto, cross, evolution = (bodies[i] for i in ids)
+    auto, cross, evolution = (bodies[i] for i in ids[1:])
 
     # Every file lands in its own sub-tab only, each with its blurb.
     assert "db01.raw_scan1.autocorr.png" in auto and "spectrum.png" not in auto and "time_evolution" not in auto
@@ -675,7 +679,7 @@ def test_diagnostics_page_has_three_horizontal_subtabs(tmp_path):
     assert positions == sorted(positions)
     assert "Baselines to EF · subband 10" in evolution
     # Lazy images never load inside a hidden panel: only the active one keeps the attribute.
-    assert 'loading="lazy"' in auto and 'loading="lazy"' not in cross and 'loading="lazy"' not in evolution
+    assert 'loading="lazy"' not in auto + cross + evolution
     # The sections live in sub-tabs now, so the side navigation has no in-page anchors.
     assert '<nav class="nav">' not in page
 
@@ -715,16 +719,24 @@ def commented_obs(tmp_path):
     return obs
 
 
-def test_overview_shows_calibration_and_results_boxes_then_the_comments(tmp_path):
+def test_overview_has_only_the_observation_antennas_sources_and_scans(tmp_path):
+    obs = commented_obs(tmp_path)
+    build_dashboard(obs)
+    text = (Path(obs["db01"].work_dir) / "html" / "index.html").read_text(encoding="utf-8")
+    assert ('<nav class="nav"><a href="#observation">Observation</a><a href="#antennas">Antennas</a>'
+            '<a href="#sources">Sources</a><a href="#scans">Scans</a></nav>') in text
+    for anchor in ('id="calibration"', 'id="results"', 'id="comments"'):
+        assert anchor not in text
+
+
+def test_calibration_page_boxes_and_diagnostics_comments(tmp_path):
     obs = commented_obs(tmp_path)
     build_dashboard(obs)
     html = Path(obs["db01"].work_dir) / "html"
-    text = (html / "index.html").read_text(encoding="utf-8")
-    order = ['id="observation"', 'id="calibration"', 'id="results"', 'id="comments"', 'id="antennas"']
-    assert [text.index(anchor) for anchor in order] == sorted(text.index(anchor) for anchor in order)
-    assert ('<a href="#observation">Observation</a><a href="#calibration">Calibration</a><a href="#results">Results'
-            '</a><a href="#comments">Comments</a><a href="#antennas">') in text
-    calibration = text[text.index('id="calibration"'):text.index('id="results"')]
+    page = (html / "calibration.html").read_text(encoding="utf-8")
+    order = ['id="chain"', 'id="summary"', 'id="amplitude-corrections"']
+    assert [page.index(anchor) for anchor in order] == sorted(page.index(anchor) for anchor in order)
+    calibration = page[page.index('id="summary"'):page.index('id="amplitude-corrections"')]
     # The instrumental delay as a box: the scan as the big number, its source, refant and the antennas covered.
     assert '<div class="card note"><div class="kicker"><span>Instrumental delay</span></div>' in calibration
     assert '<div class="big"><span class="unit">scan</span> 3</div>' in calibration
@@ -732,8 +744,9 @@ def test_overview_shows_calibration_and_results_boxes_then_the_comments(tmp_path
     assert "<dt>Applied to</dt><dd><span class=\"mono\">all</span></dd>" in calibration
     assert ("Scan 3 (3C345) was selected for the instrumental delay (reference antenna EF): it was observed by all 7 "
             "antennas with usable data, and all were solved there.") in calibration
-    section = text[text.index('id="comments"'):text.index('id="antennas"')]
-    assert "Calibration and results" not in section and "<h3>Antennas</h3>" in section
+    diagnostics = (html / "diagnostics.html").read_text(encoding="utf-8")
+    section = diagnostics[diagnostics.index('id="comments"'):diagnostics.index('id="diag-autocorr"')]
+    assert "<h3>Antennas</h3>" in section
     # One block per antenna with something to say, its code prominent and the severity as a chip.
     for name in ("YS", "O8", "TR"):
         assert f'<div class="cmt-name mono">{name}</div>' in section
@@ -741,8 +754,9 @@ def test_overview_shows_calibration_and_results_boxes_then_the_comments(tmp_path
     assert '<li class="cmt-warning"><span class="chip warn">warning</span><span>no data in scans 4-9</span></li>' in section
     assert '<span class="chip mut">note</span><span>recorded only subbands 1-2 (2 of 8)</span>' in section
     assert "Nothing to report for: EF, MC, WB, JB, NT." in section
-    assert "2 warning(s) · 1 note(s)" in section
-    # The page shows exactly the list the context carries.
+    # No tally of the comments next to the title.
+    assert "warning(s)" not in section and "note(s)" not in section
+    # The pages show exactly the list the context carries.
     context = json.loads((html / "dashboard.json").read_text())
     assert [c["category"] for c in context["comments"]] == ["calibration", "antenna", "antenna", "antenna", "antenna"]
     for comment in context["comments"]:
@@ -750,7 +764,7 @@ def test_overview_shows_calibration_and_results_boxes_then_the_comments(tmp_path
 
 
 def test_result_and_flagging_boxes_carry_the_numbers(tmp_path):
-    """A source box: role chip, the dynamic range as the big number and the model flux; flagging: the percentage."""
+    """A source box: the type as the title, the image SNR as the big number, no flux line; flagging: the percentage."""
     from vlbipy.dashboard import _calibration_section, _results_section
     ctx = {"sources": [{"name": "TGT", "type": "target"}, {"name": "PC", "type": "phasecal"}],
            "comments": [
@@ -758,17 +772,19 @@ def test_result_and_flagging_boxes_carry_the_numbers(tmp_path):
                 "data": {"kind": "flagging", "fraction": 0.686, "without": 0.5, "excluded": ["O8"]}},
                {"severity": "note", "category": "result", "antenna": "", "text": "PC (phasecal): fine.",
                 "data": {"kind": "source", "source": "PC", "role": "phasecal", "detected": True, "snr": 2175.0,
-                         "snr_label": "dynamic range (robust 0)", "flux": 0.812,
-                         "flux_label": "total flux density of the model (Jy)", "offset_mas": 0.0}},
+                         "snr_label": "SNR (robust 0 image)", "flux": 0.812,
+                         "flux_label": "total flux density of the model (Jy)", "offset_mas": 1.25}},
                {"severity": "warning", "category": "result", "antenna": "", "text": "TGT (target): not detected.",
                 "data": {"kind": "source", "source": "TGT", "role": "target", "detected": False, "snr": 4.2,
                          "snr_label": "peak SNR in the search map", "flux": None, "flux_label": "", "offset_mas": None}}]}
     results = _results_section(ctx)
-    assert results.index("<b>TGT</b>") < results.index("<b>PC</b>")                  # source-table order
-    assert '<div class="big">2175</div><div class="sub">dynamic range (robust 0)</div>' in results
-    assert "<dt>Estimated flux density</dt><dd>812 mJy" in results
+    assert results.index(">TGT</div>") < results.index(">PC</div>")                  # source-table order
+    assert '<div class="big">2175</div><div class="sub">SNR (robust 0 image)</div>' in results
+    assert "Estimated flux density" not in results
+    assert '<div class="sub">1.2 mas offset from the phase center</div>' in results
     assert '<div class="card warning result">' in results and '<div class="big word">not detected</div>' in results
-    assert '<span class="badge target">target</span>' in results
+    assert '<div class="kicker"><span>Target</span>' in results
+    assert '<div class="kicker"><span>Phase calibrator</span></div><div class="srcname role-phasecal">PC</div>' in results
     calibration = _calibration_section(ctx)
     assert '<div class="card warning"><div class="kicker"><span>Flagged data</span>' in calibration
     assert '<div class="big">68.6<span class="unit">%</span></div>' in calibration
@@ -788,9 +804,9 @@ def test_antenna_map_places_every_antenna_and_marks_the_ones_without_data():
                 {"name": "XX", "observed": True, "flagged_fraction": 0.1, "lat_deg": None, "lon_deg": None}]
     svg = _antenna_map(antennas)
     assert svg.count('<g class="ant ok"') == 1 and svg.count('<g class="ant off"') == 2 and "XX" not in svg
-    view = [float(v) for v in re.search(r'data-array="([^"]+)"', svg).group(1).split()]
+    view = [float(v) for v in re.search(r'data-view-array="([^"]+)"', svg).group(1).split()]
     assert view[2] == view[3] and view[0] < 147.4 + 180 < 149.6 + 180 < view[0] + view[2]
-    assert 'data-world="' in svg and 'id="vlbipy-land"' in svg
+    assert 'data-view-world="' in svg and 'id="vlbipy-land"' in svg
     assert _antenna_map([{"name": "AT", "lat_deg": None, "lon_deg": None}]) == ""
 
 
@@ -841,10 +857,10 @@ def test_collect_gathers_what_the_comments_need_from_the_caches(tmp_path):
     general = [c["text"] for c in context["comments"] if not c["antenna"]]
     assert "3C395 (target): detected at 27 sigma in the search map (dirty-map peak 136 uJy/beam), 0.8 mas (0.3 beams) " \
            "from the phase centre." in general
-    assert "J1848+3219 (phasecal): CLEAN image (robust 0): peak 308 mJy/beam, rms 330 uJy/beam, dynamic range 933." in general
+    assert "J1848+3219 (phasecal): CLEAN image (robust 0): peak 308 mJy/beam, rms 330 uJy/beam, SNR 933." in general
 
-    page = render_pages(context, tmp_path / "replay")
-    text = Path(page).read_text(encoding="utf-8")
+    render_pages(context, tmp_path / "replay")
+    text = (tmp_path / "replay" / "html" / "diagnostics.html").read_text(encoding="utf-8")
     assert "<h3>Warnings raised by the pipeline</h3>" in text
     assert '<span class="when">first seen 2026-10-10 12:07:00 UTC</span>' in text
     assert '<li class="cmt-problem"><span class="chip crit">problem</span><span>flag[quack] removed 61.0% of data' in text
@@ -876,15 +892,17 @@ def test_a_summary_that_cannot_be_written_does_not_cost_the_dashboard(tmp_path, 
     assert Path(index).is_file() and not (Path(obs["db01"].work_dir) / "summary.md").exists()
 
 
-def test_overview_of_a_context_without_comments(tmp_path):
+def test_comments_of_a_context_without_comments(tmp_path):
     """A dashboard.json saved before the comments existed still renders; an empty list says so plainly."""
     obs = commented_obs(tmp_path)
     context = collect(obs)
     context.pop("comments")
-    text = Path(render_pages(context, tmp_path / "old")).read_text(encoding="utf-8")
+    render_pages(context, tmp_path / "old")
+    text = (tmp_path / "old" / "html" / "diagnostics.html").read_text(encoding="utf-8")
     assert 'id="comments"' in text and "collected before the general comments existed" in text
     context["comments"] = []
-    text = Path(render_pages(context, tmp_path / "empty")).read_text(encoding="utf-8")
+    render_pages(context, tmp_path / "empty")
+    text = (tmp_path / "empty" / "html" / "diagnostics.html").read_text(encoding="utf-8")
     assert '<p class="empty">Nothing to report.</p>' in text
 
 
@@ -907,7 +925,7 @@ def test_sky_map_shows_every_source_coloured_by_type_with_a_legend():
     from vlbipy.dashboard import _sky_map
 
     html = _sky_map(sky_sources())
-    assert '<figure class="skymap">' in html
+    assert '<figure class="skymap zoommap">' in html
     for role in ("target", "phasecal", "fringefinder", "checksource", "polcal", "other"):
         assert f'class="src {role}"' in html, role
         assert f'<span class="badge {role}">{role}</span>' in html, role
@@ -934,7 +952,7 @@ def test_sky_map_handles_coincident_coordinates():
 
     coincident = [dict(s, ra_deg=10.0, dec_deg=20.0) for s in sky_sources()[:3]]
     html = _sky_map(coincident)
-    assert '<figure class="skymap">' in html and 'class="src' in html
+    assert '<figure class="skymap zoommap">' in html and 'class="src' in html
 
 
 def test_sky_map_handles_ra_wrapping_across_zero():
@@ -944,7 +962,7 @@ def test_sky_map_handles_ra_wrapping_across_zero():
     wrapped = [dict(sky_sources()[0], ra_deg=359.9, dec_deg=0.0),
                dict(sky_sources()[1], ra_deg=0.1, dec_deg=0.0)]
     html = _sky_map(wrapped)
-    assert '<figure class="skymap">' in html
+    assert '<figure class="skymap zoommap">' in html
     # 12 arcminutes apart: the ring labels stay in the arcminute regime, not ~180 degrees.
     assert ">12.0\u2032</text>" in html and "\u00b0</text>" not in html
 
@@ -957,7 +975,7 @@ def test_sky_map_skips_non_finite_and_missing_coordinates():
                dict(sky_sources()[2], ra_deg=None),
                sky_sources()[3], sky_sources()[4]]
     html = _sky_map(sources)
-    assert '<figure class="skymap">' in html
+    assert '<figure class="skymap zoommap">' in html
     assert html.count('class="src ') == 2
     # Fewer than two finite positions: no map at all.
     assert _sky_map(sources[:3]) == ""

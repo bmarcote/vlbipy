@@ -71,6 +71,9 @@ _FRINGE_PARAMS = (("phase", "phase (deg)"), ("delay", "delay (ns)"),
 SNR_COLORMAP = "viridis"
 #: Fill color for scan/antenna cells with no solution (absent antenna or failed solve).
 NO_DATA_COLOR = "#d9d9d9"
+#: Fringe SNR below which a cell of the SNR matrix is red (no detection), and that red.
+SNR_RED_BELOW = 3.0
+SNR_RED_COLOR = "#d62728"
 
 
 def style_axis(axis, *, grid: bool = True) -> None:
@@ -402,12 +405,17 @@ def plot_corrected_spectrum(spectrum: dict, plot_dir: Union[str, Path], project_
         outfile_stem=f"{project_code}{suffix}.spectrum", dpi=dpi, models=models)]
 
 
+#: Longest time span (hours) a time series is drawn in minutes; longer ones are drawn in hours.
+MINUTES_AXIS_MAX_HOURS = 1.5
+
+
 def plot_baseline_timeseries(series: dict, plot_dir: Union[str, Path], project_code: str = "",
-                             label: str = "", dpi: int = 150) -> list[Path]:
+                             label: str = "", dpi: int = 150, heading: str = "") -> list[Path]:
     """Plot amplitude and phase vs time, per baseline, in the same stacked layout.
 
-    The frequency companion to :func:`plot_corrected_spectrum`: same panels, same
-    fixed polarization colors, x axis in hours from the start of the observation.
+    The frequency companion to :func:`plot_corrected_spectrum`: same panels, same fixed polarization colors, x
+    axis in time from the first sample - in minutes when the data span at most :data:`MINUTES_AXIS_MAX_HOURS`
+    (a single scan), in hours otherwise. ``heading`` (e.g. "before calibration") opens the figure title.
 
     Returns
     -------
@@ -420,23 +428,26 @@ def plot_baseline_timeseries(series: dict, plot_dir: Union[str, Path], project_c
         return []
     pol_labels = series.get("polarizations") or ["P1", "P2"]
     times = np.asarray(series.get("times") or [], dtype=float)
-    hours = (times - times.min()) / 3600.0 if times.size else np.array([0.0])
-    panels = [(name if isinstance(name, str) else "-".join(name), [(hours, np.asarray(values))])
+    span = float(times.max() - times.min()) / 3600.0 if times.size else 0.0
+    unit, scale = ("minutes", 60.0) if span <= MINUTES_AXIS_MAX_HOURS else ("hours", 3600.0)
+    offsets = (times - times.min()) / scale if times.size else np.array([0.0])
+    panels = [(name if isinstance(name, str) else "-".join(name), [(offsets, np.asarray(values))])
               for name, values in baselines.items()]
     model_baselines = series.get("model_baselines") or {}
-    models = [[(hours, np.asarray(model_baselines[name]))] if name in model_baselines else None
+    models = [[(offsets, np.asarray(model_baselines[name]))] if name in model_baselines else None
               for name in baselines]
     # The model line is broken between scans: a bin further than a few bin widths from the previous one.
-    steps = np.diff(hours)
+    steps = np.diff(offsets)
     gap = 3.0 * float(np.median(steps[steps > 0])) if (steps > 0).any() else None
     details = [f"{series.get('column', '')} data"]
     if series.get("field"):
         details.append(series["field"])
     suffix = f".{label}" if label else ""
+    opening = f"{heading[:1].upper()}{heading[1:]}: " if heading else ""
     return [plot_baseline_panels(
         panels, plot_dir, project_code, pol_labels=pol_labels,
-        x_label="time (hours from start)",
-        title=f"{project_code} — amplitude and phase vs time ({', '.join(details)})",
+        x_label=f"time ({unit} from start)",
+        title=f"{project_code} — {opening}amplitude and phase vs time ({', '.join(details)})",
         outfile_stem=f"{project_code}{suffix}.timeseries", dpi=dpi, models=models, model_gap=gap)]
 
 
@@ -1471,6 +1482,32 @@ def snr_matrix_filename(project_code: str, source: str, polarization: str) -> st
     return f"{project_code}.snr_matrix.{str(source).replace('/', '_')}.{polarization}.png"
 
 
+def snr_colormap(norm: LogNorm, n_colors: int = 256):
+    """Colormap of the SNR matrix for ``norm``: red up to :data:`SNR_RED_BELOW`, then :data:`SNR_COLORMAP`.
+
+    A non-detection must not look like a weak detection, so everything below the threshold is red; the last
+    tenth (in log SNR) of that red part blends into the bottom of the regular scale, which then spans the rest.
+    SNRs below ``norm.vmin`` are red too and cells without a solution are :data:`NO_DATA_COLOR`.
+    """
+    from matplotlib.colors import ListedColormap, to_rgba
+
+    base = matplotlib.colormaps[SNR_COLORMAP]
+    edge = float(norm(SNR_RED_BELOW))
+    positions = np.linspace(0.0, 1.0, n_colors)
+    red, start = np.array(to_rgba(SNR_RED_COLOR)), np.array(base(0.0))
+    blend_from = 0.9 * edge
+    colors = []
+    for position in positions:
+        if position < blend_from:
+            colors.append(red)
+        elif position < edge:
+            fraction = (position - blend_from) / max(edge - blend_from, 1e-9)
+            colors.append((1.0 - fraction) * red + fraction * start)
+        else:
+            colors.append(np.array(base((position - edge) / max(1.0 - edge, 1e-9))))
+    return ListedColormap(colors, name="vlbipy_snr").with_extremes(bad=NO_DATA_COLOR, under=SNR_RED_COLOR)
+
+
 class ScanSNRPlotter:
     """Render a :class:`~vlbipy.models.ScanSNRSurvey` as scan x antenna SNR matrices, one per source.
 
@@ -1549,7 +1586,7 @@ class ScanSNRPlotter:
         figure, axis = plt.subplots(figsize=(max(5.0, 0.5 * n_antennas + 3.5),
                                              min(12.0, max(3.0, 0.16 * n_scans + 2.0))),
                                     layout="constrained")
-        colormap = matplotlib.colormaps[SNR_COLORMAP].with_extremes(bad=NO_DATA_COLOR)
+        colormap = snr_colormap(norm)
         image = axis.imshow(matrix, aspect="auto", interpolation="nearest", origin="upper",
                             cmap=colormap, norm=norm, extent=(-0.5, n_antennas - 0.5, n_scans - 0.5, -0.5))
 
@@ -1567,20 +1604,18 @@ class ScanSNRPlotter:
         axis.set_title(f"{survey.project_code} — fringe SNR, {name}{polarization} ({n_scans} scan"
                        f"{'s' if n_scans != 1 else ''})\ncentral {100 * survey.channel_fraction:.0f}{percent_sign()} of "
                        f"channels{refant}; "
-                       "grey = no solution", fontsize=10, loc="left")
+                       f"red = SNR < {SNR_RED_BELOW:g}, grey = no solution", fontsize=10, loc="left")
         figure.savefig(outfile, dpi=self.dpi)
         plt.close(figure)
         logger.info("scan SNR matrix written: {}", outfile)
         return outfile
 
     def _norm(self, matrix: np.ndarray) -> LogNorm:
-        """Return a log color normalization spanning the finite, positive SNRs."""
+        """Return a log color normalization from SNR 1 (the red part, see :func:`snr_colormap`) up to the
+        99th percentile of the finite, positive SNRs (at least 10x :data:`SNR_RED_BELOW`)."""
         finite = matrix[np.isfinite(matrix) & (matrix > 0)]
-        if not finite.size:
-            return LogNorm(vmin=1.0, vmax=10.0)
-        vmin = max(1.0, float(np.nanpercentile(finite, 1)))
-        vmax = max(vmin * 10.0, float(np.nanpercentile(finite, 99)))
-        return LogNorm(vmin=vmin, vmax=vmax)
+        vmax = float(np.nanpercentile(finite, 99)) if finite.size else 0.0
+        return LogNorm(vmin=1.0, vmax=max(10.0 * SNR_RED_BELOW, vmax))
 
     def _label_budget(self, axis) -> int:
         """Allow at least a quarter inch per categorical label, with at most thirty labels."""
@@ -1698,12 +1733,20 @@ class CalTablePlotter:
         return self._plot_gains(data, base, stem)
 
     # -- figure builders --
-    def _antenna_figure(self, antennas: np.ndarray, names: list[str], sharey: bool = False):
-        """Create the per-antenna subplot grid; returns (fig, {antenna_id: axis})."""
+    def _antenna_figure(self, antennas: np.ndarray, names: list[str], sharey: bool = False,
+                        single_column: bool = False):
+        """Create the per-antenna subplot grid; returns (fig, {antenna_id: axis}).
+
+        ``single_column`` stacks the antennas in one wide column (time series spanning the whole observation).
+        """
         present = sorted(int(a) for a in np.unique(antennas))
-        nrows, ncols = subplot_grid(len(present))
-        fig, axes = plt.subplots(nrows, ncols, figsize=(3.4 * ncols, 2.4 * nrows),
-                                 sharex=True, sharey=sharey, squeeze=False)
+        if single_column:
+            nrows, ncols = max(1, len(present)), 1
+            figsize = (11.0, 1.7 * nrows + 0.8)
+        else:
+            nrows, ncols = subplot_grid(len(present))
+            figsize = (3.4 * ncols, 2.4 * nrows)
+        fig, axes = plt.subplots(nrows, ncols, figsize=figsize, sharex=True, sharey=sharey, squeeze=False)
         axis_of = {}
         for i, antenna_id in enumerate(present):
             axis = axes[i // ncols][i % ncols]
@@ -1851,15 +1894,19 @@ class CalTablePlotter:
         """Fringe solutions in phase, delay, rate order.
 
         SBD is a frequency-dependent instrumental solution, so its x axis is the
-        subband centre frequency (or subband index when frequencies are unavailable).
-        MBD remains a time-series solution.
+        subband centre frequency (or subband index when frequencies are unavailable),
+        and it has no rate figure: the rates are not fitted (``zerorates``), so they are
+        all zero. MBD remains a time-series solution over the whole observation, drawn
+        with the antennas stacked in one wide column.
         """
         n_pol = data["param"].shape[2] // len(_FRINGE_PARAMS)
         is_sbd = str(stem).lower().startswith("sbd")
         times = np.array([mjdsec2datetime(t) for t in data["time"]])
         written = []
         for param_index, (tag, ylabel) in enumerate(_FRINGE_PARAMS[:3]):  # skip disp by default
-            fig, axis_of = self._antenna_figure(data["antenna"], data["antenna_names"])
+            if is_sbd and tag == "rate":
+                continue
+            fig, axis_of = self._antenna_figure(data["antenna"], data["antenna_names"], single_column=not is_sbd)
             for antenna_id, axis in axis_of.items():
                 for spw in np.unique(data["spw"]):
                     rows = (data["antenna"] == antenna_id) & (data["spw"] == spw)
@@ -1890,6 +1937,9 @@ class CalTablePlotter:
                 axis.set_ylabel(ylabel, fontsize=8)
             out = outfile.with_suffix(f".{tag}.png")
             written.append(self._finish(fig, self._pol_legend_handles(n_pol), f"{stem} — {tag}", out))
+        if is_sbd:
+            # A rate figure of an earlier version would otherwise stay next to the new ones in the report.
+            outfile.with_suffix(".rate.png").unlink(missing_ok=True)
         return written
 
     def _freq_axis(self, spw: int, count: int) -> np.ndarray:
@@ -1902,9 +1952,12 @@ class CalTablePlotter:
     def _plot_gains(self, data: dict, outfile: Path, stem: str) -> list[Path]:
         """Complex gains (G/B Jones): bandpass tables (nchan > 1) get one combined PNG with an
         amplitude/phase pair per antenna vs frequency; single-channel (scalar) gains get the
-        amplitude vs time only."""
+        amplitude vs time only, except the scalar bandpass (one level per antenna, subband and
+        polarization for the whole run), which is drawn against frequency."""
         if data["param"].shape[1] > 1:
             return [self._plot_bandpass(data, outfile, stem)]
+        if str(stem).lower().startswith("scalar_bp"):
+            return [self._plot_subband_levels(data, outfile, stem)]
         n_pol = data["param"].shape[2]
         times = np.array([mjdsec2datetime(t) for t in data["time"]])
         fig, axis_of = self._antenna_figure(data["antenna"], data["antenna_names"])
@@ -1921,6 +1974,34 @@ class CalTablePlotter:
             axis.set_ylabel("amplitude", fontsize=8)
         out = outfile.with_suffix(".amp.png")
         return [self._finish(fig, self._pol_legend_handles(n_pol), f"{stem} — amplitude", out)]
+
+    def _plot_subband_levels(self, data: dict, outfile: Path, stem: str) -> Path:
+        """Amplitude level per subband (x = subband centre frequency): one point per antenna, subband and pol.
+
+        The scalar bandpass holds a single time-independent level per antenna, subband and polarization. The
+        table has one row per calibrator field and subband (each stamped at the time centroid of that field's
+        data in that subband), all carrying the same merged value, so a plot against time shows a cloud of
+        identical points minutes apart; the level is drawn once, against frequency, instead.
+        """
+        n_pol = data["param"].shape[2]
+        fig, axis_of = self._antenna_figure(data["antenna"], data["antenna_names"])
+        for antenna_id, axis in axis_of.items():
+            for pol in range(n_pol):
+                xs, levels = [], []
+                for spw in np.unique(data["spw"]):
+                    rows = np.where((data["antenna"] == antenna_id) & (data["spw"] == spw))[0]
+                    values = np.abs(data["param"][rows, 0, pol]).astype(float)
+                    values = values[~data["flag"][rows, 0, pol] & np.isfinite(values)]
+                    frequencies = np.asarray(self.frequencies.get(int(spw), []), dtype=float)
+                    xs.append(float(np.nanmean(frequencies)) if frequencies.size else float(spw))
+                    levels.append(float(np.median(values)) if values.size else np.nan)
+                axis.plot(xs, levels, marker="o", ms=4.0 if pol == 0 else 2.5, lw=0.8,
+                          color=POL_COLORS[pol % len(POL_COLORS)])
+            axis.axhline(1.0, color="0.35", lw=0.6, ls=":")
+            axis.set_xlabel("frequency (GHz)" if self.frequencies else "subband", fontsize=8)
+            axis.set_ylabel("amplitude", fontsize=8)
+        out = outfile.with_suffix(".amp.png")
+        return self._finish(fig, self._pol_legend_handles(n_pol), f"{stem} — amplitude level per subband", out)
 
     def _plot_bandpass(self, data: dict, outfile: Path, stem: str) -> Path:
         """Bandpass amplitude (top) and phase (bottom) vs frequency, one gapless pair per antenna."""

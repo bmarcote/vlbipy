@@ -292,6 +292,16 @@ def time_amplitude_selfcal(obs, prefix: str, parent_ms: str, *, solint: str = "s
                        for a in range(min(len(names), curve.shape[1]))
                        if np.isfinite(curve[:, a]).any() and np.nanmax(curve[:, a]) - np.nanmin(curve[:, a]) > 0.02}
     report["flagged"] = {names[a]: int(dead[:, a].sum()) for a in range(min(len(names), dead.shape[1])) if dead[:, a].any()}
+    record = {"source": obs.source, "solint": solint, "improvement": improvement,
+              "convention": "amplitude factor the visibilities of the station were multiplied by, normalised to its "
+                            "median over time (the level is the Bayesian gscale one); null = flagged (no signal). "
+                            "CASA tables store the reciprocal.",
+              "times_mjd": [float(sol.ref_mjd + t / 86400.0) for t in np.asarray(sol.times, dtype=float)],
+              "interval_sec": [float(v) for v in np.asarray(sol.interval, dtype=float)],
+              "gain": {names[a]: [float(v) if np.isfinite(v) else None for v in curve[:, a]]
+                       for a in range(min(len(names), curve.shape[1]))}}
+    report["json"] = f"{prefix}.ampt.json"
+    Path(report["json"]).write_text(json.dumps(record, indent=2), encoding="utf-8")
     logger.info("difmapy: time-dependent amplitude corrections -> {} ({}){}", Path(report["table"]).name,
                 ", ".join(f"{n} {lo:.2f}-{hi:.2f}" for n, (lo, hi) in report["range"].items()) or "all within 2%",
                 "; flagged (no signal): " + ", ".join(f"{n} {k} integration(s)" for n, k in report["flagged"].items())
@@ -562,7 +572,7 @@ def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_value
                      solints: Optional[list[str]] = None, min_improvement: float = 0.002,
                      max_bad_fraction: float = 0.25, bayes_models=("current", "gauss1", "gauss2", "gauss3"),
                      prior_sigma: float = 0.1, workers: Optional[int] = None, imagename: Optional[str] = None,
-                     search_fov_mas: float = 0.0, search_sigma: float = 10.0, recentre_min_beams: float = 10.0,
+                     search_fov_mas: float = 0.0, search_sigma: float = 8.0, recentre_min_beams: float = 10.0,
                      mapsize: int = IMAGE_PIXELS, fixed_antennas: tuple = (), deferred_antennas: tuple = (),
                      fix_stage1: bool = True, bayes_per_if: bool = False, time_amplitude: str = "scan",
                      time_amplitude_min_improvement: float = 0.01, model_components: int = 1,
@@ -826,7 +836,7 @@ def refine_against_model(split_ms: str, parent_ms: str, prefix: str, model_path:
     return report
 
 
-def find_peak(obs, *, fov_mas: float = 1000.0, threshold_sigma: float = 10.0, fits_path: str = "") -> dict:
+def find_peak(obs, *, fov_mas: float = 1000.0, threshold_sigma: float = 8.0, fits_path: str = "") -> dict:
     """Search a wide dirty map (no CLEAN) for the brightest point and judge its significance.
 
     The map is naturally weighted for sensitivity and twice ``fov_mas`` wide,
@@ -895,7 +905,7 @@ def _record_shift(fits_path: str, east_mas: float, north_mas: float) -> None:
         hdul.flush()
 
 
-def locate_source(obs, imagename: str, *, search_fov_mas: float = 1000.0, search_sigma: float = 10.0,
+def locate_source(obs, imagename: str, *, search_fov_mas: float = 1000.0, search_sigma: float = 8.0,
                   recentre_min_beams: float = 10.0, robust: float = 0.0) -> tuple[dict, tuple[float, float]]:
     """Find the source in a wide dirty map and re-centre on it only when it is far from the phase centre.
 
@@ -937,7 +947,7 @@ def locate_source(obs, imagename: str, *, search_fov_mas: float = 1000.0, search
 
 
 def image_source(split_ms: str, imagename: str, *, robust_values=(-2.0, 0.0, 2.0), search_fov_mas: float = 0.0,
-                 search_sigma: float = 10.0, recentre_min_beams: float = 10.0, average_channels: bool = True,
+                 search_sigma: float = 8.0, recentre_min_beams: float = 10.0, average_channels: bool = True,
                  mapsize: int = IMAGE_PIXELS, **imaging_kwargs) -> dict:
     """Fit one Gaussian to an already-calibrated target/check source first, without self-calibration or CLEAN fallback.
 
