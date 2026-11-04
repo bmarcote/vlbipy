@@ -337,6 +337,23 @@ def test_write_tec_table_applies_each_field_its_own_correction(tmp_path, native_
     assert report["interp_error"] < 2e-3
 
 
+def test_tec_rate_is_finite_at_the_edges_of_the_ionex_coverage(tmp_path):
+    """Rows within RATE_STEP of the first/last map get a one-sided rate, not NaN (linear TEC: 2 TECU/h)."""
+    maps = ionex.read_ionex(write_ionex(tmp_path / "lin.inx", dt.date(2025, 9, 16), linear_tec))
+    first, last = float(maps.epochs[0]), float(maps.epochs[-1])
+    setup = {"antenna_xyz": ANTENNA_XYZ, "field_dirs": FIELD_RADEC, "field_names": ["A", "B"],
+             "antenna_names": ["EF", "WB", "HH"]}
+    scans = [(0, 1, first, first + 60.0), (0, 2, last - 60.0, last)]
+    rows = tec._field_rows(maps, setup, 0, scans, 30.0, True, {}, (CHAN_FREQ[0][0], CHAN_FREQ[0][-1], CHAN_FREQ[0][0]))
+    assert rows["time"][0] == first and rows["time"][-1] == last
+    assert np.isfinite(rows["stec_rate"]).all()
+    times = rows["time"]
+    reference = (tec.slant_tec(maps, ANTENNA_XYZ, *FIELD_RADEC[0], times + 1.0)["stec"]
+                 - tec.slant_tec(maps, ANTENNA_XYZ, *FIELD_RADEC[0], times - 1.0)["stec"]) / 2.0
+    inner = (times > first + tec.RATE_STEP) & (times < last - tec.RATE_STEP)
+    assert np.allclose(rows["stec_rate"][inner], reference.T[inner], rtol=1e-3, atol=1e-7)
+
+
 def test_write_tec_table_fails_clearly_without_maps(tmp_path, native_engine, no_network):
     ms = make_ms(tmp_path / "sim.ms")
     with pytest.raises(FileNotFoundError, match="no IONEX product covers days 2025/259"):

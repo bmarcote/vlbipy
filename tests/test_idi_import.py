@@ -18,6 +18,7 @@ import pytest
 
 from vlbipy.casacore_format.table import Table
 from vlbipy.casacore_format.tabledat import read_table_dat, serialize_table_dat
+from vlbipy.solvers import idi_import
 from vlbipy.solvers.idi_import import import_fitsidi
 from vlbipy.solvers.ms_metadata import ms_summary
 
@@ -25,8 +26,10 @@ REPO = Path(__file__).resolve().parents[1]
 IDI_DIR = Path(os.environ.get("VLBIPY_RSM07_IDI", REPO / "test" / "RSM07"))
 IDI_FILES = [IDI_DIR / "rsm07_1_1.IDI1", IDI_DIR / "rsm07_1_1.IDI2"]
 REFERENCE = Path(os.environ.get("VLBIPY_RSM07_IMPORT_REF", REPO / "test" / "RSM07_import_ref")) / "RSM07.mms"
-pytestmark = pytest.mark.skipif(not (all(f.is_file() for f in IDI_FILES) and (REFERENCE / "table.dat").is_file()),
-                                reason="RSM07 FITS-IDI files or the CASA reference import not available")
+HAVE_RSM07 = all(f.is_file() for f in IDI_FILES)
+needs_rsm07 = pytest.mark.skipif(not HAVE_RSM07, reason="RSM07 FITS-IDI files not available")
+needs_reference = pytest.mark.skipif(not (HAVE_RSM07 and (REFERENCE / "table.dat").is_file()),
+                                     reason="RSM07 FITS-IDI files or the CASA reference import not available")
 #: HISTORY messages that depend on the CASA version or on where the import ran.
 PATH_DEPENDENT = ("version:", "vis ", "outputvis ", "fitsidifile ")
 #: msmetadata of a Multi-MS, printed as one repr (run in a subprocess started in a scratch directory).
@@ -111,6 +114,7 @@ def _main_differences(ours: Path, casa: Path) -> list:
     return problems
 
 
+@needs_reference
 def test_import_fitsidi_matches_casa(tmp_path):
     out = tmp_path / "RSM07.mms"
     try:
@@ -142,3 +146,63 @@ def test_import_fitsidi_matches_casa(tmp_path):
         assert runs[0].stdout.strip().splitlines()[-1] == runs[1].stdout.strip().splitlines()[-1]
     finally:
         shutil.rmtree(out, ignore_errors=True)                # ~6 GB
+
+
+def test_time_index_summary_uses_the_time_range_not_the_first_and_last_rows():
+    index = {"time": np.array([200.0, 100.0, 300.0, 150.0]), "interval": np.array([2.0, 2.0, 4.0, 1.0], np.float32),
+             "field": np.array([0, 1, 0, 1])}
+    summary = idi_import.time_index_summary(index, {"nspw": 2}, np.array([1, 2, 1, 2]))
+    assert (summary["time_start"], summary["time_end"]) == (100.0, 304.0)
+    assert (summary["nfield"], summary["nspw"], summary["nscan"]) == (2, 2, 2)
+
+
+def test_part_index_carries_only_the_rows_of_its_chunks():
+    index = {"time": np.arange(10.0) * 3.0, "ant1": np.arange(10) % 4}
+    chunks = [{"rows": np.array([7, 2, 5]), "band": 0, "spw": 0, "scan": 1},
+              {"rows": np.array([7, 2, 5]), "band": 1, "spw": 1, "scan": 1}, {"rows": np.array([9]), "band": 0,
+                                                                               "spw": 0, "scan": 3}]
+    cut = idi_import.part_index(index, chunks)
+    assert cut["index"]["time"].size == 4
+    for original, local in zip(chunks, cut["chunks"]):
+        assert {k: v for k, v in local.items() if k != "rows"} == {k: v for k, v in original.items() if k != "rows"}
+        for key in index:
+            assert np.array_equal(cut["index"][key][local["rows"]], index[key][original["rows"]])
+
+
+def _rsm07_plan():
+    """Setup, UV tables, row index and part plan of the RSM07 files (8 parts, as the import)."""
+    from vlbipy.solvers.idi_subtables import read_idi_setup
+    setup = read_idi_setup([str(f) for f in IDI_FILES])
+    tables = idi_import.uv_tables([str(f) for f in IDI_FILES])
+    index = idi_import.read_index(tables, setup)
+    scans = idi_import.scan_numbers(index["time"], index["field"], index["array"], 15.0)
+    parts = idi_import.plan_parts(index, scans, int(setup["nif"]), 8, int(setup["nchan"]) * int(setup["ncorr"]))
+    return setup, tables, index, parts
+
+
+@needs_rsm07
+def test_part_written_from_the_cut_index_is_bit_identical(tmp_path):
+    setup, tables, index, parts = _rsm07_plan()
+    chunks = [dict(c, rows=c["rows"][:300]) for c in parts[0][:2]]      # small, two subbands of one scan
+    idi_import.write_part_job(path=str(tmp_path / "full.ms"), tables=tables, chunks=chunks, index=index,
+                              setup=setup)
+    idi_import.write_part_job(path=str(tmp_path / "cut.ms"), tables=tables, setup=setup,
+                              **idi_import.part_index(index, chunks))
+    with Table(tmp_path / "full.ms") as full, Table(tmp_path / "cut.ms") as cut:
+        assert full.nrows() == cut.nrows() == 600
+        for name in full.colnames():
+            if name != "FLAG_CATEGORY":
+                assert np.array_equal(full.getcol(name), cut.getcol(name)), name
+
+
+@needs_rsm07
+def test_failed_import_removes_the_partial_multi_ms(tmp_path, monkeypatch):
+    from vlbipy.solvers.workers import WorkerError
+
+    def failing_run_jobs(*args, **kwargs):
+        raise WorkerError("worker job write_part_job failed")
+    monkeypatch.setattr(idi_import, "run_jobs", failing_run_jobs)
+    out = tmp_path / "RSM07.mms"
+    with pytest.raises(WorkerError):
+        import_fitsidi([str(f) for f in IDI_FILES], out, scan_gap=15.0)
+    assert not out.exists()

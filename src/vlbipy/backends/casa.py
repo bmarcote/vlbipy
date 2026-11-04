@@ -61,6 +61,12 @@ FRINGE_OUTLIER_FLOOR = {"delay": 2.0, "rate": 1e-12}
 #: Fringe-fit keywords of the native solver only (:func:`vlbipy.solvers.fringefit.fringefit`), not of CASA's task.
 NATIVE_FRINGEFIT_KEYS = ("prior_scans", "prior_delay_window_ns", "prior_rate_window")
 
+#: Fringe SNR at or above which a solution is a detection even when the antenna's other solutions are noise: the
+#: highest noise peak of a delay-rate search over a scan stays around SNR 5-6. An antenna judged "not detected" keeps
+#: these (RSM06A: HH, IR, O8, TR, WB were noise on the phase calibrator but at SNR > 1000 on the fringe finders, and
+#: flagging those too left the bandpass and the second SBD with no data).
+RELIABLE_FRINGE_SNR = 20.0
+
 #: Lower-case fragments of the fringe-fit errors (native solver and CASA task) that mean the selection held no
 #: usable data: the solve is then retried on another scan instead of failing the step.
 EMPTY_SELECTION_PATTERNS = ("no solution interval had data", "no data for field", "selects zero rows",
@@ -461,10 +467,25 @@ def _delay_peak_amplitude(values: np.ndarray, good: np.ndarray, *, padding: int 
 
 
 def _channel_average(values, flags: np.ndarray, pol_indices: list[int]) -> np.ndarray:
-    """Vector-average a ``(npol, nchan, nrow)`` block over channels -> ``(nrow, n_selected_pol)``."""
-    masked = np.where(flags, np.nan, np.asarray(values))[pol_indices, :, :]
+    """Vector-average a ``(npol, nchan, nrow)`` block over channels -> ``(nrow, n_selected_pol)``.
+
+    Samples where ``flags`` is True are left out (``nan`` where a row has none left in a hand). Callers
+    reading raw data pass ``flag | (data == 0)``: zero-filled rows of a subband an antenna never recorded
+    are not data, and the same mask must apply to a model averaged alongside.
+    """
+    masked = np.where(np.asarray(flags, dtype=bool), np.nan, np.asarray(values))[pol_indices, :, :]
     with np.errstate(invalid="ignore"):
         return np.nanmean(masked, axis=1).T
+
+
+def _fringe_param_layout(n_param: int) -> tuple[int, int]:
+    """``(npol, npar)`` of a Fringe Jones FPARAM column with ``n_param`` rows.
+
+    Each polarization holds phase, delay, rate and optionally a dispersive term: 6 or 8 rows are two
+    polarizations of 3 or 4 parameters, anything else is one polarization.
+    """
+    npol = 2 if n_param in (6, 8) else 1
+    return npol, max(n_param // npol, 1)
 
 
 def _finite_mean(block: np.ndarray) -> np.ndarray:
@@ -1066,7 +1087,11 @@ class CasaDataOps(DataOps):
         try:
             for spw in range(n_spw):
                 ms_tool.selectinit(datadescid=spw)
-                select_ms_rows(ms_tool, field=field, baseline=f"{refant}&*", scans=scans)
+                try:
+                    select_ms_rows(ms_tool, field=field, baseline=f"{refant}&*", scans=scans)
+                except BackendError:
+                    ms_tool.reset()
+                    continue     # nothing recorded in this subband for this selection
                 try:
                     record = ms_tool.getdata([column_name, "flag", "antenna1", "antenna2"]
                                              + (["uvw"] if model else []))
@@ -1077,7 +1102,8 @@ class CasaDataOps(DataOps):
                 values = record.get(column_name)
                 if values is None or not values.size:
                     continue
-                flags = np.asarray(record["flag"], dtype=bool)
+                # Zero-filled rows (a subband an antenna never recorded) count as flagged.
+                flags = np.asarray(record["flag"], dtype=bool) | (np.asarray(values) == 0)
                 predicted = _model_cube(model, record, np.asarray(meta.freq_setup.frequencies_ghz(spw)) * 1e9,
                                         values.shape)
                 values = np.where(flags, np.nan, values)          # (npol, nchan, nrow)
@@ -1190,7 +1216,7 @@ class CasaDataOps(DataOps):
                 values = record.pop(column_name, None)
                 if values is None or not values.size:
                     continue
-                flags = np.asarray(record.pop("flag"), dtype=bool)
+                flags = np.asarray(record.pop("flag"), dtype=bool) | (np.asarray(values) == 0)   # zeros: not recorded
                 values = np.where(flags[pol_indices, :, :], np.nan, values[pol_indices, :, :])
                 del flags
                 if stokes_i:                       # I = (RR + LL) / 2
@@ -1299,7 +1325,7 @@ class CasaDataOps(DataOps):
                 values = record.pop(column_name, None)
                 if values is None or not values.size:
                     continue
-                good = ~np.asarray(record.pop("flag"), dtype=bool)[pol_indices, :, :]
+                good = ~np.asarray(record.pop("flag"), dtype=bool)[pol_indices, :, :] & (values[pol_indices, :, :] != 0)
                 count = good.sum(axis=(0, 1))
                 if delay_search:
                     row_values = _delay_peak_amplitude(values[pol_indices, :, :], good)
@@ -1407,8 +1433,12 @@ class CasaDataOps(DataOps):
         try:
             for spw in range(meta.freq_setup.n_subbands):
                 ms_tool.selectinit(datadescid=spw)
-                select_ms_rows(ms_tool, field=",".join(wanted), baseline=f"{refant}&*",
-                               scans=sorted(wanted_scans))
+                try:
+                    select_ms_rows(ms_tool, field=",".join(wanted), baseline=f"{refant}&*",
+                                   scans=sorted(wanted_scans))
+                except BackendError:
+                    ms_tool.reset()
+                    continue     # nothing recorded in this subband for this selection
                 try:
                     record = ms_tool.getdata([column_name, "flag", "antenna1", "antenna2", "time"]
                                              + (["uvw"] if model else []))
@@ -1418,7 +1448,7 @@ class CasaDataOps(DataOps):
                 values = record.get(column_name)
                 if values is None or not values.size:
                     continue
-                flags = np.asarray(record["flag"], dtype=bool)
+                flags = np.asarray(record["flag"], dtype=bool) | (np.asarray(values) == 0)   # zeros: not recorded
                 predicted = _model_cube(model, record, np.asarray(meta.freq_setup.frequencies_ghz(spw)) * 1e9,
                                         values.shape)
                 if predicted is not None:
@@ -1666,7 +1696,7 @@ class CasaDataOps(DataOps):
                 values = record.get(column_name)
                 if values is None or not values.size:
                     continue
-                flags = np.asarray(record["flag"], dtype=bool)
+                flags = np.asarray(record["flag"], dtype=bool) | (np.asarray(values) == 0)   # zeros: not recorded
                 per_row = _channel_average(values, flags, pol_indices)          # (nrow, npol)
                 predicted = _model_cube(model, record, np.asarray(meta.freq_setup.frequencies_ghz(spw)) * 1e9,
                                         values.shape)
@@ -1757,7 +1787,11 @@ class CasaDataOps(DataOps):
         try:
             for spw in range(n_spw):
                 ms_tool.selectinit(datadescid=spw)
-                select_ms_rows(ms_tool, field=field, baseline="*&&&", scans=scans)
+                try:
+                    select_ms_rows(ms_tool, field=field, baseline="*&&&", scans=scans)
+                except BackendError:
+                    ms_tool.reset()
+                    continue     # nothing recorded in this subband for this selection
                 try:
                     record = ms_tool.getdata([column_name, "flag", "antenna1"])
                 except RuntimeError as exc:
@@ -1835,8 +1869,12 @@ class CasaDataOps(DataOps):
         try:
             for spw in range(n_spw):
                 ms_tool.selectinit(datadescid=spw)
-                select_ms_rows(ms_tool, field=",".join(fields), baseline=f"{refant}&*",
-                               scans=[s.scan_number for s in scans])
+                try:
+                    select_ms_rows(ms_tool, field=",".join(fields), baseline=f"{refant}&*",
+                                   scans=[s.scan_number for s in scans])
+                except BackendError:
+                    ms_tool.reset()
+                    continue     # nothing recorded in this subband for this selection
                 try:
                     record = ms_tool.getdata([column_name, "flag", "antenna1", "antenna2", "scan_number"])
                 except RuntimeError as exc:
@@ -1845,7 +1883,8 @@ class CasaDataOps(DataOps):
                 values = record.get(column_name)
                 if values is None or not values.size:
                     continue
-                values = np.where(np.asarray(record["flag"], dtype=bool), np.nan, values)
+                # Zero-filled rows (a subband an antenna never recorded) count as flagged.
+                values = np.where(np.asarray(record["flag"], dtype=bool) | (np.asarray(values) == 0), np.nan, values)
                 values = values[pol_indices, channels, :]                 # (npol, nsel, nrow)
                 ant1, ant2 = np.asarray(record["antenna1"]), np.asarray(record["antenna2"])
                 other = np.where(ant1 == refant_id, ant2, ant1)
@@ -1913,7 +1952,11 @@ class CasaDataOps(DataOps):
                 nums: dict[float, int] = {}
                 for spw in range(meta.freq_setup.n_subbands):
                     ms_tool.selectinit(datadescid=spw)
-                    select_ms_rows(ms_tool, field=scan.source, scans=[scan.scan_number])
+                    try:
+                        select_ms_rows(ms_tool, field=scan.source, scans=[scan.scan_number])
+                    except BackendError:
+                        ms_tool.reset()
+                        continue     # nothing recorded in this subband for this scan
                     try:
                         record = ms_tool.getdata([column_name, "flag", "time", "antenna1", "antenna2"])
                     except RuntimeError as exc:
@@ -1923,8 +1966,10 @@ class CasaDataOps(DataOps):
                     if values is None or not values.size:
                         continue
                     cross = np.asarray(record["antenna1"]) != np.asarray(record["antenna2"])
-                    ok = ~np.asarray(record["flag"], dtype=bool)[pol_indices][:, :, cross]
-                    chunk = np.where(ok, values[pol_indices][:, :, cross], 0.0)
+                    selected = np.asarray(values)[pol_indices][:, :, cross]
+                    # Zero-filled rows (a subband an antenna never recorded) are not data: n_vis skips them.
+                    ok = ~np.asarray(record["flag"], dtype=bool)[pol_indices][:, :, cross] & (selected != 0)
+                    chunk = np.where(ok, selected, 0.0)
                     times = np.asarray(record["time"], dtype=float)[cross]
                     row_sum, row_num = chunk.sum(axis=(0, 1)), ok.sum(axis=(0, 1))
                     for stamp in np.unique(times):
@@ -1958,10 +2003,11 @@ class CasaDataOps(DataOps):
                          metadata: Optional[ObsMetadata] = None) -> dict:
         """Read the sampled (u, v) points per source, in wavelengths.
 
-        The UVW column is per row and identical across subbands, so only the
-        first data description is read and the metres are converted with a
-        single band-centre frequency (``freq_setup.ref_freq``): the per-subband
-        spread in wavelengths is a few percent and irrelevant for a coverage plot.
+        The UVW column is per row and identical across subbands, so each baseline and
+        integration is kept once, when *any* subband holds unflagged data for it (an antenna
+        that did not record, or has flagged, the first subband must not vanish from the plot).
+        The metres are converted with a single band-centre frequency (``freq_setup.ref_freq``):
+        the per-subband spread in wavelengths is a few percent and irrelevant for a coverage plot.
         Autocorrelations and rows flagged entirely are dropped; fields with more
         than ``max_points`` samples keep every k-th row (deterministic).
 
@@ -1987,26 +2033,44 @@ class CasaDataOps(DataOps):
         ms_tool = self.backend.tools.ms()
         if not ms_tool.open(str(self.backend.ms_path(project_code))):
             raise BackendError(f"could not open MS for {project_code}")
+        pieces: list[tuple] = []
         try:
-            ms_tool.selectinit(datadescid=0)
-            select_ms_rows(ms_tool, field=",".join(wanted))
-            try:
-                record = ms_tool.getdata(["uvw", "flag", "flag_row", "antenna1", "antenna2",
-                                          "field_id"])
-            except RuntimeError as exc:
-                raise BackendError(f"{project_code}: could not read uvw: {exc}") from exc
+            for spw in range(max(1, meta.freq_setup.n_subbands)):
+                ms_tool.selectinit(datadescid=spw)
+                try:
+                    select_ms_rows(ms_tool, field=",".join(wanted))
+                except BackendError:
+                    ms_tool.reset()
+                    continue     # nothing recorded in this subband for these fields
+                try:
+                    record = ms_tool.getdata(["uvw", "flag", "flag_row", "antenna1", "antenna2",
+                                              "field_id", "time"])
+                except RuntimeError as exc:
+                    raise BackendError(f"{project_code}: could not read uvw: {exc}") from exc
+                ms_tool.reset()
+                uvw = np.asarray(record.get("uvw", np.empty((3, 0))), dtype=float)
+                if not uvw.size:
+                    continue
+                ant1, ant2 = np.asarray(record["antenna1"]), np.asarray(record["antenna2"])
+                flagged = np.asarray(record["flag_row"], dtype=bool) | np.asarray(
+                    record["flag"], dtype=bool).all(axis=(0, 1))
+                keep = (ant1 != ant2) & ~flagged
+                pieces.append((uvw[:, keep], ant1[keep], ant2[keep], np.asarray(record["field_id"])[keep],
+                               np.asarray(record.get("time", np.zeros(ant1.size)), dtype=float)[keep]))
         finally:
             ms_tool.close()
 
-        uvw = np.asarray(record.get("uvw", np.empty((3, 0))), dtype=float)
         fields: dict[str, dict[str, list[float]]] = {}
-        if uvw.size:
-            ant1, ant2 = np.asarray(record["antenna1"]), np.asarray(record["antenna2"])
-            flagged = np.asarray(record["flag_row"], dtype=bool) | np.asarray(
-                record["flag"], dtype=bool).all(axis=(0, 1))
-            keep = (ant1 != ant2) & ~flagged
-            field_ids = np.asarray(record["field_id"])
-            for fid in np.unique(field_ids[keep]):
+        if pieces:
+            uvw = np.concatenate([p[0] for p in pieces], axis=1)
+            ant1, ant2, field_ids, times = (np.concatenate([p[k] for p in pieces]) for k in range(1, 5))
+            # One point per (field, time, baseline): the same row appears once per subband with data.
+            row_keys = np.stack([field_ids.astype(float), times, ant1.astype(float), ant2.astype(float)], axis=1)
+            _, first = np.unique(row_keys, axis=0, return_index=True)
+            order = np.sort(first)
+            uvw, field_ids = uvw[:, order], field_ids[order]
+            keep = np.ones(field_ids.size, dtype=bool)
+            for fid in np.unique(field_ids):
                 rows = np.flatnonzero(keep & (field_ids == fid))
                 step = max(1, int(np.ceil(rows.size / max_points)))
                 rows = rows[::step]
@@ -2089,17 +2153,25 @@ class CasaDataOps(DataOps):
         return report
 
     def _antennas_with_data(self, ms: Path, antenna_names: list[str]) -> set[str]:
-        """Names of the antennas that appear on at least one main-table row (empty on read failure).
+        """Names of the antennas that appear on at least one main-table row (every name on read failure).
 
         Used to warn only for antennas missing Tsys *while they observed*: a station absent from
         the data or present only on subbands the antenna has no Tsys for is expected, not a defect.
+        When the main table cannot be read every antenna counts as observing, so the missing-Tsys
+        warning errs on the side of being raised.
         """
         table = self.backend.tools.table()
         try:
-            table.open(str(ms))
+            if not table.open(str(ms)):
+                raise BackendError(f"could not open {ms}")
+        except Exception as exc:  # noqa: BLE001 - every name: warns for everyone, the safe side
+            logger.warning("could not read the antennas with data from {}: {}", ms, exc)
+            return set(antenna_names)
+        try:
             used = np.unique(np.concatenate([np.asarray(table.getcol(c), dtype=np.int32)
                                              for c in ("ANTENNA1", "ANTENNA2")]))
-        except Exception:  # noqa: BLE001 - an empty set warns for everyone, the safe side
+        except Exception as exc:  # noqa: BLE001 - every name: warns for everyone, the safe side
+            logger.warning("could not read the antennas with data from {}: {}", ms, exc)
             return set(antenna_names)
         finally:
             table.close()
@@ -2338,10 +2410,19 @@ class CasaCalibrationOps(CalibrationOps):
                         interp="nearest")
 
     def _normalise_emerlin_table(self, table_path: Path, antennas: list[str], fixed: str) -> None:
-        """Divide every solution by the ``fixed`` antenna's gain and set unit gain for the rest."""
+        """Divide every solution by the ``fixed`` antenna's gain and set unit gain for the rest.
+
+        Per (time, subband) group and per parameter/channel cell, an outstation solution is divided by the
+        ``fixed`` antenna's gain. Where that reference cell is flagged, zero, or has no row at all, no ratio is
+        known: the outstation cell is set to unit gain, unflagged, so it keeps its a-priori amplitude (the same
+        outcome as a failed solve; flagging it would flag the data at applycal). Such cells are counted in a
+        warning. Antennas outside ``antennas`` + ``fixed`` get unit gain.
+        """
         names = {n.lower() for n in antennas} | {fixed.lower()}
         handle = self.backend.tools.table()
-        handle.open(str(table_path), nomodify=False)
+        if not handle.open(str(table_path), nomodify=False):
+            raise BackendError(f"could not open {table_path}")
+        n_unreferenced = 0
         try:
             ant_ids = np.asarray(handle.getcol("ANTENNA1"))
             gparam = np.asarray(handle.getcol("CPARAM"))           # (nparam, nchan, nrow)
@@ -2349,21 +2430,25 @@ class CasaCalibrationOps(CalibrationOps):
             ant_names = self._table_antenna_names(table_path)
             fixed_rows = {i for i, a in enumerate(ant_ids) if ant_names[a].lower() == fixed.lower()}
             solved_rows = {i for i, a in enumerate(ant_ids) if ant_names[a].lower() in names}
-            if not fixed_rows:
-                warnings.warn(f"emgain: {fixed} has no solution; gains normalised to the mean")
             # Per (time, spw) group, divide by the fixed antenna's gain.
             spw_ids = np.asarray(handle.getcol("SPECTRAL_WINDOW_ID"))
             times = np.asarray(handle.getcol("TIME"))
             for key in set(zip(times.tolist(), spw_ids.tolist())):
                 rows = np.flatnonzero((times == key[0]) & (spw_ids == key[1]))
                 ref = [r for r in rows if r in fixed_rows]
-                ref_gain = gparam[:, :, ref[0]].copy() if ref else np.ones(gparam.shape[:2])
-                ref_gain = np.where(ref_gain == 0, 1.0, ref_gain)
+                if ref:
+                    ref_ok = ~flags[:, :, ref[0]].astype(bool) & (gparam[:, :, ref[0]] != 0)
+                    ref_gain = np.where(ref_ok, gparam[:, :, ref[0]], 1.0)
+                else:
+                    ref_ok = np.zeros(gparam.shape[:2], dtype=bool)
+                    ref_gain = np.ones(gparam.shape[:2], dtype=complex)
                 for r in rows:
                     name = ant_names[ant_ids[r]].lower()
                     if r in solved_rows and name != fixed.lower():
-                        gparam[:, :, r] = gparam[:, :, r] / ref_gain
-                        flags[:, :, r] = flags[:, :, r] | ~np.isfinite(gparam[:, :, r])
+                        n_unreferenced += int((~ref_ok & ~flags[:, :, r].astype(bool)).sum())
+                        ratio = gparam[:, :, r] / ref_gain
+                        gparam[:, :, r] = np.where(ref_ok, ratio, 1.0 + 0.0j)
+                        flags[:, :, r] = np.where(ref_ok, flags[:, :, r] | ~np.isfinite(ratio), False)
                     else:
                         gparam[:, :, r] = 1.0 + 0.0j
                         flags[:, :, r] = False
@@ -2372,6 +2457,9 @@ class CasaCalibrationOps(CalibrationOps):
             handle.flush()
         finally:
             handle.close()
+        if n_unreferenced:
+            warnings.warn(f"emgain: {fixed} has no usable solution for {n_unreferenced} outstation cell(s) of "
+                          f"{table_path.name}; those keep their a-priori amplitudes (unit gain)")
         logger.info("emgain: e-MERLIN gains of {} normalised to {}=1; all other antennas set to 1",
                     table_path.name, fixed)
 
@@ -2386,7 +2474,8 @@ class CasaCalibrationOps(CalibrationOps):
     def _all_flagged(self, table_path: Path) -> bool:
         """True when a calibration table has no row, or no unflagged solution."""
         handle = self.backend.tools.table()
-        handle.open(str(table_path))
+        if not handle.open(str(table_path)):
+            raise BackendError(f"could not open {table_path} to count its solutions")
         try:
             return handle.nrows() == 0 or bool(np.all(handle.getcol("FLAG")))
         finally:
@@ -2471,7 +2560,8 @@ class CasaCalibrationOps(CalibrationOps):
     def smooth(self, project_code: str, table: CalTable, *, threshold: float = 6.0,
                max_passes: int = 3, window: int = 5, time_window: float = 600.0, min_points: int = 3,
                smoothtype: str = "median", **kwargs) -> CalTable:
-        """De-spike and smooth a calibration table in place, per antenna / subband / polarization / field.
+        """De-spike and smooth a real-valued (FPARAM, e.g. Tsys) calibration table in place, per antenna /
+        subband / polarization / field. A complex (CPARAM) table raises :class:`BackendError`.
 
         Each antenna-subband-polarization time series of one field is tested against its own
         median and MAD: points deviating by more than ``threshold`` robust sigmas
@@ -2520,7 +2610,11 @@ class CasaCalibrationOps(CalibrationOps):
         if not handle.open(str(path), nomodify=False):
             raise BackendError(f"could not open {path} for writing")
         try:
-            param_column = "FPARAM" if "FPARAM" in handle.colnames() else "CPARAM"
+            if "FPARAM" not in handle.colnames():
+                # Casting CPARAM to float would drop the imaginary part and write it back.
+                raise BackendError(f"{project_code}: smooth() supports real (FPARAM) tables such as Tsys only; "
+                                   f"{path.name} is complex")
+            param_column = "FPARAM"
             values = np.asarray(handle.getcol(param_column)).astype(float)  # (npar, nchan, nrow)
             flags = np.asarray(handle.getcol("FLAG")).astype(bool)
             antenna_ids = np.asarray(handle.getcol("ANTENNA1"))
@@ -2824,10 +2918,18 @@ class CasaCalibrationOps(CalibrationOps):
 
     @staticmethod
     def _timerange(start: float, end: float) -> str:
-        """CASA ``timerange`` string for MJD seconds ``start``-``end``."""
+        """CASA ``timerange`` string for MJD seconds ``start``-``end``, with fractional seconds (``hh:mm:ss.s``).
+
+        Tenths of a second are kept so a slid solve window (:meth:`_stage_window`) is not truncated; CASA
+        accepts ``YYYY/MM/DD/hh:mm:ss.s``.
+        """
         epoch = dt.datetime(1858, 11, 17)
-        fmt = "%Y/%m/%d/%H:%M:%S"
-        return f"{(epoch + dt.timedelta(seconds=start)).strftime(fmt)}~{(epoch + dt.timedelta(seconds=end)).strftime(fmt)}"
+
+        def stamp(seconds: float) -> str:
+            moment = epoch + dt.timedelta(seconds=round(float(seconds), 1))
+            return f"{moment.strftime('%Y/%m/%d/%H:%M:%S')}.{moment.microsecond // 100_000}"
+
+        return f"{stamp(start)}~{stamp(end)}"
 
     def _stage_window(self, project_code: str, meta: ObsMetadata, scan_number: int, refant: str,
                       antennas: list[str], max_window_sec: float) -> str:
@@ -2853,7 +2955,8 @@ class CasaCalibrationOps(CalibrationOps):
         query = (f"SCAN_NUMBER=={int(scan_number)} && ANTENNA1!=ANTENNA2 && "
                  f"((ANTENNA1=={ref} && ANTENNA2 IN [{listed}]) || (ANTENNA2=={ref} && ANTENNA1 IN [{listed}]))")
         table = self.backend.tools.table()
-        table.open(str(self.backend.ms_path(project_code)))
+        if not table.open(str(self.backend.ms_path(project_code))):
+            raise BackendError(f"{project_code}: could not open the measurement set to place the solve window")
         try:
             selected = table.query(query, columns="TIME, FLAG_ROW, ntrue(FLAG)/nelements(FLAG) AS FLAGGED")
             try:
@@ -2990,14 +3093,19 @@ class CasaCalibrationOps(CalibrationOps):
         the rows are appended as solved, on their own reference.
         """
         table = self.backend.tools.table()
-        table.open(str(main_path / "ANTENNA"))
+        if not table.open(str(main_path / "ANTENNA")):
+            raise BackendError(f"could not open {main_path / 'ANTENNA'}")
         try:
             names = [str(n) for n in table.getcol("NAME")]
         finally:
             table.close()
         wanted = {names.index(a) for a in antennas if a in names}
+        if refant not in names:
+            raise BackendError(f"stage reference antenna {refant!r} is not in the ANTENNA table of {main_path.name} "
+                               f"({', '.join(names)})")
         ref_id = names.index(refant)
-        table.open(str(main_path))
+        if not table.open(str(main_path)):
+            raise BackendError(f"could not open {main_path}")
         try:
             main_ant = np.asarray(table.getcol("ANTENNA1"))
             main_spw = np.asarray(table.getcol("SPECTRAL_WINDOW_ID"))
@@ -3013,19 +3121,29 @@ class CasaCalibrationOps(CalibrationOps):
             raise BackendError(f"stage reference antenna {refant} has no solution in {main_path.name}")
         main_reference = int(np.bincount(main_ref[main_ref >= 0]).argmax()) if np.any(main_ref >= 0) else ref_id
 
-        table.open(str(stage_path), nomodify=False)
+        if not table.open(str(stage_path), nomodify=False):
+            raise BackendError(f"could not open {stage_path} for writing")
         try:
             ant = np.asarray(table.getcol("ANTENNA1"))
             spw = np.asarray(table.getcol("SPECTRAL_WINDOW_ID"))
             par = np.asarray(table.getcol("FPARAM"))
             flag = np.asarray(table.getcol("FLAG"))
+            npol, npar = _fringe_param_layout(par.shape[0])
             keep = [r for r in range(len(ant)) if int(ant[r]) in wanted and (not rebase or int(spw[r]) in offsets)]
+            lost: dict[str, int] = {}          # "ANT spw S pol P" -> cells flagged only because the reference is
             for row in keep if rebase else []:
                 ref_par, ref_flag = offsets[int(spw[row])]
+                newly = np.asarray(ref_flag, dtype=bool) & ~np.asarray(flag[:, :, row], dtype=bool)
+                for index in np.flatnonzero(newly.any(axis=1)):
+                    label = f"{names[int(ant[row])]} spw {int(spw[row])} pol {int(index) // npar}"
+                    lost[label] = lost.get(label, 0) + int(newly[index].sum())
                 par[:, :, row] += ref_par
                 flag[:, :, row] |= ref_flag
-            # Wrap the phase terms (every 4th parameter starting at 0) back into (-pi, pi].
-            par[0::4] = (par[0::4] + np.pi) % (2 * np.pi) - np.pi
+            if lost:
+                logger.warning("{}: {} solution cell(s) flagged because the stage reference {} is flagged in the main "
+                               "table there: {}", stage_path.name, sum(lost.values()), refant, ", ".join(sorted(lost)))
+            # Wrap the phase terms (the first parameter of each polarization) back into (-pi, pi].
+            par[0::npar] = (par[0::npar] + np.pi) % (2 * np.pi) - np.pi
             # An antenna already in the main table is here for the polarization an earlier
             # stage could not give it: fill only what is still flagged there, never replace.
             existing = {(int(a), int(w)): r for r, (a, w) in enumerate(zip(main_ant, main_spw))}
@@ -3049,7 +3167,8 @@ class CasaCalibrationOps(CalibrationOps):
         finally:
             table.close()
         if merged:
-            table.open(str(main_path), nomodify=False)
+            if not table.open(str(main_path), nomodify=False):
+                raise BackendError(f"could not open {main_path} for writing")
             try:
                 # Rows appended above come after the ones read earlier, so those are untouched.
                 table.putcol("FPARAM", main_par, 0, main_par.shape[2])
@@ -3122,6 +3241,12 @@ class CasaCalibrationOps(CalibrationOps):
         if not new_path.is_dir():
             raise BackendError(f"{project_code}: bandpass produced no table (field={field!r}); "
                                "the solve interval had too few unflagged antennas")
+        if self._all_flagged(new_path):
+            # Checked before the swap: the previous pass's table must survive for the caller's fallback (RSM06A:
+            # an all-flagged bandpass replaced the good one and the next fringe fit found no data at all).
+            shutil.rmtree(new_path)
+            raise BackendError(f"{project_code}: bandpass solved no unflagged solution (field={field!r}); no "
+                               "reference antenna of the chain had a solution through the tables applied before it")
         # Success: replace the previous table atomically.
         if table_path.exists():
             shutil.rmtree(table_path)
@@ -3324,8 +3449,9 @@ class CasaCalibrationOps(CalibrationOps):
                 if max_delay_step and np.isfinite(own) and own > max_delay_step:
                     lost.append(name)
                     warnings.warn(f"{project_code}: {name} is not detected on {field}: it {reason}, and its SNR >= "
-                                  f"{params['minsnr']:g} solutions jump {own:.0f} ns too; flagging them, so all its "
-                                  "data are flagged on apply")
+                                  f"{params['minsnr']:g} solutions jump {own:.0f} ns too; flagging those below SNR "
+                                  f"{RELIABLE_FRINGE_SNR:g}, so its data without a reliable solution are flagged on "
+                                  "apply")
                 else:
                     warnings.warn(f"{project_code}: {name} {reason}; keeping its SNR >= {params['minsnr']:g} "
                                   "solutions, its data without one will be flagged on apply")
@@ -3334,40 +3460,57 @@ class CasaCalibrationOps(CalibrationOps):
                 logger.info("fringefit: {} solution row(s) of {} taken from the SNR >= {:g} re-solve",
                             merged_rows, ", ".join(adopted), minsnr)
             if lost:
-                self._flag_antenna_solutions(table_path, lost)
+                kept = self._flag_antenna_solutions(table_path, lost, keep_snr=RELIABLE_FRINGE_SNR)
+                if kept:
+                    logger.info("fringefit: {} solution(s) of {} kept at SNR >= {:g} (real detections, e.g. on the "
+                                "fringe finders)", kept, ", ".join(lost), RELIABLE_FRINGE_SNR)
             return adopted
         finally:
             if retry_path.exists():
                 shutil.rmtree(retry_path)
 
-    def _delay_series(self, table_path: Path) -> dict[tuple[str, int], list[tuple[float, float]]]:
-        """Per (antenna name, polarization), the ``(time, delay)`` of every unflagged fringe solution."""
+    def _delay_series(self, table_path: Path) -> dict[tuple[str, int, int, int], list[tuple[float, float]]]:
+        """Per (antenna name, polarization, field id, reference antenna id), the ``(time, delay)`` of every unflagged
+        fringe solution.
+
+        Field and reference antenna are part of the key because delays are only comparable within them: two sources
+        differ by their position error and ionosphere, two references by their own delays. Mixing them made every
+        switch between the fringe finder and the phase calibrator count as a "jump", and an antenna strongly
+        detected on the fringe finder was judged noise (RSM06A).
+        """
         names = self._table_antenna_names(table_path)
         handle = self.backend.tools.table()
         if not handle.open(str(table_path)):
             raise BackendError(f"could not open {table_path} to read its delays")
         try:
+            columns = handle.colnames()
             antennas = np.asarray(handle.getcol("ANTENNA1"))
             times = np.asarray(handle.getcol("TIME"))
             params = np.asarray(handle.getcol("FPARAM"))              # (npol * npar, 1, nrow)
             flags = np.asarray(handle.getcol("FLAG")).astype(bool)
+            fields = np.asarray(handle.getcol("FIELD_ID")) if "FIELD_ID" in columns else np.zeros(antennas.shape, int)
+            refants = (np.asarray(handle.getcol("ANTENNA2")) if "ANTENNA2" in columns
+                       else np.zeros(antennas.shape, int))
         finally:
             handle.close()
         npol = 2 if params.shape[0] in (6, 8) else 1                 # phase, delay, rate[, dispersive] per pol
         npar = params.shape[0] // npol
-        series: dict[tuple[str, int], list[tuple[float, float]]] = {}
+        series: dict[tuple[str, int, int, int], list[tuple[float, float]]] = {}
         for pol in range(npol):
-            good = ~flags[pol * npar + 1, 0]
-            for antenna, time, delay in zip(antennas[good], times[good], params[pol * npar + 1, 0][good]):
+            # The reference antenna's own rows (delay 0 by definition) say nothing about its detection.
+            good = ~flags[pol * npar + 1, 0] & (antennas != refants)
+            for antenna, field, refant, time, delay in zip(antennas[good], fields[good], refants[good], times[good],
+                                                           params[pol * npar + 1, 0][good]):
                 name = names[int(antenna)] if int(antenna) < len(names) else f"#{int(antenna)}"
-                series.setdefault((name, pol), []).append((float(time), float(delay)))
+                series.setdefault((name, pol, int(field), int(refant)), []).append((float(time), float(delay)))
         return series
 
     @staticmethod
     def _median_delay_step(series: dict) -> float:
-        """Median |delay change| (ns) between time-consecutive solutions, over the polarizations given.
+        """Median |delay change| (ns) between time-consecutive solutions of each series, over the series given
+        (one per antenna, polarization, field and reference antenna: see :meth:`_delay_series`).
 
-        ``inf`` when there are too few solutions to tell (fewer than three in every polarization).
+        ``inf`` when there are too few solutions to tell (fewer than three in every series).
         """
         steps = []
         for points in series.values():
@@ -3376,18 +3519,39 @@ class CasaCalibrationOps(CalibrationOps):
                 steps.append(np.abs(np.diff(delays)))
         return float(np.median(np.concatenate(steps))) if steps else float("inf")
 
-    def _flag_antenna_solutions(self, table_path: Path, antennas: list[str]) -> None:
-        """Flag every solution of ``antennas`` in a calibration table."""
+    def _flag_antenna_solutions(self, table_path: Path, antennas: list[str], *, keep_snr: float = 0.0) -> int:
+        """Flag the solutions of ``antennas`` in a calibration table, except those with SNR >= ``keep_snr``.
+
+        ``keep_snr`` <= 0 flags every solution of those antennas. The SNR is judged per parameter cell (the table's
+        own ``SNR`` column, same shape as ``FLAG``); a table without one is flagged entirely, and so are the rows where
+        the antenna is its own reference (their SNR is a placeholder).
+
+        Returns
+        -------
+        int
+            Number of solution rows of ``antennas`` that still hold an unflagged value.
+        """
         names = self._table_antenna_names(table_path)
         wanted = [names.index(name) for name in antennas if name in names]
         handle = self.backend.tools.table()
         if not handle.open(str(table_path), nomodify=False):
             raise BackendError(f"could not open {table_path} to flag solutions")
         try:
-            rows = np.isin(np.asarray(handle.getcol("ANTENNA1")), wanted)
+            antenna1 = np.asarray(handle.getcol("ANTENNA1"))
+            rows = np.isin(antenna1, wanted)
             flags = np.asarray(handle.getcol("FLAG")).astype(bool)
-            flags[..., rows] = True
+            weak = np.ones(flags.shape, dtype=bool)
+            if keep_snr > 0 and "SNR" in handle.colnames():
+                snr = np.asarray(handle.getcol("SNR"), dtype=float)
+                if snr.shape == flags.shape:
+                    weak = ~(np.isfinite(snr) & (snr >= keep_snr))
+                # A row where the antenna is its own reference carries a placeholder SNR, not a detection.
+                if "ANTENNA2" in handle.colnames():
+                    weak[..., antenna1 == np.asarray(handle.getcol("ANTENNA2"))] = True
+            flags[..., rows] |= weak[..., rows]
             handle.putcol("FLAG", flags)
+            kept = ~flags[..., rows].reshape(-1, int(rows.sum())).all(axis=0) if rows.any() else np.zeros(0, bool)
+            return int(kept.sum())
         finally:
             handle.close()
 
@@ -3578,15 +3742,26 @@ class CasaCalibrationOps(CalibrationOps):
         if not new_path.is_dir():
             raise BackendError(f"{project_code}: scalar bandpass produced no table (field={field!r}); "
                                "the solve interval had too few unflagged antennas")
+        if self._all_flagged(new_path):
+            # fill_unsolved would turn a total failure into "gain 1 everywhere": refuse it instead, so the caller
+            # keeps the previous table (or goes on without levelling) and says so.
+            shutil.rmtree(new_path)
+            raise BackendError(f"{project_code}: scalar bandpass solved no unflagged solution (field={field!r})")
+        # Levelled on the new table and swapped in afterwards: a failure here must not leave raw amplitudes (a fit
+        # against a 1 Jy point model) where a resumed run would apply them.
+        try:
+            spread = self._subband_gain_spread(new_path)
+            # The normalisation removes each hand's level: compare the two hands first.
+            hands = self._hand_levels(new_path)
+            dropped, filled = self._normalise_per_antenna(new_path, max_factor=max_factor,
+                                                          fill_unsolved=fill_unsolved, level_hands=level_hands)
+        except Exception:
+            shutil.rmtree(new_path, ignore_errors=True)
+            raise
         if table_path.exists():
             shutil.rmtree(table_path)
         new_path.rename(table_path)
-        spread = self._subband_gain_spread(table_path)
-        # The normalisation removes each hand's level: compare the two hands first.
-        (self.backend.caldir() / f"{project_code}.scalar_bp.hands.json").write_text(
-            json.dumps(self._hand_levels(table_path), indent=1))
-        dropped, filled = self._normalise_per_antenna(table_path, max_factor=max_factor,
-                                                      fill_unsolved=fill_unsolved, level_hands=level_hands)
+        (self.backend.caldir() / f"{project_code}.scalar_bp.hands.json").write_text(json.dumps(hands, indent=1))
         if filled:
             logger.info("scalar_bandpass: {} unsolved antenna/subband solution(s) left at gain 1 (not levelled, "
                         "not flagged): {}", len(filled), self._summarise_labels(filled))
@@ -3771,27 +3946,36 @@ class CasaCalibrationOps(CalibrationOps):
 
     def _fringefit(self, project_code: str, params: dict, gaintable: Optional[list], *,
                    field: str = "", callib: bool = False) -> None:
-        """Run casatasks.fringefit with prior tables attached, replacing any existing table."""
+        """Run casatasks.fringefit with prior tables attached, replacing any existing table only on success.
+
+        The solve writes ``<caltable>.new``, renamed over ``params["caltable"]`` once it exists: a failed re-solve
+        leaves the previous table in place, so the apply chain never points at a deleted table. Every solver error
+        becomes a :class:`BackendError` (an :class:`EmptySelectionError` when the selection held no usable data).
+        """
         table_path = Path(params["caltable"])
-        if table_path.exists():
-            shutil.rmtree(table_path)
-        params = dict(params)
+        solve_path = table_path.with_name(table_path.name + ".new")
+        if solve_path.exists():
+            shutil.rmtree(solve_path)
+        params = dict(params, caltable=str(solve_path))
         params["vis"] = str(self.backend.ms_path(project_code))
-        params.update(self._prior_callib(project_code, gaintable, table_path,
+        params.update(self._prior_callib(project_code, gaintable, solve_path,
                                            field=field, callib=callib))
         try:
             self._run_fringefit_task(params)
         except (RuntimeError, ValueError) as exc:
+            if solve_path.exists():
+                shutil.rmtree(solve_path)
             message = (f"{project_code}: fringefit failed (field={params.get('field')!r}, "
                        f"scan={params.get('scan', 'all')}, refant={params.get('refant')!r}): {exc}")
             if any(pattern in str(exc).lower() for pattern in EMPTY_SELECTION_PATTERNS):
                 scan = str(params.get("scan", "")).strip()
                 raise EmptySelectionError(message, int(scan) if scan.isdigit() else None) from exc
-            if isinstance(exc, ValueError):
-                raise
             raise BackendError(message) from exc
-        if not table_path.is_dir():
-            raise BackendError(f"{project_code}: fringefit produced no table at {table_path}")
+        if not solve_path.is_dir():
+            raise BackendError(f"{project_code}: fringefit produced no table at {solve_path}")
+        if table_path.exists():
+            shutil.rmtree(table_path)
+        solve_path.rename(table_path)
 
     def _run_fringefit_task(self, params: dict) -> None:
         """Run the fringe-fit engine with CASA ``fringefit`` task parameters (the single override point).
@@ -3884,7 +4068,8 @@ class CasaCalibrationOps(CalibrationOps):
             flags = np.asarray(handle.getcol("FLAG")).astype(bool)
         finally:
             handle.close()
-        handle.open(str(Path(table.path) / "ANTENNA"))
+        if not handle.open(str(Path(table.path) / "ANTENNA")):
+            raise BackendError(f"could not open the ANTENNA subtable of {table.path}")
         try:
             names = [str(n) for n in handle.getcol("NAME")]
         finally:
@@ -3990,9 +4175,10 @@ class CasaCalibrationOps(CalibrationOps):
         and passed directly to CASA.  With ``callib=True`` a cal-library file is
         written instead and ``docallib=True`` is used.
 
-        When ``field`` is empty the accumulated tables are applied once per
-        observed source field so that phase-referencing mappings are resolved per
-        source rather than globally.
+        The tables are applied once per field: every name of a comma-separated ``field``,
+        or every observed source field when ``field`` is empty, so that ``apply_to``
+        restrictions and phase-referencing mappings are resolved per source rather than
+        for the group (as the dask-ms backend does).
 
         Parameters
         ----------
@@ -4020,7 +4206,7 @@ class CasaCalibrationOps(CalibrationOps):
         if not parang:
             warnings.warn(f"{project_code}: applycal without the parallactic-angle correction")
         if field:
-            apply_fields = [field]
+            apply_fields = [name.strip() for name in field.split(",") if name.strip()] or [""]
         else:
             meta = self.backend.data.get_metadata(project_code, [], "")
             apply_fields = sorted({s.source for s in meta.scans})
@@ -4071,6 +4257,13 @@ class CasaCalibrationOps(CalibrationOps):
         ``field`` argument is the current solve field so the per-table mapping can
         resolve ``nearest`` for self-calibration tables.  Returns an empty dict when
         there are no priors.
+
+        Parallel lists cannot restrict a table to some of the fields of one solve, so
+        with a multi-field ``field`` a table whose ``apply_to`` does not cover every
+        solve field is left out (with a warning): applying a phase calibrator's self-cal
+        gains to a fringe finder solved alongside would corrupt it, while leaving them
+        out only leaves that residual for the solve to absorb. A cal library applies
+        such a table to its own fields (``field=`` on its line), so nothing is dropped there.
         """
         if not tables:
             return {}
@@ -4078,6 +4271,17 @@ class CasaCalibrationOps(CalibrationOps):
         tables = [t if isinstance(t, CalTable) else CalTable(Path(str(t)).suffix.lstrip(".") or "prior",
                                                              path=str(t))
                   for t in tables]
+        solve_fields = {f.strip() for f in str(field).split(",") if f.strip()}
+        if not callib and len(solve_fields) > 1:
+            partial = [t for t in tables if getattr(t, "apply_to", "")
+                       and not solve_fields <= {f.strip() for f in t.apply_to.split(",") if f.strip()}]
+            if partial:
+                described = ", ".join(f"{t.cal_type} (apply_to={t.apply_to})" for t in partial)
+                warnings.warn(f"{project_code}: {table_path.name}: prior table(s) {described} cover only part of "
+                              f"the solve fields {','.join(sorted(solve_fields))}; not applied during the solve")
+                tables = [t for t in tables if t not in partial]
+            if not tables:
+                return {}
         return self._compile_apply_params(
             project_code, tables, field, include_calwt=False, callib=callib,
             filename=f"callibs/{table_path.name}.txt")
@@ -4384,17 +4588,21 @@ class CasaCalibrationOps(CalibrationOps):
             flags = np.asarray(table.getcol("FLAG")).T  # -> (nrows, nchan, nparam)
         finally:
             table.close()
-        table.open(str(table_path / "ANTENNA"))
+        if not table.open(str(table_path / "ANTENNA")):
+            raise BackendError(f"could not open the ANTENNA subtable of {table_path}")
         try:
             table_antennas = [str(n) for n in table.getcol("NAME")]
         finally:
             table.close()
 
         n_param = snr.shape[2] if snr.ndim == 3 else 1
-        # A Fringe Jones table holds (phase, delay, rate, disp) per polarization; the SNR is
-        # replicated across the four, so stride to the first parameter of each polarization.
-        stride = 4 if n_param % 4 == 0 else 1
-        n_pol = max(1, n_param // stride)
+        # A Fringe Jones table holds (phase, delay, rate[, disp]) per polarization: 3 or 4 parameters, 6 or 8
+        # for two hands. The SNR is replicated across them, so stride to the first parameter of each
+        # polarization. Any other width is one parameter per polarization.
+        if n_param in (3, 4, 6, 8):
+            n_pol, stride = _fringe_param_layout(n_param)
+        else:
+            n_pol, stride = max(1, n_param), 1
         pol_labels = polarization_labels(metadata, n_pol)
 
         wanted_sources = [f for f in field.split(",") if f] if field else []
@@ -5190,21 +5398,24 @@ class CasaFlagOps(FlagOps):
         series = self._quack_series(project_code, meta, scans, wanted, column_name, pol_indices)
         if not series:
             raise BackendError(f"{project_code}: no usable data on {field!r} to measure the slew")
-        # (scan, antenna) -> baselines of that antenna in that scan
+        # (scan, antenna) -> (baseline antenna ids, series) of every baseline of that antenna in that scan
         by_scan_antenna: dict[tuple, list] = {}
         for key, entries in series.items():
             for antenna_id in key[1:]:
-                by_scan_antenna.setdefault((key[0], antenna_id), []).append(entries)
+                by_scan_antenna.setdefault((key[0], antenna_id), []).append((key[1:], entries))
 
-        # Per baseline and scan: delegate to _leading_low_seconds with masked-resolution masking.
-        def baseline_leading_low(entries: tuple, masked: dict, scan: int) -> float:
-            """Measure leading-low seconds for one baseline in one scan, masking resolved antennas."""
+        def baseline_leading_low(baseline: tuple, entries: tuple, masked: dict) -> float:
+            """Leading-low seconds (from scan start) of one baseline in one scan.
+
+            Only the resolved antennas *of this baseline* mask its first seconds: a baseline without them was
+            never contaminated, and cutting it would hide a shorter slew of the antenna being measured.
+            """
             offsets, amps = entries
             order = np.argsort(offsets, kind="stable")
             offsets, amps = offsets[order], amps[order]
             keep = np.ones(offsets.shape, dtype=bool)
             for antenna_id, secs in masked.items():   # already-resolved antennas
-                if antenna_id in scan_antennas.get(scan, ()) and secs > 0:
+                if antenna_id in baseline and secs > 0:
                     keep &= ~(offsets < secs)
             offsets, amps = offsets[keep], amps[keep]
             return _leading_low_seconds(offsets, amps, sigma, integration, max_seconds)
@@ -5230,8 +5441,8 @@ class CasaFlagOps(FlagOps):
                     # Median consensus: at least half (and >=2) baselines must agree.
                     lows = lows_cache.get((scan, antenna_id))
                     if lows is None:
-                        lows = lows_cache[(scan, antenna_id)] = [baseline_leading_low(entries, masked, scan)
-                                                                 for entries in baselines]
+                        lows = lows_cache[(scan, antenna_id)] = [baseline_leading_low(pair, entries, masked)
+                                                                 for pair, entries in baselines]
                     estimates.setdefault(antenna_id, []).append(_scan_consensus(lows))
             # Per-antenna: median over scans (robust to scans where the antenna did not slew).
             aggregated = {a: float(np.median(v)) for a, v in estimates.items() if v}
@@ -5508,7 +5719,9 @@ class CasaFlagOps(FlagOps):
         """Return the correlation products of the data, in order (e.g. ``['RR', 'RL', 'LR', 'LL']``)."""
         codes = {5: "RR", 6: "RL", 7: "LR", 8: "LL", 9: "XX", 10: "XY", 11: "YX", 12: "YY"}
         handle = self.backend.tools.table()
-        handle.open(str(self.backend.ms_path(project_code) / "POLARIZATION"))
+        polarization = self.backend.ms_path(project_code) / "POLARIZATION"
+        if not handle.open(str(polarization)):
+            raise BackendError(f"{project_code}: could not open {polarization}")
         try:
             types = np.atleast_1d(np.asarray(handle.getcell("CORR_TYPE", 0)))
         finally:
@@ -5920,13 +6133,15 @@ class CasaExportOps(ExportOps):
         handle = self.backend.tools.table()
         windows = []
         for path in inputs:
-            handle.open(path)
+            if not handle.open(path):
+                raise BackendError(f"could not open epoch {path} to scale it")
             try:
                 times = np.asarray(handle.getcol("TIME"))
             finally:
                 handle.close()
             windows.append((float(times.min()) - 1.0, float(times.max()) + 1.0))
-        handle.open(str(combined), nomodify=False)
+        if not handle.open(str(combined), nomodify=False):
+            raise BackendError(f"could not open {combined} for writing")
         try:
             times = np.asarray(handle.getcol("TIME"))
             columns = [c for c in ("DATA", "CORRECTED_DATA") if c in handle.colnames()]
@@ -6123,8 +6338,10 @@ class CasaImagingOps(ImagingOps):
             # blanking every pixel to NaN. Reset the default mask to all-good first.
             try:
                 ia = self.backend.tools.image()
-                if ia.open(paths["image"]):
-                    ia.calcmask(mask="T", asdefault=True)
+                try:
+                    if ia.open(paths["image"]):
+                        ia.calcmask(mask="T", asdefault=True)
+                finally:
                     ia.done()
             except Exception as exc:  # noqa: BLE001 - fall through and let exportfits try anyway
                 logger.debug("could not clear the image mask on {}: {}", paths["image"], exc)
@@ -6164,7 +6381,8 @@ class CasaImagingOps(ImagingOps):
         peak = float(np.max(finite)) if finite.size else 0.0
         rms = peak
         if residual and Path(residual).is_dir():
-            ia.open(residual)
+            if not ia.open(residual):
+                raise BackendError(f"could not open residual image {residual}")
             try:
                 res_pixels = np.squeeze(np.asarray(ia.getchunk(), dtype=float))
             finally:

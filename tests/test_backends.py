@@ -886,3 +886,297 @@ def test_structure_signature_ignores_data_writes_but_not_structure(tmp_path):
     (ms / "table.dat").write_bytes(b"0" * 100)
     touch(ms / "ANTENNA" / "table.dat")           # a subtable edited
     assert _structure_signature(ms) != before
+
+
+def test_an_undetected_antenna_keeps_its_reliable_fringe_solutions(tmp_path, monkeypatch):
+    """RSM06A: BB's delays are noise on the phase calibrator, so its solutions are flagged - except the one at SNR 800
+    (a fringe finder), which is a real detection and must survive for the bandpass and the second SBD."""
+    from vlbipy.backends.casa import RELIABLE_FRINGE_SNR
+    from vlbipy.models import ObsMetadata, Scan
+    ops = _fringe_ops(monkeypatch)
+    main, retry = tmp_path / "X.mbd", tmp_path / "X.mbd.retry"
+    scans = [1, 2, 3, 4, 5, 6]
+    antennas = np.repeat([0, 1], 6)
+    store = _fringe_store(antennas, scans * 2, [1] * 6 + [1, 1, 1, 0, 0, 0],
+                          delays=[0.0] * 6 + [0.0, 100.0, -80.0, 0.0, 0.0, 0.0])
+    store["SNR"][:, 0, 6] = 800.0                                   # BB on scan 1: the fringe finder
+    _FakeCalTables.stores = {str(main): store}
+    meta = ObsMetadata.__new__(ObsMetadata)
+    meta.scans = [Scan(scan_number=n, source="CAL", antennas=["AA", "BB"]) for n in scans]
+
+    def fake_fringefit(project_code, params, gaintable, *, field="", callib=False):
+        retry.mkdir()
+        _FakeCalTables.stores[str(retry)] = _fringe_store([1, 1, 1], [4, 5, 6], [0, 0, 0])
+
+    monkeypatch.setattr(ops, "_fringefit", fake_fringefit)
+    assert ops._retry_weak_antennas("X", {"caltable": str(main), "minsnr": 5.0}, [], meta, field="CAL",
+                                    callib=False, minsnr=3.0, keep_fraction=0.75, max_delay_step=2.0) == []
+    solved = ~_FakeCalTables.stores[str(main)]["FLAG"].reshape(-1, 12).all(axis=0)
+    assert list(solved) == [1] * 6 + [1, 0, 0, 0, 0, 0] and 800.0 >= RELIABLE_FRINGE_SNR
+
+
+def test_a_fully_flagged_table_stops_the_step(monkeypatch):
+    """A solve whose every solution is flagged must fail where it happened, not when the next solve finds no data."""
+    from vlbipy.errors import StepError
+    from vlbipy.models import CalTable
+    from vlbipy.namespaces import require_solutions, solved_fraction
+    from vlbipy.solvers import msio
+
+    class Table:
+        def __init__(self, flags):
+            self.flags = np.asarray(flags, bool)
+
+        def colnames(self):
+            return ["FLAG"]
+
+        def nrows(self):
+            return len(self.flags)
+
+        def getcol(self, name):
+            return self.flags
+
+        def close(self):
+            pass
+
+    tables = {"all.bpass": Table([[True, True], [True, True]]), "some.bpass": Table([[True, False], [True, True]])}
+    monkeypatch.setattr(msio, "open_table", lambda path, **kw: tables[str(path)])
+    assert solved_fraction("some.bpass") == 0.25
+    require_solutions(CalTable(cal_type="bpass", path="some.bpass"), "bandpass", "X")
+    with pytest.raises(StepError, match="every solution in all.bpass is flagged"):
+        require_solutions(CalTable(cal_type="bpass", path="all.bpass"), "bandpass", "X")
+    monkeypatch.setattr(msio, "open_table", lambda path, **kw: (_ for _ in ()).throw(OSError("missing")))
+    assert solved_fraction("gone.bpass") is None
+    require_solutions(CalTable(cal_type="bpass", path="gone.bpass"), "bandpass", "X")   # unknown is not empty
+
+
+# -- casa.py review fixes ----------------------------------------------------------------------------------------
+
+def _small_meta(n_subbands=2, antennas=("AA", "BB", "CC")):
+    """Two-hand (RR, LL) metadata: ``antennas`` all observing one 60 s scan of CAL, 4 channels per subband."""
+    from vlbipy.models import Antenna, FreqSetup, Scan, Stokes
+    scan = Scan(scan_number=1, source="CAL", time_start=5.0e9, time_end=5.0e9 + 60.0, integration_time=2.0,
+                antennas=list(antennas))
+    return ObsMetadata(project_code="rv", antennas={a: Antenna(name=a, observed=True) for a in antennas},
+                       scans=[scan], source_names=["CAL"], source_ids={"CAL": 0},
+                       time_range=(scan.time_start, scan.time_end),
+                       freq_setup=FreqSetup(ref_freq=5.0e9, n_subbands=n_subbands, n_channels=4, channel_width=1e6,
+                                            polarizations=[Stokes.RR, Stokes.LL]))
+
+
+class _FakeSpwMs:
+    """``casatools.ms`` stand-in: ``rows[spw]`` is returned whole by ``getdata``; ``msselect`` fails on ``empty``."""
+
+    def __init__(self, rows, empty=()):
+        self.rows, self.empty, self.spw = rows, set(empty), 0
+
+    def open(self, path, nomodify=True):
+        return True
+
+    def selectinit(self, datadescid=0):
+        self.spw = datadescid
+        return True
+
+    def msselect(self, selection):
+        if self.spw in self.empty:
+            raise RuntimeError("selection is empty")
+        return True
+
+    def getdata(self, items):
+        return {k: np.asarray(v).copy() for k, v in self.rows.get(self.spw, {}).items()}
+
+    def reset(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def _data_ops(tool):
+    from types import SimpleNamespace
+    from vlbipy.backends.casa import CasaDataOps
+    ops = CasaDataOps.__new__(CasaDataOps)
+    ops._backend = SimpleNamespace(tools=SimpleNamespace(ms=lambda: tool), ms_path=lambda code: f"/nowhere/{code}.ms")
+    return ops
+
+
+def _two_rows(first_value):
+    """Two AA-BB rows at the same time: the first holds ``first_value`` everywhere, the second 2+0j."""
+    data = np.ones((2, 4, 2), dtype=complex) * 2.0
+    data[:, :, 0] = first_value
+    return {"corrected_data": data, "data": data, "flag": np.zeros(data.shape, bool),
+            "antenna1": np.array([0, 0]), "antenna2": np.array([1, 1]), "time": np.array([5.0e9 + 1] * 2),
+            "scan_number": np.array([1, 1]), "uvw": np.ones((3, 2)), "flag_row": np.zeros(2, bool),
+            "field_id": np.array([0, 0])}
+
+
+def test_spectrum_skips_a_subband_without_a_selection_and_ignores_zero_filled_rows():
+    ops = _data_ops(_FakeSpwMs({1: _two_rows(0.0)}, empty={0}))
+    result = ops.read_spectrum("rv", refant="AA", metadata=_small_meta())
+    spectrum = result["spectra"]["BB"]
+    assert np.all(np.isnan(spectrum[0])) and np.allclose(spectrum[1], 2.0)
+
+
+def test_timeseries_and_subband_phases_survive_a_null_selection_and_drop_zeros():
+    meta = _small_meta()
+    ops = _data_ops(_FakeSpwMs({1: _two_rows(0.0)}, empty={0}))
+    series = ops.read_timeseries("rv", refant="AA", metadata=meta)["baselines"]["AA-BB"]
+    assert np.nanmax(np.abs(series)) == pytest.approx(2.0)
+    phases = ops.read_subband_phases("rv", fields=["CAL"], refant="AA", metadata=meta)["phases"]["BB"]
+    assert np.isnan(phases[0, 0]).all() and np.allclose(phases[0, 1], 0.0)
+    autocorr = ops.read_autocorr_spectrum("rv", metadata=meta)       # no row is an autocorrelation: nothing, no error
+    assert autocorr["antennas"] == ["AA"]
+
+
+def test_total_visibility_counts_only_recorded_visibilities():
+    ops = _data_ops(_FakeSpwMs({1: _two_rows(0.0)}, empty={0}))
+    source = ops.read_total_visibility("rv", metadata=_small_meta())["sources"]["CAL"]
+    assert source["n_vis"][0] == 8                   # 2 hands x 4 channels of the one recorded row
+    assert source["vis_sum"][0] / source["n_vis"][0] == pytest.approx(2.0)
+
+
+def test_uv_coverage_keeps_an_antenna_flagged_in_the_first_subband_once():
+    rows0, rows1 = _two_rows(1.0), _two_rows(1.0)
+    rows0["flag"][:] = True                          # BB has nothing in subband 0
+    rows1["time"] = np.array([5.0e9 + 1, 5.0e9 + 3])
+    rows0["time"] = rows1["time"].copy()
+    ops = _data_ops(_FakeSpwMs({0: rows0, 1: rows1}))
+    fields = ops.read_uv_coverage("rv", metadata=_small_meta())["fields"]
+    assert len(fields["CAL"]["u"]) == 2              # both integrations, once each
+    rows0["flag"][:] = False                         # now both subbands hold them: still one point per row
+    assert len(_data_ops(_FakeSpwMs({0: rows0, 1: rows1})).read_uv_coverage(
+        "rv", metadata=_small_meta())["fields"]["CAL"]["u"]) == 2
+
+
+def test_channel_average_masks_what_it_is_told():
+    from vlbipy.backends.casa import _channel_average
+    values = np.array([[[1.0, 0.0], [3.0, 0.0]]])        # (1 pol, 2 chan, 2 rows)
+    flags = np.zeros(values.shape, bool) | (values == 0)
+    with np.errstate(invalid="ignore"), pytest.warns(RuntimeWarning):      # the all-masked row
+        averaged = _channel_average(values, flags, [0])
+    assert averaged[0, 0] == 2.0 and np.isnan(averaged[1, 0])
+
+
+def _record_warnings(monkeypatch) -> list:
+    """Replace the casa backend's warning collector with one that records the messages; return them."""
+    from types import SimpleNamespace
+    from vlbipy.backends import casa
+    messages = []
+    monkeypatch.setattr(casa, "warnings", SimpleNamespace(warn=messages.append))
+    return messages
+
+
+class _FakeWritableTable(_FakeCalTables):
+    def flush(self):
+        pass
+
+
+def test_emerlin_normalisation_keeps_a_priori_where_the_reference_is_flagged(tmp_path, monkeypatch):
+    from vlbipy.backends.casa import CasaCalibrationOps
+    path = tmp_path / "X.emgain"
+    gains = np.array([[[2.0, 4.0, 8.0]], [[2.0, 4.0, 8.0]]], dtype=complex)    # (2 pol, 1 chan, 3 rows)
+    flags = np.zeros(gains.shape, bool)
+    flags[1, 0, 0] = True                                                        # the reference, pol 1
+    _FakeCalTables.stores = {str(path): {"ANTENNA1": np.array([0, 1, 2]), "CPARAM": gains, "FLAG": flags,
+                                         "SPECTRAL_WINDOW_ID": np.zeros(3, int), "TIME": np.zeros(3)}}
+    ops = CasaCalibrationOps.__new__(CasaCalibrationOps)
+    ops._backend = type("B", (), {"tools": type("T", (), {"table": staticmethod(_FakeWritableTable)})()})()
+    monkeypatch.setattr(ops, "_table_antenna_names", lambda p: ["JB", "DA", "KN"])
+    messages = _record_warnings(monkeypatch)
+    ops._normalise_emerlin_table(path, ["DA", "KN"], "JB")
+    assert len(messages) == 1 and "2 outstation cell" in messages[0]
+    store = _FakeCalTables.stores[str(path)]
+    assert np.allclose(store["CPARAM"][0, 0], [1.0, 2.0, 4.0])                 # pol 0 referenced to JB
+    assert np.allclose(store["CPARAM"][1, 0, 1:], 1.0) and not store["FLAG"][:, :, 1:].any()
+
+
+def test_smooth_refuses_a_complex_table(tmp_path):
+    from vlbipy.backends.casa import CasaCalibrationOps
+    path = tmp_path / "X.g"
+    path.mkdir()
+    _FakeCalTables.stores = {str(path): {"CPARAM": np.ones((2, 1, 3), complex), "FLAG": np.zeros((2, 1, 3), bool)}}
+    ops = CasaCalibrationOps.__new__(CasaCalibrationOps)
+    ops._backend = type("B", (), {"tools": type("T", (), {"table": staticmethod(_FakeWritableTable)})()})()
+    with pytest.raises(BackendError, match="complex"):
+        ops.smooth("X", CalTable(cal_type="g", path=str(path)))
+    assert np.all(_FakeCalTables.stores[str(path)]["CPARAM"] == 1.0)
+
+
+def test_rebase_names_a_missing_reference_antenna(tmp_path):
+    from vlbipy.backends.casa import CasaCalibrationOps
+    main = tmp_path / "X.mbd"
+    _FakeCalTables.stores = {str(main / "ANTENNA"): {"NAME": np.array(["AA", "BB"])}}
+    ops = CasaCalibrationOps.__new__(CasaCalibrationOps)
+    ops._backend = type("B", (), {"tools": type("T", (), {"table": staticmethod(_FakeWritableTable)})()})()
+    with pytest.raises(BackendError, match="'ZZ'"):
+        ops._rebase_and_append(main, tmp_path / "X.stage", None, "ZZ", ["BB"])
+
+
+def test_timerange_keeps_tenths_of_a_second():
+    from vlbipy.backends.casa import CasaCalibrationOps
+    start = 5.0e9 + 12.5
+    text = CasaCalibrationOps._timerange(start, start + 30.25)
+    assert text.split("~")[0].endswith(":32.5") and text.split("~")[1].endswith(":02.8")
+
+
+def test_apply_corrects_each_listed_field_with_its_own_chain(tmp_path):
+    from types import SimpleNamespace
+    from vlbipy.backends.casa import CasaCalibrationOps
+    calls = []
+    ops = CasaCalibrationOps.__new__(CasaCalibrationOps)
+    ops._backend = SimpleNamespace(ms_path=lambda code: tmp_path / f"{code}.ms",
+                                   tasks=SimpleNamespace(applycal=lambda **kw: calls.append(kw)))
+    common, selfcal = tmp_path / "X.mbd", tmp_path / "X.selfcal"
+    common.mkdir(), selfcal.mkdir()
+    tables = [CalTable(cal_type="mbd", path=str(common)),
+              CalTable(cal_type="selfcal", path=str(selfcal), field="PC", gainfield="PC", apply_to="PC")]
+    ops.apply("X", "FF,PC", tables)
+    assert [c["field"] for c in calls] == ["FF", "PC"]
+    assert calls[0]["gaintable"] == [str(common)] and calls[1]["gaintable"] == [str(common), str(selfcal)]
+
+
+def test_solve_priors_leave_out_a_table_that_covers_only_some_solve_fields(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from vlbipy.backends.casa import CasaCalibrationOps
+    ops = CasaCalibrationOps.__new__(CasaCalibrationOps)
+    ops._backend = SimpleNamespace(work_dir=tmp_path)
+    tables = [CalTable(cal_type="mbd", path="X.mbd"),
+              CalTable(cal_type="selfcal", path="X.selfcal", field="PC", gainfield="PC", apply_to="PC")]
+    messages = _record_warnings(monkeypatch)
+    params = ops._prior_callib("X", tables, tmp_path / "X.bpass", field="FF,PC")
+    assert len(messages) == 1 and "selfcal" in messages[0]
+    assert params["gaintable"] == ["X.mbd"]
+    assert ops._prior_callib("X", tables, tmp_path / "X.bpass", field="PC")["gaintable"] == ["X.mbd", "X.selfcal"]
+
+
+def test_snr_table_with_three_parameters_per_hand_reads_two_hands(tmp_path):
+    from vlbipy.backends.casa import CasaCalibrationOps
+    path = tmp_path / "X.snr"
+    snr = np.zeros((6, 1, 2))
+    snr[0:3, 0, 1], snr[3:6, 0, 1] = 7.0, 9.0                # BB: 7 in RR, 9 in LL; AA is the reference
+    _FakeCalTables.stores = {str(path): {"TIME": np.array([5.0e9 + 30] * 2), "ANTENNA1": np.array([0, 1]),
+                                         "ANTENNA2": np.array([0, 0]), "SNR": snr,
+                                         "FLAG": np.zeros((6, 1, 2), bool)},
+                             str(path / "ANTENNA"): {"NAME": np.array(["AA", "BB"])}}
+    ops = CasaCalibrationOps.__new__(CasaCalibrationOps)
+    ops._backend = type("B", (), {"tools": type("T", (), {"table": staticmethod(_FakeWritableTable)})()})()
+    survey = ops._read_snr_table(path, _small_meta(antennas=("AA", "BB")), "AA", 0.8, "")
+    assert sorted(survey.snr) == ["LL", "RR"]
+    assert survey.snr["RR"][0][1] == 7.0 and survey.snr["LL"][0][1] == 9.0
+
+
+def test_quack_masks_a_resolved_antenna_only_on_its_own_baselines(monkeypatch):
+    """A0 slews 30 s, A1 10 s: once A0 is resolved, A1 is still measured on the baselines without A0."""
+    from vlbipy.backends.casa import CasaFlagOps
+    rng = np.random.default_rng(3)
+    offsets = np.arange(0.0, 120.0, 2.0)
+    series = {}
+    for a, b in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)):
+        amps = 1.0 + 0.01 * rng.standard_normal(offsets.size)
+        slew = max(30.0 if 0 in (a, b) else 0.0, 10.0 if 1 in (a, b) else 0.0)
+        amps[offsets < slew] = 0.2
+        series[(0, a, b)] = (offsets.copy(), amps)
+    meta = _small_meta(antennas=("A0", "A1", "A2", "A3"))
+    ops = CasaFlagOps.__new__(CasaFlagOps)
+    monkeypatch.setattr(ops, "_quack_series", lambda *args, **kwargs: series)
+    result = ops.measure_quack("rv", field="CAL", metadata=meta)
+    assert result["per_antenna"] == {"A0": pytest.approx(30.0), "A1": pytest.approx(10.0)}

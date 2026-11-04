@@ -328,6 +328,55 @@ class ImportDataNamespace(Namespace):
         return obs._metadata
 
 
+def solved_fraction(path: Union[str, Path]) -> Optional[float]:
+    """Fraction of the solutions of a calibration table that are not flagged.
+
+    Returns
+    -------
+    float or None
+        0.0 for a table with no rows or every solution flagged; None when the table cannot be read (missing,
+        or no FLAG column), so callers can tell "nothing solved" from "unknown".
+    """
+    from ..solvers.msio import open_table
+
+    try:
+        handle = open_table(str(path))
+    except Exception as exc:  # noqa: BLE001 - an unreadable table is "unknown", not "empty"
+        logger.debug("solved_fraction: cannot open {} ({})", path, exc)
+        return None
+    try:
+        if "FLAG" not in handle.colnames():
+            return None
+        if handle.nrows() == 0:
+            return 0.0
+        flags = np.asarray(handle.getcol("FLAG"), dtype=bool)
+        return float((~flags).sum()) / float(flags.size) if flags.size else 0.0
+    finally:
+        handle.close()
+
+
+def require_solutions(table: CalTable, step: str, project_code: str) -> None:
+    """Stop the step when a freshly solved table has no unflagged solution at all.
+
+    Such a table flags every visibility it is applied to, so every later solve that uses it as a prior finds no data
+    (RSM06A: a fully flagged bandpass made the sbd2 fringe fit fail with "no solution interval had data"). Failing
+    here names the step that actually broke.
+
+    Raises
+    ------
+    StepError
+        When :func:`solved_fraction` is 0.
+    """
+    fraction = solved_fraction(table.path)
+    if fraction is None:
+        return
+    logger.debug("{}: {} has {:.1%} of its solutions unflagged", step, Path(table.path).name, fraction)
+    if fraction == 0.0:
+        raise StepError(step, f"{project_code}: every solution in {Path(table.path).name} is flagged, so applying it "
+                              "would flag all the data; check the tables applied before it (the log of this step "
+                              "says which antennas lacked a solution)")
+
+
 def _fmt(value) -> str:
     """A number for the log, or ``-``."""
     try:
@@ -794,6 +843,7 @@ class CalibrateNamespace(Namespace):
         # (explicit scans from the caller) every scan is solved in one stage.
         stages = obs.cal_stages if obs.cal_stages and [st["scan"] for st in obs.cal_stages] == list(scans) else []
         table = self._solve_sbd(antennas, list(scans), stages, suffix, settings, cal_cfg)
+        require_solutions(table, step, self._code)
         if suffix == "sbd":
             # The raw data of the scans the instrumental delay was solved on; "after" follows the apply step.
             self.plot_sbd_stages("before", antennas=antennas)
@@ -820,10 +870,14 @@ class CalibrateNamespace(Namespace):
         excluded: list[int] = []
         while True:
             try:
-                return self._backend.calibrate.initial_calibration(
+                table = self._backend.calibrate.initial_calibration(
                     self._code, self._field_for_scans(scans), ",".join(antennas or []) or obs.refant,
                     scans=scans, stages=stages, gaintable=list(obs.gaintables), metadata=obs.metadata,
                     suffix=suffix, callib=cal_cfg.get("callib", False), **settings)
+                if excluded:
+                    # Persisted only now: a plan that never solved must not outlive this run.
+                    obs.set_cal_selection(list(antennas), list(scans), stages)
+                return table
             except EmptySelectionError as exc:
                 failed = exc.scan if exc.scan is not None else (int(scans[0]) if len(scans) == 1 else None)
                 if failed is None or failed in excluded or not antennas:
@@ -836,19 +890,19 @@ class CalibrateNamespace(Namespace):
                                     f"solve, and no other scan detects the antennas ({exc})") from exc
                 warnings.warn(f"{self._code}: the {suffix} solve found no usable data in scan {failed}; solving on "
                               f"scan(s) {replanned[1]} instead ({exc})")
-                antennas, scans = replanned
-                stages = obs.cal_stages
+                antennas, scans, stages = replanned
 
     def _replan_without_scans(self, antennas: list[str], scans: list[int],
-                              excluded: list[int]) -> Optional[tuple[list[str], list[int]]]:
-        """Plan the single-band-delay stages again without the ``excluded`` scans, and persist the plan.
+                              excluded: list[int]) -> Optional[tuple[list[str], list[int], list[dict]]]:
+        """Plan the single-band-delay stages again without the ``excluded`` scans (not persisted: the caller saves the
+        plan once a solve on it succeeds).
 
         The source group of the scans in use is tried first, then the other groups in the usual fallback order.
 
         Returns
         -------
         tuple or None
-            ``(antennas, scans)`` of the new plan; None when no scan outside ``excluded`` covers any antenna.
+            ``(antennas, scans, stages)`` of the new plan; None when no scan outside ``excluded`` covers any antenna.
         """
         from ..selection import plan_sbd_stages, without_scans, without_weak_detections
 
@@ -864,10 +918,9 @@ class CalibrateNamespace(Namespace):
                                      metadata=obs.metadata)
             if stages:
                 new_scans = [stage["scan"] for stage in stages]
-                obs.set_cal_selection(antennas, new_scans, stages)
                 logger.info("select_calibration_data: instrumental selection re-planned without scan(s) {} — "
                             "{} antenna(s) on scan(s) {}", excluded, len(antennas), new_scans)
-                return antennas, new_scans
+                return antennas, new_scans, stages
         return None
 
     def plot_sbd_stages(self, when: str, *, antennas: Optional[list] = None) -> list[str]:
@@ -934,7 +987,8 @@ class CalibrateNamespace(Namespace):
                 self._code, self._field_for_scans(scans), ",".join(antennas or []) or obs.refant,
                 scans=scans, gaintable=list(obs.gaintables), metadata=obs.metadata,
                 callib=cal_cfg.get("callib", False), **bp_cfg)
-        except BackendError as exc:
+            require_solutions(table, "bandpass", self._code)
+        except (BackendError, StepError) as exc:
             # A re-solve on already-flagged data can fail when the fringe finder has
             # too few unflagged antennas left (common with a single, sparse FF on a
             # third pass). The band shape is stable across passes, so fall back to the
@@ -1372,6 +1426,7 @@ class CalibrateNamespace(Namespace):
             logger.info("fringefit: solutions will be applied from {}", table.gainfield)
         if plot:
             obs.plot.caltable(table)
+        require_solutions(table, step, self._code)
         applied = self._smooth_fringe_table(table)
         obs.add_gaintable(applied, step)
         if plot and applied.path != table.path:

@@ -97,9 +97,9 @@ def parse_spw(selection, nspw: int, nchan: int) -> dict[int, np.ndarray]:
 
 
 def parse_scans(selection) -> Optional[set[int]]:
-    """Parse ``'1,2,4'`` / ``'3~8'`` into a set of scan numbers; '' -> None (all scans)."""
+    """Parse ``'1,2,4'`` / ``'3~8'`` into a set of scan numbers; '' or '*' -> None (all scans)."""
     tokens = _split_list(selection)
-    if not tokens:
+    if not tokens or tokens == ["*"]:
         return None
     scans: set[int] = set()
     for token in tokens:
@@ -221,9 +221,17 @@ def _solve_block(block: dict, setup: dict, spw_sel: dict, spw_groups: list[list[
                          "field_id": field_id, "scan": scan, "spw": int(min(group)), "refant": refant,
                          "f_ref_hz": solution.f_ref_hz, "nchan_sel": int(chans.size * len(group)), **table,
                          "n_prior": int(np.count_nonzero(solution.prior_used)),
-                         "n_ok": int((~solution.flag).sum()), "snr_median": float(np.median(
-                             solution.snr[~solution.flag])) if (~solution.flag).any() else 0.0})
+                         # The reference antenna's placeholder SNR is not a detection: kept out of both numbers.
+                         "n_ok": int(_detected(solution).sum()), "snr_median": float(np.median(
+                             solution.snr[_detected(solution)])) if _detected(solution).any() else 0.0})
     return rows
+
+
+def _detected(solution) -> np.ndarray:
+    """Mask of the unflagged solutions of an interval that are real detections (not the reference antenna's own,
+    whose SNR is :data:`~vlbipy.solvers.fringe.REFANT_SNR_SENTINEL`)."""
+    snr = np.asarray(solution.snr, dtype=float)
+    return ~np.asarray(solution.flag, dtype=bool) & (snr != REFANT_SNR_SENTINEL)
 
 
 def _interval_key(t_sol: float, spw: int) -> tuple:
@@ -231,7 +239,12 @@ def _interval_key(t_sol: float, spw: int) -> tuple:
     return (round(float(t_sol), 3), int(spw))
 
 
-def predict_from_previous(rows: list[dict], nprev: int = 3) -> dict[int, np.ndarray]:
+#: Lowest SNR of a solution that may feed :func:`predict_from_previous`. Noise peaks of a delay-rate search reach
+#: SNR 5-6, so at the usual minsnr of 5 noise solutions could otherwise predict (and lock on) further noise.
+PREDICTION_MIN_SNR = 10.0
+
+
+def predict_from_previous(rows: list[dict], nprev: int = 3, min_snr: float = PREDICTION_MIN_SNR) -> dict[int, np.ndarray]:
     """Predict each interval's delays and rates from the previous solutions of the same field.
 
     For every row (one interval and subband group, see :func:`_solve_block`), the prediction of an antenna and
@@ -239,7 +252,8 @@ def predict_from_previous(rows: list[dict], nprev: int = 3) -> dict[int, np.ndar
     the previous ``2 * nprev`` intervals with the same field, subband group and reference antenna: the residual
     delay and rate drift slowly, so this is the smoothed value the solution should be near, and the look-back
     is bounded so that it stays local in time. Delays and rates are relative to the reference antenna, so
-    intervals with another one are not used.
+    intervals with another one are not used. Only solutions with SNR >= ``min_snr`` count (rows without an
+    ``"snr"`` entry are not filtered).
 
     Returns
     -------
@@ -259,6 +273,9 @@ def predict_from_previous(rows: list[dict], nprev: int = 3) -> dict[int, np.ndar
                 continue
             fparam = np.stack([rows[i]["fparam"] for i in previous]).astype(np.float64)   # (nprev, nant, 8)
             flags = np.stack([rows[i]["flag"] for i in previous])
+            if all("snr" in rows[i] for i in previous):
+                snr = np.stack([rows[i]["snr"] for i in previous]).astype(np.float64)
+                flags = flags | ~(snr >= min_snr)
             nant = fparam.shape[1]
             prediction = np.full((nant, 2, 2), np.nan)
             for pol in range(2):
@@ -494,6 +511,8 @@ def _prior_entries(gaintable, gainfield, interp, spwmap, field_names: list[str])
     ``'nearest'`` stays ``"nearest"`` until the field being calibrated is known.
     """
     tables = [str(t) for t in (gaintable or [])] if not isinstance(gaintable, str) else _split_list(gaintable)
+    # CASA takes a single string for one table; indexing it would pick characters.
+    gainfield, interp = ([value] if isinstance(value, str) else value for value in (gainfield, interp))
     entries = []
     for i, path in enumerate(tables):
         mapping = str((gainfield or [""] * len(tables))[i] if i < len(gainfield or []) else "").strip()

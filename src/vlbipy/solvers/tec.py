@@ -361,8 +361,11 @@ def _field_rows(maps: IonexMaps, setup: dict, field_id: int, scans: list, interv
                          f"{sorted({setup['antenna_names'][a] for a in ant})} at {when.size} time(s)")
     stec_rate = np.zeros_like(stec)
     if rates:
-        around = slant_tec(maps, xyz, ra, dec, np.concatenate([times - RATE_STEP, times + RATE_STEP]), **options)
-        stec_rate = (around["stec"][:, times.size:] - around["stec"][:, :times.size]) / (2.0 * RATE_STEP)
+        # Clamped to the maps' epochs (one-sided near the edges, where the maps give NaN beyond them).
+        before = np.maximum(times - RATE_STEP, maps.epochs[0])
+        after = np.minimum(times + RATE_STEP, maps.epochs[-1])
+        around = slant_tec(maps, xyz, ra, dec, np.concatenate([before, after]), **options)
+        stec_rate = (around["stec"][:, times.size:] - around["stec"][:, :times.size]) / (after - before)
     edges = np.cumsum([0] + [grid.size for grid in grids])
     first = np.asarray([k for k in range(times.size - 1) if k + 1 not in edges], dtype=np.int64)   # pairs in a scan
     error = 0.0

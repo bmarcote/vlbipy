@@ -413,7 +413,7 @@ def test_stage_window_follows_the_reference_antenna_data():
 
     class Table:
         def open(self, path):
-            pass
+            return True
 
         def query(self, query, columns=""):
             assert "ANTENNA1==1" in query and "[0]" in query

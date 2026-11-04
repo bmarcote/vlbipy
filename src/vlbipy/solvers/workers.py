@@ -44,7 +44,7 @@ import threading
 import time
 import traceback
 from collections import OrderedDict
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed, wait
 from multiprocessing.connection import Client, Listener
 from typing import Optional
 
@@ -121,14 +121,14 @@ def job_threads() -> int:
     """Threads the array work of the running job may use (:func:`thread_map`).
 
     ``$VLBIPY_THREADS`` when set; in a worker process, its share of the cores for the jobs running alongside
-    it (set by the pool); otherwise (the main process) every core.
+    it (set by the pool); otherwise (the main process) every usable core.
     """
     configured = os.environ.get(THREADS_ENV, "").strip()
     if configured:
         return max(1, int(configured))
     if _JOB_THREADS is not None:
         return _JOB_THREADS
-    return max(1, os.cpu_count() or 1)
+    return max(1, _cpus())
 
 
 def in_thread_map() -> bool:
@@ -176,6 +176,16 @@ def resolve(function_path: str):
 
 class WorkerError(RuntimeError):
     """A job raised inside a worker process; the message carries the remote traceback."""
+
+
+class WorkerNotImplementedError(WorkerError, NotImplementedError):
+    """A job raised ``NotImplementedError`` inside a worker process: still a :class:`WorkerError`, and caught by
+    ``except NotImplementedError`` too, so a fast path that does not cover a request falls back (e.g. to CASA)
+    whether its jobs ran in the pool or in this process. ``remote_traceback`` holds the worker's traceback."""
+
+    def __init__(self, message: str, remote_traceback: str = "") -> None:
+        super().__init__(message)
+        self.remote_traceback = remote_traceback
 
 
 class SharedRef:
@@ -311,13 +321,15 @@ class WorkerPool:
             while len(held) > WORKER_CACHE_SIZE:
                 held.popitem(last=False)
             connection.send((function_path, kwargs, outgoing, self._job_threads))
-            ok, payload = connection.recv()
+            ok, payload, not_implemented = connection.recv()
         except (EOFError, OSError) as exc:
             # The worker died (out of memory, a crash in a C library): the pool cannot be trusted any more.
             self.closed = True
             raise WorkerError(f"worker process running {job[0]} died: {exc!r}") from exc
         finally:
             self._idle.put(index)
+        if not ok and not_implemented is not None:
+            raise WorkerNotImplementedError(not_implemented, payload)
         if not ok:
             raise WorkerError(f"worker job {job[0]} failed:\n{payload}")
         return payload
@@ -330,13 +342,16 @@ class WorkerPool:
         """Run ``function(**kwargs)`` for every kwargs dict of ``jobs``; results come back in job order.
 
         ``on_done``, when given, is called once per finished job (in completion order), which is what
-        drives the progress bars of :func:`run_jobs`.
+        drives the progress bars of :func:`run_jobs`. When a job fails, the jobs not started yet are cancelled
+        and the running ones are waited for (they may be writing the same measurement set) before its
+        exception is raised.
         """
         if self.closed:
             raise RuntimeError("the worker pool is closed")
         self._digests = {}     # object ids are only stable while the caller holds the jobs
         # The cores are shared among the jobs that run at the same time (see :func:`thread_map`).
-        self._job_threads = max(1, (os.cpu_count() or 1) // max(1, min(len(jobs), self.size)))
+        self._job_threads = max(1, _cpus() // max(1, min(len(jobs), self.size)))
+        futures: list[Future] = []
         try:
             futures = [self._threads.submit(self._run, (function_path, kwargs)) for kwargs in jobs]
             results = [None] * len(futures)
@@ -346,6 +361,11 @@ class WorkerPool:
                 if on_done is not None:
                     on_done()
             return results
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            wait(futures)
+            raise
         finally:
             self._digests = {}
 
@@ -437,6 +457,8 @@ def _run_here(function_path: str, kwargs: dict) -> Future:
     future: Future = Future()
     try:
         future.set_result(resolve(function_path)(**kwargs))
+    except NotImplementedError as exc:
+        future.set_exception(WorkerNotImplementedError(str(exc), traceback.format_exc()))
     except Exception:  # noqa: BLE001 - reported through the future, as a pool job would be
         future.set_exception(WorkerError(f"worker job {function_path} failed:\n{traceback.format_exc()}"))
     return future
@@ -467,8 +489,9 @@ def _connect(address: str, authkey: bytes, attempts: int = 50, pause: float = 0.
 
 
 def _serve(address: str) -> None:
-    """Worker main loop: receive ``(function path, kwargs, shared objects, threads)``, reply ``(True, result)``
-    or ``(False, traceback)``; shared objects are kept for later jobs (see :func:`_share`)."""
+    """Worker main loop: receive ``(function path, kwargs, shared objects, threads)``, reply ``(True, result, None)``
+    or ``(False, traceback, message)``, ``message`` being the text of a ``NotImplementedError`` (None for any
+    other failure, see :class:`WorkerNotImplementedError`); shared objects are kept for later jobs (:func:`_share`)."""
     global _JOB_THREADS, _IN_WORKER
     _IN_WORKER = True
     connection = _connect(address, bytes.fromhex(os.environ["VLBIPY_WORKER_AUTHKEY"]))
@@ -483,9 +506,11 @@ def _serve(address: str) -> None:
             kwargs = _unshare(kwargs, cache)
             while len(cache) > WORKER_CACHE_SIZE:
                 cache.popitem(last=False)
-            reply = (True, resolve(function_path)(**kwargs))
+            reply = (True, resolve(function_path)(**kwargs), None)
+        except NotImplementedError as exc:
+            reply = (False, traceback.format_exc(), str(exc))
         except BaseException:  # noqa: BLE001 - every failure must travel back to the caller
-            reply = (False, traceback.format_exc())
+            reply = (False, traceback.format_exc(), None)
         connection.send(reply)
 
 

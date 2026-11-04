@@ -486,6 +486,15 @@ def _declare_empty_cube_rank(path: Path, column: str, template: str) -> None:
                  desc.dm_group, tile[:-1] + (1,) + tile[-1:])
 
 
+def part_index(index: dict, chunks: list[dict]) -> dict:
+    """The ``chunks`` and ``index`` arguments of :func:`write_part_job` for one part: ``index`` cut to the rows
+    those chunks use, and the chunks' ``rows`` renumbered into that cut (so every job does not carry the whole
+    index of every file)."""
+    needed = np.unique(np.concatenate([c["rows"] for c in chunks]))
+    local = [dict(c, rows=np.searchsorted(needed, c["rows"])) for c in chunks]
+    return {"chunks": local, "index": {key: values[needed] for key, values in index.items()}}
+
+
 def write_part_job(*, path: str, tables: list[dict], chunks: list[dict], index: dict, setup: dict) -> dict:
     """Worker job: write one part (main table only) from its chunks; returns ``rows`` and ``seconds``."""
     from ..casacore_format.table import Table
@@ -600,36 +609,42 @@ def import_fitsidi(idi_files: list, mms, *, scan_gap: float = 15.0, nparts: Opti
     parts = plan_parts(index, scans, nband, nparts, int(setup["nchan"]) * int(setup["ncorr"]))
     submss = mms / "SUBMSS"
     submss.mkdir(parents=True)
-    names = [f"{mms.name}.{k:04d}.ms" for k in range(len(parts))]
-    jobs = [{"path": str(submss / name), "tables": tables, "chunks": chunks, "index": index, "setup": setup}
-            for name, chunks in zip(names, parts)]
-    reports = run_jobs("vlbipy.solvers.idi_import:write_part_job", jobs, workers,
-                       desc="importfitsidi: writing parts")
-    written = time_index_summary(index, setup, scans)
-    first = submss / names[0]
-    # In CASA's keyword order (write_subtables returns it; WEATHER and PHASE_CAL depend on the files).
-    subtables = write_subtables([str(f) for f in idi_files], first, setup, written, specframe=specframe,
-                                history_params={"scanreindexgap_s": float(scan_gap)})
-    for name in names:
-        part = submss / name
-        if part != first:
-            for sub in subtables:
-                if sub == "HISTORY":                 # every part has its own, without partition's rows
-                    write_part_history(first, part)
-                elif sub == "SOURCE":                # partition writes a SOURCE table in every part
-                    shutil.copytree(first / sub, part / sub, symlinks=True)
-                else:
-                    os.symlink(f"../{names[0]}/{sub}", part / sub)
-        dat = read_table_dat(part)
-        dat.keywords.update({sub: TableRef(f"././{sub}") for sub in subtables})
-        write_table_dat(part, dat)
-    for sub in subtables:
-        os.symlink(f"SUBMSS/{names[0]}/{sub}", mms / sub)
-    total = int(sum(r["rows"] for r in reports))
-    write_concat_dat(mms, total, [f"SUBMSS/{name}" for name in names])
-    readme = (f"AxisType = scan,spw\n{PART_README}Virtual concatenation of the following tables:\n"
-              + "".join(f"  SUBMSS/{name}\n" for name in names) + "\n")
-    write_table_info(mms, "Measurement Set", "CONCATENATED", readme)
+    try:
+        names = [f"{mms.name}.{k:04d}.ms" for k in range(len(parts))]
+        jobs = [dict(part_index(index, chunks), path=str(submss / name), tables=tables, setup=setup)
+                for name, chunks in zip(names, parts)]
+        reports = run_jobs("vlbipy.solvers.idi_import:write_part_job", jobs, workers,
+                           desc="importfitsidi: writing parts")
+        written = time_index_summary(index, setup, scans)
+        first = submss / names[0]
+        # In CASA's keyword order (write_subtables returns it; WEATHER and PHASE_CAL depend on the files).
+        subtables = write_subtables([str(f) for f in idi_files], first, setup, written, specframe=specframe,
+                                    history_params={"scanreindexgap_s": float(scan_gap)})
+        for name in names:
+            part = submss / name
+            if part != first:
+                for sub in subtables:
+                    if sub == "HISTORY":                 # every part has its own, without partition's rows
+                        write_part_history(first, part)
+                    elif sub == "SOURCE":                # partition writes a SOURCE table in every part
+                        shutil.copytree(first / sub, part / sub, symlinks=True)
+                    else:
+                        os.symlink(f"../{names[0]}/{sub}", part / sub)
+            dat = read_table_dat(part)
+            dat.keywords.update({sub: TableRef(f"././{sub}") for sub in subtables})
+            write_table_dat(part, dat)
+        for sub in subtables:
+            os.symlink(f"SUBMSS/{names[0]}/{sub}", mms / sub)
+        total = int(sum(r["rows"] for r in reports))
+        write_concat_dat(mms, total, [f"SUBMSS/{name}" for name in names])
+        readme = (f"AxisType = scan,spw\n{PART_README}Virtual concatenation of the following tables:\n"
+                  + "".join(f"  SUBMSS/{name}\n" for name in names) + "\n")
+        write_table_info(mms, "Measurement Set", "CONCATENATED", readme)
+    except BaseException:
+        # A partial <code>.mms would be taken for a finished import by a resumed run (it skips existing ones).
+        logger.error("importfitsidi[native]: writing {} failed; removing the partial Multi-MS", mms)
+        shutil.rmtree(mms, ignore_errors=True)
+        raise
     report = {"rows": total, "parts": len(names), "scans": int(np.unique(scans).size),
               "seconds": _time.perf_counter() - started}
     logger.info("importfitsidi[native]: {} file(s) -> {} ({} rows in {} part(s), {} scans) in {:.1f}s",
@@ -639,7 +654,8 @@ def import_fitsidi(idi_files: list, mms, *, scan_gap: float = 15.0, nparts: Opti
 
 def time_index_summary(index: dict, setup: dict, scans: np.ndarray) -> dict:
     """What only the main-table pass knows, for the subtables: time range, fields and subbands written."""
-    return {"time_start": float(index["time"][0]),
-            "time_end": float(index["time"][-1] + float(index["interval"][-1])),
+    # min/max, not first/last: the files (or the rows inside one) need not be in time order.
+    return {"time_start": float(np.min(index["time"])),
+            "time_end": float(np.max(index["time"] + index["interval"].astype(np.float64))),
             "nfield": int(index["field"].max()) + 1 if index["field"].size else 0,
             "nspw": int(setup["nspw"]), "nscan": int(np.unique(scans).size)}
