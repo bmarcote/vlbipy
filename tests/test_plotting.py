@@ -585,3 +585,35 @@ def test_model_is_drawn_as_a_grey_dashed_line_broken_at_gaps_and_wraps(tmp_path,
               "model_baselines": {"EF-WB": values}, "field": "TGT", "column": "corrected"}
     plot_baseline_timeseries(series, tmp_path, "p1", label="final_TGT")
     assert len(lines) == 2                                                   # amplitude and phase of EF-WB only
+
+
+def test_uvdistance_roundtrip_and_missing_file(tmp_path):
+    from vlbipy.plotting import load_uvdistance, save_uvdistance
+    data = _demo_uvdata()
+    path = save_uvdistance(data, tmp_path / "x.preselfcal.radplot.npz")
+    assert path.name == "x.preselfcal.radplot.npz" and path.is_file()       # no ".npz" appended by numpy
+    back = load_uvdistance(path)
+    assert np.allclose(back["values"], data["values"]) and np.allclose(back["uvdist_mlambda"], data["uvdist_mlambda"])
+    assert back["polarizations"] == ["RR", "LL"] and back["field"] == "3C345" and back["time_bin"] == 30.0
+    assert load_uvdistance(tmp_path / "missing.npz") is None
+
+
+def test_radplot_reference_drawn_grey_behind_the_data(tmp_path):
+    import matplotlib.pyplot as plt
+
+    from vlbipy.plotting import _draw_reference_uvdistance, _stacked_pair, plot_radplot
+    data = _demo_uvdata(with_model=True)
+    reference = _demo_uvdata()
+    reference["values"] = reference["values"] * 1.4                     # self-cal changed the amplitudes
+    out = plot_radplot(dict(data, reference=reference), tmp_path, "rp01", label="final")
+    assert out.is_file() and out.stat().st_size > 1000
+    figure = plt.figure()
+    amp_axis, phase_axis = _stacked_pair(figure, figure.add_gridspec(1, 1)[0])
+    assert _draw_reference_uvdistance(amp_axis, phase_axis, reference)
+    lines = amp_axis.get_lines() + phase_axis.get_lines()
+    assert len(lines) == 4                                               # both hands, amplitude and phase
+    for line in lines:
+        assert line.get_color() == "0.55" and line.get_alpha() < 0.5 and line.get_markeredgewidth() == 0.0
+        assert line.get_zorder() < 2                                     # below the final data points
+    assert not _draw_reference_uvdistance(amp_axis, phase_axis, None)
+    plt.close(figure)

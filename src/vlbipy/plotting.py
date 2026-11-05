@@ -630,6 +630,45 @@ def _binned_median(x: np.ndarray, y: np.ndarray, n_bins: int = 60) -> tuple[np.n
     return np.asarray(centres), np.asarray(medians)
 
 
+#: The pre-self-calibration data drawn under a radplot: for reference only, behind everything else.
+REFERENCE_POINTS = {"ls": "none", "marker": ".", "ms": 2.0, "mew": 0.0, "mec": "none", "color": "0.55",
+                    "alpha": 0.35, "zorder": 1, "rasterized": True}
+
+
+def save_uvdistance(uvdata: dict, path: Union[str, Path]) -> Path:
+    """Save the binned visibilities of a ``read_uvdistance`` read to an ``.npz`` file.
+
+    Only what a radplot overlay needs is kept: ``uvdist_mlambda`` (1-D), ``values`` (``(n, n_pol)`` complex),
+    ``polarizations``, ``field``, ``column`` and ``time_bin``. Returns the written path.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as handle:                      # a file handle: numpy would otherwise append ".npz"
+        np.savez_compressed(handle, uvdist_mlambda=np.asarray(uvdata.get("uvdist_mlambda", []), dtype=float),
+                            values=np.asarray(uvdata.get("values", []), dtype=complex),
+                            polarizations=np.asarray(list(uvdata.get("polarizations") or []), dtype=str),
+                            field=str(uvdata.get("field", "")), column=str(uvdata.get("column", "")),
+                            time_bin=float(uvdata.get("time_bin", 0.0) or 0.0))
+    logger.info("uv-distance data saved: {} ({} point(s))", path, len(uvdata.get("uvdist_mlambda", [])))
+    return path
+
+
+def load_uvdistance(path: Union[str, Path]) -> Optional[dict]:
+    """Read back a :func:`save_uvdistance` file as a ``read_uvdistance``-like dict; None when it is missing
+    or unreadable (a missing overlay must never stop the plot)."""
+    path = Path(path)
+    if not path.is_file():
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            return {"uvdist_mlambda": data["uvdist_mlambda"], "values": data["values"],
+                    "polarizations": [str(p) for p in data["polarizations"]], "field": str(data["field"]),
+                    "column": str(data["column"]), "time_bin": float(data["time_bin"])}
+    except Exception as exc:  # noqa: BLE001 - a broken cache only loses the overlay
+        logger.warning("could not read uv-distance data {}: {}", path, exc)
+        return None
+
+
 def plot_radplot(uvdata: dict, plot_dir: Union[str, Path], project_code: str = "",
                  label: str = "", dpi: int = 150) -> Path:
     """Plot amplitude and phase against uv distance for one source (a "radplot").
@@ -650,7 +689,10 @@ def plot_radplot(uvdata: dict, plot_dir: Union[str, Path], project_code: str = "
         Output of the backend's ``read_uvdistance``. An optional ``"model"`` entry
         ``{"uvdist_mlambda", "values"}`` (the model averaged like the data) is drawn in grey: its amplitude
         (mean of the parallel hands) as a dashed line through the median of bins in uv distance, its phase as
-        points.
+        points. An optional ``"reference"`` entry (same layout as ``uvdata``: the data before
+        self-calibration, :func:`load_uvdistance`) is drawn underneath everything, every parallel hand in
+        semi-transparent grey without edges, so a change of amplitude or phase forced by self-calibration
+        shows without competing with the final data.
     label : str
         Extra tag for the file name.
 
@@ -674,6 +716,7 @@ def plot_radplot(uvdata: dict, plot_dir: Union[str, Path], project_code: str = "
 
     figure = plt.figure(figsize=(7.5, 5.5), layout="constrained")
     amp_axis, phase_axis = _stacked_pair(figure, figure.add_gridspec(1, 1)[0])
+    reference_drawn = _draw_reference_uvdistance(amp_axis, phase_axis, uvdata.get("reference"))
     for pol in range(values.shape[1] if values.ndim > 1 else 1):
         column = values[:, pol] if values.ndim > 1 else values
         name = pol_labels[pol] if pol < len(pol_labels) else f"P{pol + 1}"
@@ -685,6 +728,9 @@ def plot_radplot(uvdata: dict, plot_dir: Union[str, Path], project_code: str = "
                       alpha=0.5, color=color, label=name)
     handles = [Line2D([], [], color=polarization_color(name, i), lw=0, marker="o", ms=5,
                       label=name) for i, name in enumerate(pol_labels)]
+    if reference_drawn:
+        handles.append(Line2D([], [], lw=0, marker="o", ms=5, mew=0.0, color=REFERENCE_POINTS["color"],
+                              alpha=0.6, label="before self-cal"))
     model = uvdata.get("model") or {}
     model_uv = np.asarray(model.get("uvdist_mlambda", []), dtype=float)
     model_values = np.asarray(model.get("values", []))
@@ -708,8 +754,29 @@ def plot_radplot(uvdata: dict, plot_dir: Union[str, Path], project_code: str = "
                     "averaged per subband", x=0.01, ha="left", fontsize=11, fontweight="bold")
     figure.savefig(outfile, dpi=dpi)
     plt.close(figure)
-    logger.info("radplot written: {}", outfile)
+    logger.info("radplot written: {}{}", outfile, " (with the data before self-calibration)" if reference_drawn else "")
     return outfile
+
+
+def _draw_reference_uvdistance(amp_axis, phase_axis, reference: Optional[dict]) -> bool:
+    """Draw ``reference`` (a ``read_uvdistance``-like dict) as grey, semi-transparent, edgeless points behind
+    the radplot data: every column, amplitude and phase. Returns whether any point was drawn."""
+    if not reference:
+        return False
+    uvdist = np.asarray(reference.get("uvdist_mlambda", []), dtype=float)
+    values = np.asarray(reference.get("values", []))
+    if uvdist.size == 0 or values.size == 0:
+        return False
+    columns = values.reshape(len(uvdist), -1)
+    drawn = False
+    for pol in range(columns.shape[1]):
+        finite = np.isfinite(columns[:, pol]) & np.isfinite(uvdist)
+        if not finite.any():
+            continue
+        amp_axis.plot(uvdist[finite], np.abs(columns[finite, pol]), **REFERENCE_POINTS)
+        phase_axis.plot(uvdist[finite], np.degrees(np.angle(columns[finite, pol])), **REFERENCE_POINTS)
+        drawn = True
+    return drawn
 
 
 def plot_uv_coverage(data: dict, output: str, *, title: str = "", dpi: int = 150,

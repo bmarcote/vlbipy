@@ -636,8 +636,14 @@ class PlotOps(BackendComponent):
 
     def radplot(self, project_code: str, *, field: str = "", column: str = "corrected",
                 time_bin: float = 10.0, label: str = "", with_model: bool = False, **kwargs) -> str:
-        """Plot amplitude and phase vs uv distance for one source (optionally with the model)."""
+        """Plot amplitude and phase vs uv distance for one source (optionally with the model; ``reference=``
+        a :meth:`radplot_data` file drawn underneath in grey)."""
         raise self._unsupported("radplot")
+
+    def radplot_data(self, project_code: str, *, field: str = "", output: str = "", column: str = "corrected",
+                     time_bin: float = 10.0, **kwargs) -> str:
+        """Save the binned visibilities :meth:`radplot` would draw for ``field`` to ``output`` (``.npz``)."""
+        raise self._unsupported("radplot_data")
 
     def lightcurve(self, project_code: str, *, fields: Optional[list[str]] = None,
                    column: str = "corrected", label: str = "", averaging_sec=None, **kwargs) -> str:

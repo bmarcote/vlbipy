@@ -1592,16 +1592,34 @@ class CalibrateNamespace(Namespace):
         if not field:
             self.plot_sbd_stages("after")
 
-    def transfer_chain(self) -> list[CalTable]:
+    def apply_without_selfcal(self) -> list[CalTable]:
+        """Apply the chain minus every self-calibration table (:func:`is_selfcal_table`) to every field.
+
+        The corrected data then hold the calibration as it was before self-calibration, for the snapshot
+        drawn under the final radplots (:meth:`PlotNamespace.preselfcal_data`). Deferred where the backend can
+        (dask-ms); the step state is not touched, so the next :meth:`apply` restores the full chain.
+        Returns the chain applied.
+        """
+        tables = [table for table in self._obs.gaintables if not is_selfcal_table(table)]
+        chain = self.transfer_chain(tables)
+        options = {"defer": True} if getattr(self._backend.calibrate, "defers_apply", False) else {}
+        logger.info("calibrate.apply_without_selfcal: {} table(s), leaving out {}", len(tables),
+                    ", ".join(t.cal_type for t in self._obs.gaintables if is_selfcal_table(t)) or "none")
+        self._backend.calibrate.apply(self._code, "", chain,
+                                      callib=self._obs.config.get("calibration", {}).get("callib", False), **options)
+        return chain
+
+    def transfer_chain(self, tables: Optional[list] = None) -> list[CalTable]:
         """The apply chain with the phase-reference transfer resolved (:func:`vlbipy.phaseref.transfer_chain`).
 
         With the ``interpolate`` strategy every receiver (target, check source; the phase calibrators with
         inverse phase referencing) takes tables interpolated between the two reference sources nearest to it,
         rebuilt whenever a table they come from changed; otherwise this is the chain as solved.
+        ``tables`` replaces the registered chain (``obs.gaintables``) as the input.
         """
         from .. import phaseref
         obs = self._obs
-        tables = list(obs.gaintables)
+        tables = list(obs.gaintables if tables is None else tables)
         if not self._backend.requires_data_files:
             return tables
         plan = obs.phaseref_plan()
@@ -2212,6 +2230,8 @@ class PlotNamespace(Namespace):
             jobs.append(self._uv_coverage_job("uv_coverage"))
         for job in self._radplot_jobs(all_sources=True, column="corrected", label="final", with_model=True):
             job.kwargs["model"] = models.get(job.kwargs["field"]) or None
+            reference = preselfcal_data_path(self._obs.work_dir, self._code, job.kwargs["field"])
+            job.kwargs["reference"] = str(reference) if reference.is_file() else ""
             jobs.append(job)
         jobs += [self._spectrum_job(f"spectrum[{name}]", field=name, column="corrected", label=f"final_{name}",
                                     model=models[name] or None) for name in names]
@@ -2220,6 +2240,27 @@ class PlotNamespace(Namespace):
         jobs.append(self._lightcurve_job("lightcurve", column="corrected", label="final"))
         written = self._run_jobs(jobs, "final")
         logger.info("plot.final_data: {} plot(s) over {} source(s)", len(written), len(names))
+        return written
+
+    def preselfcal_data(self) -> list[str]:
+        """Save the radplot data of every source from the corrected column as it is now, meant to be called
+        with the chain applied without the self-cal tables (:meth:`CalibrateNamespace.apply_without_selfcal`).
+
+        One ``radplot_data`` job per source, binned like the final radplot (``[export].radplot_time_bin``), to
+        :func:`preselfcal_data_path`; :meth:`final_data` draws them in grey under the final data. Earlier files
+        are removed first, so a read that fails leaves no overlay from an older calibration.
+        Returns the files written.
+        """
+        obs = self._obs
+        names = self._all_source_names()
+        for stale in (Path(obs.work_dir) / "selfcal").glob(f"{self._code}.*.preselfcal.radplot.npz"):
+            stale.unlink()
+        time_bin = obs.config.get("export", {}).get("radplot_time_bin", 10.0)
+        jobs = [PlotJob(f"radplot_data[{name}]", method="radplot_data", kwargs=dict(
+                    field=name, column="corrected", time_bin=time_bin, metadata=obs.metadata,
+                    output=str(preselfcal_data_path(obs.work_dir, self._code, name)))) for name in names]
+        written = self._run_jobs(jobs, "preselfcal")
+        logger.info("plot.preselfcal_data: {} of {} source(s) saved", len(written), len(names))
         return written
 
     def _all_source_names(self) -> list[str]:
@@ -2998,6 +3039,20 @@ def finders_set(obs) -> set:
     return {s.name for s in obs.sources.fringe_finders}
 
 
+#: Calibration kinds written by self-calibration (``<kind>_<source>``): left out of the pre-selfcal snapshot.
+SELFCAL_TABLE_PREFIXES = ("selfcal_", "selfamp_", "selfampt_", "selfphase_", "joint_")
+
+
+def is_selfcal_table(table: CalTable) -> bool:
+    """Whether ``table`` is a self-calibration table (by its kind, :data:`SELFCAL_TABLE_PREFIXES`)."""
+    return table.cal_type.startswith(SELFCAL_TABLE_PREFIXES)
+
+
+def preselfcal_data_path(work_dir, project_code: str, source: str) -> Path:
+    """Where the binned uv-distance data of ``source`` before self-calibration are kept (``.npz``)."""
+    return Path(work_dir) / "selfcal" / f"{project_code}.{source}.preselfcal.radplot.npz"
+
+
 class SelfcalNamespace(Namespace):
     """Self-calibration with difmapy: modelfit, phase ladder, Bayesian amplitude gains.
 
@@ -3193,6 +3248,8 @@ class SelfcalNamespace(Namespace):
         with_data = set(obs.metadata.source_names) if obs.metadata else set(obs.sources.names)
         finders = [s.name for s in obs.sources.fringe_finders if s.name in with_data]
         phasecals = [s.name for s in obs.sources.phase_calibrators if s.name in with_data and s.name not in finders]
+        if any(obs._state.should_run(f"selfcal_{name}", force=force) for name in finders + phasecals):
+            self._snapshot_preselfcal()
         for name in finders + phasecals:
             if obs._state.should_run(f"selfcal_{name}", force=force):
                 # Deferred: only the split reads it, and calibrates while it reads (dask-ms).
@@ -3203,6 +3260,26 @@ class SelfcalNamespace(Namespace):
             obs.calibrate.apply(force=True)
             obs.export.per_source(force=True)
         return results
+
+
+    def _snapshot_preselfcal(self) -> list[str]:
+        """Save every source's radplot data as calibrated before self-calibration (drawn grey under the final
+        radplots): apply the chain without the self-cal tables, then :meth:`PlotNamespace.preselfcal_data`.
+
+        Reporting only: a failure warns and self-calibration goes on. Returns the files written.
+        """
+        from ..errors import StaleCalibrationError
+        obs = self._obs
+        if not self._backend.supports("plot", "radplot_data"):
+            return []
+        try:
+            obs.calibrate.apply_without_selfcal()
+            return obs.plot.preselfcal_data()
+        except StaleCalibrationError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a reference overlay must not stop self-calibration
+            warnings.warn(f"{self._code}: could not save the data before self-calibration ({exc})")
+            return []
 
 
 class ExportNamespace(Namespace):

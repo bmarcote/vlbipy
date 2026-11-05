@@ -6439,7 +6439,8 @@ class CasaPlotOps(PlotOps):
     #: every selected scan at once). One subband is read at a time in every case.
     READ_PATTERNS = {"spectrum": ("refant", None), "timeseries": ("refant", None),
                      "subband_phases": ("refant", None), "autocorr": ("auto", None),
-                     "radplot": ("all", _SCANS_PER_READ), "baseline_corner": ("all", _SCANS_PER_READ),
+                     "radplot": ("all", _SCANS_PER_READ), "radplot_data": ("all", _SCANS_PER_READ),
+                     "baseline_corner": ("all", _SCANS_PER_READ),
                      "baseline_corners": ("all", _SCANS_PER_READ), "lightcurve": ("all", 1),
                      "diagnostic": ("all", None)}
 
@@ -6559,15 +6560,28 @@ class CasaPlotOps(PlotOps):
 
     def radplot(self, project_code: str, *, field: str = "", column: str = "corrected",
                 time_bin: float = 10.0, label: str = "", with_model: bool = False,
-                metadata: Optional[ObsMetadata] = None, model: Optional[list] = None, **kwargs) -> str:
+                metadata: Optional[ObsMetadata] = None, model: Optional[list] = None, reference: str = "",
+                **kwargs) -> str:
         """Plot amplitude and phase vs uv distance for one source (model overlaid when asked: the components
-        of ``model``, else the MODEL_DATA column)."""
-        from ..plotting import plot_radplot
+        of ``model``, else the MODEL_DATA column). ``reference`` is a :meth:`radplot_data` file (the data before
+        self-calibration) drawn underneath in grey; a missing file draws nothing."""
+        from ..plotting import load_uvdistance, plot_radplot
         uvdata = self.backend.data.read_uvdistance(project_code, field=field, column=column,
                                                    time_bin=time_bin, with_model=with_model,
                                                    metadata=metadata, model=model)
+        if reference:
+            uvdata["reference"] = load_uvdistance(reference)
         return str(plot_radplot(uvdata, self.plot_dir(self.category_for_column(column)),
                                 project_code, label=label))
+
+    def radplot_data(self, project_code: str, *, field: str = "", output: str = "", column: str = "corrected",
+                     time_bin: float = 10.0, metadata: Optional[ObsMetadata] = None, **kwargs) -> str:
+        """Read what :meth:`radplot` would plot for ``field`` (no model) and save it to ``output`` (``.npz``,
+        :func:`~vlbipy.plotting.save_uvdistance`) instead of drawing it. Returns ``output``."""
+        from ..plotting import save_uvdistance
+        uvdata = self.backend.data.read_uvdistance(project_code, field=field, column=column, time_bin=time_bin,
+                                                   metadata=metadata)
+        return str(save_uvdistance(uvdata, output))
 
     def lightcurve(self, project_code: str, *, fields: Optional[list[str]] = None,
                    column: str = "corrected", label: str = "", averaging_sec=None,

@@ -217,3 +217,41 @@ def test_scan_snr_survey_per_scan_antenna_and_namespace_helper():
     table = obs.plot.snr_for_scans()
     assert set(table) == set(obs["fp01"].metadata.snr_survey.scan_numbers)
     assert all(set(row) == set(obs["fp01"].metadata.antennas) for row in table.values())
+
+
+# -- data before self-calibration under the final radplot --
+
+def test_apply_without_selfcal_leaves_out_selfcal_tables():
+    from vlbipy.models import CalTable
+    obs = make_obs(phasecal="J1848+3219", fringe_finder="3C345")
+    observation = obs["fp01"]
+    observation.add_gaintable(CalTable(cal_type="selfcal_3C345", field="3C345", gainfield="3C345"), "selfcal_3C345")
+    observation.add_gaintable(CalTable(cal_type="selfampt_J1848+3219", field="J1848+3219"), "selfcal_J1848+3219")
+    applied = []
+    observation._backend.calibrate.apply = lambda code, field, tables, **kw: applied.append((field, tables))
+    chain = observation.calibrate.apply_without_selfcal()
+    assert applied and applied[0][0] == ""
+    assert not any(t.cal_type.startswith(("selfcal_", "selfampt_")) for t in chain)
+    assert len(chain) == len(observation.gaintables) - 2
+
+
+def test_preselfcal_data_jobs_and_final_radplot_reference(tmp_path, monkeypatch):
+    from vlbipy.namespaces import preselfcal_data_path
+    monkeypatch.chdir(tmp_path)                                          # the dummy work_dir is the cwd
+    obs = make_obs(phasecal="J1848+3219", fringe_finder="3C345")
+    observation = obs["fp01"]
+    seen = []
+    observation.plot._run_jobs = lambda jobs, label: seen.append((label, jobs)) or []
+    stale = preselfcal_data_path(observation.work_dir, "fp01", "OLD")
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_bytes(b"")
+    observation.plot.preselfcal_data()
+    label, jobs = seen[-1]
+    assert label == "preselfcal" and not stale.exists()
+    assert {job.kwargs["field"] for job in jobs} == {"3C395", "J1848+3219", "3C345"}
+    assert all(job.method == "radplot_data" and job.kwargs["output"].endswith(".preselfcal.radplot.npz")
+               for job in jobs)
+    preselfcal_data_path(observation.work_dir, "fp01", "3C345").write_bytes(b"")
+    observation.plot.final_data()
+    radplots = {job.kwargs["field"]: job.kwargs["reference"] for job in seen[-1][1] if job.method == "radplot"}
+    assert radplots["3C345"].endswith("fp01.3C345.preselfcal.radplot.npz") and radplots["3C395"] == ""
