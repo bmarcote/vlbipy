@@ -129,18 +129,7 @@ class LBAObservatory(ObservatoryHandler):
 
     def _report_antab_coverage(self, idi_file: str, project_code: str) -> None:
         """Warn about antennas the appended tables say nothing about."""
-        from astropy.io import fits
-        import numpy as np
-
-        with fits.open(idi_file) as hdulist:
-            numbers = {int(n): str(name).strip() for name, n in zip(hdulist["ARRAY_GEOMETRY"].data["ANNAME"],
-                                                                    hdulist["ARRAY_GEOMETRY"].data["NOSTA"])}
-            with_tsys = set(np.unique(hdulist["SYSTEM_TEMPERATURE"].data["ANTENNA_NO"]).tolist()) \
-                if "SYSTEM_TEMPERATURE" in hdulist else set()
-            with_gc = set(np.unique(hdulist["GAIN_CURVE"].data["ANTENNA_NO"]).tolist()) \
-                if "GAIN_CURVE" in hdulist else set()
-        for label, present in (("Tsys", with_tsys), ("gain curve", with_gc)):
-            missing = [name for number, name in sorted(numbers.items()) if number not in present]
+        for label, missing in fitsidi.apriori_coverage(idi_file).items():
             if missing:
                 warnings.anomaly(f"{project_code}: the .antab has no {label} for {', '.join(missing)}; "
                                  "those antennas cannot be amplitude-calibrated (add nominal values "

@@ -61,6 +61,9 @@ class ObservatoryHandler:
     needs_eop: bool = False
     #: Whether ACCOR (correlator amplitude) corrections apply.
     needs_accor: bool = False
+    #: Whether the a-priori flags come inside the FITS-IDI file (its FLAG table, imported into FLAG_CMD)
+    #: instead of a separate ``.uvflg`` / ``.flag`` file (VLBA).
+    flags_in_fitsidi: bool = False
 
     def find_data_files(self, project_code: str, directory: str) -> list[str]:
         """Return already-present raw data files for a project (empty if none)."""

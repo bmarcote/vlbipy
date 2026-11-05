@@ -90,6 +90,62 @@ def has_gain_curve(fitsidi_file: Union[str, Path]) -> bool:
         return any(hdu.name == "GAIN_CURVE" and hdu.header.get("NAXIS2", 0) > 0 for hdu in hdulist)
 
 
+def expected_size(fitsidi_file: Union[str, Path]) -> int:
+    """Bytes the file must have to hold every HDU its headers announce (FITS 2880-byte blocks).
+
+    Only headers are read, so this is cheap on a file of many GB. A file still being downloaded, or cut short,
+    is smaller than this; its last HDUs are then missing or incomplete (in VLBA FITS-IDI, the FLAG,
+    SYSTEM_TEMPERATURE and GAIN_CURVE tables come after UV_DATA).
+    """
+    import warnings as _warnings
+    end = 0
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("ignore")                     # astropy warns about the truncation we measure
+        with fits.open(fitsidi_file, memmap=True, lazy_load_hdus=False) as hdulist:
+            for index, hdu in enumerate(hdulist):
+                header = hdu.header
+                naxes = [int(header.get(f"NAXIS{i}", 0)) for i in range(1, int(header.get("NAXIS", 0)) + 1)]
+                elements = int(np.prod(naxes)) if naxes else 0
+                size = abs(int(header.get("BITPIX", 8))) // 8 * int(header.get("GCOUNT", 1)) * (
+                    int(header.get("PCOUNT", 0)) + elements)
+                start = hdulist.fileinfo(index)["datLoc"]
+                end = max(end, start + -(-size // 2880) * 2880)
+    return end
+
+
+def check_complete(fitsidi_file: Union[str, Path]) -> None:
+    """Raise ``ValueError`` when the file is shorter than its headers say (:func:`expected_size`)."""
+    actual, expected = Path(fitsidi_file).stat().st_size, expected_size(fitsidi_file)
+    if actual < expected:
+        raise ValueError(f"{Path(fitsidi_file).name} is incomplete: {actual / 1e9:.2f} of {expected / 1e9:.2f} GB "
+                         "(still downloading, or cut short); its tables after the visibilities are missing")
+
+
+def table_rows(fitsidi_file: Union[str, Path]) -> dict[str, int]:
+    """Rows of every table HDU of the file, by EXTNAME (the first of each name; headers only)."""
+    rows: dict[str, int] = {}
+    with fits.open(fitsidi_file, memmap=True) as hdulist:
+        for hdu in hdulist[1:]:
+            rows.setdefault(hdu.name, int(hdu.header.get("NAXIS2", 0)))
+    return rows
+
+
+def apriori_coverage(fitsidi_file: Union[str, Path]) -> dict[str, list[str]]:
+    """Antennas of ARRAY_GEOMETRY that the SYSTEM_TEMPERATURE and GAIN_CURVE tables say nothing about.
+
+    Returns ``{"Tsys": [names], "gain curve": [names]}``; a missing table lists every antenna.
+    """
+    with fits.open(fitsidi_file, memmap=True) as hdulist:
+        geometry = hdulist["ARRAY_GEOMETRY"].data
+        numbers = {int(n): str(name).strip() for name, n in zip(geometry["ANNAME"], geometry["NOSTA"])}
+        present = {}
+        for label, extname in (("Tsys", "SYSTEM_TEMPERATURE"), ("gain curve", "GAIN_CURVE")):
+            present[label] = set(np.unique(hdulist[extname].data["ANTENNA_NO"]).tolist()) \
+                if extname in hdulist and hdulist[extname].header.get("NAXIS2", 0) > 0 else set()
+    return {label: [name for number, name in sorted(numbers.items()) if number not in antennas]
+            for label, antennas in present.items()}
+
+
 def remove_empty_table(fitsidi_file: Union[str, Path], extname: str) -> bool:
     """Remove a zero-row table from a FITS-IDI file; return True if one was removed.
 

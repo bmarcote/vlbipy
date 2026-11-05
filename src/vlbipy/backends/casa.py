@@ -4789,8 +4789,11 @@ class CasaFlagOps(FlagOps):
     def _run_flagdata(self, project_code: str, kind: str, *, field: str = "", **kwargs) -> None:
         """Translate a vlbipy flagging mode into a casatasks.flagdata call."""
         ms = self.backend.ms_path(project_code)
-        if kind not in self.MODES and kind != "edges":
-            raise self._unsupported(f"run[{kind}]", f"known modes: {', '.join(self.MODES)}, edges")
+        if kind not in self.MODES and kind not in ("edges", "fitsidi"):
+            raise self._unsupported(f"run[{kind}]", f"known modes: {', '.join(self.MODES)}, edges, fitsidi")
+        if kind == "fitsidi":
+            self._apply_fitsidi_flags(project_code)
+            return
         params: dict = {"vis": str(ms), "flagbackup": False}
         if field:
             params["field"] = field
@@ -4841,6 +4844,66 @@ class CasaFlagOps(FlagOps):
             self.backend.tasks.flagdata(**params)
         except RuntimeError as exc:
             raise BackendError(f"{project_code}: flagdata[{kind}] failed: {exc}") from exc
+
+    def _read_columns(self, table_path: Path, columns: tuple, *, required: bool = True) -> dict:
+        """Columns of one table as numpy arrays (empty arrays for an empty table); ``required=False`` gives
+        an empty dict when the table does not exist."""
+        if not required and not table_path.is_dir():
+            return {}
+        handle = self.backend.tools.table()
+        if not handle.open(str(table_path)):
+            raise BackendError(f"could not open {table_path}")
+        try:
+            if handle.nrows() == 0:
+                return {name: np.asarray([]) for name in columns}
+            return {name: np.asarray(handle.getcol(name)) for name in columns}
+        finally:
+            handle.close()
+
+    def _apply_fitsidi_flags(self, project_code: str) -> int:
+        """Apply the FLAG_CMD rows the FITS-IDI import wrote (the correlator's FLAG table), then mark them
+        APPLIED. Returns the number of commands applied.
+
+        Every row is applied, applied before or not: this runs as the a-priori flag step, after an
+        ``--scratch`` reset may have cleared the flags again. Commands are built by
+        :func:`vlbipy.flag_cmd.commands_from_flag_cmd` (time range from TIME/INTERVAL, IDs to names).
+        """
+        from ..flag_cmd import commands_from_flag_cmd
+        ms = self.backend.ms_path(project_code)
+        rows = self._read_columns(ms / "FLAG_CMD", ("TIME", "INTERVAL", "COMMAND"), required=False)
+        if not rows or not len(rows["TIME"]):
+            warnings.anomaly(f"{project_code}: the measurement set has no FLAG_CMD rows (the FITS-IDI file carried "
+                             "no FLAG table); no a-priori flags were applied")
+            return 0
+        antennas = [str(n) for n in self._read_columns(ms / "ANTENNA", ("NAME",))["NAME"]]
+        fields = [str(n) for n in self._read_columns(ms / "FIELD", ("NAME",))["NAME"]]
+        result = commands_from_flag_cmd(rows["TIME"], rows["INTERVAL"], rows["COMMAND"], antennas, fields)
+        if result["skipped"]:
+            warnings.anomaly(f"{project_code}: {len(result['skipped'])} FLAG_CMD row(s) could not be applied: "
+                             + "; ".join(result["skipped"][:5]) + (" ..." if len(result["skipped"]) > 5 else ""))
+        commands = result["commands"]
+        logger.info("flag[fitsidi]: {} FITS-IDI flag command(s) from FLAG_CMD ({})", len(commands),
+                    ", ".join(f"{name} {count}" for name, count in sorted(result["per_antenna"].items())))
+        if not commands:
+            return 0
+        try:
+            self.backend.tasks.flagdata(vis=str(ms), mode="list", inpfile=commands, flagbackup=False,
+                                        action="apply")
+        except RuntimeError as exc:
+            raise BackendError(f"{project_code}: flagdata[fitsidi] failed: {exc}") from exc
+        self._mark_flag_cmd_applied(ms / "FLAG_CMD")
+        return len(commands)
+
+    def _mark_flag_cmd_applied(self, table_path: Path) -> None:
+        """Set APPLIED on every FLAG_CMD row (what ``flagcmd(action='apply')`` records)."""
+        handle = self.backend.tools.table()
+        if not handle.open(str(table_path), nomodify=False):
+            logger.warning("could not open {} to mark its rows applied", table_path)
+            return
+        try:
+            handle.putcol("APPLIED", np.ones(handle.nrows(), dtype=bool))
+        finally:
+            handle.close()
 
     def _spike_departures(self, amplitude: np.ndarray, finite: np.ndarray, threshold: float,
                           smooth_bins: int) -> tuple[np.ndarray, np.ndarray]:

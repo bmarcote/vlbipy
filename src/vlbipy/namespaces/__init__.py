@@ -1659,25 +1659,33 @@ class FlagNamespace(Namespace):
 
         The a-priori flag table (``.uvflg`` for the EVN/LBA) marks data the
         station or correlator already knows to be bad — off-source slews,
-        receiver problems, known RFI. VLBA data carries those flags inside the
-        FITS-IDI, so ``importfitsidi`` has already applied them and only the
-        autocorrelations remain.
+        receiver problems, known RFI. VLBA data carry those flags inside the
+        FITS-IDI file (``flags_in_fitsidi``): the import only copies them into the
+        FLAG_CMD subtable, unapplied, so they are applied from there
+        (``flag_fitsidi``, :mod:`vlbipy.flag_cmd`), every row with its time range.
         """
-        obs = self._obs
-        handler = obs._observatory_handler
-        flagfile = self._ensure_flag_file()
-        flagged = 0.0
-        if flagfile:
-            logger.info("flag.apriori: applying {}", Path(flagfile).name)
-            flagged += self.from_file(str(flagfile), force=force)
+        handler = self._obs._observatory_handler
+        if handler.flags_in_fitsidi:
+            logger.info("flag.apriori: applying the FITS-IDI flags imported into FLAG_CMD")
+            flagged = self._run("fitsidi", force=force)
         else:
-            warnings.anomaly(
-                f"{self._code}: no a-priori flag file for {handler.name}; off-source and slewing "
-                "data will stay in the dataset (visible as low amplitudes at scan starts)")
+            flagged = self._apriori_from_file(force=force)
         if self._accor_pending():
             logger.info("flag.apriori: the autocorrelations are kept for accor; calibrate.a_priori flags them")
             return flagged
         return flagged + self.autocorr(force=force)
+
+    def _apriori_from_file(self, *, force: bool = False) -> float:
+        """Apply the network's a-priori flag file (:meth:`_ensure_flag_file`); warn when there is none.
+        Returns the fraction newly flagged."""
+        flagfile = self._ensure_flag_file()
+        if flagfile:
+            logger.info("flag.apriori: applying {}", Path(flagfile).name)
+            return self.from_file(str(flagfile), force=force)
+        warnings.anomaly(f"{self._code}: no a-priori flag file for {self._obs._observatory_handler.name}; "
+                         "off-source and slewing data will stay in the dataset (visible as low amplitudes at "
+                         "scan starts)")
+        return 0.0
 
     def _accor_pending(self) -> bool:
         """True when accor still has to run on this observation (it needs the autocorrelations unflagged)."""
