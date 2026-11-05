@@ -69,7 +69,7 @@ def _uv_dtype(header) -> tuple[np.dtype, dict]:
         if kind is None:
             raise NotImplementedError(f"UV_DATA column {name} has unsupported TFORM {form}")
         dims = header.get(f"TDIM{k}")
-        if dims:
+        if dims and count != 1:                        # TDIM='(1)' (DiFX) stays a scalar field
             shape = tuple(int(n) for n in str(dims).strip("() ").split(","))[::-1]
         elif count == 0:
             shape = (0,)                                # a zero-count column (e.g. DiFX's GATEID) is 0 bytes

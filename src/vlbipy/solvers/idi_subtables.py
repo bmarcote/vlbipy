@@ -411,10 +411,18 @@ def scan_idi_file(path) -> dict:
                     if repeat[column][1] == "A":
                         data[column] = [str(v).rstrip(" \x00") for v in values]
                     else:
-                        data[column] = np.array(values)
+                        data[column] = _flatten_single(np.array(values), repeat[column][0])
                 entry["data"] = data
             hdus.append(entry)
     return {"path": path, "correlat": correlat, "corver": corver, "vanvleck": vanvleck, "hdus": hdus}
+
+
+def _flatten_single(values: np.ndarray, count: int) -> np.ndarray:
+    """A one-element column as ``(nrow,)``: astropy gives ``(nrow, 1)`` when the column has ``TDIM = '(1)'``
+    (DiFX/VLBA files), and NumPy >= 2.5 refuses ``float()`` / ``int()`` on the 1-element cells that follows."""
+    if count == 1 and values.ndim > 1 and values.size == values.shape[0]:
+        return values.reshape(values.shape[0])
+    return values
 
 
 def _nrows(entry: dict) -> int:

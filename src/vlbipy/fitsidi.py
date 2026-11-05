@@ -57,6 +57,12 @@ def find_fitsidi_files(directory: Union[str, Path], project_code: str) -> list[s
     return []
 
 
+def _scalar(value):
+    """The single element of a table cell: a scalar, or a 1-element array (astropy gives ``(1,)`` cells for a
+    column with ``TDIM = '(1)'``, as DiFX/VLBA files write; NumPy >= 2.5 refuses ``float()`` on those)."""
+    return np.asarray(value).reshape(-1)[0]
+
+
 def _common_header(hdulist: fits.HDUList) -> fits.Header:
     """Return the header of the first FITS-IDI table HDU (holds the common keywords)."""
     for hdu in hdulist[1:]:
@@ -137,10 +143,10 @@ def apriori_coverage(fitsidi_file: Union[str, Path]) -> dict[str, list[str]]:
     """
     with fits.open(fitsidi_file, memmap=True) as hdulist:
         geometry = hdulist["ARRAY_GEOMETRY"].data
-        numbers = {int(n): str(name).strip() for name, n in zip(geometry["ANNAME"], geometry["NOSTA"])}
+        numbers = {int(_scalar(n)): str(name).strip() for name, n in zip(geometry["ANNAME"], geometry["NOSTA"])}
         present = {}
         for label, extname in (("Tsys", "SYSTEM_TEMPERATURE"), ("gain curve", "GAIN_CURVE")):
-            present[label] = set(np.unique(hdulist[extname].data["ANTENNA_NO"]).tolist()) \
+            present[label] = set(np.unique(np.ravel(hdulist[extname].data["ANTENNA_NO"])).tolist()) \
                 if extname in hdulist and hdulist[extname].header.get("NAXIS2", 0) > 0 else set()
     return {label: [name for number, name in sorted(numbers.items()) if number not in antennas]
             for label, antennas in present.items()}
@@ -182,8 +188,8 @@ def _read_antennas(hdulist: fits.HDUList) -> dict[str, Antenna]:
     columns = hdulist["ARRAY_GEOMETRY"].columns.names
     for i in range(len(table)):
         name = str(table["ANNAME"][i]).strip()
-        position = tuple(float(v) for v in table["STABXYZ"][i]) if "STABXYZ" in columns else (0.0, 0.0, 0.0)
-        diameter = float(table["DIAMETER"][i]) if "DIAMETER" in columns else 0.0
+        position = tuple(float(v) for v in np.ravel(table["STABXYZ"][i])) if "STABXYZ" in columns else (0.0, 0.0, 0.0)
+        diameter = float(_scalar(table["DIAMETER"][i])) if "DIAMETER" in columns else 0.0
         antennas[name] = Antenna(name=name, diameter=diameter, position=position, observed=True)
     return antennas
 
@@ -203,8 +209,7 @@ def _read_sources(hdulist: fits.HDUList) -> tuple[list[str], dict[str, tuple[flo
         names.append(name)
         if "RAEPO" in columns and "DECEPO" in columns:
             # Some correlators write RA wrapped to (-180, 180]; normalize to [0, 360).
-            coords[name] = (float(np.atleast_1d(table["RAEPO"][i])[0]) % 360.0,
-                            float(np.atleast_1d(table["DECEPO"][i])[0]))
+            coords[name] = (float(_scalar(table["RAEPO"][i])) % 360.0, float(_scalar(table["DECEPO"][i])))
     return names, coords
 
 

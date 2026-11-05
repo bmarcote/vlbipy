@@ -169,3 +169,26 @@ def test_apriori_on_vlba_applies_the_fitsidi_flags_not_a_flag_file(tmp_path, mon
     obs["vb01"].flag.apriori()
     assert obs["vb01"]._state.status("flag_fitsidi") == "done"
     assert not any("no a-priori flag file" in a for a in anomalies())
+
+
+def test_one_element_tdim_columns_read_as_scalars(tmp_path):
+    """DiFX/VLBA files give one-element columns TDIM='(1)', which astropy reads as (nrow, 1): NumPy >= 2.5 refuses
+    float()/int() on those cells ("only 0-dimensional arrays can be converted to Python scalars")."""
+    one = {"dim": "(1)"}
+    hdus = [fits.PrimaryHDU(),
+            _table("ARRAY_GEOMETRY", [fits.Column("ANNAME", "8A", array=ANTENNAS),
+                                      fits.Column("NOSTA", "1J", array=np.arange(1, 5).reshape(4, 1), **one),
+                                      fits.Column("DIAMETER", "1E", array=np.full((4, 1), 25.0), **one)]),
+            _table("SOURCE", [fits.Column("SOURCE", "16A", array=["J0000+0000"]),
+                              fits.Column("RAEPO", "1D", array=np.array([[-10.0]]), **one),
+                              fits.Column("DECEPO", "1D", array=np.array([[45.0]]), **one)]),
+            _table("SYSTEM_TEMPERATURE", [fits.Column("ANTENNA_NO", "1J", array=np.array([[1], [2]]), **one)])]
+    path = tmp_path / "vb02.idifits"
+    fits.HDUList(hdus).writeto(path)
+    with fits.open(path) as hdulist:
+        assert hdulist["ARRAY_GEOMETRY"].data["NOSTA"].shape == (4, 1)        # the layout this test is about
+        antennas = fitsidi._read_antennas(hdulist)
+        names, coords = fitsidi._read_sources(hdulist)
+    assert [a.diameter for a in antennas.values()] == [25.0] * 4
+    assert names == ["J0000+0000"] and coords["J0000+0000"] == (350.0, 45.0)
+    assert fitsidi.apriori_coverage(path) == {"Tsys": ["HN", "KP"], "gain curve": ANTENNAS}

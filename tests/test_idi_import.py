@@ -206,3 +206,17 @@ def test_failed_import_removes_the_partial_multi_ms(tmp_path, monkeypatch):
     with pytest.raises(WorkerError):
         import_fitsidi([str(f) for f in IDI_FILES], out, scan_gap=15.0)
     assert not out.exists()
+
+
+def test_uv_dtype_reads_one_element_tdim_columns_as_scalars():
+    """A UV_DATA column with TDIM='(1)' (DiFX/VLBA) is a scalar field, so row reads give one value per row."""
+    from astropy.io import fits
+    header = fits.Header([("NAXIS1", 4 + 8 + 4 * 2 * 2), ("TFIELDS", 3),
+                          ("TTYPE1", "INTTIM"), ("TFORM1", "1E"), ("TDIM1", "(1)"),
+                          ("TTYPE2", "DATE"), ("TFORM2", "1D"),
+                          ("TTYPE3", "FLUX"), ("TFORM3", "4E"), ("TDIM3", "(2,2)")])
+    dtype, shapes = idi_import._uv_dtype(header)
+    assert shapes["INTTIM"] == () and dtype["INTTIM"].shape == ()
+    assert shapes["FLUX"] == (2, 2)
+    rows = np.zeros(2, dtype=dtype)
+    assert float(rows["INTTIM"][0]) == 0.0

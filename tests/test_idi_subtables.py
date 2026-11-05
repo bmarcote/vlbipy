@@ -346,3 +346,22 @@ def test_synthetic_subtables_match_casa(tmp_path):
     assert {"WEATHER", "PHASE_CAL", "SYSCAL", "GAIN_CURVE", "EARTH_ORIENTATION"} <= set(written["syn_ab"])
     with Table(tmp_path / "native" / "syn_ab.mms" / "SUBMSS" / "syn_ab.mms.0000.ms" / "FLAG_CMD") as flags:
         assert flags.nrows() == 4                     # the ARRAY 1 row is skipped, the second file's is dropped
+
+
+def test_one_element_tdim_columns_are_scanned_as_one_value_per_row(tmp_path):
+    """TDIM='(1)' (DiFX/VLBA) makes astropy return (nrow, 1) columns; the scan flattens them to (nrow,) so that
+    int()/float() of a cell works under NumPy >= 2.5."""
+    from astropy.io import fits
+    from vlbipy.solvers.idi_subtables import _antenna_numbering, scan_idi_file
+    numbers = np.array([[3], [1], [2]], dtype=np.int32)
+    columns = [fits.Column("ANNAME", "8A", array=["BR", "FD", "HN"]),
+               fits.Column("NOSTA", "1J", array=numbers, dim="(1)"),
+               fits.Column("STABXYZ", "3D", array=np.zeros((3, 3)))]
+    hdu = fits.BinTableHDU.from_columns(columns)
+    hdu.header["EXTNAME"] = "ARRAY_GEOMETRY"
+    path = tmp_path / "tdim.idifits"
+    fits.HDUList([fits.PrimaryHDU(), hdu]).writeto(path)
+    entry = scan_idi_file(path)["hdus"][0]
+    assert entry["data"]["NOSTA"].shape == (3,)
+    assert entry["data"]["STABXYZ"].shape == (3, 3)            # real vectors keep their shape
+    assert _antenna_numbering({"hdus": [entry]}) == {3: 0, 1: 1, 2: 2}

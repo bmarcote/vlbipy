@@ -27,7 +27,7 @@ from ..logging_utils import get_logger, warnings
 from ..models import (Antenna, CalTable, FreqSetup, ObsMetadata, QualityMetrics, Scan, ScanSNRSurvey,
                       Stokes)
 from ..results import Image
-from ..tools import fetch_eop_file, mjdsec2datetime, space_available_gb
+from ..tools import ensure_casa_data_dir, fetch_eop_file, mjdsec2datetime, space_available_gb
 from .base import (TIME_EVOLUTION_CHANNEL_FRACTION, Backend, CalibrationOps, DataOps, ExportOps, FlagOps,
                    ImagingOps, PlotOps)
 
@@ -6798,6 +6798,7 @@ class CasaBackend(Backend):
     export_ops = CasaExportOps
 
     def __init__(self, work_dir: str = ".") -> None:
+        ensure_casa_data_dir()                     # casatools does not import without it
         try:
             import casatasks
             import casatools

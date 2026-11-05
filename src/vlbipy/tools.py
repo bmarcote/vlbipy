@@ -26,6 +26,24 @@ logger = get_logger()
 _MJD_ORIGIN = dt.datetime(1858, 11, 17, tzinfo=None)
 
 
+#: Where casatools (casaconfig ``measurespath``) and python-casacore look for the measures data by default.
+CASA_DATA_DIR = Path("~/.casa/data")
+
+
+def ensure_casa_data_dir(path: Union[str, Path] = CASA_DATA_DIR) -> Path:
+    """Create the CASA measures directory (default ``~/.casa/data``) when it does not exist; return its path.
+
+    casatools refuses to import when its ``measurespath`` is missing, and python-casacore expects the same
+    directory, so it has to exist before the first ``import casatools`` / ``import casacore`` (CASA and dask-ms
+    backends). An existing directory is left untouched; with it in place casaconfig can populate it itself.
+    """
+    target = Path(path).expanduser()
+    if not target.is_dir():
+        target.mkdir(parents=True, exist_ok=True)
+        logger.info("created the CASA data directory {} (measures data are fetched there by casaconfig)", target)
+    return target
+
+
 def mjd2datetime(mjd: float) -> dt.datetime:
     """Convert a Modified Julian Date (in days) to a naive UTC datetime."""
     return _MJD_ORIGIN + dt.timedelta(days=float(mjd))

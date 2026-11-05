@@ -1412,6 +1412,8 @@ class DaskMsBackend(CasaBackend):
     export_ops = DaskMsExportOps
 
     def __init__(self, work_dir: str = ".") -> None:
+        from ..tools import ensure_casa_data_dir
+        ensure_casa_data_dir()                     # daskms imports python-casacore, which expects it
         try:
             import daskms  # noqa: F401
         except ImportError as exc:
