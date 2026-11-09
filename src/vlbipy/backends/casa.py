@@ -2364,46 +2364,141 @@ class CasaCalibrationOps(CalibrationOps):
         return CalTable(cal_type="accor", path=str(applied), field=field, interp=APRIORI_TABLE_SPECS["accor"][1])
 
     def _set_model_column(self, ms: Path, field: str, model: str) -> None:
-        """Fill MODEL_DATA of ``field`` from the model image (engine hook: native under dask-ms)."""
-        self.backend.tasks.setjy(vis=str(ms), field=field, model=str(model), scalebychan=True)
+        """Fill MODEL_DATA of ``field`` from the model image (engine hook: native under dask-ms).
 
-    def emerlin_scale(self, project_code: str, field: str, antennas: list[str], fixed: str, *,
-                      model: str, flux_total: Optional[float] = None,
+        CASA's ``setjy`` reads a CASA image (the ``*.model.tt0`` e-MERLIN models) and scales it, channel by
+        channel, to the Perley-Butler 2017 flux density of a standard such as 3C286.
+        """
+        self.backend.tasks.setjy(vis=str(ms), field=field, model=str(model), standard="Perley-Butler 2017",
+                                 scalebychan=True, usescratch=True)
+
+    def emerlin_scale(self, project_code: str, field: str, antennas: list[str], reference: str, *,
+                      model: str, hold_reference: bool = False, phase_solint: str = "30s", minsnr: float = 3.0,
                       gaintable: Optional[list] = None, callib: bool = False, **kwargs) -> Optional[CalTable]:
-        """Amplitude gains of the e-MERLIN outstations from a modelled flux calibrator (3C286).
+        """Amplitude gains of the e-MERLIN antennas from a modelled flux calibrator (3C286).
 
-        The e-MERLIN outstations lack reliable Tsys, so their subband amplitudes
-        are rescaled against the known source: the model is written into
-        MODEL_DATA, amplitude gains are solved for ``antennas`` on the baselines
-        among them and ``fixed`` (``calmode='a'``, ``solint='inf'``), the
-        solutions are renormalised so that ``fixed`` keeps gain 1, and every
-        other antenna gets unit gain — the table can then sit in the apply chain
-        and correct only the e-MERLIN data.
+        The e-MERLIN outstations lack reliable Tsys, so their subband amplitudes are set against the known
+        source, the way the e-MERLIN pipeline does it (``setjy`` with the model, ``gaincal``): the model goes
+        into MODEL_DATA (scaled to the catalogue flux in every channel), the phases are solved on
+        ``phase_solint`` so that the amplitudes average coherently, and one amplitude gain per antenna, subband and
+        hand is solved over every scan of the calibrator (``calmode='a'``, ``solint='inf'``,
+        ``combine='scan'``). Only the baselines among the e-MERLIN antennas take part: ``antennas`` (the
+        outstations) and ``reference`` (Jb). Jb is solved like the others, so every e-MERLIN antenna ends on the
+        model's absolute scale; ``hold_reference`` keeps Jb at its a-priori amplitude instead (its gain set to
+        1, the outstations divided by it). Every other antenna gets unit gain, so the table can sit in the apply
+        chain and correct only the e-MERLIN data.
 
-        Returns the CalTable (cal_type ``emgain``), or None when the solve produced nothing.
+        The phase solutions are only an intermediate and are deleted. Returns the CalTable (cal_type
+        ``emgain``, its ``spwmap`` sending a subband without e-MERLIN baselines to the nearest one that has
+        them; see :meth:`_complete_emerlin_table`), or None when the solve produced nothing.
         """
         ms = self.backend.ms_path(project_code)
         table_path = self.backend.caldir() / f"{project_code}.emgain"
-        if table_path.exists():
-            shutil.rmtree(table_path)
+        phase_path = self.backend.caldir() / f"{project_code}.emgain_phase"
+        for path in (table_path, phase_path):
+            if path.exists():
+                shutil.rmtree(path)
         self._set_model_column(ms, field, model)
-        # Both groups: baselines outstation-outstation and outstation-Jb.
-        selection = "&".join([",".join(antennas), ",".join([*antennas, fixed])])
-        params = {"vis": str(ms), "caltable": str(table_path), "field": field, "calmode": "a",
-                  "solint": "inf", "antenna": selection, "minsnr": 1.0, "parang": True}
-        params.update(self._prior_callib(project_code, gaintable, table_path, field=field, callib=callib))
+        members = [*antennas, reference]
+        base = {"vis": str(ms), "field": field, "antenna": ",".join(members) + "&", "refant": reference,
+                "minsnr": float(minsnr), "parang": True}
         try:
-            self._run_gaincal_task(params)
-        except RuntimeError as exc:
+            phase = dict(base, caltable=str(phase_path), calmode="p", solint=str(phase_solint))
+            phase.update(self._prior_callib(project_code, gaintable, phase_path, field=field, callib=callib))
+            self._run_gaincal_task(phase)
+            priors = list(gaintable or [])
+            if phase_path.is_dir():
+                priors.append(CalTable(cal_type="emgain_phase", path=str(phase_path), field=field, gainfield=field,
+                                       interp="linear"))
+            amplitude = dict(base, caltable=str(table_path), calmode="a", solint="inf", combine="scan")
+            amplitude.update(self._prior_callib(project_code, priors, table_path, field=field, callib=callib))
+            self._run_gaincal_task(amplitude)
+        except (RuntimeError, BackendError, ValueError) as exc:
             warnings.warn(f"{project_code}: e-MERLIN flux-scale gaincal failed ({exc}); "
-                          "the outstations keep their a-priori amplitudes")
+                          "the e-MERLIN antennas keep their a-priori amplitudes")
             return None
+        finally:
+            if phase_path.exists():
+                shutil.rmtree(phase_path)
         if not table_path.is_dir():
             warnings.warn(f"{project_code}: e-MERLIN flux-scale produced no table")
             return None
-        self._normalise_emerlin_table(table_path, antennas, fixed)
-        return CalTable(cal_type="emgain", path=str(table_path), field=field, gainfield=field,
-                        interp="nearest")
+        if hold_reference:
+            self._normalise_emerlin_table(table_path, antennas, reference)
+        solved = antennas if hold_reference else members
+        summary = self._complete_emerlin_table(table_path, solved)
+        spws = sorted(summary["spws"])
+        nspw = int(kwargs.get("nspw", 0) or 0) or (max(spws) + 1 if spws else 0)
+        spwmap = [] if not spws or spws == list(range(nspw)) else \
+            [s if s in spws else min(spws, key=lambda solved_spw: (abs(solved_spw - s), solved_spw)) for s in range(nspw)]
+        Path(f"{table_path}.json").write_text(json.dumps({**summary, "spws": spws, "spwmap": spwmap,
+                                                           "model": str(model), "field": field,
+                                                           "reference": reference, "hold_reference": hold_reference},
+                                                          indent=2), encoding="utf-8")
+        logger.info("emgain: amplitude corrections (factors multiply the data) per antenna and subband, both hands: "
+                    "{}{}", "; ".join(f"{name} " + " ".join(
+                        f"spw{spw} " + "/".join(f"{v:.3f}" for v in values)
+                        for spw, values in sorted(per_spw.items(), key=lambda kv: int(kv[0])))
+                        for name, per_spw in summary["factors"].items()),
+                    f"; subbands without e-MERLIN baselines take the nearest one's (spwmap {spwmap})" if spwmap else "")
+        return CalTable(cal_type="emgain", path=str(table_path), field=field, gainfield=field, interp="nearest",
+                        spwmap=spwmap)
+
+    def _complete_emerlin_table(self, table_path: Path, solved: list[str]) -> dict:
+        """Make the e-MERLIN amplitude table safe to apply to every field, and summarise it.
+
+        Antennas outside ``solved`` get unit gain, unflagged. A cell of a solved antenna without a solution
+        (flagged, or zero) gets the antenna's median gain over its solved subbands and hands, unflagged: the
+        antenna keeps one level rather than having those data flagged at apply time. Returns ``spws`` (the subbands
+        the table has rows for), ``factors`` (antenna -> subband -> the correction per hand, 1/|gain|, before
+        the filling) and ``filled`` (antenna -> number of cells filled).
+        """
+        keep = {name.lower() for name in solved}
+        handle = self.backend.tools.table()
+        if not handle.open(str(table_path), nomodify=False):
+            raise BackendError(f"could not open {table_path}")
+        try:
+            ant_ids = np.asarray(handle.getcol("ANTENNA1"))
+            spw_ids = np.asarray(handle.getcol("SPECTRAL_WINDOW_ID"))
+            gparam = np.asarray(handle.getcol("CPARAM"))           # (npol, nchan, nrow)
+            flags = np.asarray(handle.getcol("FLAG")).astype(bool)
+            names = self._table_antenna_names(table_path)
+            factors: dict = {}
+            filled: dict = {}
+            for antenna in np.unique(ant_ids):
+                name = names[int(antenna)] if int(antenna) < len(names) else f"#{int(antenna)}"
+                rows = np.flatnonzero(ant_ids == antenna)
+                if name.lower() not in keep:
+                    gparam[:, :, rows] = 1.0 + 0.0j
+                    flags[:, :, rows] = False
+                    continue
+                cells = gparam[:, :, rows]
+                good = ~flags[:, :, rows] & (np.abs(cells) > 0) & np.isfinite(cells)
+                if not good.any():
+                    gparam[:, :, rows] = 1.0 + 0.0j
+                    flags[:, :, rows] = False
+                    filled[name] = int(good.size)
+                    continue
+                for row in rows:
+                    ok = ~flags[:, :, row] & (np.abs(gparam[:, :, row]) > 0)
+                    if ok.any():
+                        factors.setdefault(name, {})[str(int(spw_ids[row]))] = [
+                            float(1.0 / np.abs(gparam[pol, :, row][ok[pol]]).mean()) if ok[pol].any() else None
+                            for pol in range(gparam.shape[0])]
+                level = float(np.exp(np.median(np.log(np.abs(cells[good])))))
+                if (~good).any():
+                    filled[name] = int((~good).sum())
+                gparam[:, :, rows] = np.where(good, cells, level + 0.0j)
+                flags[:, :, rows] = False
+            handle.putcol("CPARAM", gparam)
+            handle.putcol("FLAG", flags)
+            handle.flush()
+        finally:
+            handle.close()
+        if filled:
+            logger.info("emgain: cells without a solution set to the antenna's median gain: {}",
+                        ", ".join(f"{name} {count}" for name, count in filled.items()))
+        return {"spws": {int(s) for s in np.unique(spw_ids)}, "factors": factors, "filled": filled}
 
     def _normalise_emerlin_table(self, table_path: Path, antennas: list[str], fixed: str) -> None:
         """Divide every solution by the ``fixed`` antenna's gain and set unit gain for the rest.

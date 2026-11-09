@@ -78,6 +78,19 @@ wrong, copy the reviewed rows to `data/ai/CODE.features.jsonl` and run `vlbipy a
   detect it among themselves at fringe SNR 30-130. `[calibration.mbd].subarray_km` re-solves such nearby
   undetected antennas among themselves (`vlbipy/subarrays.py`); the baselines between sub-arrays are flagged in
   the per-source splits. A uv taper cannot help there: the long baselines have no phase solutions at all.
+- e-MERLIN flux scale (`emerlin_scale`, EM178 2026-11-09): the 3C286 models are in
+  `data/emerlin_calibrator_models` - CASA images (`*.clean.model.tt0`, used by CASA and dask-ms) and AIPS ones
+  (`*.ICL001`). The step solves the phases, then one amplitude gain per antenna, subband and hand over all 3C286
+  scans, on the baselines among the outstations and Jb (Jb solved too; `hold_reference` keeps it at 1), against
+  the model scaled to Perley-Butler 2017 per channel; subbands without e-MERLIN data take the nearest one's
+  (`spwmap`). Self-calibration then holds the amplitudes of those antennas (`bayes_gscale(fixed=)`: no correction,
+  and they hold each IF's flux scale) while their phases solve - difmap's `selfant` fix would hold the phases too.
+  `emerlin_check` compares the calibrated 3C286 amplitudes with the model per antenna, subband and hand after the
+  step and after self-calibration (`emerlin_check_<stage>.json`). The native setjy had read FITS models with
+  |CDELT| (mirrored in RA) and never scaled to the catalogue spectrum; neither applies now.
+- A resume (`--from-step`) forgets the per-source steps after the split (`selfcal_*`, `joint_*`, `clean_*`,
+  `epoch_products`, `final_plots`) and drops their tables; before, they stayed "done" and their self-cal tables
+  became the priors of the re-solved step. A re-run of the AI distribution flagging restores its previous flags.
 - Inverse phase referencing needs a target the fringe fit detects: IRAS1829 (~3 mJy) was detected by no
   antenna, so every target-referenced solution was flagged.
 - difmap grids only |u|, |v| < 1/(4 cell) x (1 - 8/npix) (difmap-core `uv_limits`). The source-search map

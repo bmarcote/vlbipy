@@ -42,7 +42,8 @@ vlbipy = "vlbipy.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-vlbipy = ["templates/*.toml", "data/*.fits", "data/*.json", "data/ai/*.json", "data/ai/*.jsonl"]
+vlbipy = ["templates/*.toml", "data/*.fits", "data/*.json", "data/ai/*.json", "data/ai/*.jsonl",
+          "data/emerlin_calibrator_models/*.ICL001", "data/emerlin_calibrator_models/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

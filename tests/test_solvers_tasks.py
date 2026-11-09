@@ -1142,3 +1142,63 @@ def test_gain_solve_follows_the_antennas_left_with_data():
     pair[0, 2] = pair[1, 2] = 0.0                        # only the 0-1 baseline left
     _, flags, _ = solve_antenna_gains(np.where(pair > 0, cross, 0), pair, mode="a", minblperant=4)
     assert flags.all()
+
+
+def test_setjy_fills_an_unwritten_model_column_and_the_check_finds_the_gains(sim):
+    """EM178: a MODEL_DATA column whose cells were never written ("TSM: no array in row 0") stopped the native
+    setjy, which read it for its shape. The e-MERLIN 3C286 model goes in as the direct sum of its components, and
+    the check against the model recovers the antenna amplitudes the calibrated data carry."""
+    from vlbipy.solvers.fluxcheck import model_check
+    from vlbipy.solvers.setjy import casa_image_components, predict, setjy
+
+    pytest.importorskip("casacore.images")
+    image = Path(__file__).resolve().parents[1] / "src/vlbipy/data/emerlin_calibrator_models/3C286_L.clean.model.tt0"
+    ms = sim["ms"]
+    positions = 6.371e6 * np.array([[np.cos(0.1 * i), np.sin(0.1 * i), 0.5] for i in range(NANT)])
+    uvw = 0.2 * (positions[sim["ant2"]] - positions[sim["ant1"]])           # 30-130 km: e-MERLIN baselines
+    tb = casatools.table()
+    tb.open(str(ms), nomodify=False)
+    tb.addcols({"UVW": dict(_array("double", [3]), dataManagerType="StandardStMan", dataManagerGroup="UVW")})
+    tb.putcol("UVW", np.asfortranarray(uvw.T))
+    tb.addcols({"MODEL_DATA": dict(_array("complex", ndim=2), dataManagerType="TiledShapeStMan",
+                                   dataManagerGroup="MODEL")})
+    tb.close()
+    report = setjy(ms, "CAL", image)
+    assert report["scaled"] == "image" and report["components"] == 5925
+    flux, l, m, _ = casa_image_components(image)
+    (model,) = _columns(ms, "MODEL_DATA")
+    for spw in range(NSPW):
+        rows = np.flatnonzero(sim["spw"] == spw)
+        expected = predict(uvw[rows], CHAN_FREQ[spw], flux, l, m)
+        np.testing.assert_allclose(model[rows][:, :, 0], expected, rtol=1e-4, atol=1e-4)
+        np.testing.assert_allclose(model[rows][:, :, NCORR - 1], expected, rtol=1e-4, atol=1e-4)
+        assert not np.any(model[rows][:, :, 1:NCORR - 1])                     # Stokes I only
+    amplitude = np.array([1.0, 1.1, 0.9, 1.05, 0.95])
+    corrected = model * (amplitude[sim["ant1"]] * amplitude[sim["ant2"]])[:, None, None]
+    tb.open(str(ms), nomodify=False)
+    tb.addcols({"CORRECTED_DATA": dict(_array("complex", [NCORR, NCHAN]), dataManagerType="TiledShapeStMan",
+                                       dataManagerGroup="CORRECTED")})
+    tb.putcol("CORRECTED_DATA", np.asfortranarray(corrected.astype(np.complex64).T))
+    tb.close()
+    check = model_check(ms, "CAL", [f"A{i}" for i in range(NANT)], image)
+    for spw in ("0", "1"):
+        for entry in check["spws"][spw].values():
+            ratios = [entry["antennas"][f"A{i}"] for i in range(NANT)]
+            np.testing.assert_allclose(ratios, amplitude, rtol=1e-4)
+
+
+def test_a_new_model_column_holds_the_unit_model_everywhere(sim):
+    """No cell of MODEL_DATA is left without an array: the readers of the column (the fringe fit of the calibrated
+    SNR survey) failed on the rows setjy did not write."""
+    from vlbipy.solvers.msio import read_layout, read_setup
+    from vlbipy.solvers.setjy import unit_model
+
+    ms = sim["ms"]
+    tb = casatools.table()
+    tb.open(str(ms), nomodify=False)
+    tb.addcols({"MODEL_DATA": dict(_array("complex", ndim=2), dataManagerType="TiledShapeStMan",
+                                   dataManagerGroup="MODEL")})
+    tb.close()
+    assert unit_model(ms, read_layout(ms), read_setup(ms), max_rows=7) == len(sim["ant1"])
+    (model,) = _columns(ms, "MODEL_DATA")
+    assert np.all(model[:, :, [0, NCORR - 1]] == 1) and not np.any(model[:, :, 1:NCORR - 1])

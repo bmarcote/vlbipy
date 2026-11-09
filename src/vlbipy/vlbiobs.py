@@ -583,6 +583,8 @@ class VLBIObs:
 
         # The sequence follows the reduce-vlbi-data procedure step by step.
         self.import_data(force=force)                                  # steps 1-3
+        # The roles an earlier run inferred, before any step: a resumed run skips the step that adopts them.
+        self._each_project(lambda obs: obs.calibrate.reuse_source_roles())
         self._split_frequency_bands(force=force)                       # multi-band (S/X): one pipeline per band
         self._each_project(lambda obs: obs.notebook())                 # first notebook: what is there so far
         self.flag.apriori(force=force)                                 # step 4
@@ -626,11 +628,8 @@ class VLBIObs:
             self.calibrate.apply(force=True, defer=True)
         # e-MERLIN flux scale: a model-based amplitude correction of the outstations,
         # appended to the chain before the split sees it.
-        def emerlin_scale(obs: Observation) -> None:
-            if obs.calibrate.emerlin_scale(force=force):
-                obs.calibrate.apply(force=True, defer=True)
-
-        self._each_project(emerlin_scale)
+        # The step applies its table and checks the e-MERLIN amplitudes against the model itself.
+        self._each_project(lambda obs: obs.calibrate.emerlin_scale(force=force))
         # AI mode: whatever the calibrated data show outside the noise distribution (Rice amplitudes, von Mises
         # phases, one level for every subband) is flagged before self-calibration and imaging see it.
         self._each_project(lambda obs: obs.ai.flag_distribution(force=force)

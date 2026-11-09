@@ -197,7 +197,7 @@ def phase_selfcal(obs, solints: list[str], *, min_improvement: float = 0.002,
 
 def amplitude_calibration(obs, prefix: str, parent_ms: str, *, models=("current", "gauss1", "gauss2", "gauss3"),
                           prior_sigma: float = 0.1, workers: Optional[int] = None, allow_clean: bool = False,
-                          per_if: bool = True, if_sigma: Optional[float] = 0.1) -> dict:
+                          per_if: bool = True, if_sigma: Optional[float] = 0.1, fixed=()) -> dict:
     """Bayesian station amplitude calibration; writes ``<prefix>.json``, ``.png`` and the CASA table.
 
     The table refers to ``parent_ms`` (the multi-source measurement set), so
@@ -211,13 +211,16 @@ def amplitude_calibration(obs, prefix: str, parent_ms: str, *, models=("current"
     weak phase calibrator could not solve), while the per-IF estimates of a weak station, which are noise the
     table would carry to every field, collapse to its one level (EB104G: T6 x13-24 across IFs at sigma ~0.7).
     ``if_sigma=None`` judges every IF on its own; ``per_if=False`` gives one correction per station.
+
+    ``fixed`` stations (the e-MERLIN antennas set against 3C286's model) get no correction and hold the flux scale
+    of every IF: the other stations are scaled to them.
     """
     models = tuple(models)
     if not allow_clean:
         models = tuple(model for model in models if not str(getattr(model, "kind", model)).strip().lower().startswith("clean"))
         models = models or ("current", "gauss1", "gauss2", "gauss3")
     result = obs.bayes_gscale(models=models, prior_sigma=prior_sigma, prefix=str(prefix), per_if=per_if,
-                              if_sigma=if_sigma if per_if and if_sigma else None,
+                              if_sigma=if_sigma if per_if and if_sigma else None, fixed=list(fixed) or None,
                               outformat="CASA", ms=str(parent_ms), workers=workers, plot=False, quiet=False,
                               verbose=False)
     raw_files = dict(getattr(result, "files", {}) or {})
@@ -240,7 +243,8 @@ TIME_AMPLITUDE_MAX = 5.0
 
 
 def time_amplitude_selfcal(obs, prefix: str, parent_ms: str, *, solint: str = "scan", min_improvement: float = 0.01,
-                           max_factor: float = TIME_AMPLITUDE_MAX, max_bad_fraction: float = 0.25) -> tuple[object, dict]:
+                           max_factor: float = TIME_AMPLITUDE_MAX, max_bad_fraction: float = 0.25,
+                           fixed=()) -> tuple[object, dict]:
     """Amplitude self-calibration in time, normalised so that only the time dependence is corrected.
 
     The Bayesian gscale (:func:`amplitude_calibration`) gives every station one level for the whole run, which is
@@ -258,6 +262,9 @@ def time_amplitude_selfcal(obs, prefix: str, parent_ms: str, *, solint: str = "s
     up to x12.7) pulled every other station to x0.65-0.8 and the fit got 60x worse. The median normalisation per
     station makes the scale irrelevant anyway.
 
+    ``fixed`` stations are held (difmap ``selfant``) during the solve, phases are not solved here, and keep a flat
+    curve: their amplitudes are already right (the e-MERLIN antennas set against 3C286).
+
     Returns
     -------
     (observation, report)
@@ -268,7 +275,14 @@ def time_amplitude_selfcal(obs, prefix: str, parent_ms: str, *, solint: str = "s
     from difmapy.io.solutions import from_gain_table
     snapshot = obs.gain_snapshot()
     trial = obs.copy()
-    result = trial.selfcal(amp=True, phase=False, solint=solint, float_scale=True, quiet=False, verbose=False)
+    held = [name for name in fixed if name in trial.antennas]
+    if held:
+        trial.selfant(held, fix=True, verbose=False)
+    try:
+        result = trial.selfcal(amp=True, phase=False, solint=solint, float_scale=True, quiet=False, verbose=False)
+    finally:
+        if held:
+            trial.selfant(held, fix=False, verbose=False)
     before, after = float(result["fit_before"]["chisq"]), float(result["fit_after"]["chisq"])
     improvement = (before - after) / before if before > 0 else 0.0
     bad = _bad_fraction(result)
@@ -286,6 +300,10 @@ def time_amplitude_selfcal(obs, prefix: str, parent_ms: str, *, solint: str = "s
         level = np.nanmedian(curve, axis=0)                                            # (nant,)
         curve = curve / np.where(np.isfinite(level) & (level > 0), level, 1.0)[None, :]
     curve = np.where(np.isfinite(curve), curve, 1.0)
+    names = list(trial.antennas)
+    for name in held:
+        if names.index(name) < curve.shape[1]:
+            curve[:, names.index(name)] = 1.0
     dead = (curve > max_factor) | (curve < 1.0 / max_factor)
     sol.amp = np.repeat(np.where(dead, 1.0, curve)[:, None, :], amp.shape[1], axis=1)
     sol.phs = np.zeros_like(sol.phs)
@@ -293,7 +311,6 @@ def time_amplitude_selfcal(obs, prefix: str, parent_ms: str, *, solint: str = "s
     curve = np.where(dead, np.nan, curve)
     info = trial.savecaltable(f"{prefix}.ampt", outformat="CASA", ms=str(parent_ms), solutions=sol, quiet=False,
                               verbose=False)
-    names = list(trial.antennas)
     report["table"] = str(info.get("path", f"{prefix}.ampt"))
     report["range"] = {names[a]: [float(np.nanmin(curve[:, a])), float(np.nanmax(curve[:, a]))]
                        for a in range(min(len(names), curve.shape[1]))
@@ -637,8 +654,9 @@ def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_value
     fixed = [known[n] for n in (a.lower() for a in fixed_antennas) if n in known]
     deferred = [known[n] for n in (a.lower() for a in deferred_antennas) if n in known]
     if fixed:
-        obs.selfant(fixed, fix=True, verbose=False)
-        logger.info("difmapy: {} fixed in self-calibration (a-priori amplitudes held)", ", ".join(fixed))
+        # Amplitudes only: their phases self-calibrate like everyone's (difmap's selfant would hold both).
+        logger.info("difmapy: amplitudes of {} held in self-calibration (set against the flux calibrator's model); "
+                    "the other stations are scaled to them", ", ".join(fixed))
     search, shift = locate_source(obs, imagename or prefix, search_fov_mas=search_fov_mas, search_sigma=search_sigma,
                                   recentre_min_beams=recentre_min_beams)
     # Stage 1 ignores the longest-baseline antennas: they see a resolved source and would bias the
@@ -679,7 +697,7 @@ def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_value
         else {}
     amplitude = amplitude_calibration(obs, f"{prefix}.amp", parent_ms, models=bayes_models, prior_sigma=prior_sigma,
                                       workers=workers, allow_clean=imaging_kwargs.get("method", "modelfit") == "clean",
-                                      per_if=bayes_per_if, if_sigma=bayes_if_sigma)
+                                      per_if=bayes_per_if, if_sigma=bayes_if_sigma, fixed=fixed)
     gains = write_gain_record(obs, f"{prefix}.gains.json", amplitude)
     # One accumulated table (phase + amplitude corrections since the first model) is what
     # gets transferred to the targets and check sources.
@@ -695,7 +713,7 @@ def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_value
         try:
             obs.modelfit(verbose=False)
             obs, time_amp = time_amplitude_selfcal(obs, prefix, parent_ms, solint=time_amplitude,
-                                                   min_improvement=time_amplitude_min_improvement)
+                                                   min_improvement=time_amplitude_min_improvement, fixed=fixed)
         except Exception as exc:  # noqa: BLE001 - the constant amplitude calibration stands without it
             logger.warning("difmapy: time-dependent amplitude self-calibration failed ({})", exc)
     obs.auto_mapsize(npix=int(mapsize))

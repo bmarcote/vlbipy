@@ -292,6 +292,14 @@ class AINamespace(Namespace):
         obs = self._obs
         if not self.enabled or not obs._state.should_run(step, force=force):
             return self.load_report(step)
+        from ..solvers.flagmanager import delete_version, list_versions, restore_version
+        before = f"before_{step}"
+        if before in {name for name, _ in list_versions(self._ms())}:
+            # Run again (a resumed run, a new calibration): its previous flags were judged on the old calibration
+            # and are dropped, or each run would add its own on top.
+            restore_version(self._ms(), before)
+            delete_version(self._ms(), before)
+            logger.info("ai: restored the flags from before the previous {} ({})", step, before)
         cfg = self._cfg
         if fields is None:
             fields = self._calibrators()

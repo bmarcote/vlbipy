@@ -54,6 +54,12 @@ STEP_ORDER = [
 ]
 
 
+#: Steps recorded per source after the split (``selfcal_<source>``, ``joint_<source>``, ``clean_<source>``) and the
+#: products made from them: not in :data:`STEP_ORDER`, but after every step in it.
+PER_SOURCE_STEP_PREFIXES = ("selfcal_", "joint_", "clean_")
+PER_SOURCE_STEPS = ("epoch_products", "final_plots")
+
+
 class Observation:
     """A single VLBI observation (one project code).
 
@@ -619,7 +625,15 @@ class Observation:
             # antennas and scans it uses; a cached choice would make the new survey pointless.
             if STEP_ORDER.index(from_step) <= STEP_ORDER.index("initial_calibration"):
                 self.clear_cal_selection()
-            stale = self.drop_gaintables(STEP_ORDER[STEP_ORDER.index(from_step):])
+            # The per-source steps after the split (self-calibration, joint models, images, the epoch products) are
+            # not in STEP_ORDER but derive from every step in it: they are forgotten as well, and their tables leave
+            # the chain - a resumed calibration step would otherwise solve on top of the old self-calibration.
+            later = [name for name in self._state.completed()
+                     if name.startswith(PER_SOURCE_STEP_PREFIXES) or name in PER_SOURCE_STEPS]
+            for name in later:
+                self._state.invalidate_downstream(name, STEP_ORDER)
+            later += [t.step for t in self.gaintables if t.step.startswith(PER_SOURCE_STEP_PREFIXES)]
+            stale = self.drop_gaintables(STEP_ORDER[STEP_ORDER.index(from_step):] + later)
             if stale:
                 logger.info("[{}] dropped from the calibration chain: {}",
                             self.project_code, ", ".join(stale))

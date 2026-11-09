@@ -79,6 +79,24 @@ def test_resuming_from_a_step_drops_the_tables_it_will_redo(tmp_path):
         == ["tsys", "sbd"]
 
 
+def test_resuming_forgets_the_self_calibration_after_it(tmp_path):
+    """EM178, resumed from emerlin_scale: the self-calibration tables would have been the priors of the new solve,
+    and selfcal_<source> / clean_<source> stayed "done", so nothing after the split ran again."""
+    from vlbipy.models import CalTable
+    from vlbipy.observation import Observation
+
+    cfg = load_config(overrides={"global": {"backend": "casa"}})
+    obs = Observation("ts_later", cfg, work_dir=str(tmp_path))
+    obs.add_gaintable(CalTable("scalar_bp"), "scalar_bandpass")
+    obs.add_gaintable(CalTable("selfamp_FF"), "selfcal_FF")
+    obs.add_gaintable(CalTable("joint_PC"), "joint_PC")
+    for step in ("scalar_bandpass", "selfcal_FF", "joint_PC", "clean_TGT", "epoch_products", "flag_weak_polarization"):
+        obs._state.mark_complete(step)
+    obs.prepare_run(from_step="emerlin_scale")
+    assert [t.cal_type for t in obs.gaintables] == ["scalar_bp"]
+    assert sorted(obs._state.completed()) == ["flag_weak_polarization", "scalar_bandpass"]
+
+
 def test_scratch_clears_the_persisted_chain(tmp_path):
     from vlbipy.models import CalTable
     from vlbipy.observation import Observation

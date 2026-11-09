@@ -385,6 +385,21 @@ def _fmt(value) -> str:
         return "-"
 
 
+def emerlin_antennas(obs) -> list[str]:
+    """The e-MERLIN antennas of the array whose amplitudes the ``emgain`` table set, as named in the data: the
+    outstations and Jb, or only the outstations with ``[calibration.emerlin].hold_reference``. Empty without an
+    ``emgain`` table in the chain. Self-calibration holds their amplitudes."""
+    if not any(t.cal_type == "emgain" for t in obs.gaintables):
+        return []
+    names = list(obs.metadata.antennas) if obs.metadata else []
+    outstations = {s.lower() for s in CalibrateNamespace.EMERLIN_OUTSTATIONS}
+    chosen = [n for n in names if n.lower() in outstations]
+    if not obs.config.get("calibration", {}).get("emerlin", {}).get("hold_reference", False):
+        reference = CalibrateNamespace.EMERLIN_REFERENCE.lower()
+        chosen += [n for n in names if n.lower().startswith(reference)][:1]
+    return chosen
+
+
 class CalibrateNamespace(Namespace):
     """Calibration: a-priori, single-band delay, bandpass, global fringe fit, apply."""
 
@@ -671,6 +686,28 @@ class CalibrateNamespace(Namespace):
         logger.info("select_calibration_data: instrumental selection re-planned for the antennas that lost "
                     "their scan — {} antenna(s) on scan(s) {}", len(antennas), new_scans)
         return antennas, new_scans
+
+    def reuse_source_roles(self) -> dict:
+        """Adopt the roles an earlier run inferred (:data:`~vlbipy.observation.SOURCE_ROLES_FILENAME`) for the
+        observed sources without a declared one; no survey. Returns the roles adopted.
+
+        Run at the start of every run: the inference itself sits in the first calibration step, and a run resumed
+        after it (``--from-step emerlin_scale``, EM178) otherwise had no fringe finders, so self-calibration
+        went straight to the phase calibrator.
+        """
+        obs = self._obs
+        if obs.metadata is None:
+            return {}
+        missing = [name for name in (obs.metadata.source_names or []) if name and name not in obs.sources]
+        if not missing:
+            return {}
+        stored, stored_phaseref = obs.load_source_roles()
+        reusable = {name: role for name, role in stored.items() if name in missing}
+        if reusable:
+            logger.info("source roles: reusing the roles inferred on an earlier run ({})",
+                        ", ".join(f"{n} = {r.value}" for n, r in reusable.items()))
+            obs.adopt_source_roles(reusable, stored_phaseref, persist=False)
+        return reusable
 
     def infer_source_roles(self, *, force: bool = False) -> dict:
         """Give the sources in the data a role when the configuration declares none for them.
@@ -1307,6 +1344,9 @@ class CalibrateNamespace(Namespace):
         self.second_pass(force=True, step="model_pass")
         obs.flag.edges(force=True, step="flag_edges_final")
         self.scalar_bandpass(force=True)
+        if any(t.cal_type == "emgain" for t in obs.gaintables):
+            # Solved on the chain just replaced: the e-MERLIN amplitudes are set again on the new one.
+            self.emerlin_scale(force=True)
         self.apply(force=True, defer=True)
         if redo_ai:
             obs.ai.flag_distribution(force=True)
@@ -1318,16 +1358,25 @@ class CalibrateNamespace(Namespace):
     EMERLIN_OUTSTATIONS = ("Cm", "Da", "De", "Kn", "Pi")
     EMERLIN_REFERENCE = "Jb"
 
-    def emerlin_scale(self, *, force: bool = False, field: str = "3C286") -> Optional[CalTable]:
-        """Fix the e-MERLIN outstation amplitudes against a modelled flux calibrator.
+    def emerlin_antennas(self) -> list[str]:
+        """The e-MERLIN antennas whose amplitudes the ``emgain`` table set (see :func:`emerlin_antennas`)."""
+        return emerlin_antennas(self._obs)
 
-        When the array contains e-MERLIN outstations (any of ``EMERLIN_OUTSTATIONS``,
-        Jb excluded — its Tsys is trustworthy) and the flux calibrator ``field``
-        was observed, their gains are solved against the source model
-        (``[calibration.emerlin]``, models exist for the L and C bands only) on the
-        outstation–outstation and outstation–Jb baselines, Jb's gain held at 1.
-        The ``emgain`` table enters the apply chain and corrects only those
-        antennas; the same antennas are then held fixed in difmapy self-calibration.
+    def emerlin_scale(self, *, force: bool = False, field: str = "3C286") -> Optional[CalTable]:
+        """Set the e-MERLIN amplitudes against a modelled flux calibrator, then check them against the model.
+
+        When the array contains e-MERLIN outstations (any of ``EMERLIN_OUTSTATIONS``) and Jb, and the flux
+        calibrator ``field`` was observed, the e-MERLIN pipeline's ``setjy`` + ``gaincal`` is run on the baselines
+        among them (Jb included): the model image of the band (``[calibration.emerlin]``; the CASA images in
+        ``vlbipy/data/emerlin_calibrator_models`` cover L and C band) is scaled to the Perley-Butler 2017 spectrum
+        in MODEL_DATA, and one amplitude gain per antenna, subband and hand is solved over all its scans (see the
+        backend's ``emerlin_scale``). Jb is solved too, unless ``hold_reference`` keeps it at its a-priori
+        amplitude. The ``emgain`` table enters the apply chain and corrects only those antennas; self-calibration
+        then holds their amplitudes (:meth:`emerlin_antennas`), so the rest of the array is scaled to them.
+
+        Once applied, the calibrated amplitudes of ``field`` on those baselines are compared with the model in
+        every subband and hand (:meth:`emerlin_check`); the self-calibration repeats the check at its end.
+        Re-running the step replaces the previous table.
         """
         obs = self._obs
         present = {n.lower(): n for n in (obs.metadata.antennas if obs.metadata else {})}
@@ -1354,33 +1403,111 @@ class CalibrateNamespace(Namespace):
         model = self._emerlin_model(freq_ghz, cfg)
         if not model:
             warnings.warn(f"{self._code}: no 3C286 model image for {freq_ghz:.2f} GHz (models cover L and C "
-                          "band); set [calibration.emerlin].model or copy the FITS into the package data "
-                          "directory (src/vlbipy/data/). The e-MERLIN amplitudes keep their a-priori values")
+                          "band); set [calibration.emerlin].model. The e-MERLIN amplitudes keep their a-priori "
+                          "values")
             obs._state.mark_complete("emerlin_scale", outputs=["no model"])
             return None
+        obs.drop_gaintables({"emerlin_scale"})
+        nspw = int(obs.metadata.freq_setup.n_subbands) if obs.metadata.freq_setup else 0
+        logger.info("emerlin_scale: {} on the baselines among {} and {} (model {})", field, ", ".join(antennas), jb,
+                    Path(model).name)
         table = self._backend.calibrate.emerlin_scale(
             self._code, field, antennas, jb, model=model, gaintable=list(obs.gaintables),
-            callib=obs.config.get("calibration", {}).get("callib", False), **cfg)
+            callib=obs.config.get("calibration", {}).get("callib", False),
+            hold_reference=bool(cfg.get("hold_reference", False)), phase_solint=str(cfg.get("phase_solint", "30s")),
+            minsnr=float(cfg.get("minsnr", 3.0)), nspw=nspw)
         if table is None:
             obs._state.mark_complete("emerlin_scale", outputs=["failed"])
             return None
         obs.add_gaintable(table, "emerlin_scale")
+        self.apply(force=True, defer=True)
+        self._emerlin_field, self._emerlin_model_path = field, model
+        self.emerlin_check(stage="emerlin_scale")
         obs._state.mark_complete("emerlin_scale", outputs=["emgain"])
         return table
 
+    def emerlin_check(self, *, stage: str = "") -> dict:
+        """Compare the calibrated amplitudes of the flux calibrator on the e-MERLIN baselines with its model.
+
+        Per subband and hand, the ratio of calibrated to model amplitude of every e-MERLIN antenna (and baseline)
+        is computed (:func:`vlbipy.solvers.fluxcheck.model_check`), logged as a table and written to
+        ``<work_dir>/emerlin_check[_<stage>].json``. A ratio beyond ``[calibration.emerlin].check_tolerance``
+        (default 5%) of 1 is warned about. Returns the report ({} when there is nothing to check).
+        """
+        from ..solvers.fluxcheck import model_check, worst
+        obs = self._obs
+        antennas = self.emerlin_antennas()
+        if not antennas or not self._backend.requires_data_files:
+            return {}
+        cfg = obs.config.get("calibration", {}).get("emerlin", {})
+        field = getattr(self, "_emerlin_field", "") or next(
+            (t.field for t in obs.gaintables if t.cal_type == "emgain"), "3C286")
+        model = getattr(self, "_emerlin_model_path", "") or self._emerlin_model(
+            obs.metadata.freq_setup.freq_ghz if obs.metadata and obs.metadata.freq_setup else 0.0, cfg)
+        if not model:
+            return {}
+        outstations = {s.lower() for s in self.EMERLIN_OUTSTATIONS}
+        members = sorted(set(antennas) | {n for n in (obs.metadata.antennas if obs.metadata else {})
+                                          if n.lower() in outstations or
+                                          n.lower().startswith(self.EMERLIN_REFERENCE.lower())})
+        try:
+            report = model_check(self._backend.ms_path(self._code), field, members, model)
+        except Exception as exc:  # noqa: BLE001 - a check that cannot run must not stop the calibration
+            warnings.warn(f"{self._code}: the e-MERLIN amplitude check against the {field} model failed ({exc})")
+            return {}
+        tolerance = float(cfg.get("check_tolerance", 0.05))
+        report.update(stage=stage, tolerance=tolerance)
+        name = f"emerlin_check_{stage}.json" if stage else "emerlin_check.json"
+        Path(obs.work_dir, name).write_text(json.dumps(report, indent=2), encoding="utf-8")
+        spws = sorted(report["spws"], key=int)
+        names = sorted({a for per_hand in report["spws"].values() for entry in per_hand.values()
+                        for a in entry["antennas"]})
+        hands = sorted({h for per_hand in report["spws"].values() for h in per_hand})
+        lines = [f"{'':6}" + "".join(f"{'spw' + s + ' ' + h:>12}" for s in spws for h in hands)]
+        for antenna in names:
+            cells = []
+            for s in spws:
+                for h in hands:
+                    ratio = report["spws"][s].get(h, {}).get("antennas", {}).get(antenna)
+                    cells.append(f"{ratio:>12.3f}" if ratio is not None else f"{'-':>12}")
+            lines.append(f"{antenna:6}" + "".join(cells))
+        lines.append(f"{'median':6}" + "".join(
+            f"{report['spws'][s][h]['median']:>12.3f}" if h in report["spws"][s] else f"{'-':>12}"
+            for s in spws for h in hands))
+        logger.info("emerlin_check{}: {} calibrated / model amplitude on the e-MERLIN baselines ({} rows; 1 = the "
+                    "model):\n{}", f" [{stage}]" if stage else "", field, report["rows"], "\n".join(lines))
+        antenna, spw, hand, ratio = worst(report)
+        off = [f"{a} spw{s} {h} {r:.3f}" for s in spws for h, entry in report["spws"][s].items()
+               for a, r in entry["antennas"].items() if abs(r - 1.0) > tolerance]
+        if not report["spws"]:
+            warnings.warn(f"{self._code}: no calibrated {field} data on the e-MERLIN baselines to check against "
+                          "the model")
+        elif off:
+            warnings.warn(f"{self._code}: e-MERLIN amplitudes on {field} differ from the model by more than "
+                          f"{tolerance:.0%}{' after ' + stage if stage else ''}: {', '.join(off)}")
+        else:
+            logger.info("emerlin_check{}: every e-MERLIN antenna, subband and hand within {:.0%} of the {} model "
+                        "(worst {} spw{} {} {:.3f})", f" [{stage}]" if stage else "", tolerance, field, antenna, spw,
+                        hand, ratio)
+        return report
+
     def _emerlin_model(self, freq_ghz: float, cfg: dict) -> Optional[str]:
-        """Path of the 3C286 model image for this band (config, then package data)."""
+        """Path of the 3C286 model image for this band: ``[calibration.emerlin].model`` / ``model_<band>``, else the
+        package's e-MERLIN model in the backend's format - the CASA image (``3C286_<band>.clean.model.tt0``) for
+        CASA and dask-ms, the AIPS one (``3C286_<band>.ICL001``) for AIPS."""
         band = "L" if freq_ghz < 3.0 else ("C" if freq_ghz < 8.5 else "")
         candidates = [cfg.get("model"), cfg.get(f"model_{band.lower()}")] if band else [cfg.get("model")]
         candidates = [c for c in candidates if c]
         if band:
             try:
                 from importlib.resources import files
-                candidates.append(str(files("vlbipy") / "data" / f"3C286_{band}.fits"))
+                data = files("vlbipy") / "data" / "emerlin_calibrator_models"
+                aips = getattr(self._backend, "kind", "") == "aips"
+                candidates.append(str(data / (f"3C286_{band}.ICL001" if aips else f"3C286_{band}.clean.model.tt0")))
             except Exception:  # noqa: BLE001 - fall through to "no model"
                 pass
         for candidate in candidates:
-            if candidate and Path(str(candidate)).is_file():
+            if candidate and Path(str(candidate)).exists():
                 return str(candidate)
         return None
 
@@ -3179,8 +3306,8 @@ class SelfcalNamespace(Namespace):
         image_dir = Path(obs.work_dir) / "images"
         image_dir.mkdir(parents=True, exist_ok=True)
         solints = cfg.get("solints") or None
-        emgain = any(t.cal_type == "emgain" for t in obs.gaintables)
-        fixed = [s for s in CalibrateNamespace.EMERLIN_OUTSTATIONS if emgain]
+        # The e-MERLIN antennas set against the flux calibrator's model keep their amplitudes (phases solve).
+        fixed = emerlin_antennas(obs)
         defer_cfg = cfg.get("defer_antennas", {})
         deferred = defer_cfg.get(obs.observatory, defer_cfg.get("default", [])) if isinstance(defer_cfg, dict) \
             else (defer_cfg or [])
@@ -3336,6 +3463,8 @@ class SelfcalNamespace(Namespace):
         if results:
             obs.calibrate.apply(force=True)
             obs.export.per_source(force=True)
+            if emerlin_antennas(obs):
+                obs.calibrate.emerlin_check(stage="selfcal")
         return results
 
 

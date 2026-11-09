@@ -188,15 +188,23 @@ enabled = true
 column = "corrected"
 minsamp = 2
 
-# e-MERLIN flux scale from a modelled calibrator (3C286; model images cover L and C band only).
-# Runs when e-MERLIN outstations (not Jb) are in the array and the calibrator was observed: the
-# model goes into MODEL_DATA, amplitude gains are solved on the outstation(+Jb) baselines with Jb
-# held at 1, and the resulting table corrects only those antennas in the apply chain.
+# e-MERLIN flux scale from a modelled calibrator (3C286), as the e-MERLIN pipeline sets it (setjy + gaincal).
+# Runs when e-MERLIN outstations and Jb are in the array and the calibrator was observed: the model image is
+# scaled to the Perley-Butler 2017 spectrum in MODEL_DATA, the phases are solved (phase_solint), then one amplitude
+# gain per antenna, subband and hand over all the calibrator's scans, on the baselines among the e-MERLIN antennas
+# only (Jb included, and solved). The table corrects only those antennas; self-calibration then holds their
+# amplitudes (phases solve) and scales the rest of the array to them. The calibrated amplitudes on those baselines
+# are checked against the model in every subband and hand, after this step and after self-calibration.
 [calibration.emerlin]
 enabled = true
-model = ""                    # FITS model image; overrides the band choice below
-model_l = ""                  # L band (<3 GHz); empty = src/vlbipy/data/3C286_L.fits
-model_c = ""                  # C band (3-8.5 GHz); empty = src/vlbipy/data/3C286_C.fits
+model = ""                    # model image (CASA image directory or FITS); overrides the band choice below
+model_l = ""                  # L band (<3 GHz); empty = data/emerlin_calibrator_models/3C286_L.clean.model.tt0
+model_c = ""                  # C band (3-8.5 GHz); empty = data/emerlin_calibrator_models/3C286_C.clean.model.tt0
+                              # (the AIPS backend takes the 3C286_<band>.ICL001 images next to them)
+hold_reference = false        # true: keep Jb at its a-priori amplitude and scale the outstations to it
+phase_solint = "30s"          # phase solution interval before the amplitude solve
+minsnr = 3.0
+check_tolerance = 0.05        # calibrated/model amplitude of an antenna, subband and hand beyond this is warned about
 
 # Correlator amplitude correction from the autocorrelations, for DiFX data (VLBA, LBA): CASA accor,
 # then smoothcal. Applied with nearest interpolation, like the EOP correction.
