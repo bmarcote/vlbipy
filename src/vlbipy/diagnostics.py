@@ -16,6 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 from astropy import coordinates as coord
 
 from .comments import comments_text
@@ -119,6 +120,17 @@ def frequency_summary(metadata: ObsMetadata) -> str:
     ])
 
 
+def sexagesimal(angle, **kwargs) -> str:
+    """``angle.to_string(**kwargs)`` without a spurious numpy warning.
+
+    astropy 7.1's sexagesimal formatter (under numpy 2.3) leaves numpy's floating-point "invalid" flag set
+    for any angle of one degree or hour or more, so every source position printed a RuntimeWarning
+    "invalid value encountered in do_format (vectorized)"; the strings themselves are right.
+    """
+    with np.errstate(invalid="ignore"):
+        return angle.to_string(**kwargs)
+
+
 def source_summary(metadata: ObsMetadata, sources: Optional[SourceSet] = None) -> str:
     """Render the source table: field ID, name, role, coordinates, and scan count.
 
@@ -148,8 +160,8 @@ def source_summary(metadata: ObsMetadata, sources: Optional[SourceSet] = None) -
         radec = metadata.source_coords.get(name)
         if radec is not None:
             position = coord.SkyCoord(ra=radec[0], dec=radec[1], unit="deg")
-            ra_str = position.ra.to_string(unit="hourangle", sep=":", precision=5, pad=True)
-            dec_str = position.dec.to_string(sep=":", precision=5, pad=True, alwayssign=True)
+            ra_str = sexagesimal(position.ra, unit="hourangle", sep=":", precision=5, pad=True)
+            dec_str = sexagesimal(position.dec, sep=":", precision=5, pad=True, alwayssign=True)
         else:
             ra_str = dec_str = "N/A"
         source_type = sources[name].source_type.value if sources and name in sources else "other"

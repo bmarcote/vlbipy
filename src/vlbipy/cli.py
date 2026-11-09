@@ -27,7 +27,7 @@ from typing import Optional
 from rich_argparse import RawDescriptionRichHelpFormatter, RichHelpFormatter
 
 from ._version import __version__
-from .logging_utils import configure_logging, get_logger
+from .logging_utils import capture_python_warnings, configure_logging, get_logger
 from .models import CalTable
 from .registry import get_backend
 from .vlbiobs import VLBIObs
@@ -818,6 +818,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     args.force = getattr(args, "force", False) or getattr(args, "scratch", False)
     _validate_args(parser, args)
     configure_logging("DEBUG" if args.verbose else "INFO")
+    capture_python_warnings()                  # library warnings go to the run log, not the terminal
 
     if args.command == "ai" and args.actions and set(args.actions) <= {"rules", "train"}:
         return _cmd_ai(None, args)       # the rule base and the shipped training sets need no project

@@ -7,9 +7,16 @@ run so a summary can be printed at the end and embedded in reports.
 loguru is used per project convention for this (complex) program. Configuration
 is centralised here so the logging backend stays swappable.
 """
+import contextlib
 import datetime as dt
+import logging as _stdlib_logging
+import os
 import sys
+import tempfile
+import warnings as _pywarnings
 from pathlib import Path
+from typing import Optional
+
 from loguru import logger as _logger
 
 _CONFIGURED = False
@@ -48,6 +55,85 @@ def configure_logging(level: str = "INFO") -> None:
                 filter=_steps_only if str(level).upper() == "INFO" else None)
     _CONFIGURED = True
     _CONSOLE_LEVEL = level
+
+
+#: Environment variable that hands the run logs to the solver worker processes for their Python warnings.
+WARNINGS_LOG_ENV = "VLBIPY_WARNINGS_LOG"
+
+
+def capture_python_warnings(files: Optional[list] = None) -> list[int]:
+    """Send Python warnings and stdlib ``logging`` records to the run log instead of the terminal.
+
+    They come from the libraries underneath (numpy's "Mean of empty slice" for a time bin without data, astropy,
+    dask, the stdlib loggers of the solvers) and describe a computation, not the data: on the terminal they read
+    as problems with the run. Python warnings become DEBUG lines; a stdlib record keeps its level, and the console
+    shows it only when it is an error (or with ``--verbose``). What the user should act on goes through
+    :data:`warnings` and the console sink. Only the command line and its worker processes install this; a notebook
+    keeps Python's own behaviour.
+
+    ``files``: run logs to append these lines to, for a process that has no file sink of its own (a solver
+    worker, which logs nothing else there). Returns the ids of the sinks added for them.
+    """
+    _pywarnings.showwarning = _log_python_warning
+    root = _stdlib_logging.getLogger()
+    root.handlers = [_InterceptHandler()]
+    return [_logger.add(str(path), level="DEBUG", format=_FILE_FORMAT, colorize=False, enqueue=False,
+                        filter=lambda record: record["extra"].get("library", False))
+            for path in files or []]
+
+
+@contextlib.contextmanager
+def native_output_to_log(label: str):
+    """Send what compiled libraries print on the terminal during the block to the run log (debug level).
+
+    CASA's logger writes its WARN and SEVERE lines straight to the process's file descriptors, whatever
+    ``casalog`` is told: a task expected to complain (concat of two epochs whose subtables differ) would
+    otherwise put them in front of the user. Each captured line is logged as ``<label>: <line>``.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(Exception):
+            stream.flush()
+    sink = tempfile.TemporaryFile()
+    saved = (os.dup(1), os.dup(2))
+    try:
+        os.dup2(sink.fileno(), 1)
+        os.dup2(sink.fileno(), 2)
+        yield
+    finally:
+        for stream in (sys.stdout, sys.stderr):
+            with contextlib.suppress(Exception):
+                stream.flush()
+        os.dup2(saved[0], 1)
+        os.dup2(saved[1], 2)
+        os.close(saved[0])
+        os.close(saved[1])
+        sink.seek(0)
+        for line in sink.read().decode(errors="replace").splitlines():
+            if line.strip():
+                _logger.bind(library=True).debug("{}: {}", label, line.rstrip())
+        sink.close()
+
+
+def capturing_python_warnings() -> bool:
+    """True when this process sends library output to the run log (:func:`capture_python_warnings`)."""
+    return _pywarnings.showwarning is _log_python_warning
+
+
+def _log_python_warning(message, category, filename, lineno, file=None, line=None) -> None:
+    """``warnings.showwarning`` replacement: one DEBUG line in the run log."""
+    _logger.bind(library=True).debug("python warning: {}:{}: {}: {}", filename, lineno, category.__name__, message)
+
+
+class _InterceptHandler(_stdlib_logging.Handler):
+    """Hands stdlib ``logging`` records to loguru, so they go where vlbipy's own lines go."""
+
+    def emit(self, record: _stdlib_logging.LogRecord) -> None:
+        try:
+            level = _logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelno
+        _logger.bind(library=True).opt(exception=record.exc_info).log(level, "{}: {}", record.name,
+                                                                      record.getMessage())
 
 
 def _console_format(record) -> str:
@@ -147,6 +233,7 @@ def attach_logging(setup: dict) -> None:
     if setup == _ATTACHED:
         return
     configure_logging(setup.get("level") or "INFO")
+    capture_python_warnings()
     _FILE_SINKS.clear()               # configure_logging removed every sink, the files' included
     for path in setup.get("files") or []:
         sink_id = _logger.add(path, level="DEBUG", format=_FILE_FORMAT, colorize=False, enqueue=False,
@@ -174,16 +261,32 @@ class WarningCollector:
 
     def __init__(self) -> None:
         self._items: list[str] = []
+        self._keyed: dict = {}
 
-    def warn(self, message: str) -> None:
-        """Log a warning and record it for the summary."""
+    def warn(self, message: str, *, key=None) -> None:
+        """Log a warning and record it for the summary.
+
+        ``key``: a warning that a later pass repeats with updated numbers (the fringe fit of every calibration
+        pass judges the weak antennas again). The run log keeps every one; the summary keeps the latest, in the
+        place of the first, so the list neither grows with the passes nor shifts.
+        """
         get_logger().warning(message)
+        if key is not None and key in self._keyed:
+            self._items[self._keyed[key]] = message
+            return
+        if key is not None:
+            self._keyed[key] = len(self._items)
         self._items.append(message)
 
-    def anomaly(self, message: str) -> None:
-        """Log a prominent anomaly (shown on the console at every level) and record it for the summary."""
-        get_logger().bind(anomaly=True).warning("ANOMALY: {}", message)
-        self._items.append("ANOMALY: " + message)
+    def anomaly(self, message: str, *, console: bool = True, record: bool = True) -> None:
+        """Log a prominent anomaly (shown on the console at every level) and record it for the summary.
+
+        ``console=False`` leaves it to the run log (one console line sums up a group of them); ``record=False``
+        keeps that summing-up line out of the summary, which lists the group's members.
+        """
+        (get_logger().bind(anomaly=True) if console else get_logger()).warning("ANOMALY: {}", message)
+        if record:
+            self._items.append("ANOMALY: " + message)
 
     def summary(self) -> list[str]:
         """Return the list of recorded warnings and anomalies."""
@@ -192,6 +295,7 @@ class WarningCollector:
     def reset(self) -> None:
         """Clear all recorded items."""
         self._items.clear()
+        self._keyed.clear()
 
 
 # Module-level default collector for convenience.

@@ -34,8 +34,8 @@ def test_epoch_spec_preserves_backend_reconstruction(tmp_path, monkeypatch):
     assert epoch_jobs.epoch_spec(obs, True)["backend"] == backend
 
 
-@pytest.mark.parametrize("fail", [False, True])
-def test_epoch_queue_preserves_state_and_finishes_other_epochs(tmp_path, monkeypatch, fail):
+@pytest.mark.parametrize("fail,collect", [(False, False), (True, False), (True, True)])
+def test_epoch_queue_preserves_state_and_finishes_other_epochs(tmp_path, monkeypatch, fail, collect):
     run = VLBIObs(["A", "B", "C"], backend="dummy", work_dir=tmp_path)
     events, environments = [], []
     monkeypatch.setattr(epoch_jobs, "usable_cpus", lambda: 10)
@@ -67,7 +67,12 @@ def test_epoch_queue_preserves_state_and_finishes_other_epochs(tmp_path, monkeyp
             return 0 if self.done else None
 
     monkeypatch.setattr(epoch_jobs.subprocess, "Popen", Process)
-    if fail:
+    if fail and collect:
+        # A campaign run collects the failures instead: the other epochs' images come back for combination.
+        failed = {}
+        assert epoch_jobs.run_epochs(run.observations, failed=failed) == {code: {"target": code} for code in "BC"}
+        assert failed == {"A": "test failure"}
+    elif fail:
         with pytest.raises(RuntimeError, match="A"):
             epoch_jobs.run_epochs(run.observations)
     else:

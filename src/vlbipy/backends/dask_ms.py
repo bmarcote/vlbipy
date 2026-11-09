@@ -171,6 +171,11 @@ def _casatools_table_to_dataset(path: str, taql: str = "", chunk_rows: int = _DE
             for name in selection.colnames():
                 if name in skip:
                     continue
+                # Reads that are known to fail are not attempted: casatools prints every exception it
+                # raises as a SEVERE line on the terminal, even when the caller expects and handles it.
+                if not selection.iscelldefined(name, 0):
+                    logger.debug("skipping column {} of {}: its first cell is undefined", name, table_name)
+                    continue
                 try:
                     probes[name] = np.asarray(selection.getcol(name, 0, 1)).T
                     value_type = str(selection.getcoldesc(name).get("valueType", "")).lower()
@@ -179,23 +184,24 @@ def _casatools_table_to_dataset(path: str, taql: str = "", chunk_rows: int = _DE
                     logger.debug("skipping column {} of {}: {}", name, table_name, exc)
                     continue
                 if not lazy:
-                    try:
+                    if not selection.isvarcol(name):
                         eager[name] = np.asarray(selection.getcol(name)).T.astype(dtypes[name], copy=False)
-                    except RuntimeError:
-                        # Variable row shapes: read cell by cell and zero-pad to the max shape.
-                        cells = []
-                        for row in range(nrows):
-                            try:
-                                cells.append(np.asarray(selection.getcell(name, row)).T)
-                            except RuntimeError:
-                                cells.append(None)
-                        try:
-                            eager[name] = _zero_pad_cells(cells, dtypes[name])
-                        except ValueError:
-                            logger.debug("skipping column {} of {}: no readable cells", name, table_name)
-                            continue
-                        logger.info("{}: column {} has variable row shapes; zero-padded to {}",
-                                    table_name, name, eager[name].shape[1:])
+                        continue
+                    # A variable-shape column (GAIN_CURVE.GAIN follows NUM_POLY): cell by cell, zero-padded to the
+                    # largest shape when the rows differ.
+                    cells = [np.asarray(selection.getcell(name, row)).T if selection.iscelldefined(name, row)
+                             else None for row in range(nrows)]
+                    shapes = {cell.shape for cell in cells if cell is not None}
+                    if len(shapes) == 1 and all(cell is not None for cell in cells):
+                        eager[name] = np.stack(cells).astype(dtypes[name], copy=False)
+                        continue
+                    try:
+                        eager[name] = _zero_pad_cells(cells, dtypes[name])
+                    except ValueError:
+                        logger.debug("skipping column {} of {}: no readable cells", name, table_name)
+                        continue
+                    logger.debug("{}: column {} has variable row shapes; zero-padded to {}",
+                                 table_name, name, eager[name].shape[1:])
         finally:
             if taql:
                 selection.close()

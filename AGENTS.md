@@ -51,7 +51,9 @@ wrong, copy the reviewed rows to `data/ai/CODE.features.jsonl` and run `vlbipy a
 
 - The scalar bandpass levels the two hands together (`level_hands`): nothing downstream can correct an RCP/LCP
   offset (difmap gains are per station).
-- Bayesian gscale per station (`[selfcal].bayes_per_if = false`); a time-dependent, median-normalised amplitude
+- Bayesian gscale per station and subband (`[selfcal].bayes_per_if = true`): one level per station, each subband
+  around it shrunk by `bayes_if_sigma` = 0.1 (weak stations' per-IF noise collapses; EM178's 5-15% subband steps on
+  the fringe finders, left by a scalar bandpass the weak phase calibrator could not solve, are levelled); a time-dependent, median-normalised amplitude
   self-cal per scan follows what the Tsys cannot (`[selfcal].time_amplitude`). A fringe finder's time curve
   applies to itself only.
 - The time-dependent amplitude solve uses `float_scale=True`: difmap's default holds the mean gain of each IF at
@@ -63,3 +65,26 @@ wrong, copy the reviewed rows to `data/ai/CODE.features.jsonl` and run `vlbipy a
 - A constant Tsys with DPFU = 1 (JB, T6) is an SEFD: the a-priori calibration then carries no time dependence.
 - `mbd_smooth` (delay/rate smoothing) was suspected of decorrelating the calibrators and cleared: identical
   coherence with and without it.
+
+## Calibration lessons (EM178 / RSM06B, 18 cm near the Galactic plane, 2026-11-07)
+
+- Self-calibration order: each fringe finder (on data carrying the earlier ones' amplitudes; one that cannot be
+  self-calibrated is skipped), its amplitude table to every field and its phase and time curve to itself only;
+  then the phase-reference source (the target with inverse phase referencing), whose phase x amplitude table
+  goes to itself and the fields it calibrates. The corrections multiply: the dashboard's "Total" tab is
+  scalar bandpass x every self-cal amplitude table applied to the target fields.
+- A scatter-broadened phase calibrator (J1832-1035: 0.78 Jy, ~165 mas Gaussian) is seen only on baselines
+  < ~150-200 km. Referenced to EF, the e-MERLIN stations found nothing and lost all their data, although they
+  detect it among themselves at fringe SNR 30-130. `[calibration.mbd].subarray_km` re-solves such nearby
+  undetected antennas among themselves (`vlbipy/subarrays.py`); the baselines between sub-arrays are flagged in
+  the per-source splits. A uv taper cannot help there: the long baselines have no phase solutions at all.
+- Inverse phase referencing needs a target the fringe fit detects: IRAS1829 (~3 mJy) was detected by no
+  antenna, so every target-referenced solution was flagged.
+- difmap grids only |u|, |v| < 1/(4 cell) x (1 - 8/npix) (difmap-core `uv_limits`). The source-search map
+  used cell = resolution/3, so it dropped every baseline longer than ~0.7 of the longest, and all the
+  data of RSM06B, whose target was left with EF-WB only ("no data with the current selection/uv
+  range"; no target image in any run before). `SEARCH_OVERSAMPLE` is now 5. Any map made with a
+  coarser cell than resolution/4.6 loses baselines silently.
+- difmap (and difmapy, an exact port of `ob_select`) flags an IF average when any selected channel in it is
+  flagged: load channel-averaged (`freqavg="all"`, as the imaging and self-cal paths do) or select the
+  unflagged channels.

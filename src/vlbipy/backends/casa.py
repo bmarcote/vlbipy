@@ -2130,15 +2130,11 @@ class CasaDataOps(DataOps):
             try:
                 n_gc = table.nrows()
                 if n_gc:
-                    # GAIN cells are variable-shaped in some imported MSs, so getcol
-                    # cannot stack them; read row by row instead.
-                    try:
-                        gain = np.asarray(table.getcol("GAIN"))
-                    except Exception:  # noqa: BLE001
-                        cells = [np.ravel(table.getcell("GAIN", r)) for r in range(n_gc)]
-                        gc_trivial = all(np.all(c == 1.0) for c in cells)
-                    else:
-                        gc_trivial = bool(np.all(gain == 1.0))
+                    # GAIN cells are variable-shaped in imported EVN MSs (the polynomial order differs
+                    # between stations), and a getcol that cannot stack them logs a SEVERE "StManIndArray
+                    # shapes not conforming" from CASA before raising: read the few rows cell by cell.
+                    cells = [np.ravel(table.getcell("GAIN", r)) for r in range(n_gc)]
+                    gc_trivial = all(np.all(c == 1.0) for c in cells)
             finally:
                 table.close()
 
@@ -3260,7 +3256,7 @@ class CasaCalibrationOps(CalibrationOps):
                   dispersive: bool = False, channel_fraction: float = 0.8,
                   retry_minsnr: float = 3.0, retry_below: float = 0.5, max_delay_step: float = 0.0,
                   prior_scans: int = 3, prior_delay_window_ns: float = 2.0, prior_rate_window: float = 1e-12,
-                  metadata: Optional[ObsMetadata] = None, callib: bool = False,
+                  subarray_km: float = 300.0, metadata: Optional[ObsMetadata] = None, callib: bool = False,
                   **kwargs) -> CalTable:
         """Global (multi-band delay) fringe fit on the calibrators.
 
@@ -3299,14 +3295,14 @@ class CasaCalibrationOps(CalibrationOps):
             Fraction of central channels per subband used for the solve (the
             solution is applied to the whole band). 1.0 uses every channel.
         retry_minsnr, retry_below : float
-            An antenna solved in fewer than ``retry_below`` of the calibrator
-            scans it observed is fringe-fitted again on its unsolved scans with
-            ``minsnr=retry_minsnr`` (see :meth:`_retry_weak_antennas`). Its
-            lower-SNR solutions are kept only if they then cover at least that
-            fraction of its scans *and* are real detections (``max_delay_step``);
-            otherwise the antenna is lost: its data without a solution are
-            flagged on apply. ``retry_minsnr=0`` (or not below ``minsnr``)
-            disables the retry.
+            An antenna solved in fewer than ``retry_below`` of the scans of a
+            calibrator it observed is fringe-fitted again on its unsolved scans
+            with ``minsnr=retry_minsnr`` (see :meth:`_retry_weak_antennas`; each
+            calibrator is judged on its own). Its lower-SNR solutions are kept
+            only if they then cover at least that fraction of its scans *and*
+            are real detections (``max_delay_step``); otherwise its data without
+            a solution are flagged on apply. ``retry_minsnr=0`` (or not below
+            ``minsnr``) disables the retry.
         max_delay_step : float
             Largest median change of a weak antenna's delay (ns) from one
             solution to the next for its solutions to count as detections; 0
@@ -3320,6 +3316,13 @@ class CasaCalibrationOps(CalibrationOps):
             the fringe peak around that median (+-window, ns and s/s) as well
             (:func:`vlbipy.solvers.fringefit.fringefit`; native engine only, CASA
             ignores them). 0 disables it.
+        subarray_km : float
+            Antennas still without solutions on a calibrator after the retry,
+            within this distance of each other (single linkage), are fringe-fitted
+            again among themselves with a reference antenna of their own: a
+            calibrator resolved out on every longer baseline (scatter-broadened
+            near the Galactic plane) still calibrates their mutual baselines
+            (:mod:`vlbipy.subarrays`). 0 disables it.
         callib : bool
             Use a CASA cal-library file for the on-the-fly priors instead of
             explicit parallel lists.
@@ -3356,120 +3359,296 @@ class CasaCalibrationOps(CalibrationOps):
                     "(prior: {})", suffix, field, spw, solint, combine, minsnr, dispersive,
                     ", ".join(t.cal_type for t in gaintable or []) or "none")
         self._fringefit(project_code, params, gaintable, field=field, callib=callib)
+        from ..subarrays import write_subarrays
+        write_subarrays(table_path, {})
         if retry_minsnr and float(retry_minsnr) < float(minsnr):
             bandwidth = float(getattr(meta.freq_setup, "total_bandwidth", 0.0) or 0.0)
             step = float(max_delay_step) or (1e9 / bandwidth if bandwidth > 0 else 0.0)
             self._retry_weak_antennas(project_code, params, gaintable, meta, field=field, callib=callib,
                                       minsnr=float(retry_minsnr), keep_fraction=float(retry_below),
-                                      max_delay_step=step)
+                                      max_delay_step=step, subarray_km=float(subarray_km or 0.0))
         spwmap = self._combined_spwmap(table_path, meta) if "spw" in combine else []
         return CalTable(cal_type=suffix, path=str(table_path), field=field, interp="linear",
                         spwmap=spwmap, snr=self._median_table_snr(table_path))
 
     def _retry_weak_antennas(self, project_code: str, params: dict, gaintable: Optional[list],
                              meta: ObsMetadata, *, field: str, callib: bool, minsnr: float,
-                             keep_fraction: float, max_delay_step: float = 0.0) -> list[str]:
-        """Re-solve antennas that lost most of their fringe solutions at a lower SNR threshold.
+                             keep_fraction: float, max_delay_step: float = 0.0,
+                             subarray_km: float = 0.0) -> list[str]:
+        """Re-solve antennas that lost most of their fringe solutions on a calibrator at a lower SNR threshold.
 
         A weak antenna on a weak phase calibrator has the data of every scan it
         has no solution for flagged by ``applycal``. The fringe fit is repeated
         on the scans those antennas have no solution for, with ``minsnr``
         lowered, and an antenna's new solutions are merged into the table only
-        when it is then solved on at least ``keep_fraction`` of the calibrator
-        scans it observed **and** its delays are consistent from one solution to
-        the next (median step at most ``max_delay_step`` ns; 0 skips the test).
+        when it is then solved on at least ``keep_fraction`` of the scans it
+        observed **and** its delays are consistent from one solution to the next
+        (median step at most ``max_delay_step`` ns; 0 skips the test).
 
         The second condition is what tells detections from noise: a fringe
         search always finds *some* peak, and at SNR 3 one is found almost
         everywhere. On GL048 JB and UR went from 25-33% to 100% of their
         J1305-1033 scans "solved" at SNR 3, but their delays jumped by ~130 ns
-        between consecutive scans - at SNR 5 as well. An antenna failing either
-        condition is lost: when its original solutions fail the delay test too,
-        they are flagged (they would only transfer random phases to the target),
-        so ``applycal`` flags all of its data rather than calibrating part of it
-        with noise.
+        between consecutive scans - at SNR 5 as well. When the original
+        solutions fail the delay test too, they are flagged (they would only
+        transfer random phases to the target), so ``applycal`` flags the data
+        they would calibrate rather than calibrating them with noise.
+
+        Every (antenna, calibrator source) pair is judged on its own, and only
+        that source's solutions change. An antenna can be detected at SNR 300
+        on the fringe finder and not at all on a phase calibrator that is
+        resolved at 18 cm (RSM06B: JB, O8 and HH on J1512-0905 and J1832-1035;
+        EM178: the e-MERLIN stations at SNR 7,600-154,000 on J2136+0041). Judged
+        on all sources together, the phase calibrator's noise flagged their
+        fringe-finder solutions as well, and the bandpass was left with too few
+        antennas. Fewer than three solutions on a source cannot show a delay
+        step, which is no evidence of noise: they are kept.
+
+        The antennas still unsolved on a source are then grouped by distance
+        (``subarray_km``) and each group is fringe-fitted on its own baselines
+        with a reference antenna among them (:meth:`_solve_subarrays`); the
+        members it detects take those solutions, and the groups are recorded in
+        the table so the baselines between them are flagged downstream.
 
         Returns
         -------
         list of str
-            The antennas whose lower-SNR solutions were adopted.
+            The antennas whose lower-SNR solutions were adopted (on at least one source).
         """
         table_path = Path(params["caltable"])
         sources = {name for name in field.split(",") if name}
-        observed: dict[str, set[int]] = {}
+        observed: dict[tuple[str, str], set[int]] = {}
         for scan in meta.scans:
             if not sources or scan.source in sources:
                 for name in scan.antennas:
-                    observed.setdefault(name, set()).add(int(scan.scan_number))
+                    observed.setdefault((name, scan.source), set()).add(int(scan.scan_number))
         solved = self._solved_scans(table_path)
-        weak = {name: scans for name, scans in observed.items()
-                if len(solved.get(name, set()) & scans) < keep_fraction * len(scans)}
+        weak = {pair: scans for pair, scans in observed.items()
+                if len(solved.get(pair[0], set()) & scans) < keep_fraction * len(scans)}
         if not weak:
             return []
-        for name, scans in sorted(weak.items()):
-            logger.info("fringefit: {} solved on {} of the {} calibrator scan(s) it observed at SNR >= {:g}",
-                        name, len(solved.get(name, set()) & scans), len(scans), params["minsnr"])
-        retry_scans = sorted(set().union(*(scans - solved.get(name, set()) for name, scans in weak.items())))
+        weak_sources = sorted({source for _, source in weak})
+        for source in weak_sources:
+            logger.info("fringefit: on {}, solved at SNR >= {:g} on few of the scans observed: {}", source,
+                        params["minsnr"], ", ".join(f"{name} {len(solved.get(name, set()) & scans)}/{len(scans)}"
+                                                    for (name, src), scans in sorted(weak.items()) if src == source))
+        retry_scans = sorted(set().union(*(scans - solved.get(name, set()) for (name, _), scans in weak.items())))
         retry_path = table_path.with_name(table_path.name + ".retry")
         retry = dict(params, caltable=str(retry_path), minsnr=minsnr, scan=",".join(map(str, retry_scans)))
         # Only weak scans are re-solved here: their neighbours in this run are no basis for a prediction.
         for name in NATIVE_FRINGEFIT_KEYS:
             retry.pop(name, None)
+        weak_names = sorted({name for name, _ in weak})
         logger.info("fringefit: retrying {} on their {} unsolved scan(s) with minsnr={:g}",
-                    ", ".join(sorted(weak)), len(retry_scans), minsnr)
-        original = self._delay_series(table_path)
+                    ", ".join(weak_names), len(retry_scans), minsnr)
+        scans_of = {source: set().union(*(scans for (_, src), scans in observed.items() if src == source))
+                    for source in weak_sources}
+        original = {source: self._delay_series(table_path, scans=scans_of[source]) for source in weak_sources}
         try:
             try:
                 self._fringefit(project_code, retry, gaintable, field=field, callib=callib)
-                recovered, retried = self._solved_scans(retry_path), self._delay_series(retry_path)
+                recovered = self._solved_scans(retry_path)
+                retried = {source: self._delay_series(retry_path, scans=scans_of[source]) for source in weak_sources}
             except BackendError as exc:
-                warnings.warn(f"{project_code}: the lower-SNR fringe fit of {', '.join(sorted(weak))} failed "
+                warnings.warn(f"{project_code}: the lower-SNR fringe fit of {', '.join(weak_names)} failed "
                               f"({exc}); judging them on their original solutions")
-                recovered, retried = {}, {}
-            adopted, lost = [], []
-            for name, scans in sorted(weak.items()):
+                recovered, retried = {}, {source: {} for source in weak_sources}
+            adopted: dict[str, set[int]] = {}
+            adopted_pairs: set[tuple[str, str]] = set()
+            lost: dict[str, set[int]] = {}
+            lost_on: dict[str, list[tuple[str, str]]] = {}
+            kept_on: dict[str, list] = {}
+            for (name, source), scans in sorted(weak.items()):
                 before = solved.get(name, set()) & scans
                 after = before | (recovered.get(name, set()) & scans)
+                own = {key: series for key, series in original[source].items() if key[0] == name}
+                new = {key: series for key, series in retried[source].items() if key[0] == name}
                 # One solution per time: where both solves have one, the original (higher-SNR) one counts.
-                merged = {key: list({**dict(retried.get(key, [])), **dict(original.get(key, []))}.items())
-                          for key in set(original) | set(retried) if key[0] == name}
+                merged = {key: list({**dict(new.get(key, [])), **dict(own.get(key, []))}.items())
+                          for key in set(own) | set(new)}
                 step = self._median_delay_step(merged)
                 coherent = not max_delay_step or step <= max_delay_step
                 if len(after) > len(before) and len(after) >= keep_fraction * len(scans) and coherent:
-                    adopted.append(name)
-                    logger.info("fringefit: {} recovered at SNR >= {:g}: solved on {} of {} scan(s) (was {}), "
-                                "delay steps {:.2f} ns; adopting its lower-SNR solutions", name, minsnr, len(after),
-                                len(scans), len(before), step)
+                    adopted.setdefault(name, set()).update(scans)
+                    adopted_pairs.add((name, source))
+                    logger.info("fringefit: {} recovered on {} at SNR >= {:g}: solved on {} of {} scan(s) (was {}), "
+                                "delay steps {:.2f} ns; adopting its lower-SNR solutions there", name, source, minsnr,
+                                len(after), len(scans), len(before), step)
                     continue
-                reason = (f"is solved on only {len(after)} of the {len(scans)} calibrator scan(s) it observed even at "
-                          f"SNR >= {minsnr:g}" if len(after) < keep_fraction * len(scans) else
-                          f"has only noise at SNR >= {minsnr:g} (its delay jumps {step:.0f} ns between solutions, "
-                          f"against {max_delay_step:.2f} ns allowed)")
-                own = self._median_delay_step({key: series for key, series in original.items() if key[0] == name})
-                if max_delay_step and np.isfinite(own) and own > max_delay_step:
-                    lost.append(name)
-                    warnings.warn(f"{project_code}: {name} is not detected on {field}: it {reason}, and its SNR >= "
-                                  f"{params['minsnr']:g} solutions jump {own:.0f} ns too; flagging those below SNR "
-                                  f"{RELIABLE_FRINGE_SNR:g}, so its data without a reliable solution are flagged on "
-                                  "apply")
+                own_step = self._median_delay_step(own)
+                if max_delay_step and np.isfinite(own_step) and own_step > max_delay_step:
+                    lost.setdefault(name, set()).update(scans)
+                    lost_on.setdefault(source, []).append((name, f"{name} {own_step:.0f} ns"))
                 else:
-                    warnings.warn(f"{project_code}: {name} {reason}; keeping its SNR >= {params['minsnr']:g} "
-                                  "solutions, its data without one will be flagged on apply")
+                    kept_on.setdefault(source, []).append((name, len(before), len(after), len(scans)))
             if adopted:
                 merged_rows = self._merge_antenna_solutions(table_path, retry_path, adopted)
                 logger.info("fringefit: {} solution row(s) of {} taken from the SNR >= {:g} re-solve",
-                            merged_rows, ", ".join(adopted), minsnr)
+                            merged_rows, ", ".join(sorted(adopted)), minsnr)
             if lost:
                 kept = self._flag_antenna_solutions(table_path, lost, keep_snr=RELIABLE_FRINGE_SNR)
                 if kept:
                     logger.info("fringefit: {} solution(s) of {} kept at SNR >= {:g} (real detections, e.g. on the "
-                                "fringe finders)", kept, ", ".join(lost), RELIABLE_FRINGE_SNR)
-            return adopted
+                                "fringe finders)", kept, ", ".join(sorted(lost)), RELIABLE_FRINGE_SNR)
+            recovered: set[tuple[str, str]] = set()
+            if subarray_km > 0:
+                unsolved = {}
+                for name, source in weak:
+                    if (name, source) not in adopted_pairs:
+                        unsolved.setdefault(source, set()).add(name)
+                recovered = self._solve_subarrays(project_code, params, gaintable, meta, unsolved, observed,
+                                                  callib=callib, keep_fraction=keep_fraction,
+                                                  max_delay_step=max_delay_step, max_km=subarray_km)
+            lost_on = {source: [text for name, text in items if (name, source) not in recovered]
+                       for source, items in lost_on.items()}
+            kept_on = {source: [item for item in items if (item[0], source) not in recovered]
+                       for source, items in kept_on.items()}
+            # Every calibration pass judges the antennas again: the summary keeps the last pass's numbers.
+            for source, items in lost_on.items():
+                if not items:
+                    continue
+                warnings.warn(f"{project_code}: not detected on {source} (median delay step between solutions at "
+                              f"SNR >= {params['minsnr']:g}: {', '.join(items)}; a detection moves less than "
+                              f"{max_delay_step:.2f} ns): their {source} solutions below SNR {RELIABLE_FRINGE_SNR:g} are "
+                              "flagged, so the data they would calibrate are flagged on apply", key=(project_code, "fringe-noise", source))
+            for source, items in kept_on.items():
+                if not items:
+                    continue
+                if not any(solved_before or solved_after for _, solved_before, solved_after, _ in items):
+                    warnings.warn(f"{project_code}: {source} is not detected by {', '.join(n for n, *_ in items)}, "
+                                  f"even at SNR >= {minsnr:g}; their data calibrated from it are flagged on apply",
+                                  key=(project_code, "fringe-few", source))
+                    continue
+                listed = ", ".join(f"{name} {solved_before}/{total}" for name, solved_before, _, total in items)
+                warnings.warn(f"{project_code}: solved on few {source} scans, even at SNR >= {minsnr:g} "
+                              f"(scans solved at SNR >= {params['minsnr']:g}: {listed}); the data without "
+                              "a solution are flagged on apply", key=(project_code, "fringe-few", source))
+            return sorted(adopted)
         finally:
             if retry_path.exists():
                 shutil.rmtree(retry_path)
 
-    def _delay_series(self, table_path: Path) -> dict[tuple[str, int, int, int], list[tuple[float, float]]]:
+    def _solve_subarrays(self, project_code: str, params: dict, gaintable: Optional[list], meta: ObsMetadata,
+                         unsolved: dict[str, set[str]], observed: dict[tuple[str, str], set[int]], *,
+                         callib: bool, keep_fraction: float, max_delay_step: float,
+                         max_km: float) -> set[tuple[str, str]]:
+        """Fringe-fit the antennas a calibrator is not detected by among themselves, cluster by cluster.
+
+        A calibrator resolved out on every baseline longer than a few hundred km is invisible on the
+        baselines to a distant reference antenna, yet detected between nearby stations (EM178,
+        J1832-1035 at 18 cm: the e-MERLIN stations at fringe SNR 30-130 among themselves, nothing to EF).
+        The unsolved antennas of each source are clustered by distance (``max_km``, single linkage); each
+        cluster is solved on its own baselines (``antenna='A,B,...&'``) on every scan of the source, with its
+        members as the reference chain. Its members judged as in the retry - solved on ``keep_fraction`` of
+        the scans they observed, delays consistent within ``max_delay_step`` - and the reference antennas their
+        solutions use form a sub-array: their solutions on that source are replaced by the sub-array's, and
+        the group is recorded in the table (:func:`vlbipy.subarrays.write_subarrays`), so the baselines
+        between sub-arrays are flagged where these solutions are applied.
+
+        Returns
+        -------
+        set of tuple
+            ``(antenna, source)`` of every antenna that now has sub-array solutions on that source.
+        """
+        from ..subarrays import read_subarrays, station_clusters, write_subarrays
+        table_path = Path(params["caltable"])
+        antennas = meta.antennas.values() if isinstance(meta.antennas, dict) else meta.antennas
+        positions = {a.name: a.position for a in antennas}
+        chain = [name for name in str(params.get("refant", "")).split(",") if name]
+        main_ref = chain[0] if chain else "the reference antenna"
+        recorded = read_subarrays(table_path)
+        recovered: set[tuple[str, str]] = set()
+        sub_path = table_path.with_name(f"{table_path.name}.subarray")
+        for source in sorted(unsolved):
+            clusters = station_clusters({name: positions.get(name, (0.0, 0.0, 0.0)) for name in unsolved[source]},
+                                        max_km)
+            if not clusters:
+                continue
+            scans = set().union(*(s for (_, src), s in observed.items() if src == source))
+            groups = list(recorded.get(source, []))
+            for cluster in clusters:
+                order = [name for name in chain if name in cluster] + sorted(set(cluster) - set(chain))
+                sub = dict(params, caltable=str(sub_path), field=source, antenna=",".join(order) + "&",
+                           refant=",".join(order), scan=",".join(map(str, sorted(scans))))
+                try:
+                    try:
+                        self._fringefit(project_code, sub, gaintable, field=source, callib=callib)
+                        real, references = self._referenced_solutions(sub_path)
+                        series = self._delay_series(sub_path)
+                    except BackendError as exc:
+                        logger.info("fringefit: sub-array {} on {} could not be solved ({})", ",".join(order),
+                                    source, exc)
+                        continue
+                    detected = []
+                    for name in order:
+                        own = observed.get((name, source), set())
+                        got = real.get(name, set()) & own
+                        step = self._median_delay_step({k: v for k, v in series.items() if k[0] == name})
+                        if own and len(got) >= keep_fraction * len(own) and \
+                                (not max_delay_step or step <= max_delay_step):
+                            detected.append(name)
+                    if not detected:
+                        logger.info("fringefit: {} not detected on the baselines among {} either", source,
+                                    ",".join(order))
+                        continue
+                    group = sorted(set(detected) | set().union(*(references.get(name, set()) for name in detected)))
+                    if len(group) < 2:
+                        continue
+                    wanted = {name: set(scans) for name in group}
+                    # Their solutions referenced to the main array (noise, or flagged) give way to the sub-array's.
+                    self._flag_antenna_solutions(table_path, wanted)
+                    rows = self._merge_antenna_solutions(table_path, sub_path, wanted)
+                    groups.append(group)
+                    recovered.update((name, source) for name in group)
+                    solved_on = {name: len(real.get(name, set()) & observed.get((name, source), set()))
+                                 for name in group}
+                    refs = sorted(set().union(*(references.get(name, set()) for name in detected)))
+                    logger.info("fringefit: {} is not seen on the baselines to {}, but {} detect it among "
+                                "themselves (reference {}); solved as a sub-array: {} ({} solution row(s)). Their "
+                                "baselines to the other antennas are flagged in the data calibrated from {}",
+                                source, main_ref, ", ".join(group), ",".join(refs) or order[0],
+                                ", ".join(f"{name} {solved_on[name]}/{len(observed.get((name, source), ()))}"
+                                          for name in group if name not in refs or solved_on[name]),
+                                rows, source)
+                finally:
+                    if sub_path.exists():
+                        shutil.rmtree(sub_path)
+            if groups:
+                recorded[source] = groups
+        write_subarrays(table_path, recorded)
+        return recovered
+
+    def _referenced_solutions(self, table_path: Path) -> tuple[dict[str, set[int]], dict[str, set[str]]]:
+        """Per antenna, the scans of its unflagged solutions against another antenna, and those reference antennas.
+
+        A fringe table stores the reference antenna of each solution in ANTENNA2; the reference antenna's own
+        row (ANTENNA1 = ANTENNA2) is the identity and says nothing about a detection.
+        """
+        names = self._table_antenna_names(table_path)
+        handle = self.backend.tools.table()
+        if not handle.open(str(table_path)):
+            raise BackendError(f"could not open {table_path} to read its solutions")
+        try:
+            antenna1 = np.asarray(handle.getcol("ANTENNA1"))
+            antenna2 = np.asarray(handle.getcol("ANTENNA2"))
+            scans = np.asarray(handle.getcol("SCAN_NUMBER"))
+            flags = np.asarray(handle.getcol("FLAG")).astype(bool)
+        finally:
+            handle.close()
+        good = ~flags.reshape(-1, flags.shape[-1]).all(axis=0) & (antenna1 != antenna2) & (antenna2 >= 0)
+
+        def name(index) -> str:
+            return names[int(index)] if 0 <= int(index) < len(names) else f"#{int(index)}"
+
+        real: dict[str, set[int]] = {}
+        references: dict[str, set[str]] = {}
+        for a1, a2, scan in zip(antenna1[good], antenna2[good], scans[good]):
+            real.setdefault(name(a1), set()).add(int(scan))
+            references.setdefault(name(a1), set()).add(name(a2))
+        return real, references
+
+    def _delay_series(self, table_path: Path, scans: Optional[set] = None) -> dict[tuple[str, int, int, int],
+                                                                                  list[tuple[float, float]]]:
         """Per (antenna name, polarization, field id, reference antenna id), the ``(time, delay)`` of every unflagged
         fringe solution.
 
@@ -3477,6 +3656,8 @@ class CasaCalibrationOps(CalibrationOps):
         differ by their position error and ionosphere, two references by their own delays. Mixing them made every
         switch between the fringe finder and the phase calibrator count as a "jump", and an antenna strongly
         detected on the fringe finder was judged noise (RSM06A).
+
+        ``scans``: only the solutions of these scans (all when ``None``).
         """
         names = self._table_antenna_names(table_path)
         handle = self.backend.tools.table()
@@ -3491,6 +3672,8 @@ class CasaCalibrationOps(CalibrationOps):
             fields = np.asarray(handle.getcol("FIELD_ID")) if "FIELD_ID" in columns else np.zeros(antennas.shape, int)
             refants = (np.asarray(handle.getcol("ANTENNA2")) if "ANTENNA2" in columns
                        else np.zeros(antennas.shape, int))
+            in_scans = np.isin(np.asarray(handle.getcol("SCAN_NUMBER")), sorted(scans)) if scans is not None \
+                else np.ones(antennas.shape, bool)
         finally:
             handle.close()
         npol = 2 if params.shape[0] in (6, 8) else 1                 # phase, delay, rate[, dispersive] per pol
@@ -3498,7 +3681,7 @@ class CasaCalibrationOps(CalibrationOps):
         series: dict[tuple[str, int, int, int], list[tuple[float, float]]] = {}
         for pol in range(npol):
             # The reference antenna's own rows (delay 0 by definition) say nothing about its detection.
-            good = ~flags[pol * npar + 1, 0] & (antennas != refants)
+            good = ~flags[pol * npar + 1, 0] & (antennas != refants) & in_scans
             for antenna, field, refant, time, delay in zip(antennas[good], fields[good], refants[good], times[good],
                                                            params[pol * npar + 1, 0][good]):
                 name = names[int(antenna)] if int(antenna) < len(names) else f"#{int(antenna)}"
@@ -3519,26 +3702,31 @@ class CasaCalibrationOps(CalibrationOps):
                 steps.append(np.abs(np.diff(delays)))
         return float(np.median(np.concatenate(steps))) if steps else float("inf")
 
-    def _flag_antenna_solutions(self, table_path: Path, antennas: list[str], *, keep_snr: float = 0.0) -> int:
-        """Flag the solutions of ``antennas`` in a calibration table, except those with SNR >= ``keep_snr``.
+    def _flag_antenna_solutions(self, table_path: Path, solutions: dict[str, set[int]], *,
+                                keep_snr: float = 0.0) -> int:
+        """Flag the solutions of each antenna of ``solutions`` on the scans given for it, except those with SNR >=
+        ``keep_snr``.
 
-        ``keep_snr`` <= 0 flags every solution of those antennas. The SNR is judged per parameter cell (the table's
+        ``keep_snr`` <= 0 flags every one of those solutions. The SNR is judged per parameter cell (the table's
         own ``SNR`` column, same shape as ``FLAG``); a table without one is flagged entirely, and so are the rows where
         the antenna is its own reference (their SNR is a placeholder).
 
         Returns
         -------
         int
-            Number of solution rows of ``antennas`` that still hold an unflagged value.
+            Number of those solution rows that still hold an unflagged value.
         """
         names = self._table_antenna_names(table_path)
-        wanted = [names.index(name) for name in antennas if name in names]
         handle = self.backend.tools.table()
         if not handle.open(str(table_path), nomodify=False):
             raise BackendError(f"could not open {table_path} to flag solutions")
         try:
             antenna1 = np.asarray(handle.getcol("ANTENNA1"))
-            rows = np.isin(antenna1, wanted)
+            scans = np.asarray(handle.getcol("SCAN_NUMBER"))
+            rows = np.zeros(antenna1.shape, bool)
+            for name, wanted in solutions.items():
+                if name in names:
+                    rows |= (antenna1 == names.index(name)) & np.isin(scans, sorted(wanted))
             flags = np.asarray(handle.getcol("FLAG")).astype(bool)
             weak = np.ones(flags.shape, dtype=bool)
             if keep_snr > 0 and "SNR" in handle.colnames():
@@ -3574,15 +3762,15 @@ class CasaCalibrationOps(CalibrationOps):
             solved.setdefault(name, set()).add(int(scan))
         return solved
 
-    def _merge_antenna_solutions(self, table_path: Path, source_path: Path, antennas: list[str]) -> int:
-        """Copy the unflagged solutions of ``antennas`` from ``source_path`` into ``table_path``.
+    def _merge_antenna_solutions(self, table_path: Path, source_path: Path, solutions: dict[str, set[int]]) -> int:
+        """Copy the unflagged solutions of each antenna of ``solutions``, on its scans, from ``source_path``.
 
         Rows are matched on antenna, scan, field and subband; a solution replaces
         the target row only where that row is flagged, so nothing the original
         (higher-SNR) solve found is overwritten. Returns the number of rows copied.
         """
         names = self._table_antenna_names(table_path)
-        wanted = {names.index(name) for name in antennas if name in names}
+        wanted = {names.index(name): set(scans) for name, scans in solutions.items() if name in names}
         keys = ("ANTENNA1", "SCAN_NUMBER", "FIELD_ID", "SPECTRAL_WINDOW_ID")
         source = self.backend.tools.table()
         if not source.open(str(source_path)):
@@ -3593,7 +3781,8 @@ class CasaCalibrationOps(CalibrationOps):
             index = np.stack([np.asarray(source.getcol(k)) for k in keys], axis=1)
             flags = np.asarray(source.getcol("FLAG")).astype(bool)
             good = ~flags.reshape(-1, flags.shape[-1]).all(axis=0)
-            rows = {tuple(int(v) for v in index[r]): r for r in np.where(good)[0] if int(index[r, 0]) in wanted}
+            rows = {tuple(int(v) for v in index[r]): r for r in np.where(good)[0]
+                    if int(index[r, 1]) in wanted.get(int(index[r, 0]), ())}
             values = {c: np.asarray(source.getcol(c)) for c in columns}
         finally:
             source.close()
@@ -6165,24 +6354,30 @@ class CasaExportOps(ExportOps):
         # A split of a Multi-MS is itself a Multi-MS, and concat cannot append to one: every
         # such input goes through a plain-MS copy first (these are small, averaged files).
         temporary: list[Path] = []
+        from ..logging_utils import native_output_to_log
         try:
-            plain = []
-            for index, path in enumerate(inputs):
-                if (Path(path) / "SUBMSS").is_dir():
-                    copy = target.with_name(f"{target.name}.part{index}")
-                    if copy.exists():
-                        shutil.rmtree(copy)
-                    # split(keepmms=False): mstransform on a Multi-MS writes a Multi-MS again.
-                    self.backend.tasks.split(vis=str(path), outputvis=str(copy), datacolumn="data",
-                                             keepmms=False)
-                    temporary.append(copy)
-                    plain.append(str(copy))
+            # CASA complains when one epoch has an EARTH_ORIENTATION table and the other none (EM178 + RSM06B:
+            # SEVERE getcell::TIME, WARN "not fully consistent", "Could not merge EOP subtables"), and its
+            # logger prints that on the terminal whatever casalog is told: expected, so it goes to the log.
+            with native_output_to_log("concat"):
+                plain = []
+                for index, path in enumerate(inputs):
+                    if (Path(path) / "SUBMSS").is_dir():
+                        copy = target.with_name(f"{target.name}.part{index}")
+                        if copy.exists():
+                            shutil.rmtree(copy)
+                        # split(keepmms=False): mstransform on a Multi-MS writes a Multi-MS again.
+                        self.backend.tasks.split(vis=str(path), outputvis=str(copy), datacolumn="data",
+                                                 keepmms=False)
+                        temporary.append(copy)
+                        plain.append(str(copy))
+                    else:
+                        plain.append(str(path))
+                if len(plain) == 1:
+                    shutil.copytree(plain[0], target)
                 else:
-                    plain.append(str(path))
-            if len(plain) == 1:
-                shutil.copytree(plain[0], target)
-            else:
-                self.backend.tasks.concat(vis=plain, concatvis=str(target), respectname=True, copypointing=False)
+                    self.backend.tasks.concat(vis=plain, concatvis=str(target), respectname=True,
+                                              copypointing=False)
         except RuntimeError as exc:
             raise BackendError(f"concat of {', '.join(source_names)} failed: {exc}") from exc
         finally:

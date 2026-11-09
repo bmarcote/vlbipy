@@ -82,6 +82,13 @@ def _point_scatter(series: np.ndarray) -> float:
     return float(mad_sigma(np.diff(finite)) / np.sqrt(2.0) / np.median(finite))
 
 
+def _finite_median(values: np.ndarray) -> float:
+    """Median of the finite values; NaN when there are none (a series flagged at its start or end), without
+    numpy's "All-NaN slice" warning."""
+    values = values[np.isfinite(values)]
+    return float(np.median(values)) if values.size else np.nan
+
+
 def assess(syscal: dict, *, hands: tuple = ("R", "L")) -> list[dict]:
     """Classify every (antenna, subband, hand) Tsys series.
 
@@ -114,8 +121,7 @@ def assess(syscal: dict, *, hands: tuple = ("R", "L")) -> list[dict]:
                 bad = (~good) | (series < UNPHYSICAL_FRACTION * med)
                 clean = np.where(bad, np.nan, series)
                 n15 = max(3, int(0.15 * clean.size))
-                with np.errstate(invalid="ignore", divide="ignore"):
-                    first, last = np.nanmedian(clean[:n15]), np.nanmedian(clean[-n15:])
+                first, last = _finite_median(clean[:n15]), _finite_median(clean[-n15:])
                 rel = np.nanstd(clean) / med if np.isfinite(med) and med > 0 else np.nan
                 stats[(int(spw), p)] = {"median": med, "scatter": _point_scatter(clean), "n": int(good.sum()),
                                         "unphysical": int(bad.sum()), "rel_std": float(rel),

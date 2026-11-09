@@ -57,8 +57,11 @@ DIVERGENCE_TOLERANCE = 0.02
 #: ... and does not stop on the residual-peak criterion while a batch still lowers the residual rms by more
 #: than this fraction: the rms is then still made of the sidelobes of flux that has not been cleaned.
 RMS_CONVERGENCE = 0.01
-#: Pixels per resolution element in the wide dirty map searched for a target.
-SEARCH_OVERSAMPLE = 3.0
+#: Pixels per resolution element in the wide dirty map searched for a target. difmap grids only |u|, |v| below
+#: 1/(4 cell) x (1 - 8/npix) (difmap-core ``uv_limits``), so a cell of resolution/3 dropped every baseline longer
+#: than ~0.7 of the longest, and all of the data when they lie on one baseline (RSM06B: EF-WB only -> "no data
+#: with the current selection/uv range"). 5 keeps the longest baseline down to the smallest (64-pixel) map.
+SEARCH_OVERSAMPLE = 5.0
 #: Largest side (pixels) of that map; the cell grows instead when the field needs more.
 SEARCH_MAX_PIXELS = 16384
 
@@ -194,23 +197,27 @@ def phase_selfcal(obs, solints: list[str], *, min_improvement: float = 0.002,
 
 def amplitude_calibration(obs, prefix: str, parent_ms: str, *, models=("current", "gauss1", "gauss2", "gauss3"),
                           prior_sigma: float = 0.1, workers: Optional[int] = None, allow_clean: bool = False,
-                          per_if: bool = False) -> dict:
+                          per_if: bool = True, if_sigma: Optional[float] = 0.1) -> dict:
     """Bayesian station amplitude calibration; writes ``<prefix>.json``, ``.png`` and the CASA table.
 
     The table refers to ``parent_ms`` (the multi-source measurement set), so
     CASA can apply the corrections to every field. Returns the JSON-able summary
     with the table path under ``"caltable"``.
 
-    ``per_if=False`` (the default) solves one correction per station: the subband levels are the scalar
-    bandpass's job, solved on every scan and both hands of the calibrator at high SNR, while a per-IF Bayesian
-    estimate on a weak station is noise that the table would carry to every field (EB104G: T6 on the fringe
-    finder, 5.3-7.6 across IFs, and up to 18% subband steps on that source afterwards).
+    The corrections are per station and subband (``per_if``, the default). With ``if_sigma`` (default 0.1) each
+    station's level is decided once, on its subbands together, and every subband follows its own estimate around
+    that level, shrunk by a Gaussian prior of that width: a subband step measured to much better than 10% is
+    levelled in full (EM178, fringe finders: WB 0.88-1.06 across the IFs at 1%, left by a scalar bandpass that the
+    weak phase calibrator could not solve), while the per-IF estimates of a weak station, which are noise the
+    table would carry to every field, collapse to its one level (EB104G: T6 x13-24 across IFs at sigma ~0.7).
+    ``if_sigma=None`` judges every IF on its own; ``per_if=False`` gives one correction per station.
     """
     models = tuple(models)
     if not allow_clean:
         models = tuple(model for model in models if not str(getattr(model, "kind", model)).strip().lower().startswith("clean"))
         models = models or ("current", "gauss1", "gauss2", "gauss3")
     result = obs.bayes_gscale(models=models, prior_sigma=prior_sigma, prefix=str(prefix), per_if=per_if,
+                              if_sigma=if_sigma if per_if and if_sigma else None,
                               outformat="CASA", ms=str(parent_ms), workers=workers, plot=False, quiet=False,
                               verbose=False)
     raw_files = dict(getattr(result, "files", {}) or {})
@@ -242,7 +249,7 @@ def time_amplitude_selfcal(obs, prefix: str, parent_ms: str, *, solint: str = "s
     calibrators, JB wandered +-30% and jumped 9-11% from scan to scan), an elevation-dependent gain the gain curve
     misses (UR -30% over the track), an absorbing atmosphere (YS, last 1.5 h). This step solves amplitude gains per
     ``solint`` against the converged model, keeps them only when the fit improves by ``min_improvement``, and then
-    reduces them to one curve per station (median over the IFs, which the scalar bandpass has levelled) divided by
+    reduces them to one curve per station (median over the IFs, which the Bayesian gscale has levelled) divided by
     its own median over time - so the level stays the Bayesian one and only the shape is added. A correction more
     than ``max_factor`` from that median is written flagged: the station had no usable signal then.
 
@@ -408,7 +415,7 @@ def clean_image(obs, fits_path: str, *, robust: float, niter: int = 4000, gain: 
     valid = obs.valid_slice
     peak = float(np.nanmax(np.asarray(obs.restored_map)[valid]))
     final = obs.imstat()
-    noise = float(final.get("rms", rms)) or rms
+    noise = _image_noise(obs, float(final.get("rms", rms)) or rms, peak)
     beam = obs.estimated_beam
     info = {"fits": str(fits_path), "robust": float(robust), "peak": peak, "rms": noise,
             "dynamic_range": peak / noise if noise > 0 else 0.0, "model_flux": float(obs.model_flux),
@@ -492,6 +499,30 @@ def fit_image_model(obs, *, max_components: int = 1, component_sigma: float = 5.
     return obs, report
 
 
+#: No VLBI image reaches this dynamic range: a residual rms that low means the model fits every visibility left.
+MAX_DYNAMIC_RANGE = 1e5
+
+
+def _image_noise(obs, measured: float, peak: float) -> float:
+    """The residual rms of an image, or the thermal noise the weights predict when that rms measures nothing.
+
+    With nearly every visibility flagged (EM178: J1832-1035, 99%) the model can fit the few left exactly and the
+    residual map is zero to rounding: rms 1e-14 Jy/beam, dynamic range 1e12. Then the noise the visibility
+    weights predict for the map stands in for it.
+    """
+    if measured > 0 and abs(peak) < MAX_DYNAMIC_RANGE * measured:
+        return measured
+    try:
+        expected = float((obs.invert(verbose=False, quiet=False) or {}).get("noise", 0.0))
+    except Exception:  # noqa: BLE001 - keep what was measured
+        return measured
+    if expected > measured:
+        logger.info("difmapy: residual rms {:.3g} Jy/beam is below the {:.3g} Jy/beam the weights predict (the "
+                    "model fits the few visibilities left exactly); using the expected noise", measured, expected)
+        return expected
+    return measured
+
+
 def modelfit_image(obs, fits_path: str, *, robust: float, model_report: Optional[dict] = None,
                    max_components: int = 1, component_sigma: float = 5.0,
                    component_improvement: float = 0.01) -> tuple[object, dict]:
@@ -507,6 +538,7 @@ def modelfit_image(obs, fits_path: str, *, robust: float, model_report: Optional
     obs.wmap(str(fits_path), overwrite=True)
     _crop_to_valid(fits_path, obs.valid_slice)
     peak = float(np.nanmax(np.asarray(obs.restored_map)[obs.valid_slice]))
+    noise = _image_noise(obs, noise, peak)
     beam = obs.estimated_beam
     info = {"fits": str(fits_path), "robust": float(robust), "peak": peak, "rms": noise,
             "dynamic_range": peak / noise if noise > 0 else 0.0, "model_flux": float(obs.model_flux),
@@ -574,7 +606,8 @@ def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_value
                      prior_sigma: float = 0.1, workers: Optional[int] = None, imagename: Optional[str] = None,
                      search_fov_mas: float = 0.0, search_sigma: float = 8.0, recentre_min_beams: float = 10.0,
                      mapsize: int = IMAGE_PIXELS, fixed_antennas: tuple = (), deferred_antennas: tuple = (),
-                     fix_stage1: bool = True, bayes_per_if: bool = False, time_amplitude: str = "scan",
+                     fix_stage1: bool = True, bayes_per_if: bool = True, bayes_if_sigma: Optional[float] = 0.1,
+                     time_amplitude: str = "scan",
                      time_amplitude_min_improvement: float = 0.01, model_components: int = 1,
                      structure_components: int = 0, **imaging_kwargs) -> dict:
     """Full difmapy calibrator sequence: model, phase ladder, amplitude gains, images, tables.
@@ -646,7 +679,7 @@ def calibrate_source(split_ms: str, parent_ms: str, prefix: str, *, robust_value
         else {}
     amplitude = amplitude_calibration(obs, f"{prefix}.amp", parent_ms, models=bayes_models, prior_sigma=prior_sigma,
                                       workers=workers, allow_clean=imaging_kwargs.get("method", "modelfit") == "clean",
-                                      per_if=bayes_per_if)
+                                      per_if=bayes_per_if, if_sigma=bayes_if_sigma)
     gains = write_gain_record(obs, f"{prefix}.gains.json", amplitude)
     # One accumulated table (phase + amplitude corrections since the first model) is what
     # gets transferred to the targets and check sources.

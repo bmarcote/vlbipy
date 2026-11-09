@@ -54,6 +54,17 @@ def _tsys_log_gain(syscal: dict, antenna_name: str, scans) -> np.ndarray:
     return values
 
 
+def _mean_over_subbands(values: np.ndarray) -> np.ndarray:
+    """Per-time mean of an antenna's (time, subband) log-gains over its finite subbands.
+
+    A time without data of the antenna (off source, flagged) is NaN, without numpy's "Mean of empty slice"
+    warning that ``np.nanmean`` prints for it.
+    """
+    finite = np.isfinite(values)
+    count = finite.sum(axis=1)
+    return np.where(count > 0, np.where(finite, values, 0.0).sum(axis=1) / np.maximum(count, 1), np.nan)
+
+
 class AINamespace(Namespace):
     """Data-driven diagnostics and decisions (see :mod:`vlbipy.ai`)."""
 
@@ -156,7 +167,7 @@ class AINamespace(Namespace):
         scatters = {}
         for field, g in gains.items():
             for a, name in enumerate(names):
-                x = np.nanmean(g["x"][:, a, :], axis=1)
+                x = _mean_over_subbands(g["x"][:, a, :])
                 ok = np.isfinite(x)
                 if ok.sum() < 3:
                     continue
@@ -332,7 +343,7 @@ class AINamespace(Namespace):
         per_antenna = {}
         for field, g in gains.items():
             for a, ant in enumerate(names):
-                x = np.nanmean(g["x"][:, a, :], axis=1)
+                x = _mean_over_subbands(g["x"][:, a, :])
                 ok = np.isfinite(x)
                 if ok.sum() >= 3:
                     per_antenna.setdefault(ant, {})[field] = features.series_stats(g["time"][ok], x[ok])

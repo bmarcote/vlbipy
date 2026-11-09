@@ -75,8 +75,10 @@ reversible: the version `before_ai_flag_distribution` is saved):
 * subbands off the band median by >15% and >6 sigma;
 * scans where a baseline's amplitude leaves its own slow trend by >20% and >5 sigma.
 
-**Self-calibration** (difmapy): the Bayesian gscale gives one correction per station (`[selfcal].bayes_per_if =
-false`; the scalar bandpass levels the subbands), then an amplitude self-calibration per scan
+**Self-calibration** (difmapy): the Bayesian gscale gives a correction per station and subband
+(`[selfcal].bayes_per_if = true`): the station's level is decided on its subbands together, and each subband
+follows its own estimate around it, shrunk by a 10% prior (`[selfcal].bayes_if_sigma`) so that a weak station's
+per-IF noise collapses to one level; then an amplitude self-calibration per scan
 (`[selfcal].time_amplitude`), solved with a floating flux scale (difmap's default holds the mean gain of each IF,
 and one far-off station drags the rest), kept when the fit improves by 1% and normalised to median 1 per station -
 only the time dependence the Tsys cannot follow is added; a correction more than x5 from the median flags the data
@@ -187,7 +189,7 @@ hands, low subbands, scattered short-baseline phases and an unexplained UR-T6 dr
 | YS Tsys x2.4 in the last 1.5 h is real but under-corrects | raw amplitude slope 2.1 vs Tsys (corr 0.98): weather absorbs the signal as it raises the Tsys | opacity-like exponent |
 | RR/LL offsets UR -12%, O8 -6%, SR -5% after calibration | UR DPFU R/L = 1.13 (looks swapped) and RCP Tsys 12% low; O8 RCP Tsys 10% low; raw hands equal | hand-joint scalar bandpass |
 | short-baseline phases off the distribution | TR phase jumps of ±180° within scans (scans 1, 32, 64, 96, 141, 142); TR antenna-based | distribution flags |
-| per-IF Bayesian corrections of a weak station are noise | T6 on the fringe finder 5.3-7.6 across IFs, carried to every field | one correction per station |
+| per-IF Bayesian corrections of a weak station are noise | T6 on the fringe finder 5.3-7.6 across IFs, carried to every field | one level per station, subbands shrunk towards it (`bayes_if_sigma`) |
 | band-edge channels left ~14% low | channel test on the calibrators' spectra | flagged (`AI_CHANNEL`) |
 | the phase calibrator's time curve does not transfer | check source: reduced chi-squared 28.9 -> 34.9, SNR 204 -> 180 with it | applied to the calibrator only (opt-in transfer) |
 | difmap amplitude self-cal diverged (chi-squared x60) | the mean-gain normalisation dragged by T6 | solved with a floating scale, normalised per station |

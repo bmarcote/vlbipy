@@ -67,6 +67,19 @@ class StepError(Exception):
         super().__init__(f"{message} {detail}")
 
 
+class CampaignError(Exception):
+    """Raised at the end of a multi-project run in which some projects failed.
+
+    A project that fails is left out of the rest of the run while the others carry on to the end; this
+    error then names every project that failed and why. ``failures`` maps each project code to its exception.
+    """
+
+    def __init__(self, failures: dict) -> None:
+        self.failures: dict = dict(failures)
+        super().__init__("; ".join(str(exc) if str(exc).startswith(f"{code}:") else f"{code}: {exc}"
+                                   for code, exc in self.failures.items()))
+
+
 class StaleCalibrationError(StepError):
     """Raised when legacy calibration provenance makes continuing the pipeline unsafe.
 

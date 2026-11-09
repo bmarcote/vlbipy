@@ -23,12 +23,14 @@ from html import escape
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 from astropy.time import Time
 from loguru import logger
 
 # The thresholds shared with the general comments are defined once, in vlbipy.comments.
 from .comments import (FRINGE_DETECTION_SNR, GAIN_BAD_DEVIATION, GAIN_DECIMALS, GAIN_WARN_DEVIATION,
                        NO_DATA_FLAGGED_FRACTION, build_comments, format_flux, group_comments, load_run_warnings)
+from .diagnostics import sexagesimal
 
 #: (file stem, tab title) in display order. ``index`` is the overview.
 PAGES: list[tuple[str, str]] = [("index", "Overview"), ("diagnostics", "Diagnostics"),
@@ -352,8 +354,9 @@ def _source_rows(observation, metadata) -> list[dict]:
             coords = SkyCoord(ra * u.deg, dec * u.deg)
         rows.append({"name": name, "type": source.source_type.value if source else "other",
                      "id": metadata.source_ids.get(name, "") if metadata else "",
-                     "ra": coords.ra.to_string(unit=u.hourangle, sep=":", precision=4, pad=True) if coords else "",
-                     "dec": coords.dec.to_string(unit=u.deg, sep=":", precision=3, alwayssign=True, pad=True) if coords else "",
+                     "ra": sexagesimal(coords.ra, unit=u.hourangle, sep=":", precision=4, pad=True) if coords else "",
+                     "dec": sexagesimal(coords.dec, unit=u.deg, sep=":", precision=3, alwayssign=True, pad=True)
+                     if coords else "",
                      "ra_deg": float(coords.ra.deg) if coords else None,
                      "dec_deg": float(coords.dec.deg) if coords else None,
                      "n_scans": sum(1 for s in metadata.scans if s.source == name) if metadata else 0})
@@ -783,6 +786,164 @@ def _gain_corrections(work_dir: Path, project_code: str, sources: list[dict], an
     return entries
 
 
+#: Self-calibration tables whose amplitude reaches every field they are applied to. The time-dependent curves
+#: (``selfampt_``) are normalised to a median of one and stay on their own source; the phase tables carry none.
+SELFCAL_AMPLITUDE_PREFIXES = ("selfamp_", "selfcal_")
+
+
+def _amplitude_table_factors(path) -> dict[str, dict[tuple[int, int], float]]:
+    """Visibility amplitude factor ``1/|g|`` of a G Jones table, per antenna and ``(subband, hand)``.
+
+    The median over the table's solution times; flagged or zero gains are left out. Empty when the table
+    cannot be read.
+    """
+    try:
+        from casacore.tables import table
+        with table(str(path), ack=False) as main:
+            cparam, flag = main.getcol("CPARAM"), main.getcol("FLAG")
+            antenna, spw = main.getcol("ANTENNA1"), main.getcol("SPECTRAL_WINDOW_ID")
+        with table(str(Path(path) / "ANTENNA"), ack=False) as subtable:
+            names = [str(n) for n in subtable.getcol("NAME")]
+    except Exception as exc:  # noqa: BLE001 - the total just goes without this factor
+        logger.debug("dashboard: could not read {} ({})", path, exc)
+        return {}
+    values: dict[tuple[str, int, int], list[float]] = {}
+    for row in range(len(antenna)):
+        for hand in range(cparam.shape[2]):
+            gains = np.abs(cparam[row, :, hand])
+            good = ~flag[row, :, hand] & (gains > 0)
+            if good.any() and 0 <= int(antenna[row]) < len(names):
+                values.setdefault((names[int(antenna[row])], int(spw[row]), hand), []).append(
+                    float(np.median(gains[good])))
+    out: dict[str, dict[tuple[int, int], float]] = {}
+    for (name, subband, hand), gains in values.items():
+        out.setdefault(name, {})[(subband, hand)] = 1.0 / float(np.median(gains))
+    return out
+
+
+def gain_total_entry(tables: list[dict], entries: list[dict], fields: list[str], antennas: list[dict],
+                     channel_freqs: list, hands: list[str], scalar: Optional[dict] = None) -> Optional[dict]:
+    """Total amplitude correction the calibration applies to ``fields`` beyond the a-priori calibration.
+
+    The product, per antenna, subband and hand, of the scalar bandpass (``scalar``: :func:`_amplitude_table_factors`
+    of it, per hand and subband) and of the amplitude of every self-calibration table of the chain that is applied to
+    ``fields[0]`` - the fringe finders' (every field), then the phase-reference source's (itself and the fields it
+    calibrates). A self-calibration table with no solution for an antenna and subband contributes nothing there,
+    as on apply.
+
+    Parameters
+    ----------
+    tables : list of dict
+        The apply chain (``CalTable.to_dict()``), in order.
+    entries : list of dict
+        ``ctx["gain_corrections"]`` (:func:`gain_correction_entry`): the factors of each self-calibrated source.
+    fields : list of str
+        Fields with this same chain; the first decides which tables apply.
+    antennas : list of dict
+        Context ``antennas`` list (``name``, ``observed``, ``subbands``).
+    channel_freqs : list of list of float
+        Channel frequencies (Hz) per subband.
+    hands : list of str
+        Parallel hands in table order (``["R", "L"]``).
+    scalar : dict, optional
+        Scalar-bandpass factors.
+
+    Returns
+    -------
+    dict or None
+        An entry shaped like :func:`gain_correction_entry` (``role`` "total", a column per subband and hand) plus
+        ``factors`` (the tables multiplied, in chain order) and ``fields``; None when nothing applies.
+    """
+    by_source = {str(e.get("source")): e for e in entries}
+    field = fields[0]
+    used = []
+    for table in tables:
+        cal_type = str(table.get("cal_type", ""))
+        apply_to = {f for f in str(table.get("apply_to") or "").split(",") if f}
+        if apply_to and field not in apply_to:
+            continue
+        if cal_type == "scalar_bp" and scalar:
+            used.append((cal_type, None))
+            continue
+        prefix = next((p for p in SELFCAL_AMPLITUDE_PREFIXES if cal_type.startswith(p)), None)
+        if prefix and cal_type[len(prefix):] in by_source:
+            used.append((cal_type, by_source[cal_type[len(prefix):]]))
+    if not any(entry is not None for _, entry in used):
+        return None
+    n_subbands = len(channel_freqs) or max((len(e.get("subbands") or []) for _, e in used if e), default=0)
+    hands = list(hands) or ["R", "L"]
+    columns = [(subband, hand) for subband in range(n_subbands) for hand in range(len(hands))]
+    known = {a["name"]: a for a in antennas}
+    names = list(known) + sorted({n for _, e in used if e for n in e.get("antennas") or []} - set(known))
+    gains: dict[str, list[Optional[float]]] = {}
+    for name in names:
+        row = []
+        for subband, hand in columns:
+            if not _metadata_has_solution(known.get(name), subband):
+                row.append(None)
+                continue
+            factor, solved = 1.0, False
+            for cal_type, entry in used:
+                if entry is None:
+                    value = (scalar.get(name) or {}).get((subband, hand))
+                else:
+                    position = {sb: i for i, sb in enumerate(entry.get("subbands") or []) if sb is not None}
+                    per_if = (entry.get("gain_per_if") or {}).get(name) or []
+                    index = position.get(subband)
+                    value = per_if[index] if index is not None and index < len(per_if) else None
+                value = _finite_or_none(value)
+                if value is not None:
+                    factor *= value
+                    solved = True
+            row.append(factor if solved else None)
+        gains[name] = row
+    solved = {name: [g for g in gains[name] if g is not None] for name in names}
+    centres = [float(np.mean(freqs)) if len(freqs) else None for freqs in channel_freqs] or [None] * n_subbands
+    return {"source": "Total", "role": "total", "fields": list(fields), "factors": [c for c, _ in used],
+            "file": "", "applied": True, "antennas": names, "subbands": [s for s, _ in columns],
+            "subband_labels": [f"SB {s} {hands[h]}" for s, h in columns],
+            "if_freqs_hz": [centres[s] if s < len(centres) else None for s, _ in columns],
+            "gain_per_if": gains,
+            "gain_median": {name: float(statistics.median(solved[name])) if solved[name] else None for name in names},
+            "findings": []}
+
+
+def _gain_totals(observation, tables: list[dict], entries: list[dict], antennas: list[dict], channel_freqs: list,
+                 polarizations: list[str]) -> list[dict]:
+    """:func:`gain_total_entry` for the phase-reference source and the fields it calibrates (one per chain)."""
+    if not entries:
+        return []
+    try:
+        plan = observation.phaseref_plan()
+        fields = list(dict.fromkeys(list(plan.references) + list(plan.receivers)))
+    except Exception:  # noqa: BLE001 - an observation without a plan: its targets
+        fields = []
+    finders = {s.name for s in observation.sources.fringe_finders}
+    fields = [f for f in fields if f not in finders] or [s.name for s in observation.sources.targets]
+    products = [{"5": "RR", "8": "LL", "9": "XX", "12": "YY"}.get(str(getattr(p, "name", p)), str(getattr(p, "name", p)))
+                for p in polarizations or []]
+    hands = [p[0] for p in products if len(p) == 2 and p[0] == p[1]]
+    scalar_tables = [t for t in tables if t.get("cal_type") == "scalar_bp" and t.get("path")]
+    scalar = _amplitude_table_factors(scalar_tables[-1]["path"]) if scalar_tables else {}
+    groups: dict[tuple, list[str]] = {}
+    for field in fields:
+        # Fields multiplied by the same amplitude tables share one total (the phase-reference source's own time
+        # curve or phase table does not count).
+        chain = tuple(t["cal_type"] for t in tables if (not t.get("apply_to") or field in str(t["apply_to"]).split(","))
+                      and (t["cal_type"] == "scalar_bp" or str(t["cal_type"]).startswith(SELFCAL_AMPLITUDE_PREFIXES)))
+        groups.setdefault(chain, []).append(field)
+    out = []
+    for group in groups.values():
+        try:
+            entry = gain_total_entry(tables, entries, group, antennas, channel_freqs, hands, scalar)
+        except Exception as exc:  # noqa: BLE001 - the per-source tables still render
+            logger.warning("dashboard: total amplitude correction of {} not computed ({})", ", ".join(group), exc)
+            entry = None
+        if entry:
+            out.append(entry)
+    return out
+
+
 def _calibration_selection(observation, scans: list[dict]) -> list[dict]:
     """Stages of the instrumental (single-band delay) selection, each with the source of its scan.
 
@@ -1020,6 +1181,9 @@ def collect(obs, *, flag_statistics: Optional[dict] = None) -> dict:
         "caltables": [t.to_dict() for t in observation.gaintables],
         "work_dir": str(observation.work_dir),
     }
+    context["gain_total"] = _gain_totals(observation, context["caltables"], context["gain_corrections"], antennas,
+                                         list(freq.channel_freqs) if freq else [],
+                                         context["observation"]["polarizations"])
     # What only the general comments need. Every piece comes from a cache on disk (or from the
     # observation object), never from the measurement set: the report is rebuilt after it is gone.
     context["calibration_selection"] = _calibration_selection(observation, context["scans"])
@@ -2269,18 +2433,36 @@ def _gain_section(ctx: dict) -> str:
     A single source renders as one titled table, several get a sub-tab each. A context without
     ``gain_corrections`` (an older ``dashboard.json``), or with none, renders the "empty" notice.
     """
+    totals = [e for e in (ctx.get("gain_total") or []) if isinstance(e, dict) and e.get("antennas")]
     entries = [e for e in (ctx.get("gain_corrections") or []) if isinstance(e, dict) and e.get("antennas")]
     if not entries:
         return '<p class="empty">No amplitude corrections from the self-calibration available.</p>'
-    labels = []
+    labels, panels, keys = [], [], []
+    for entry in totals:
+        fields = ", ".join(str(f) for f in entry.get("fields") or [])
+        labels.append(f'Total{f" &rarr; {escape(fields)}" if len(totals) > 1 else ""} '
+                      f'<span class="badge total">total</span>')
+        panels.append(_gain_total_note(entry) + _gain_table(entry))
+        keys.append(f"total {fields}")
     for entry in entries:
         source, role = escape(str(entry.get("source", ""))), escape(str(entry.get("role") or "other"))
         labels.append(f'{source} <span class="badge {role}">{role}</span>')
-    if len(entries) == 1:
-        return _gain_legend() + f"<h3>{labels[0]}</h3>" + _gain_panel(entries[0])
-    ids = _panel_ids("gains", [str(entry.get("source", "")) for entry in entries])
-    return _gain_legend() + _subtabs([(pid, label, _gain_panel(entry))
-                                      for pid, label, entry in zip(ids, labels, entries)])
+        panels.append(_gain_panel(entry))
+        keys.append(str(entry.get("source", "")))
+    if len(panels) == 1:
+        return _gain_legend() + f"<h3>{labels[0]}</h3>" + panels[0]
+    ids = _panel_ids("gains", keys)
+    return _gain_legend() + _subtabs(list(zip(ids, labels, panels)))
+
+
+def _gain_total_note(entry: dict) -> str:
+    """What the total multiplies and which fields it applies to."""
+    factors = " &times; ".join(f'<span class="mono">{escape(str(f))}</span>' for f in entry.get("factors") or [])
+    fields = ", ".join(escape(str(f)) for f in entry.get("fields") or [])
+    return (f'<p class="count">Product of every amplitude correction applied to {fields} after the a-priori '
+            f'calibration: {factors}. The self-calibration factors are per station and subband, the same for both hands; '
+            f'the scalar bandpass sets the hands. Time-dependent curves (selfampt) stay on their own source and '
+            f'are not included.</p>')
 
 
 def _source_tab_label(name: str, role: str) -> str:
@@ -2362,9 +2544,11 @@ def render_calibration(ctx: dict, html_dir: Path, plot_root: Path) -> str:
                        "The scan(s) the instrumental delay was solved on, how much of the data is flagged, and what "
                        "else the calibration has to say.")
             + _section("amplitude-corrections", "Amplitude corrections", _gain_section(ctx),
-                       "Amplitude factor the difmapy gscale self-calibration applied to the visibilities of every "
-                       "antenna and subband (1.00 = unchanged). The last column is the median over the subbands "
-                       "the antenna has a solution in."))
+                       "Amplitude factor applied to the visibilities of every antenna and subband (1.00 = "
+                       "unchanged). Total: the product of every correction that reaches the target fields - the "
+                       "scalar bandpass, the fringe finders' self-calibration and the phase-reference source's. "
+                       "The other tabs show each self-calibrated source's own factors. The last column is the "
+                       "median over the subbands the antenna has a solution in."))
     for title, blurb, patterns in CALIBRATION_GROUPS:
         anchor = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
         paths = find_plots(plot_root, patterns)

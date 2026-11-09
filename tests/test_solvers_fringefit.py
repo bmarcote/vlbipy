@@ -102,3 +102,20 @@ def test_run_fringefit_matches_casa_on_rsm07(tmp_path):
     assert np.median(diffs[:, :2]) < 0.05, "delays differ from CASA by more than 50 ps (median)"
     assert np.max(diffs[:, :2]) < 0.5, "a delay differs from CASA by more than 0.5 ns"
     assert np.degrees(np.median(diffs[:, 2])) < 5.0, "phases differ from CASA by more than 5 degrees (median)"
+
+
+def test_the_logged_median_snr_leaves_the_reference_antenna_out():
+    """An interval where only the reference antenna is "solved" has no SNR to report (EM178, inverse phase
+    referencing: the log said median SNR 999 for a target nobody detected); a bright source's SNRs above the
+    sentinel stay in (the instrumental-delay scan on J2136+0041: median ~4700)."""
+    from types import SimpleNamespace
+    from vlbipy.solvers.fringe import REFANT_SNR_SENTINEL
+    from vlbipy.solvers.fringefit import _median_snr
+    only_ref = SimpleNamespace(snr=np.array([[REFANT_SNR_SENTINEL] * 2, [2.0, 2.5], [3.0, 3.5]]),
+                               flag=np.array([[False] * 2, [True] * 2, [True] * 2]), refant=0)
+    assert _median_snr(only_ref) == 0.0
+    solved = SimpleNamespace(snr=np.array([8.0, REFANT_SNR_SENTINEL, 12.0, 2.0]),
+                             flag=np.array([False, False, False, True]), refant=1)
+    assert _median_snr(solved) == 10.0
+    bright = SimpleNamespace(snr=np.array([REFANT_SNR_SENTINEL, 4000.0, 6000.0]), flag=np.zeros(3, bool), refant=0)
+    assert _median_snr(bright) == 5000.0

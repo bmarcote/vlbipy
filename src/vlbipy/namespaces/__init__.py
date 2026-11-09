@@ -485,6 +485,11 @@ class CalibrateNamespace(Namespace):
         from ..selection import plan_sbd_stages, select_antennas, without_weak_detections
 
         obs = self._obs
+        # The source roles first, also when the selection below is reused: those inferred from the data on the
+        # first pass (.source_roles.json) are what make a fringe finder of an undeclared source. A run resumed
+        # after this step (--from-step fringefit) otherwise solved the delays on the phase calibrator alone and
+        # left the bandpass on the fringe finder without them (RSM06B: 100% flagged).
+        self.infer_source_roles()
         # Decide the antenna/scan set once — on the first (cleanest) pass — and reuse it for
         # every later pass. Re-surveying on the progressively flagged data of a second/third
         # pass lets the detectable set shrink (e.g. 8 -> 6 -> 2 antennas on a sparse fringe
@@ -504,7 +509,6 @@ class CalibrateNamespace(Namespace):
             return antennas, scans
         cal_cfg = obs.config.get("calibration", {})
         threshold = min_snr if min_snr is not None else cal_cfg.get("detection_snr", 7.0)
-        self.infer_source_roles()
         # Survey one source group at a time, in the order the calibration falls back
         # through them. The fringe finder is both the right source to solve on and
         # usually the one with fewest scans, so this avoids fringe-fitting every
@@ -1239,8 +1243,10 @@ class CalibrateNamespace(Namespace):
         layout = read_layout(ms, engine=engine)
         field_names = list(read_setup(ms, engine=engine)["field_names"])
         out: dict = {}
+        # "phasecal" is the phase-reference role of the fringe fit: the targets with inverse phase referencing.
+        finders = {s.name for s in obs.sources.fringe_finders}
         roles = [(s.name, "fringefinder") for s in obs.sources.fringe_finders] + \
-            [(s.name, "phasecal") for s in obs.sources.phase_calibrators]
+            [(name, "phasecal") for name in obs.phaseref_plan().references if name not in finders]
         for name, role in roles:
             result = obs._selfcal_results.get(name)
             report = result.report if result is not None and getattr(result, "report", None) else {}
@@ -1470,7 +1476,7 @@ class CalibrateNamespace(Namespace):
                           f"({exc}); applying them unsmoothed")
             return table
 
-    def scan_snr(self, *, field: str = "", force: bool = False, **kwargs):
+    def scan_snr(self, *, field: str = "", force: bool = False, warn_dead: bool = True, **kwargs):
         """Measure fringe SNR per scan, antenna and polarization on the calibrators.
 
         A diagnostic fringe fit over the central channels of every calibrator
@@ -1485,6 +1491,11 @@ class CalibrateNamespace(Namespace):
             phase calibrators), falling back to the targets when none is defined.
         force : bool
             Re-run even if the survey already exists.
+        warn_dead : bool
+            Warn for every antenna without a usable fringe. The survey of the calibrated data at the end of
+            the run passes ``False``: there an antenna whose data the calibration flagged has no fringes
+            either, which the flagged-fraction anomaly already reports - and the survey of the raw data, at
+            the start, is where an antenna without fringes shows.
 
         Returns
         -------
@@ -1516,8 +1527,13 @@ class CalibrateNamespace(Namespace):
         obs._snr_surveys[selection] = survey
         if obs._metadata is not None:
             obs._metadata.snr_survey = survey
-        for antenna in survey.dead_antennas():
-            warnings.warn(f"{self._code}: antenna {antenna} shows no usable fringes on {selection}")
+        dead = list(survey.dead_antennas())
+        if dead and warn_dead:
+            for antenna in dead:
+                warnings.warn(f"{self._code}: antenna {antenna} shows no usable fringes on {selection}")
+        elif dead:
+            logger.info("scan_snr: no fringes from {} in the calibrated data of {} (flagged by the calibration, "
+                        "or not detected)", ", ".join(dead), selection)
         obs._state.mark_complete("scan_snr", outputs=["snr"])
         return survey
 
@@ -1904,10 +1920,16 @@ class FlagNamespace(Namespace):
         logger.info("flag.statistics: {:.1%} of observable data flagged; per antenna: {}",
                     report.get("fraction", 0.0),
                     ", ".join(f"{a} {v['fraction']:.0%}" for a, v in worst))
-        for antenna, values in worst:
-            if values["observable"] and values["fraction"] >= 0.9:
-                warnings.anomaly(f"{self._code}: antenna {antenna} has {values['fraction']:.0%} of its "
-                                 "recorded data flagged")
+        heavy = [(antenna, values["fraction"]) for antenna, values in worst
+                 if values["observable"] and values["fraction"] >= 0.9]
+        # Each antenna is its own item of the summary; on the console one line sums them up (EM178: 14).
+        for antenna, fraction in heavy:
+            warnings.anomaly(f"{self._code}: antenna {antenna} has {fraction:.0%} of its recorded data flagged",
+                             console=len(heavy) == 1)
+        if len(heavy) > 1:
+            low, high = f"{heavy[-1][1]:.0%}", f"{heavy[0][1]:.0%}"
+            warnings.anomaly(f"{self._code}: {len(heavy)} antennas have {low if low == high else f'{low}-{high}'} "
+                             f"of their recorded data flagged: {', '.join(a for a, _ in heavy)}", record=False)
         return report
 
     def aoflagger(self, *, force: bool = False) -> float:
@@ -2885,6 +2907,7 @@ class CleanNamespace(Namespace):
             timebin, chanbin = obs.export.averaging(source)
             path = Path(self._backend.export.ms(self._code, source, timebin=timebin, chanbin=chanbin,
                                                 metadata=obs.metadata))
+            _flag_split_subarrays(obs, source, path)
         return str(path)
 
     def _image_with_difmap(self, src: str, robust_values: list[float], img_cfg: dict, weighting: str,
@@ -3042,6 +3065,27 @@ def _image_from_difmap(source: str, info: dict, weighting: str = "briggs") -> Im
                  paths={"fits": info["fits"]}, stats=metrics)
 
 
+def _flag_split_subarrays(obs, source: str, path) -> int:
+    """Flag the baselines between fringe-fit sub-arrays in the split of ``source`` (:mod:`vlbipy.subarrays`).
+
+    A sub-array's solutions are referenced to an antenna of its own, so they calibrate only the baselines
+    inside it; on a baseline to another sub-array nothing relates the two phases. Returns the rows flagged.
+    """
+    from ..subarrays import flag_cross_subarrays, groups_for_field
+    group_sets = groups_for_field(getattr(obs, "gaintables", None) or [], source)
+    if not group_sets or not Path(path).is_dir():
+        return 0
+    try:
+        flagged = flag_cross_subarrays(path, group_sets, label=source)
+        from ..interactive import snapshot_flags
+        snapshot_flags(str(path))
+        return flagged
+    except Exception as exc:  # noqa: BLE001 - reported; the split itself is still usable
+        warnings.warn(f"{obs.project_code}: could not flag the baselines between fringe-fit sub-arrays in "
+                      f"{Path(path).name} ({exc}); they carry uncalibrated phases")
+        return 0
+
+
 def finders_set(obs) -> set:
     """Names of the fringe finders of ``obs``."""
     return {s.name for s in obs.sources.fringe_finders}
@@ -3105,8 +3149,9 @@ class SelfcalNamespace(Namespace):
         Parameters
         ----------
         transfer_phases : bool, optional
-            Put the phase self-cal table into the apply chain (for the fields of
-            :meth:`_apply_to`). Defaults to False for fringe finders, True otherwise.
+            Apply the phase self-cal table to the fields of :meth:`_apply_to`, like the
+            amplitudes; False keeps it on this source only. Defaults to False for fringe
+            finders, True otherwise.
         """
         from ..backends import difmap
         obs = self._obs
@@ -3140,7 +3185,7 @@ class SelfcalNamespace(Namespace):
         deferred = defer_cfg.get(obs.observatory, defer_cfg.get("default", [])) if isinstance(defer_cfg, dict) \
             else (defer_cfg or [])
         logger.info("selfcal[{}]: difmapy on {} ({}; phases {})", src, Path(split).name,
-                    "fringe finder" if is_finder else "phase calibrator", "transferred" if transfer else "kept local")
+                    "fringe finder" if is_finder else "phase reference", "transferred" if transfer else "kept local")
         report = difmap.calibrate_source(
             split, str(self._backend.ms_path(self._code)), str(out_dir / f"{self._code}.{src}"),
             robust_values=[float(r) for r in img_cfg.get("robust", [-2, 0, 2])],
@@ -3151,7 +3196,8 @@ class SelfcalNamespace(Namespace):
             prior_sigma=float(cfg.get("prior_sigma", 0.1)), workers=cfg.get("workers") or None,
             imagename=str(image_dir / f"{self._code}_{src}"), **settings,
             fixed_antennas=tuple(fixed), deferred_antennas=tuple(deferred),
-            fix_stage1=bool(cfg.get("fix_stage1", True)), bayes_per_if=bool(cfg.get("bayes_per_if", False)),
+            fix_stage1=bool(cfg.get("fix_stage1", True)), bayes_per_if=bool(cfg.get("bayes_per_if", True)),
+            bayes_if_sigma=float(cfg.get("bayes_if_sigma", 0.1) or 0.0) or None,
             time_amplitude=str(cfg.get("time_amplitude", "scan") or ""),
             time_amplitude_min_improvement=float(cfg.get("time_amplitude_min_improvement", 0.01)),
             model_components=int(kwargs.pop("model_components", cfg.get("model_components", 1)) or 1),
@@ -3171,8 +3217,10 @@ class SelfcalNamespace(Namespace):
             time_entry = CalTable(cal_type=f"selfampt_{src}", path=time_table, field=src, gainfield=src,
                                   interp="linear", apply_to=apply_to if transfer_time else src, snr=0.0)
         accumulated = report.get("accumulated_table") or ""
-        if accumulated and Path(accumulated).is_dir():
-            # Single table carrying phase + amplitude corrections accumulated by the difmapy session.
+        if transfer and accumulated and Path(accumulated).is_dir():
+            # Single table carrying phase + amplitude corrections accumulated by the difmapy session. It is the
+            # phase table times the amplitude table, so it serves only when both go to the same fields: when
+            # the phases stay local (a fringe finder), the two are registered separately below.
             obs.add_gaintable(CalTable(cal_type=f"selfcal_{src}", path=accumulated, field=src, gainfield=src,
                                        interp="linear", apply_to=apply_to, snr=0.0), step)
             if time_entry is not None:
@@ -3197,9 +3245,11 @@ class SelfcalNamespace(Namespace):
                                        interp="nearest", apply_to=apply_to, snr=0.0), step)
         if time_entry is not None:
             obs.add_gaintable(time_entry, step)
-        if transfer and report.get("phase_table") and Path(report["phase_table"]).is_dir():
+        if report.get("phase_table") and Path(report["phase_table"]).is_dir():
+            # Kept local, the phases still calibrate the source they were solved on.
             obs.add_gaintable(CalTable(cal_type=f"selfphase_{src}", path=report["phase_table"], field=src,
-                                       gainfield=src, interp="linear", apply_to=apply_to, snr=0.0), step)
+                                       gainfield=src, interp="linear", apply_to=apply_to if transfer else src,
+                                       snr=0.0), step)
         images = [_image_from_difmap(src, info) for info in report["images"].values()]
         rounds = [dict(r, mode="phase") for r in report["rounds"]]
         result = SelfcalResult(src, rounds, any(r["accepted"] for r in rounds), images[0] if images else None)
@@ -3231,9 +3281,11 @@ class SelfcalNamespace(Namespace):
         1. fringe finder(s), one after the other: difmapy sequence; the amplitude table
            goes to every field, the phases stay local (a fringe finder is too far from
            the target for its phases to transfer);
-        2. phase calibrator(s): difmapy sequence on data that already carry those
-           amplitudes; amplitude + phase tables -> the phase calibrator, the targets and
-           the check sources, never the fringe finders;
+        2. phase calibrator(s) (the targets with inverse phase referencing), in the order of
+           :meth:`~vlbipy.observation.Observation.phaseref_plan`: difmapy sequence on data
+           that already carry those amplitudes; amplitude + phase tables -> itself and the
+           sources it serves (targets, check sources; the phase calibrators when inverse),
+           never the fringe finders;
         3. apply the whole chain to every field, then re-split every source (and
            UVFITS) so imaging sees the final calibration.
 
@@ -3255,15 +3307,32 @@ class SelfcalNamespace(Namespace):
         _require_current_selfcal(obs, imaging_settings(obs.config.get("imaging", {})))
         with_data = set(obs.metadata.source_names) if obs.metadata else set(obs.sources.names)
         finders = [s.name for s in obs.sources.fringe_finders if s.name in with_data]
-        phasecals = [s.name for s in obs.sources.phase_calibrators if s.name in with_data and s.name not in finders]
-        if any(obs._state.should_run(f"selfcal_{name}", force=force) for name in finders + phasecals):
+        # The phase-reference sources in their solve order: the phase calibrators, or the targets with
+        # inverse phase referencing (the fringe fit already solved on them and transferred from them).
+        references = [name for name in obs.phaseref_plan().references if name in with_data and name not in finders]
+        if any(obs._state.should_run(f"selfcal_{name}", force=force) for name in finders + references):
             self._snapshot_preselfcal()
-        for name in finders + phasecals:
-            if obs._state.should_run(f"selfcal_{name}", force=force):
-                # Deferred: only the split reads it, and calibrates while it reads (dask-ms).
-                obs.calibrate.apply(force=True, field=name, defer=True)
-                obs.clean.split_ms(name, force=True)
-            results[name] = self.calibrator(name, force=force, **overrides)
+        from ..errors import StaleCalibrationError
+        failed: dict[str, Exception] = {}
+        for name in finders + references:
+            # One calibrator that cannot be self-calibrated (RSM06B: a one-scan fringe finder no antenna
+            # detected, so every visibility of it is flagged) must not cost the others their session.
+            try:
+                if obs._state.should_run(f"selfcal_{name}", force=force):
+                    # Deferred: only the split reads it, and calibrates while it reads (dask-ms).
+                    obs.calibrate.apply(force=True, field=name, defer=True)
+                    obs.clean.split_ms(name, force=True)
+                results[name] = self.calibrator(name, force=force, **overrides)
+            except StaleCalibrationError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - the next calibrator does not depend on this one
+                failed[name] = exc
+                obs._state.mark_failed(f"selfcal_{name}", str(exc))
+        if failed and not results:
+            raise next(iter(failed.values()))
+        for name, exc in failed.items():
+            warnings.warn(f"{self._code}: {name} could not be self-calibrated ({exc}); "
+                          "the self-calibration went on without it")
         if results:
             obs.calibrate.apply(force=True)
             obs.export.per_source(force=True)
@@ -3307,7 +3376,9 @@ class ExportNamespace(Namespace):
     def ms(self, source: TargetLike = None, **kwargs) -> str:
         """Split a source into its own measurement set."""
         src = self._resolve_source_name(source)
-        return self._backend.export.ms(self._code, src, **kwargs)
+        path = self._backend.export.ms(self._code, src, **kwargs)
+        _flag_split_subarrays(self._obs, src, path)
+        return path
 
     def averaging(self, source: str) -> tuple[str, int]:
         """Time and channel averaging of the split of ``source``: ``(timebin, chanbin)``.
@@ -3363,6 +3434,7 @@ class ExportNamespace(Namespace):
             try:
                 products[name] = self._backend.export.ms(
                     self._code, name, **{"timebin": timebin, "chanbin": chanbin, **kwargs})
+                _flag_split_subarrays(obs, name, products[name])
             except Exception as exc:  # noqa: BLE001 - one bad field must not lose the others
                 warnings.anomaly(f"{self._code}: could not split {name}: {exc}")
         logger.info("split: wrote {} of {} per-source measurement set(s)", len(products), len(names))

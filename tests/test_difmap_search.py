@@ -100,3 +100,18 @@ def test_locate_source_never_recentres_on_noise():
     obs = LocatableObservation(0.0, 0.0, flux=0.0)
     search, shift = difmap.locate_source(obs, "", search_fov_mas=400.0)
     assert not search["detected"] and shift == (0.0, 0.0) and obs.shifts == []
+
+
+class OneBaselineObservation(StubObservation):
+    """All the data on baselines near the longest one (RSM06B: EF-WB only). difmap grids only |u|, |v| below
+    1/(4 cell) x (1 - 8/npix) and fails with no data when nothing is left (difmap-core ``uv_limits``)."""
+
+    def invert(self, verbose=True):
+        if 1.0 / (4.0 * self.cell) * (1.0 - 8.0 / self.npix) < 1.0 / self.resolution:
+            raise RuntimeError("no data with the current selection/uv range")
+        super().invert(verbose)
+
+
+def test_the_search_map_keeps_the_longest_baseline():
+    result = difmap.find_peak(OneBaselineObservation(0.0, 0.0, flux=50.0, resolution=228.0), fov_mas=1000.0)
+    assert result["npix"] == 64 and result["detected"]

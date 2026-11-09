@@ -834,6 +834,38 @@ def test_fringe_retry_rejects_noise_detections_and_flags_the_antenna(tmp_path, m
     assert not flags[:8].any() and flags[8:].all()                    # AA untouched; every BB solution flagged
 
 
+def test_fringe_retry_judges_each_source_on_its_own(tmp_path, monkeypatch):
+    """RSM06B: BB is detected on the fringe finder (scan 1) and only noise on the phase calibrator (2-9).
+
+    Only its phase-calibrator solutions are flagged: the fringe-finder one stays for the bandpass.
+    """
+    from vlbipy.models import ObsMetadata, Scan
+    ops = _fringe_ops(monkeypatch)
+    main, retry = tmp_path / "X.mbd", tmp_path / "X.mbd.retry"
+    scans = list(range(1, 10))
+    smooth = 1.0 + 0.05 * np.arange(9)
+    noise = np.array([1.0, 80.0, -120.0, 30.0, 140.0, -60.0, 10.0, -150.0, 95.0])   # scan 1: a real detection
+    _FakeCalTables.stores = {str(main): _fringe_store(np.repeat([0, 1], 9), scans * 2,
+                                                      [1] * 9 + [1, 1, 1, 1, 0, 0, 0, 0, 0],
+                                                      delays=np.concatenate([smooth, noise]))}
+    meta = ObsMetadata.__new__(ObsMetadata)
+    meta.scans = [Scan(scan_number=n, source="FF" if n == 1 else "CAL", antennas=["AA", "BB"]) for n in scans]
+
+    def fake_fringefit(project_code, params, gaintable, *, field="", callib=False):
+        assert params["scan"] == "5,6,7,8,9"                            # only BB's unsolved CAL scans
+        retry.mkdir()
+        _FakeCalTables.stores[str(retry)] = _fringe_store(np.repeat([0, 1], 5), scans[4:] * 2, [1] * 10,
+                                                          delays=np.concatenate([smooth[4:], noise[4:]]))
+
+    monkeypatch.setattr(ops, "_fringefit", fake_fringefit)
+    adopted = ops._retry_weak_antennas("X", {"caltable": str(main), "minsnr": 5.0}, [], meta, field="FF,CAL",
+                                       callib=False, minsnr=3.0, keep_fraction=0.5, max_delay_step=2.0)
+    assert adopted == []
+    flags = _FakeCalTables.stores[str(main)]["FLAG"].reshape(-1, 18).all(axis=0)
+    assert not flags[:9].any()                                          # AA untouched
+    assert not flags[9] and flags[10:].all()                            # BB: fringe finder kept, CAL flagged
+
+
 def test_median_delay_step_ignores_too_short_series():
     from vlbipy.backends.casa import CasaCalibrationOps
     assert CasaCalibrationOps._median_delay_step({("A", 0): [(0.0, 1.0), (1.0, 9.0)]}) == float("inf")

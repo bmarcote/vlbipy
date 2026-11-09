@@ -430,7 +430,7 @@ def fringe_fft_search(data, refant, *, pad=4, delay_window_ns=None, rate_window=
     bin_rate = 1.0 / (nt_pad * dt * f0)
     result.update(f0_hz=f0, f_grid0_hz=f_grid0, t_grid0=t_grid0, bin_delay_ns=bin_delay, bin_rate=bin_rate)
     if ants.size == 0:
-        log.warning("fringe_fft_search: no baselines to refant %d", refant)
+        log.debug("fringe_fft_search: no baselines to refant %d", refant)
         return result
     # Weighted unit vectors, zero where flagged; conjugated when the refant is ANTENNA1 (sgn rule of CASA).
     flagged = data.flag[bl_index]
@@ -683,7 +683,7 @@ def fringe_global_solve(data, refant, start, *, active=(True, True, False), mins
         good[refant] = True
         bl_sel = np.nonzero(good[data.antenna1] & good[data.antenna2])[0]
         if bl_sel.size == 0:
-            log.warning("fringe_global_solve: pol %d has no usable baselines", p)
+            log.debug("fringe_global_solve: pol %d has no usable baselines", p)
             continue
         a1, a2 = data.antenna1[bl_sel], data.antenna2[bl_sel]
         solved = np.setdiff1d(np.union1d(a1, a2), [refant])

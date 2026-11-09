@@ -321,3 +321,86 @@ def test_files_before_a_selector_do_not_swallow_it():
     """`calibrate --files X bandpass`: the step name is moved out of the greedy --files."""
     args = parse(["calibrate", "-p", "TS01", "--files", "a.idi", "bandpass"])
     assert args.files == ["a.idi"] and args.steps == ["bandpass"]
+
+
+def test_python_warnings_go_to_the_run_log_not_the_terminal(tmp_path, capfd):
+    """numpy's "Mean of empty slice" and a solver's stdlib warning are logged, not printed on the terminal."""
+    import warnings
+
+    import numpy as np
+
+    import logging
+
+    from vlbipy.logging_utils import _logger, capture_python_warnings, capturing_python_warnings
+    log = tmp_path / "run.log"
+    handlers = list(logging.getLogger().handlers)
+    with warnings.catch_warnings():                     # restores Python's own showwarning afterwards
+        warnings.simplefilter("always")
+        sinks = capture_python_warnings([log])
+        try:
+            assert capturing_python_warnings()
+            np.nanmean(np.full(3, np.nan))
+            logging.getLogger("vlbipy.solvers.apply").warning("table kind %r applied as a gain", "X")
+        finally:
+            for sink in sinks:
+                _logger.remove(sink)
+            logging.getLogger().handlers = handlers
+    err = capfd.readouterr().err
+    assert "Mean of empty slice" not in err and "applied as a gain" not in err
+    text = log.read_text()
+    assert "RuntimeWarning: Mean of empty slice" in text
+    assert "WARNING | vlbipy.solvers.apply: table kind 'X' applied as a gain" in text
+    assert not capturing_python_warnings()
+
+
+def test_a_keyed_warning_repeated_by_a_later_pass_is_summarised_once():
+    from vlbipy.logging_utils import WarningCollector
+    collector = WarningCollector()
+    collector.warn("first")
+    collector.warn("CAL: HH 7/30", key=("X", "fringe-few", "CAL"))
+    collector.warn("other")
+    collector.warn("CAL: HH 0/30", key=("X", "fringe-few", "CAL"))       # the next pass, updated numbers
+    assert collector.summary() == ["first", "CAL: HH 0/30", "other"]
+    collector.reset()
+    collector.warn("again", key=("X", "fringe-few", "CAL"))
+    assert collector.summary() == ["again"]
+
+
+def test_native_output_goes_to_the_log_not_the_terminal(capfd):
+    """CASA's logger writes on the file descriptors directly (concat's SEVERE/WARN lines)."""
+    import os
+    from loguru import logger
+    from vlbipy.logging_utils import native_output_to_log
+    seen = []
+    sink = logger.add(lambda message: seen.append(str(message)), level="DEBUG", format="{message}")
+    try:
+        with native_output_to_log("concat"):
+            os.write(2, b"2026-11-06 21:45:55\tSEVERE\tgetcell::TIME\tno such row\n")
+            os.write(1, b"WARN concat not fully consistent\n")
+    finally:
+        logger.remove(sink)
+    out, err = capfd.readouterr()
+    assert "SEVERE" not in err and "WARN" not in out
+    assert any("concat: 2026-11-06 21:45:55\tSEVERE\tgetcell::TIME\tno such row" in line for line in seen)
+    assert any("concat: WARN concat not fully consistent" in line for line in seen)
+
+
+def test_many_heavily_flagged_antennas_make_one_console_line(capsys):
+    """EM178: 14 antennas >= 90% flagged were 14 console lines; the summary still lists each."""
+    from types import SimpleNamespace
+    from vlbipy.logging_utils import configure_logging, warnings
+    from vlbipy.namespaces import FlagNamespace
+    configure_logging("INFO")
+    report = {"fraction": 0.94, "antenna": {"EF": {"fraction": 0.91, "observable": 10},
+                                            "JB": {"fraction": 0.95, "observable": 10},
+                                            "WB": {"fraction": 0.50, "observable": 10}}}
+    obs = SimpleNamespace(project_code="X", work_dir=".",
+                          _backend=SimpleNamespace(supports=lambda *a: True, requires_data_files=False,
+                                                   flag=SimpleNamespace(summary=lambda code: report)))
+    warnings.reset()
+    FlagNamespace(obs).statistics()
+    err = capsys.readouterr().err
+    assert err.count("ANOMALY") == 1 and "2 antennas have 91%-95% of their recorded data flagged: JB, EF" in err
+    assert warnings.summary() == ["ANOMALY: X: antenna JB has 95% of its recorded data flagged",
+                                  "ANOMALY: X: antenna EF has 91% of its recorded data flagged"]
+    warnings.reset()

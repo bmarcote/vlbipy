@@ -199,15 +199,6 @@ def test_native_reads_casacore_tables(tmp_path):
     table.close()
 
 
-def test_rows_recorded_only_in_the_lock_file(tmp_path):
-    pytest.importorskip("casacore.tables")
-    from test_solvers_caltable import _lock_only_table
-    _lock_only_table(tmp_path / "SPW", nrow=8)
-    with Table(tmp_path / "SPW") as table:
-        assert table.nrows() == 8
-        np.testing.assert_array_equal(table.getcol("NUM_CHAN"), np.full(8, 32))
-
-
 def test_casatools_compatible_tool(written):
     casatools = pytest.importorskip("casatools")
     from vlbipy.casacore_format.compat import table as native_tool

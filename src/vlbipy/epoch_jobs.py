@@ -89,12 +89,15 @@ def batch_size(peaks: list[int], max_workers: int, memory_fraction: float) -> in
     return plan_workers(peaks, max_workers=max_workers, available=int(free * memory_fraction))
 
 
-def run_epochs(observations: list, *, force: bool = False) -> dict:
+def run_epochs(observations: list, *, force: bool = False, failed: dict | None = None) -> dict:
     """Finish queued epochs in memory-bounded batches; do not divide their numerical thread budgets.
 
     Every process owns a different MS and retains the serial source/calibration dependencies within
     that epoch. Failed epochs retain their partial state; other queued epochs still finish before the
     failure is raised. The parent regains the updated chain, metadata and products before combination.
+
+    With ``failed`` (a dict), nothing is raised: it receives ``{project_code: last line of the error}`` for
+    every failed epoch, and the images of the others are returned.
     """
     if not observations:
         return {}
@@ -168,9 +171,14 @@ def run_epochs(observations: list, *, force: bool = False) -> dict:
                         except subprocess.TimeoutExpired:
                             process.kill()
                             process.wait()
-    if failures:
+    if failures and failed is None:
         raise RuntimeError("epoch products failed for " + ", ".join(failures) + "; successful epochs are preserved")
-    return {obs.project_code: images[obs.project_code] for obs in observations}
+    if failed is not None:
+        for obs in observations:
+            if obs.project_code in failures:
+                error = str(obs._state._steps.get("epoch_products", {}).get("error", "")).strip()
+                failed[obs.project_code] = error.splitlines()[-1] if error else "epoch products failed"
+    return {obs.project_code: images[obs.project_code] for obs in observations if obs.project_code not in failures}
 
 
 if __name__ == "__main__":

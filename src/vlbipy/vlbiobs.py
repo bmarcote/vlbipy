@@ -13,7 +13,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterator, Optional, Union
-from .errors import ConfigError, StaleCalibrationError
+from .errors import CampaignError, ConfigError, StaleCalibrationError
 from .config import _deep_merge, kwargs_to_overrides, load_config
 from .logging_utils import get_logger, headline, run_logs, warnings
 from .observation import Observation
@@ -38,22 +38,41 @@ class _Fanout:
     and ``repr`` lists the available operations.
     """
 
-    def __init__(self, children: list, parallel: bool = False) -> None:
+    def __init__(self, children: list, parallel: bool = False, on_failure=None) -> None:
         self._children = children
         self._parallel = parallel
+        self._on_failure = on_failure
 
     def _each(self, call) -> list:
         """``[call(child) for child in children]``, in parallel threads when this fan-out allows it.
 
         Parallel calls share the solver worker pool (their jobs interleave there) and the shared
         progress display (each child contributes its own bars); CASA fallbacks serialize internally.
+
+        One project's failure never stops the others: every child runs. Then, with an ``on_failure``
+        handler (:meth:`VLBIObs.run`), each failed child's observation goes to it - the run drops that
+        project and carries on with the rest - and the results of the others are returned. Without one,
+        the first failure is raised once all children have run, the others noted on it.
         """
         children = object.__getattribute__(self, "_children")
         if not object.__getattribute__(self, "_parallel") or len(children) <= 1:
-            return [call(child) for child in children]
-        logger.info("running {} projects in parallel", len(children))
-        with ThreadPoolExecutor(max_workers=len(children), thread_name_prefix="vlbipy-fanout") as pool:
-            return list(pool.map(call, children))
+            outcomes = [_outcome(call, child) for child in children]
+        else:
+            logger.info("running {} projects in parallel", len(children))
+            with ThreadPoolExecutor(max_workers=len(children), thread_name_prefix="vlbipy-fanout") as pool:
+                outcomes = list(pool.map(lambda child: _outcome(call, child), children))
+        failed = [(child, error) for child, (ok, error) in zip(children, outcomes) if not ok]
+        if failed:
+            on_failure = object.__getattribute__(self, "_on_failure")
+            owners = [getattr(child, "_obs", None) for child, _ in failed]
+            if on_failure is None or any(owner is None for owner in owners):
+                first = failed[0][1]
+                for child, error in failed[1:]:
+                    first.add_note(f"{_child_code(child)} failed too: {error}")
+                raise first
+            for owner, (_, error) in zip(owners, failed):
+                on_failure(owner, error)
+        return [value for ok, value in outcomes if ok]
 
     def __call__(self, *args, **kwargs):
         results = self._each(lambda child: child(*args, **kwargs))
@@ -86,6 +105,19 @@ class _Fanout:
 
     def __repr__(self) -> str:
         return f"<fan-out over {len(self._children)} observation(s); operations: {', '.join(self.operations())}>"
+
+
+def _outcome(call, child) -> tuple:
+    """``(True, call(child))``, or ``(False, exception)`` when it raised one."""
+    try:
+        return True, call(child)
+    except Exception as exc:  # noqa: BLE001 - handed back to the fan-out, which decides
+        return False, exc
+
+
+def _child_code(child) -> str:
+    """The project code of a fan-out child (a namespace of one observation), for messages."""
+    return getattr(getattr(child, "_obs", None), "project_code", None) or repr(child)
 
 
 def _string_list(value: str | list | tuple | None) -> list:
@@ -155,11 +187,17 @@ class VLBIObs:
             self._observations.append(Observation(code, self.config, work_dir=obs_work))
 
         self._merged: Optional[Observation] = None
+        #: Inside :meth:`run`: a project that fails is set aside here and the others go on.
+        self._isolating = False
+        self._failed: dict[str, tuple[Observation, Exception]] = {}
         self._save_project(codes, base_work)
         logger.info(f"VLBIObs {', '.join(codes)}")
 
     #: File that lets a later process (the notebook, ``vlbipy report``) rebuild this object.
     PROJECT_FILENAME = ".project.json"
+
+    #: Class default for runners built without ``__init__`` (the epoch subprocess): failures propagate.
+    _isolating = False
 
     def _save_project(self, codes: list[str], base_work) -> None:
         """Persist the project codes and the fully-merged configuration next to the products.
@@ -262,31 +300,67 @@ class VLBIObs:
             return self._observations[0]
         raise Exception("call merge() before imaging/exporting a multi-project campaign")
 
+    # -- one project's failure does not stop the others --
+    def _fanout(self, namespace: str, parallel: bool = False) -> _Fanout:
+        """A fan-out of ``namespace`` over the observations still in the run (see :meth:`_drop_failed`)."""
+        return _Fanout([getattr(o, namespace) for o in self._observations], parallel=parallel,
+                       on_failure=self._drop_failed if self._isolating else None)
+
+    def _drop_failed(self, obs: Observation, error: Exception) -> None:
+        """Leave a failed project out of the rest of :meth:`run`; the others carry on to the end.
+
+        The step it had in progress (the last one started) is recorded as failed in its state file. When it was
+        the last project still running there is nothing left to do: its error is raised (all the failures, when
+        several).
+        """
+        if obs._state._started:
+            obs._state.mark_failed(next(reversed(obs._state._started)), str(error))
+        self._failed[obs.project_code] = (obs, error)
+        self._observations = [o for o in self._observations if o is not obs]
+        if not self._observations:
+            if len(self._failed) == 1:
+                raise error
+            raise CampaignError({code: exc for code, (_, exc) in self._failed.items()}) from error
+        logger.error("[{}] failed: {}", obs.project_code, error)
+        headline("[{}] failed and is left out; {} carr{} on", obs.project_code,
+                 ", ".join(o.project_code for o in self._observations),
+                 "ies" if len(self._observations) == 1 else "y")
+
+    def _each_project(self, call) -> None:
+        """``call(obs)`` for every observation still in the run, a failure handled like a fan-out's."""
+        for obs in list(self._observations):
+            try:
+                call(obs)
+            except Exception as exc:  # noqa: BLE001 - the other projects go on
+                if not self._isolating:
+                    raise
+                self._drop_failed(obs, exc)
+
     # -- fan-out namespaces (pre-merge, per project) --
     @property
     def import_data(self) -> _Fanout:
         """Import namespace, fanned out across all observations; a campaign's projects import in parallel."""
-        return _Fanout([o.import_data for o in self._observations], parallel=True)
+        return self._fanout("import_data", parallel=True)
 
     @property
     def calibrate(self) -> _Fanout:
         """Calibration namespace, fanned out across all observations."""
-        return _Fanout([o.calibrate for o in self._observations])
+        return self._fanout("calibrate")
 
     @property
     def flag(self) -> _Fanout:
         """Flagging namespace, fanned out across all observations."""
-        return _Fanout([o.flag for o in self._observations])
+        return self._fanout("flag")
 
     @property
     def plot(self) -> _Fanout:
         """Plotting namespace, fanned out across all observations."""
-        return _Fanout([o.plot for o in self._observations])
+        return self._fanout("plot")
 
     @property
     def ai(self) -> _Fanout:
         """AI-mode namespace (diagnostics, Tsys repair, distribution flagging), fanned out across all observations."""
-        return _Fanout([o.ai for o in self._observations])
+        return self._fanout("ai")
 
     # -- delegated namespaces (post-merge / single target) --
     @property
@@ -298,21 +372,21 @@ class VLBIObs:
     def clean(self):
         """Imaging namespace: every epoch of a campaign, else the merged (or sole) observation."""
         if self._per_epoch_products:
-            return _Fanout([o.clean for o in self._observations])
+            return self._fanout("clean")
         return self._imaging_target().clean
 
     @property
     def selfcal(self):
         """Self-cal namespace: every epoch of a campaign, else the merged (or sole) observation."""
         if self._per_epoch_products:
-            return _Fanout([o.selfcal for o in self._observations])
+            return self._fanout("selfcal")
         return self._imaging_target().selfcal
 
     @property
     def export(self):
         """Export namespace: every epoch of a campaign, else the merged (or sole) observation."""
         if self._per_epoch_products:
-            return _Fanout([o.export for o in self._observations])
+            return self._fanout("export")
         return self._imaging_target().export
 
     @property
@@ -456,6 +530,10 @@ class VLBIObs:
         ``<work_dir>/.pipeline_state.json``, so an interrupted run continues
         rather than redoing hours of calibration.
 
+        In a campaign, a project that fails is left out and the others run to the end; the run then raises
+        :class:`~vlbipy.errors.CampaignError` naming the failed projects (the error itself when a lone
+        project fails, or the last one still running).
+
         Parameters
         ----------
         force : bool
@@ -470,6 +548,33 @@ class VLBIObs:
         dict
             Mapping of target source name -> produced image(s).
         """
+        self._isolating, self._failed = True, {}
+        try:
+            images = self._run_steps(force=force, scratch=scratch, from_step=from_step)
+        finally:
+            self._isolating = False
+            self._observations = self._observations + [obs for obs, _ in self._failed.values()]
+        for obs, _ in self._failed.values():
+            try:
+                obs.report()                                           # its summary.md says how far it got
+            except Exception as exc:  # noqa: BLE001 - the report of a failed project is best effort
+                logger.warning("[{}] report failed: {}", obs.project_code, exc)
+        summary = warnings.summary()
+        logs = ", ".join(str(path) for path in run_logs()) or "the run log"
+        failed = ", ".join(self._failed)
+        headline("run finished{}: {} warning(s){}; details in {} and summary.md",
+                 f" for {', '.join(o.project_code for o in self._observations if o.project_code not in self._failed)}"
+                 f"; {failed} FAILED" if failed else "",
+                 len(summary), " (see below)" if summary else "", logs)
+        if summary:
+            for item in summary:
+                logger.warning("  - {}", item)
+        if self._failed:
+            raise CampaignError({code: exc for code, (_, exc) in self._failed.items()})
+        return images
+
+    def _run_steps(self, *, force: bool, scratch: bool, from_step: str) -> dict:
+        """The steps of :meth:`run`, over the projects still running."""
         if not scratch:
             for observation in self._observations:
                 self._require_imaging_policy(observation)
@@ -479,7 +584,7 @@ class VLBIObs:
         # The sequence follows the reduce-vlbi-data procedure step by step.
         self.import_data(force=force)                                  # steps 1-3
         self._split_frequency_bands(force=force)                       # multi-band (S/X): one pipeline per band
-        self.notebook()                                                # first notebook: what is there so far
+        self._each_project(lambda obs: obs.notebook())                 # first notebook: what is there so far
         self.flag.apriori(force=force)                                 # step 4
         # AI mode: what the raw data (a-priori flags only) say about every antenna and Tsys series; the Tsys
         # repair of the next step follows its plan.
@@ -521,14 +626,15 @@ class VLBIObs:
             self.calibrate.apply(force=True, defer=True)
         # e-MERLIN flux scale: a model-based amplitude correction of the outstations,
         # appended to the chain before the split sees it.
-        for obs in self._observations:
+        def emerlin_scale(obs: Observation) -> None:
             if obs.calibrate.emerlin_scale(force=force):
                 obs.calibrate.apply(force=True, defer=True)
+
+        self._each_project(emerlin_scale)
         # AI mode: whatever the calibrated data show outside the noise distribution (Rice amplitudes, von Mises
         # phases, one level for every subband) is flagged before self-calibration and imaging see it.
-        for obs in self._observations:
-            if obs.ai.enabled and obs.config.get("ai", {}).get("flag_distribution", True):
-                obs.ai.flag_distribution(force=force)
+        self._each_project(lambda obs: obs.ai.flag_distribution(force=force)
+                           if obs.ai.enabled and obs.config.get("ai", {}).get("flag_distribution", True) else None)
         self._survey_all_sources()                                      # final calibrated SNR coverage
         if self._per_epoch_products:
             images = self._finish_campaign(force=force)
@@ -558,14 +664,6 @@ class VLBIObs:
                 except Exception as exc:  # noqa: BLE001 - a report never fails the run
                     warnings.warn(f"{obs.project_code}: AI post-diagnostic failed: {exc}")
         self.report()
-        summary = warnings.summary()
-        logs = ", ".join(str(path) for path in run_logs()) or "the run log"
-        headline("run finished: {} warning(s){}; details in {} and summary.md", len(summary),
-                 " (see below)" if summary else "", logs)
-        if summary:
-            for item in summary:
-                logger.warning("  - {}", item)
-
         return images
 
     def _model_calibration(self, obs: Optional[Observation] = None, *, force: bool = False) -> dict:
@@ -714,9 +812,22 @@ class VLBIObs:
                obs.config.get("imaging", {}).get("imager", "difmap")) == "difmap"
                for obs in self._observations):
             from .epoch_jobs import run_epochs
-            images = run_epochs(self._observations, force=force)
+            failed: dict = {}
+            images = run_epochs(self._observations, force=force, failed=failed if self._isolating else None)
+            for obs in [o for o in self._observations if o.project_code in failed]:
+                self._drop_failed(obs, RuntimeError(f"{obs.project_code}: epoch products failed: "
+                                                    f"{failed[obs.project_code]}"))
         else:
-            images = {obs.project_code: self._finish_epoch(obs, force=force) for obs in self._observations}
+            images = {}
+
+            def finish(obs: Observation) -> None:
+                images[obs.project_code] = self._finish_epoch(obs, force=force)
+
+            self._each_project(finish)
+        if len(self._observations) < 2:
+            logger.info("campaign: only {} left; no multi-epoch combination",
+                        ", ".join(o.project_code for o in self._observations))
+            return images
         try:
             # Band splits share one epoch: combining them into a joint model would be wrong.
             if not all(getattr(o, "_band_of", None) for o in self._observations):
@@ -742,9 +853,14 @@ class VLBIObs:
         calibration (a backend that defers its applications writes it here), and the jplotter figures read
         it from disk.
         """
-        for each in [obs] if obs is not None else self._observations:
+        def diagnostics(each: Observation) -> None:
             each.calibrate.write_corrected()
             each.plot.diagnostics(column="corrected", label="calibrated")
+
+        if obs is not None:
+            diagnostics(obs)
+        else:
+            self._each_project(diagnostics)
 
     def _survey_all_sources(self) -> None:
         """Measure final per-scan SNR on every observed source without changing solve selection."""
@@ -756,7 +872,7 @@ class VLBIObs:
             saved_selection = obs.cal_selection
             saved_stages = obs.cal_stages
             try:
-                obs.calibrate.scan_snr(field=selection, force=True, max_scans=0)
+                obs.calibrate.scan_snr(field=selection, force=True, max_scans=0, warn_dead=False)
             except Exception as exc:  # noqa: BLE001 - final diagnostics must not abort calibration
                 warnings.warn(f"{obs.project_code}: all-source calibrated SNR survey failed ({exc})")
             finally:

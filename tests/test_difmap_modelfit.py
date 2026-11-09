@@ -112,6 +112,7 @@ class ModelfitObservation:
 
     def bayes_gscale(self, models=None, **kwargs):
         self.calls["bayes_models"] = tuple(models)
+        self.calls["bayes_kwargs"] = kwargs
         return SimpleNamespace(files={"caltable": "out.G"}, best_model="gauss1", summary=lambda: "summary",
                                to_dict=lambda: {"stations": []})
 
@@ -447,3 +448,33 @@ def test_phase_selfcal_failed_refit_discards_accepted_gain_trial():
     assert len(rounds) == 1 and rounds[0]["accepted"] is False
     assert rounds[0]["reason"] == "modelfit refit failed"
     assert obs.calls["modelfit"] == 1
+
+
+def test_a_residual_fitted_exactly_reports_the_expected_noise():
+    """EM178's J1832-1035 (99% flagged): rms 1e-14 Jy/beam would claim a dynamic range of 1e12."""
+    from vlbipy.backends.difmap import _image_noise
+
+    class Fitted:
+        inverted = 0
+
+        def invert(self, verbose=True, quiet=True):
+            self.inverted += 1
+            return {"noise": 1e-3}
+
+    obs = Fitted()
+    assert _image_noise(obs, 2e-3, 0.05) == 2e-3 and obs.inverted == 0   # a normal image: no extra invert
+    assert _image_noise(obs, 1e-14, 0.05) == 1e-3
+    assert _image_noise(obs, 0.0, 0.05) == 1e-3
+
+
+@pytest.mark.parametrize("per_if, if_sigma, expected", [(True, 0.1, (True, 0.1)), (True, None, (True, None)),
+                                                       (False, 0.1, (False, None))])
+def test_amplitude_calibration_solves_per_subband_around_the_station_level(per_if, if_sigma, expected):
+    """The default is per station and subband, shrunk towards the station's level by a 10% prior; the prior only
+    means something per subband."""
+    obs = ModelfitObservation()
+    difmap.amplitude_calibration(obs, "x.amp", "parent.ms", per_if=per_if, if_sigma=if_sigma)
+    kwargs = obs.calls["bayes_kwargs"]
+    assert (kwargs["per_if"], kwargs["if_sigma"]) == expected
+    difmap.amplitude_calibration(obs, "x.amp", "parent.ms")
+    assert (obs.calls["bayes_kwargs"]["per_if"], obs.calls["bayes_kwargs"]["if_sigma"]) == (True, 0.1)

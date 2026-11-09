@@ -275,6 +275,11 @@ class WorkerPool:
         for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VLBIPY_FFT_WORKERS"):
             environment[name] = "1"
         environment["VLBIPY_WORKER_AUTHKEY"] = authkey.hex()
+        # A command-line run keeps library warnings off the terminal: the workers send theirs to its run log.
+        from ..logging_utils import WARNINGS_LOG_ENV, capturing_python_warnings, logging_setup
+        environment.pop(WARNINGS_LOG_ENV, None)
+        if capturing_python_warnings():
+            environment[WARNINGS_LOG_ENV] = os.pathsep.join(logging_setup()["files"])
         command = [sys.executable, "-m", "vlbipy.solvers.workers", str(listener.address)]
         self._processes = [subprocess.Popen(command, env=environment, stdin=subprocess.DEVNULL)
                            for _ in range(self.size)]
@@ -494,6 +499,9 @@ def _serve(address: str) -> None:
     other failure, see :class:`WorkerNotImplementedError`); shared objects are kept for later jobs (:func:`_share`)."""
     global _JOB_THREADS, _IN_WORKER
     _IN_WORKER = True
+    from ..logging_utils import WARNINGS_LOG_ENV, capture_python_warnings
+    if WARNINGS_LOG_ENV in os.environ:
+        capture_python_warnings([path for path in os.environ[WARNINGS_LOG_ENV].split(os.pathsep) if path])
     connection = _connect(address, bytes.fromhex(os.environ["VLBIPY_WORKER_AUTHKEY"]))
     cache: OrderedDict = OrderedDict()
     while True:

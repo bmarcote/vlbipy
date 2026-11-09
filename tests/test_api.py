@@ -304,3 +304,85 @@ def test_export_averaging_can_leave_the_target_at_full_resolution():
                   export={"average_targets": False})["RSM07"]
     assert obs.export.averaging("3C286") == ("", 1)
     assert obs.export.averaging("J1048+7143") == ("10s", -1)
+
+
+# -- one project's failure does not stop a campaign --
+
+def _breaks_fringefit(obs):
+    """A stand-in for ``calibrate.instrumental`` that fails inside its fringe fit, as RSM06B did."""
+    def instrumental(**kwargs):
+        obs._state.should_run("fringefit", force=True)
+        raise RuntimeError(f"{obs.project_code}: fringefit failed (field='J1512-0905', scan=1, refant='EF'): "
+                           "fringefit: no solution interval had data")
+    return instrumental
+
+
+def test_campaign_run_finishes_the_other_projects_when_one_fails(tmp_path, monkeypatch):
+    from vlbipy.errors import CampaignError
+    camp = VLBIObs(project=["RSM07", "RSM08", "RSM09"], network="EVN", backend="dummy",
+                   target="3C286", fringe_finder="3C345", work_dir=tmp_path)
+    bad = camp["RSM08"]
+    monkeypatch.setattr(bad.calibrate, "instrumental", _breaks_fringefit(bad))
+    with pytest.raises(CampaignError, match=r"^RSM08: fringefit failed .*no solution interval had data$") as info:
+        camp.run()
+    assert list(info.value.failures) == ["RSM08"]
+    assert bad._state.status("fringefit") == "failed"
+    assert bad._state.status("third_pass") is None                     # nothing after the failure ran on it
+    for code in ("RSM07", "RSM09"):
+        assert camp[code]._state.status("third_pass") == "done"        # the others ran to the end
+    assert camp._merged.project_code == "RSM07+RSM09"                   # and were merged and imaged without it
+    assert sorted(o.project_code for o in camp) == ["RSM07", "RSM08", "RSM09"]
+
+
+def test_campaign_run_raises_the_error_itself_when_the_last_project_fails(tmp_path, monkeypatch):
+    from vlbipy.errors import CampaignError
+    camp = VLBIObs(project=["RSM07", "RSM08"], network="EVN", backend="dummy",
+                   target="3C286", fringe_finder="3C345", work_dir=tmp_path)
+    for obs in camp:
+        monkeypatch.setattr(obs.calibrate, "instrumental", _breaks_fringefit(obs))
+    with pytest.raises(CampaignError) as info:
+        camp.run()
+    assert list(info.value.failures) == ["RSM07", "RSM08"]
+    assert len(camp) == 2
+
+    single = VLBIObs(project="RSM07", network="EVN", backend="dummy", target="3C286", fringe_finder="3C345",
+                     work_dir=tmp_path / "single")
+    monkeypatch.setattr(single["RSM07"].calibrate, "instrumental", _breaks_fringefit(single["RSM07"]))
+    with pytest.raises(RuntimeError, match="no solution interval had data"):
+        single.run()
+
+
+def test_fanout_outside_run_finishes_every_project_then_raises():
+    from vlbipy.vlbiobs import _Fanout
+    calls = []
+
+    class Child:
+        def __init__(self, code, fail):
+            self.code, self.fail = code, fail
+
+        def step(self):
+            calls.append(self.code)
+            if self.fail:
+                raise ValueError(f"{self.code} broke")
+            return self.code
+
+    with pytest.raises(ValueError, match="A broke") as info:
+        _Fanout([Child("A", True), Child("B", False), Child("C", True)]).step()
+    assert calls == ["A", "B", "C"]
+    assert any("C broke" in note for note in info.value.__notes__)
+
+
+def test_a_resumed_selection_still_adopts_the_inferred_source_roles(tmp_path, monkeypatch):
+    """--from-step fringefit reuses the saved selection; the fringe finders inferred on the first pass come back too.
+
+    RSM06B: without them the delays were solved on the phase calibrator alone and the bandpass on the fringe
+    finder came out 100% flagged.
+    """
+    obs = VLBIObs(project="p1", network="EVN", backend="dummy", target="SRC", phasecal="CAL", work_dir=tmp_path)
+    obs.import_data()
+    single = obs["p1"]
+    single.set_cal_selection(["A", "B"], [1])
+    calls = []
+    monkeypatch.setattr(single.calibrate, "infer_source_roles", lambda **kw: calls.append(kw) or {})
+    assert single.calibrate.select_calibration_data() == (["A", "B"], [1])
+    assert calls == [{}]

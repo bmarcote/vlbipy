@@ -222,16 +222,29 @@ def _solve_block(block: dict, setup: dict, spw_sel: dict, spw_groups: list[list[
                          "f_ref_hz": solution.f_ref_hz, "nchan_sel": int(chans.size * len(group)), **table,
                          "n_prior": int(np.count_nonzero(solution.prior_used)),
                          # The reference antenna's placeholder SNR is not a detection: kept out of both numbers.
-                         "n_ok": int(_detected(solution).sum()), "snr_median": float(np.median(
-                             solution.snr[_detected(solution)])) if _detected(solution).any() else 0.0})
+                         "n_ok": int(_detected(solution).sum()), "snr_median": _median_snr(solution)})
     return rows
 
 
 def _detected(solution) -> np.ndarray:
-    """Mask of the unflagged solutions of an interval that are real detections (not the reference antenna's own,
-    whose SNR is :data:`~vlbipy.solvers.fringe.REFANT_SNR_SENTINEL`)."""
-    snr = np.asarray(solution.snr, dtype=float)
-    return ~np.asarray(solution.flag, dtype=bool) & (snr != REFANT_SNR_SENTINEL)
+    """Mask of the unflagged solutions of an interval that are real detections: the reference antenna's own (its
+    SNR is the placeholder :data:`~vlbipy.solvers.fringe.REFANT_SNR_SENTINEL`) is left out by its index. Not by
+    value: a bright calibrator's solutions reach SNR 5000-60000 (EM178, J2136+0041), and one of them could equal it.
+    Without a recorded reference antenna, by value."""
+    ok = ~np.asarray(solution.flag, dtype=bool)
+    refant = getattr(solution, "refant", None)
+    if refant is not None and 0 <= int(refant) < len(ok):
+        ok[int(refant)] = False
+    else:
+        ok &= np.asarray(solution.snr, dtype=float) != REFANT_SNR_SENTINEL
+    return ok
+
+
+def _median_snr(solution) -> float:
+    """Median SNR of an interval's detections (:func:`_detected`); 0 without any (EM178, inverse phase referencing:
+    intervals where only the reference was "solved" reported a median SNR of 999)."""
+    ok = _detected(solution)
+    return float(np.median(np.asarray(solution.snr, dtype=float)[ok])) if ok.any() else 0.0
 
 
 def _interval_key(t_sol: float, spw: int) -> tuple:
@@ -465,7 +478,8 @@ def fringefit(vis: str, caltable: str, *, field="", spw="", scan="", timerange="
     n_ok = sum(r["n_ok"] for r in rows)
     logger.info("fringefit[dask-ms]: {} interval(s) on {} scan(s), {} antenna solutions, median SNR {:.0f}; "
                 "{} written in {:.2f}s", len(rows), len(jobs), n_ok,
-                float(np.median([r["snr_median"] for r in rows if r["n_ok"]])) if n_ok else 0.0,
+                float(np.median([r["snr_median"] for r in rows if r["snr_median"] > 0]))
+                if any(r["snr_median"] > 0 for r in rows) else 0.0,
                 caltable.name, _time.time() - t_start)
     return caltable
 
