@@ -40,6 +40,8 @@ obsdate = ""                 # YYMMDD; empty = auto-resolve (FITS-IDI RDATE or a
 username = ""                # archive credentials for proprietary data (empty = public)
 password = ""
 replace_tsys = false         # overwrite Tsys/GC tables in the FITS-IDI even if already present
+use_embedded_tsys = false    # EVN: keep the Tsys/GC embedded in the FITS-IDI (since 2023) instead of
+                             # replacing them with the archive .antab (the embedded tables had appending issues)
 reset_existing = true        # clearcal + unflag an existing MS so a previous attempt's state
                              # does not carry over (flags otherwise only accumulate)
 unflag_existing = true       # part of the reset: clear all flags (re-applied by flag.apriori)

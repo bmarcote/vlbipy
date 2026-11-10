@@ -24,7 +24,8 @@ antennas, 4 × 64 channels) on the CASA backend unless noted.
 | Apply | via a CASA cal library (`caltables.txt`); each solve declares its own priors in `callibs/` |
 | Export | per-source measurement sets and Difmap-ready UVFITS |
 | Diagnostics | spectrum, time series, per-baseline corner, radplot, all calibration tables |
-| Global fringe fit | dispersive (ionospheric) delay solved below 6 GHz; `--no-ionos` to disable |
+| Global fringe fit | dispersive (ionospheric) delay solved below 8 GHz (`[calibration].ionos_max_ghz`); `--no-ionos` to disable |
+| Imaging and self-calibration | difmapy (dask-ms backend): visibility model fitting first, phase self-cal, Bayesian amplitude gscale per station and subband, time-dependent amplitude self-cal, e-MERLIN flux scale from 3C286 |
 | LBA (DiFX) | `<CODE>.FITS` + `.antab` + `.uvflg` found beside the working directory; Tsys / gain curves appended in place; ACCOR and EOP corrections; tested on V589 (4 epochs, 8.4 GHz, dask-ms backend) |
 | Polarization-aware instrumental calibration | an antenna with one dead polarization, or one that appears only in other scans, keeps what it has |
 | Campaigns | per-epoch calibration, joint phase-calibrator model, per-epoch refinement, combined images (`combine()`) |
@@ -33,9 +34,9 @@ antennas, 4 × 64 channels) on the CASA backend unless noted.
 
 ## Not implemented
 
-- **Imaging** — `image.clean` is not written for CASA. `run()` skips it with a
-  warning rather than failing.
-- **Self-calibration** — the loop exists on the dummy backend only.
+- **Imaging and self-calibration on the CASA backend** — `image.clean` is not
+  written for CASA (`run()` skips it with a warning); use the dask-ms backend,
+  which images and self-calibrates with difmapy.
 - **Spectral line, multi-phase-centre, pulsar binning** modes.
 - **Polarization calibration** (RL delay, RL phase, D-terms).
 - **AIPS backend** — component interfaces exist; every method is a stub.

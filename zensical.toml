@@ -18,6 +18,7 @@ nav = [
         { "Command line" = "usage/cli.md" },
         { "Interactive Python" = "usage/python.md" },
         { "AI mode" = "usage/ai.md" },
+        { "AI coding agents" = "usage/agents.md" },
         { "Status" = "usage/status.md" },
     ]},
     { "Scientific Background" = "science.md" },

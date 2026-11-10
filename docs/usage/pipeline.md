@@ -3,8 +3,9 @@
 !!! warning "Partially implemented"
 
     The calibration chain runs end to end and produces calibrated per-source
-    data. **Imaging and self-calibration are not implemented**, so `run()`
-    stops after the export and logs that it skipped imaging.
+    data. Imaging and self-calibration run through difmapy on the dask-ms
+    backend; on the CASA backend `run()` stops after the export and logs that
+    it skipped imaging.
 
 One command takes a project from raw correlator output to calibrated,
 Difmap-ready data:

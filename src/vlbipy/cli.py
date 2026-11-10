@@ -48,7 +48,10 @@ PLOT_KINDS: list[str] = ["caltables", "caltable", "tplot", "uv_coverage", "diagn
 
 #: Known subcommand names (used to route the no-subcommand form to ``pipeline``).
 COMMANDS: list[str] = ["pipeline", "import", "calibrate", "flag", "image", "plot", "applycal", "summary", "export",
-                       "report", "ai"]
+                       "report", "ai", "skills"]
+
+#: Actions of ``vlbipy skills`` (positional; the first is the default).
+SKILLS_ACTIONS: list[str] = ["list", "show", "path", "install"]
 
 #: AI-mode actions selectable via ``vlbipy ai`` (positional).
 AI_ACTIONS: list[str] = ["prediagnose", "tsys", "calibrated", "flag", "rules", "train", "predict"]
@@ -96,7 +99,8 @@ def _common_parser(*, project_required: bool = True) -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help=argparse.SUPPRESS)  # alias of --scratch (merged)
     p.add_argument("--no-ionos", dest="ionos", action="store_false", default=None,
                    help="Do not solve the dispersive (ionospheric) delay in the fringe fit. "
-                        "By default it is solved below 6 GHz, where the ionosphere matters.")
+                        "By default it is solved below 8 GHz ([calibration].ionos_max_ghz), where the "
+                        "ionosphere matters.")
     p.add_argument("--phaseref-strategy", dest="phaseref_strategy",
                    choices=("auto", "single", "sequential", "interpolate", "time"),
                    help="Phase-referencing strategy of [phase_referencing].strategy")
@@ -322,6 +326,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_nb.add_argument("--link", action="store_true",
                       help="Link the plots by relative path instead of embedding them: a small notebook that has "
                            "to stay in the work directory")
+    from .agent_skills import AGENT_DIRS
+    p_sk = sub.add_parser(
+        "skills", formatter_class=RichHelpFormatter,
+        help="The VLBI data-reduction skills for coding agents (Devin, Claude Code, Codex, Cursor, Copilot): "
+             "list, show, path, install",
+        description="vlbipy ships agent skills on VLBI data reduction (reduce-vlbi-data, reduce-vlbi-vlbipy, "
+                    "reduce-vlbi-casa, reduce-vlbi-aips). 'list' shows them and whether the agent's copy is current; "
+                    "'show NAME' prints a SKILL.md; 'path [NAME]' prints where they are; 'install [NAME ...]' copies "
+                    "them (or links them, --link) to the agent's skills directory.")
+    p_sk.add_argument("action", nargs="?", default="list", choices=SKILLS_ACTIONS, help="Default: list")
+    p_sk.add_argument("names", nargs="*", metavar="NAME", help="Skill name(s); default: all")
+    p_sk.add_argument("--agent", choices=list(AGENT_DIRS), default="agents",
+                      help="Whose skills directory: agents (~/.agents/skills, the open standard read by Codex, "
+                           "Devin and others; default), devin, claude, cursor, copilot, windsurf")
+    p_sk.add_argument("--project", metavar="DIR",
+                      help="Install into the project DIR (e.g. DIR/.agents/skills) instead of the home directory")
+    p_sk.add_argument("--link", action="store_true",
+                      help="Symbolic links into the installed vlbipy instead of copies (follow an editable install)")
+    p_sk.add_argument("--force", action="store_true",
+                      help="Replace skills of the same name that vlbipy did not install")
+    p_sk.add_argument("-v", "--verbose", action="store_true", help="Verbose (DEBUG) logging")
 
     parser.epilog = _options_epilog(sub, common)
     return parser
@@ -781,6 +806,30 @@ def _cmd_ai(obs: VLBIObs, args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_skills(args: argparse.Namespace) -> int:
+    """List, show, locate or install the shipped agent skills (no project needed)."""
+    from . import agent_skills
+    if args.action == "show":
+        for name in args.names or [s.name for s in agent_skills.available()]:
+            print((agent_skills.get(name).path / "SKILL.md").read_text(encoding="utf-8"))
+        return 0
+    if args.action == "path":
+        paths = [agent_skills.get(name).path for name in args.names] if args.names else [agent_skills.SKILLS_DIR]
+        print("\n".join(str(p) for p in paths))
+        return 0
+    if args.action == "install":
+        for path in agent_skills.install(args.names or None, agent=args.agent, project=args.project, link=args.link,
+                                         force=args.force):
+            print(path)
+        return 0
+    base = agent_skills.target_dir(args.agent, args.project)
+    print(f"Skills shipped with vlbipy (state in {base}):")
+    for skill, state in agent_skills.status(args.agent, args.project):
+        print(f"  {skill.name:20s} {state:16s} {skill.description[:90]}")
+    print("Install or update with: vlbipy skills install [--agent AGENT] [--project DIR] [--link]")
+    return 0
+
+
 #: Dispatch table mapping subcommand name -> handler(obs, args) -> exit code.
 #: "run" stays as a hidden alias of "pipeline".
 _HANDLERS = {"pipeline": _cmd_pipeline, "run": _cmd_pipeline, "import": _cmd_import,
@@ -820,6 +869,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     configure_logging("DEBUG" if args.verbose else "INFO")
     capture_python_warnings()                  # library warnings go to the run log, not the terminal
 
+    if args.command == "skills":
+        try:
+            return _cmd_skills(args)
+        except (KeyError, ValueError, FileExistsError) as exc:
+            logger.error("skills failed: {}", exc)
+            return 1
     if args.command == "ai" and args.actions and set(args.actions) <= {"rules", "train"}:
         return _cmd_ai(None, args)       # the rule base and the shipped training sets need no project
     obs = None if args.command == "applycal" or (args.command == "plot" and args.ms) else _build_obs(args)

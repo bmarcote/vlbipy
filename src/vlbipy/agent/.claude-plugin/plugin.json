@@ -1,0 +1,22 @@
+{
+  "name": "vlbipy",
+  "displayName": "vlbipy VLBI data reduction",
+  "description": "VLBI data-reduction skills: the science of each calibration and imaging step (reduce-vlbi-data), and how to run it with vlbipy, CASA or AIPS",
+  "author": {
+    "name": "Benito Marcote",
+    "email": "marcote@jive.eu"
+  },
+  "homepage": "https://bmarcote.github.io/vlbipy/",
+  "repository": "https://github.com/bmarcote/vlbipy",
+  "keywords": [
+    "vlbi",
+    "radio-astronomy",
+    "interferometry",
+    "calibration",
+    "casa",
+    "aips",
+    "evn",
+    "vlba"
+  ],
+  "license": "GPL-3.0-only"
+}

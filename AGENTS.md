@@ -4,7 +4,9 @@
 
 - Editable install in `/home/marcote/.venv` (`uv pip install -e .`); `difmapy` is the sibling checkout.
 - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests -q` (zarr's auto-loaded pytest plugin breaks start-up
-  with an older numpy). The AI mode has its own synthetic-data tests in `tests/test_ai.py`.
+  with an older numpy). The AI mode has its own synthetic-data tests in `tests/test_ai.py`. On the macOS machine use
+  `~/.venvs/venv313/bin/python` (the repo's `venv/` has a casacore built against a missing Homebrew library).
+- Tests never reach the network: `tests/conftest.py` makes `tools.download_file`/`fetch_url_text` fail for http(s).
 - `vlbipy -p EB104G ...` uses `./EB104G` as its work dir. Raw files (FITS-IDI, `.antab`, `.uvflg`) are looked
   for in the work dir, its `input_data/` and its parent (`fitsidi.search_dirs`, nearest first), so files
   downloaded by hand into the directory where vlbipy is started are found; the converted `.flag` and all
@@ -46,6 +48,24 @@ Invariants worth keeping:
 Adding an experiment to the training set: run `vlbipy ai -p CODE` (or the read-only path), review the rows in
 `<work_dir>/ai/CODE.features.jsonl`, write a review file like `data/ai/EB104G.review.json` for the labels that are
 wrong, copy the reviewed rows to `data/ai/CODE.features.jsonl` and run `vlbipy ai train -p any`.
+
+## Agent skills (`src/vlbipy/agent/`)
+
+- `agent/skills/<name>/SKILL.md` (+ `references/`) are the VLBI skills shipped as package data: `reduce-vlbi-data`
+  (science, S0-S21), `reduce-vlbi-vlbipy`, `reduce-vlbi-casa`, `reduce-vlbi-aips`. `vlbipy skills list|show|path|install`
+  (`agent_skills.py`) installs them for agents; `agent/` is also a Devin/Claude plugin (`.devin-plugin`,
+  `.claude-plugin`; root `.claude-plugin/marketplace.json`). The plugin root is `agent/`, not the repo root, because a
+  Devin plugin injects the `AGENTS.md` at its root into every session.
+- **Every calibration lesson added below must also go, condensed and anonymised (no experiment codes or target
+  names), into the skills** - usually `reduce-vlbi-data/references/*.md`, and `reduce-vlbi-vlbipy` when a step,
+  option or default changes. `tests/test_agent_skills.py` checks the skills against the CLI, `STEP_ORDER` and
+  `defaults.toml`, and rejects project codes and local paths.
+
+## EVN a-priori tables (2026-11-10)
+
+- EVN FITS-IDI carry Tsys/GC tables since January 2023, but the appending had issues: `EVNObservatory.prepare_for_import`
+  replaces them with the archive `.antab` (fetched from `pipe/` when missing); `[import].use_embedded_tsys = true`
+  keeps them. The flag-only call after the import (`_ensure_flag_file`) passes `tsys=False` and never rewrites them.
 
 ## Calibration lessons (EB104G, 2026-10-30)
 

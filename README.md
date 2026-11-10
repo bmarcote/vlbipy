@@ -3,8 +3,8 @@
 Backend-agnostic VLBI data calibration and imaging pipeline.
 
 **Work in progress.** The calibration chain runs end to end and produces
-calibrated, per-source data on the CASA backend. Imaging and self-calibration
-are not implemented yet. See [Status](docs/usage/status.md) for the honest
+calibrated, per-source data; imaging and self-calibration run through difmapy
+on the dask-ms backend. See [Status](docs/usage/status.md) for the honest
 inventory of what works.
 
 Aims to support **EVN**, **VLBA**, and **LBA** observations through different
@@ -143,6 +143,18 @@ vlbipy ai rules -p any              # the expert rules and the experiments behin
 ```
 
 See [AI mode](docs/usage/ai.md).
+
+## Skills for AI coding agents
+
+vlbipy ships agent skills on VLBI data reduction - the science of every step (`reduce-vlbi-data`), running and
+reviewing vlbipy (`reduce-vlbi-vlbipy`), and the CASA and AIPS commands (`reduce-vlbi-casa`, `reduce-vlbi-aips`) -
+for Devin, Claude Code, Codex, Cursor, Copilot and others:
+
+```bash
+vlbipy skills install                  # ~/.agents/skills; --agent claude|devin|cursor|copilot|windsurf, --project DIR
+```
+
+See [AI coding agents](docs/usage/agents.md).
 
 ## Configuration
 
@@ -304,4 +316,4 @@ zensical serve      # live preview
 
 ## License
 
-MIT
+GNU General Public License v3.0 (see [LICENSE](LICENSE)).

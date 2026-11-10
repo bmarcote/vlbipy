@@ -116,7 +116,10 @@ class ImportDataNamespace(Namespace):
             file_list = self._locate_files(files, imp_cfg)
             file_list = obs._observatory_handler.prepare_for_import(
                 file_list, obs.work_dir, project_code=self._code,
-                replace_tsys=imp_cfg.get("replace_tsys", False))
+                replace_tsys=imp_cfg.get("replace_tsys", False),
+                use_embedded_tsys=imp_cfg.get("use_embedded_tsys", False),
+                obsdate=imp_cfg.get("obsdate") or None, username=imp_cfg.get("username") or None,
+                password=imp_cfg.get("password") or None)
             self._backend.data.import_data(self._code, obs.sources.names, scan_gap=scan_gap,
                                            files=file_list, delete=force,
                                            zarr_store=imp_cfg.get("zarr_store", False),
@@ -1354,7 +1357,8 @@ class CalibrateNamespace(Namespace):
                                  + [f"rows={report['rows']}"])
         return obs.gaintables
 
-    #: e-MERLIN outstations (antenna names as they appear in the data); Jb is the trusted reference.
+    #: e-MERLIN outstations (antenna names as they appear in the data): their presence triggers the e-MERLIN
+    #: flux scale. Jb never triggers it (it observes in plain EVN runs) but is solved with them.
     EMERLIN_OUTSTATIONS = ("Cm", "Da", "De", "Kn", "Pi")
     EMERLIN_REFERENCE = "Jb"
 
@@ -1875,7 +1879,7 @@ class FlagNamespace(Namespace):
             warnings.warn(f"{self._code}: {Path(existing).name} found but no FITS-IDI files are "
                           "present to convert it against; a-priori flags not applied")
             return None
-        handler.prepare_for_import(idi_files, obs.work_dir, project_code=self._code)
+        handler.prepare_for_import(idi_files, obs.work_dir, project_code=self._code, tsys=False)
         return handler.get_flag_file(self._code, obs.work_dir)
 
     def autocorr(self, *, force: bool = False) -> float:

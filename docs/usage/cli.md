@@ -110,9 +110,9 @@ Steps already recorded as complete are skipped:
 
 ## The ionosphere
 
-Below 6 GHz the fringe fit also solves for the dispersive (ionospheric) delay,
+Below 8 GHz (`[calibration].ionos_max_ghz`) the fringe fit also solves for the dispersive (ionospheric) delay,
 because at those frequencies the residual delay is genuinely frequency-dependent
-and fitting a single non-dispersive delay leaves phase behind. Above 6 GHz it is
+and fitting a single non-dispersive delay leaves phase behind. Above 8 GHz it is
 skipped — the effect is negligible there and the extra free parameter only costs
 SNR. Every run logs which way it went. To turn it off regardless of frequency:
 

@@ -274,6 +274,52 @@ def test_evn_flag_conversion_reads_the_station_dialects_of_a_global_experiment(i
         "antenna='O8' timerange='2024/03/01/10:05:00~2024/03/01/10:05:30' reason='DISH_IS_STOPPING'"]
 
 
+class _FakeCasavlbitools:
+    """Records the append_tsys/append_gc calls instead of writing into the FITS-IDI files."""
+
+    def __init__(self):
+        self.calls = []
+
+    def append_tsys(self, antab, files, replace=False):
+        self.calls.append(("tsys", replace))
+
+    def append_gc(self, antab, file, replace=False):
+        self.calls.append(("gc", replace))
+
+
+@pytest.mark.parametrize("embedded, use_embedded, expected", [
+    (True, False, [("tsys", True), ("gc", True)]),     # recent EVN: the archive .antab replaces the embedded tables
+    (True, True, []),                                  # [import].use_embedded_tsys keeps them
+    (False, False, [("tsys", False), ("gc", False)]),  # older EVN: appended as before
+])
+def test_evn_archive_antab_replaces_embedded_tsys(idi_dir, monkeypatch, embedded, use_embedded, expected):
+    from vlbipy.observatories import evn
+    fake = _FakeCasavlbitools()
+    monkeypatch.setattr(evn, "_import_casavlbitools", lambda: fake)
+    monkeypatch.setattr(evn.fitsidi, "has_tsys", lambda path: embedded)
+    (idi_dir / f"{PROJECT}.antab").write_text("x")
+    files = [str(path) for path in sorted(idi_dir.glob(f"{PROJECT}_1_1.IDI*"))]
+    EVNObservatory().prepare_for_import(files, str(idi_dir), project_code=PROJECT, use_embedded_tsys=use_embedded)
+    assert fake.calls == expected
+    fake.calls.clear()
+    EVNObservatory().prepare_for_import(files, str(idi_dir), project_code=PROJECT, tsys=False)
+    assert fake.calls == []                            # the flag-only call never touches the Tsys
+
+
+def test_evn_embedded_tsys_without_antab_tries_the_archive_then_warns(idi_dir, monkeypatch):
+    from vlbipy import logging_utils
+    from vlbipy.observatories import evn
+    fetched = []
+    monkeypatch.setattr(evn.fitsidi, "has_tsys", lambda path: True)
+    monkeypatch.setattr(EVNObservatory, "fetch_apriori_files",
+                        lambda self, code, directory, **kw: fetched.append(code) or {"antab": None, "uvflg": None})
+    logging_utils.warnings.reset()
+    files = [str(path) for path in sorted(idi_dir.glob(f"{PROJECT}_1_1.IDI*"))]
+    EVNObservatory().prepare_for_import(files, str(idi_dir), project_code=PROJECT)
+    assert fetched == [PROJECT]
+    assert any("appending issues" in w for w in logging_utils.warnings.summary())
+
+
 # -- import_data namespace orchestration --
 
 class RecordingDataOps(DataOps):

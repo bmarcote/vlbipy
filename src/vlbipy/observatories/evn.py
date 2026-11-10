@@ -260,38 +260,68 @@ class EVNObservatory(ObservatoryHandler):
         return self._find_file(project_code, directory, ".flag") or self._find_file(project_code, directory, ".uvflg")
 
     def prepare_for_import(self, files: list[str], directory: str, *, project_code: str = "",
-                           replace_tsys: bool = False, **kwargs) -> list[str]:
-        """Append Tsys/GC tables from .antab and convert .uvflg to a CASA .flag file.
+                           replace_tsys: bool = False, use_embedded_tsys: bool = False, tsys: bool = True,
+                           fetch: bool = True, obsdate: Optional[str] = None, username: Optional[str] = None,
+                           password: Optional[str] = None, **kwargs) -> list[str]:
+        """Attach the archive .antab Tsys/GC tables and convert .uvflg to a CASA .flag file.
 
-        Both steps are no-ops when the FITS-IDI files already carry the tables /
-        the .flag file already exists. Requires ``casavlbitools``; without it the
-        step is skipped with a warning unless the FITS-IDI files already contain
-        the Tsys tables (then nothing is needed).
+        The Tsys/GC tables that recent EVN FITS-IDI files (since January 2023) carry had appending issues, so
+        the archive ``.antab`` replaces them (fetched from the archive when it is not on disk and ``fetch``);
+        ``use_embedded_tsys`` keeps the embedded tables instead (``replace_tsys`` still forces the replacement).
+        Without an ``.antab`` the embedded tables are used with a warning. ``tsys=False`` only converts the
+        flags (the a-priori flag step after the import). The flag conversion is a no-op when the ``.flag`` file
+        already exists. Requires ``casavlbitools`` for the Tsys/GC tables.
         """
         if not files:
             return list(files)
         project_code = project_code or Path(files[0]).name.split("_")[0].split(".")[0]
-        antab = self.get_antab_file(project_code, directory)
-        already_has_tsys = fitsidi.has_tsys(files[0])
-
-        if antab and (replace_tsys or not already_has_tsys):
-            cvt = _import_casavlbitools()
-            if cvt is not None:
-                logger.info("appending Tsys from {} to the FITS-IDI files", antab)
-                cvt.append_tsys(str(antab), files, replace=replace_tsys)
-                logger.info("appending gain-curve information from {}", antab)
-                cvt.append_gc(str(antab), files[0], replace=replace_tsys)
-            elif not already_has_tsys:
-                warnings.anomaly(f"{project_code}: FITS-IDI files lack Tsys and casavlbitools is "
-                                 "unavailable — amplitude calibration will be wrong")
-        elif not antab and not already_has_tsys:
-            warnings.anomaly(f"{project_code}: no .antab file found and the FITS-IDI files carry "
-                             "no Tsys tables — amplitude calibration will be wrong")
+        if tsys:
+            self._attach_antab(files, directory, project_code, replace_tsys=replace_tsys,
+                               use_embedded_tsys=use_embedded_tsys, fetch=fetch, obsdate=obsdate,
+                               username=username, password=password)
 
         existing = self.get_flag_file(project_code, directory)
         if existing and existing.endswith(".uvflg"):
             self._convert_flags(files, Path(existing), Path(directory) / f"{project_code.lower()}.flag", project_code)
         return list(files)
+
+    def _attach_antab(self, files: list[str], directory: str, project_code: str, *, replace_tsys: bool,
+                      use_embedded_tsys: bool, fetch: bool, obsdate: Optional[str], username: Optional[str],
+                      password: Optional[str]) -> None:
+        """Put the archive ``.antab`` Tsys/GC tables in the FITS-IDI files (see :meth:`prepare_for_import`)."""
+        already_has_tsys = fitsidi.has_tsys(files[0])
+        replace = already_has_tsys and (replace_tsys or not use_embedded_tsys)
+        antab = self.get_antab_file(project_code, directory)
+        if not antab and fetch and (replace or not already_has_tsys):
+            try:
+                antab = self.fetch_apriori_files(project_code, directory, obsdate=obsdate, username=username,
+                                                 password=password).get("antab")
+            except Exception as exc:  # noqa: BLE001 - offline or proprietary: reported below
+                logger.warning("{}: could not fetch the .antab from the archive ({})", project_code, exc)
+        if not antab:
+            if not already_has_tsys:
+                warnings.anomaly(f"{project_code}: no .antab file found and the FITS-IDI files carry "
+                                 "no Tsys tables — amplitude calibration will be wrong")
+            elif replace:
+                warnings.warn(f"{project_code}: no archive .antab found; using the Tsys/GC tables embedded in the "
+                              "FITS-IDI files, which had appending issues — download the .antab to replace them")
+            return
+        if already_has_tsys and not replace:
+            logger.info("keeping the Tsys/GC tables embedded in the FITS-IDI files ([import].use_embedded_tsys)")
+            return
+        cvt = _import_casavlbitools()
+        if cvt is None:
+            if not already_has_tsys:
+                warnings.anomaly(f"{project_code}: FITS-IDI files lack Tsys and casavlbitools is "
+                                 "unavailable — amplitude calibration will be wrong")
+            return
+        if replace:
+            logger.info("replacing the Tsys/GC tables embedded in the FITS-IDI files with {} (the embedded EVN "
+                        "tables had appending issues; [import].use_embedded_tsys keeps them)", antab)
+        logger.info("appending Tsys from {} to the FITS-IDI files", antab)
+        cvt.append_tsys(str(antab), files, replace=replace)
+        logger.info("appending gain-curve information from {}", antab)
+        cvt.append_gc(str(antab), files[0], replace=replace)
 
     def _convert_flags(self, files: list[str], uvflg: Path, flagfile: Path, project_code: str) -> None:
         """Convert the AIPS ``uvflg`` file into the CASA flag-command file ``flagfile``.

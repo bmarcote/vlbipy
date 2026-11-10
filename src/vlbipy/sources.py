@@ -338,9 +338,11 @@ def _is_pair(metadata, first: str, second: str) -> bool:
 def _calibrator_of_pair(metadata, survey, first: str, second: str) -> tuple[str, str]:
     """Return ``(phase calibrator, target)`` for an interleaved pair of sources.
 
-    Brightness alone cannot decide this: plenty of targets are brighter than
-    their calibrator. Three independent structural signatures of a
-    phase-referencing cycle are used instead and the majority wins —
+    The schedule decides this, not brightness: calibrators are normally the
+    brighter source, but a target brighter than its calibrator does occur (the
+    case for inverse phase referencing) and must not swap the roles. Three
+    independent structural signatures of a phase-referencing cycle are used
+    instead and the majority wins —
 
     * the cycle opens on the calibrator, so its first scan comes first;
     * the calibrator is visited at least as often as the target (``cal, target,
@@ -350,8 +352,8 @@ def _calibrator_of_pair(metadata, survey, first: str, second: str) -> tuple[str,
     Three signals cannot tie, so no further tiebreak is needed. The array-wide
     fringe SNR of both sources is logged for the reader but deliberately not
     voted on: it decides which source the *instrumental* solve uses (see
-    :meth:`~vlbipy.models.ScanSNRSurvey.rank_sources`), while a target brighter
-    than its own calibrator is entirely ordinary.
+    :meth:`~vlbipy.models.ScanSNRSurvey.rank_sources`) and whether inverse
+    phase referencing is worth considering.
     """
     per_source = _scans_per_source(metadata)
     one, other = per_source.get(first, []), per_source.get(second, [])

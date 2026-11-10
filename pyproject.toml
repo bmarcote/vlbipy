@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vlbipy"
-version = "0.5.1"
+version = "0.6.0"
 description = "Backend-agnostic VLBI data reduction suite (API-first)"
 readme = "README.md"
 requires-python = ">=3.12"
-license = {text = "MIT"}
+license = {text = "GPL-3.0-only"}
 authors = [{name = "Benito Marcote", email = "marcote@jive.eu"}]
 dependencies = [
     "numpy",
@@ -43,7 +43,8 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 vlbipy = ["templates/*.toml", "data/*.fits", "data/*.json", "data/ai/*.json", "data/ai/*.jsonl",
-          "data/emerlin_calibrator_models/*.ICL001", "data/emerlin_calibrator_models/**/*"]
+          "data/emerlin_calibrator_models/*.ICL001", "data/emerlin_calibrator_models/**/*",
+          "agent/skills/*/SKILL.md", "agent/skills/*/references/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -131,6 +131,7 @@ Source names must exactly match those in the data file. Both the new-style keys 
 | `scan_gap` | int | `15` | Time gap in seconds that defines a new scan boundary during import |
 | `files` | string or list[str] | *(unset)* | Explicit FITS-IDI file(s) or a glob pattern; skips the search on disk and the download |
 | `replace_tsys` | bool | `false` | Overwrite the Tsys/GC tables already present in the FITS-IDI files with the ANTAB ones (acts only when the data are imported) |
+| `use_embedded_tsys` | bool | `false` | EVN: keep the Tsys/GC tables embedded in the FITS-IDI files (since January 2023) instead of replacing them with the archive `.antab`, fetched when missing (the embedded tables had appending issues) |
 
 ### `[flagging]`
 
