@@ -161,27 +161,29 @@ prior_rate_window = 1e-12    # is solved again with the fringe peak also searche
                              # it cuts false detections on weak calibrators — check no real solution is clipped)
 # ratewindow = [-50, 50]     # the same for the rate, in mHz
 
-# Time smoothing of the fringe (MBD, MBD2, ...) solutions. Each solution carries the noise
-# of one solution interval, while the residual atmospheric delay and rate it measures drift
-# slowly, so neighbouring solutions average that noise down. The smoothed copy
-# (<code>.mbd_smooth) is what gets applied; the solved table stays on disk and is plotted
-# next to it. The phase is never smoothed — it wraps.
+# Outlier rejection on the fringe (MBD, MBD2, ...) solutions, like the clipping stage of AIPS SNSMO
+# (CPARM). A false fringe-fit detection (wrong peak on a weak antenna) is flagged; every other
+# solution keeps its own measured delay, rate and phase. The rate extrapolates the phase between
+# solutions and carries real structure on the scale of a few scans, so it must NOT be replaced by a
+# long-window average. The cleaned copy (<code>.mbd_smooth) is what gets applied; the solved table
+# stays on disk and is plotted next to it.
 [calibration.mbd_smooth]
-window = 7200.0              # full width of the centred time window in seconds (0 = apply unsmoothed).
-                             # Solutions are grouped per field, so the window must span several
-                             # scans *of the same source*: with two phase calibrators observed in
-                             # alternating blocks those come in pairs ~25 min apart, and 2 h holds
-                             # ~8; the fringe finder, every ~30 min, ~4. A centred window leaves a
-                             # linear drift unbiased.
-smoothtype = "median"        # "median" (robust: also removes a single bad solution) or "mean"
-parameters = ["delay", "rate"]   # Fringe Jones parameters to smooth; "dispersive" may be added
-min_points = 4               # leave a solution alone when its window holds fewer than this
+mode = "clip"                # "clip" (flag outliers only), "smooth" (also replace the good values of
+                             # `parameters` by their window median: opt-in) or "none"
+window = 3600.0              # full width of the centred time window in seconds (0 = apply unsmoothed).
+                             # Solutions are grouped per field; the window is widened per series so it
+                             # always holds `min_points` neighbours (sparse fringe-finder scans).
+smoothtype = "median"        # only used by mode = "smooth": "median" or "mean"
+parameters = ["delay", "rate"]   # Fringe Jones parameters to check; "dispersive" may be added
+min_points = 4               # leave a solution unjudged when fewer other solutions share its window
 outlier_sigma = 5.0          # flag a solution whose delay or rate departs from the others in its
-                             # window by more than this (robust sigmas): a false fringe detection,
-                             # not noise. 0 disables.
-outlier_floor = { delay = 2.0, rate = 1e-12 }   # ...and by more than this (ns, s/s): precise
-                             # solutions scatter so little that a real atmospheric drift can read
-                             # as 5 sigma; a false fringe peak lands several ns away.
+                             # window by more than this many robust sigmas of that window...
+auto_floor_sigma = 5.0       # ...and by more than the floor below; for "auto" the floor is this many
+                             # times the pooled (all antennas/subbands/fields) scatter of the
+                             # leave-one-out residuals, i.e. learnt from the data.
+outlier_floor = { delay = "auto", rate = "auto" }   # minimum departure flagged: "auto" or a number
+                             # (ns for the delay, s/s for the rate). AIPS SNSMO equivalents:
+                             # delay = 20.0 (CPARM(9)), rate = 2e-12 (CPARM(8) = 10 mHz at ~5 GHz).
 
 # Reweighting (statwt) after the full chain is applied; the pipeline then flags outliers
 # again and re-solves everything (third pass). Set enabled = false to skip.

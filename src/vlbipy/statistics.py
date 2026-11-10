@@ -236,6 +236,50 @@ def outliers_in_time(values: np.ndarray, times: np.ndarray, *, window: float = 7
     return mask
 
 
+def residuals_in_time(values: np.ndarray, times: np.ndarray, *, window: float,
+                      min_points: int = 4) -> np.ndarray:
+    """Return each point's departure from the median of the *other* usable points in its time window.
+
+    The leave-one-out residual that :func:`outliers_in_time` judges; exposed so the
+    characteristic scatter of a whole set of series can be measured before any
+    threshold is chosen. ``nan`` where the point is unusable or has fewer than
+    ``min_points`` neighbours.
+    """
+    series = np.asarray(values, dtype=float)
+    stamps = np.asarray(times, dtype=float)
+    out = np.full(series.shape, np.nan, dtype=float)
+    if window <= 0 or series.size == 0:
+        return out
+    usable = np.isfinite(series)
+    half = 0.5 * float(window)
+    for index in np.flatnonzero(usable):
+        inside = usable & (np.abs(stamps - stamps[index]) <= half)
+        inside[index] = False
+        if int(inside.sum()) < max(1, int(min_points)):
+            continue
+        out[index] = series[index] - np.median(series[inside])
+    return out
+
+
+def auto_outlier_floor(residuals: list[np.ndarray], *, n_sigma: float = 5.0) -> float:
+    """Return the smallest departure worth flagging, learnt from the data itself.
+
+    The residuals of every series (all antennas, subbands, polarizations and fields)
+    are pooled and their scatter measured with the MAD, which the outliers being
+    hunted cannot inflate; the floor is ``n_sigma`` times that. It is the typical
+    point-to-point variability of the parameter on this array and experiment, so a
+    precise series (whose own scatter is tiny) is only flagged for a departure that
+    is large compared with what its peers do, while a noisy one is protected by its
+    own local sigma. Returns 0 (no floor) when fewer than 8 residuals exist.
+    """
+    pooled = np.concatenate([np.asarray(r, dtype=float).ravel() for r in residuals]) if residuals else np.empty(0)
+    pooled = pooled[np.isfinite(pooled)]
+    if pooled.size < 8:
+        return 0.0
+    sigma = mad_sigma(pooled)
+    return float(n_sigma * sigma) if np.isfinite(sigma) else 0.0
+
+
 def find_flat_range(profile: np.ndarray, *, threshold: float = 6.0,
                     max_edge_fraction: float = 0.25) -> tuple[int, int]:
     """Return the ``(first, last)`` indices of the flat interior of a bandpass-like profile.
