@@ -46,17 +46,14 @@ _REFANT_SNR_SENTINEL = 999.0
 #: the rate dimensionless (s/s) and the phase in radians.
 FRINGE_PARAMETERS = {"phase": 0, "delay": 1, "rate": 2, "dispersive": 3}
 
-#: Fringe parameters smoothed in time by default: the delay and the rate are smooth
-#: physical quantities measured once per solution interval, so averaging neighbouring
-#: solutions beats each one's own noise. The phase is deliberately absent — it wraps,
-#: and a mean of values either side of a 2-pi jump is meaningless.
+#: Fringe parameters tested for outliers (and smoothed in ``mode="smooth"``). The phase is
+#: deliberately absent — it wraps, and a mean of values either side of a 2-pi jump is
+#: meaningless. The rate is NOT a slowly varying quantity (it carries real structure on
+#: the scale of a few scans), which is why the default mode only clips and never replaces.
 FRINGE_SMOOTH_PARAMETERS = ("delay", "rate")
 
-#: Smallest departure from its neighbours for which a fringe solution is flagged, per
-#: parameter in the table's units (delay in ns, rate in s/s). The residual atmosphere
-#: moves the delay by ~1 ns and the rate by ~1e-13 s/s over a run, while a false fringe
-#: peak lands a sizeable fraction of 1/bandwidth (several ns) or of 1/scan away.
-FRINGE_OUTLIER_FLOOR = {"delay": 2.0, "rate": 1e-12}
+#: Fringe-table outlier floors (delay in ns, rate in s/s) are measured from the data
+#: ("auto") unless set in ``[calibration.mbd_smooth].outlier_floor``.
 
 #: Fringe-fit keywords of the native solver only (:func:`vlbipy.solvers.fringefit.fringefit`), not of CASA's task.
 NATIVE_FRINGEFIT_KEYS = ("prior_scans", "prior_delay_window_ns", "prior_rate_window")
@@ -2761,92 +2758,100 @@ class CasaCalibrationOps(CalibrationOps):
                           "solutions had to be de-spiked; check the table plot")
         return table
 
-    def smooth_fringe(self, project_code: str, table: CalTable, *, window: float = 7200.0,
+    def smooth_fringe(self, project_code: str, table: CalTable, *, mode: str = "clip",
+                      window: float = 3600.0,
                       smoothtype: str = "median", parameters: tuple = FRINGE_SMOOTH_PARAMETERS,
                       min_points: int = 4, outlier_sigma: float = 5.0,
-                      outlier_floor: Optional[dict] = None,
+                      outlier_floor: Optional[dict] = None, auto_floor_sigma: float = 5.0,
                       metadata: Optional[ObsMetadata] = None,
                       **kwargs) -> CalTable:
-        """Smooth a fringe table's delay and rate in time; return the smoothed copy.
+        """Clean a fringe table in time (outlier rejection, optionally smoothing); return the copy to apply.
 
-        The multi-band delay is solved once per solution interval, so each
-        solution carries the full noise of one interval while the quantity it
-        measures — the residual atmospheric delay and its rate — varies slowly
-        and smoothly. Averaging each solution with its neighbours in time
-        therefore removes noise rather than signal, and it is the smoothed table
-        that should be applied: an unsmoothed per-scan delay transfers its own
-        scatter onto the target.
+        ``mode="clip"`` (default) works like AIPS ``SNSMO`` with only its clipping
+        stage: a solution whose delay or rate departs from the local median by more
+        than the threshold is flagged, and **every other solution keeps its own
+        measured values**. The delay, rate and phase of a fringe solution are
+        mutually consistent (the rate extrapolates the phase from the solution
+        time), and the residual rate is *not* a slowly varying quantity: it carries
+        real structure on the scale of a few scans. Replacing it with a long-window
+        median erases the phase trends between calibrator scans.
 
-        A centred boxcar in time (:func:`~vlbipy.statistics.smooth_in_time`) is
-        used per antenna, subband, polarization *and field*. Grouping by field
-        matters: the residual delay is a function of direction, so solutions on
-        the fringe finder and on the phase calibrator must not be averaged
-        together. The phase is never smoothed (it wraps), flagged solutions take
-        no part and stay flagged — unlike CASA's ``smoothcal``, which unflags
-        them — and the original table is left untouched on disk so both can be
-        plotted and compared.
+        ``mode="smooth"`` additionally replaces each good solution of the selected
+        ``parameters`` with the median/mean of its ``window`` (opt-in; only sensible
+        for a parameter known to be smooth, e.g. the delay). ``mode="none"`` (or
+        ``window <= 0``) applies the solved table unchanged.
 
-        Before smoothing, a solution whose delay or rate departs from the other
-        solutions in its window by more than ``outlier_sigma`` robust sigmas, and
-        by more than ``outlier_floor``, is flagged (:func:`~vlbipy.statistics.outliers_in_time`), all of its
-        parameters for that polarization. Such a solution is a false detection —
-        a wrong fringe peak on a weak antenna, typically — not noise, and a
-        median would still let it leak into the interpolation onto the target.
+        Thresholds: a solution is an outlier when it departs from the median of the
+        other solutions in its window by more than ``outlier_sigma`` robust sigmas of
+        that window **and** by more than a per-parameter floor. A floor given as
+        ``"auto"`` (the default) is measured from the data: the leave-one-out
+        residuals of every series in the table are pooled and the floor is
+        ``auto_floor_sigma`` times their MAD scatter, i.e. the characteristic
+        variability of that parameter on this experiment. A number (ns for the delay,
+        s/s for the rate) fixes it. Solutions are grouped per antenna, subband,
+        polarization *and field* (the residual delay depends on direction); the
+        window is widened per series so it always holds enough solutions to judge a
+        sparsely sampled field. The phase is never smoothed (it wraps), flagged
+        solutions take no part, and the original table stays on disk for comparison.
 
         Parameters
         ----------
         project_code : str
-            Project code (the smoothed table is written next to the original).
+            Project code (the cleaned table is written next to the original).
         table : CalTable
-            The fringe table to smooth; not modified.
+            The fringe table to clean; not modified.
+        mode : str
+            ``"clip"``, ``"smooth"`` or ``"none"``.
         window : float
-            Full width of the smoothing window in seconds; <= 0 returns ``table``
-            unchanged (``[calibration.mbd_smooth].window``). It must span several
-            solutions *of the same field*: with two phase calibrators observed in
-            alternating blocks, those are much sparser than the cycle time.
+            Full width of the centred window in seconds (``[calibration.mbd_smooth].window``).
         smoothtype : str
-            ``"median"`` (robust, default) or ``"mean"``.
+            ``"median"`` (default) or ``"mean"``; only used by ``mode="smooth"``.
         parameters : tuple of str
-            Which Fringe Jones parameters to smooth; names of
-            :data:`FRINGE_PARAMETERS`. Defaults to the delay and the rate.
+            Fringe Jones parameters to test (and smooth in ``"smooth"`` mode); names
+            of :data:`FRINGE_PARAMETERS`. Defaults to the delay and the rate.
         min_points : int
-            Leave a solution untouched when its window holds fewer than this many
-            usable solutions, so an isolated scan is never "smoothed" with itself;
-            likewise the outlier test needs this many other solutions.
+            Minimum number of other usable solutions needed to judge (or smooth) one.
         outlier_sigma : float
-            Flag solutions departing by more than this many robust sigmas from
-            their window; <= 0 disables the rejection.
+            Local robust-sigma cut; <= 0 disables the rejection.
         outlier_floor : dict, optional
-            Minimum departure flagged, per parameter name; overrides
-            :data:`FRINGE_OUTLIER_FLOOR` key by key.
+            Per parameter name: ``"auto"`` or a minimum departure in table units.
+            Missing names are ``"auto"``.
+        auto_floor_sigma : float
+            Multiple of the pooled residual scatter used for an ``"auto"`` floor.
         metadata : ObsMetadata, optional
             Unused; accepted so the call site can forward it like the other steps.
 
         Returns
         -------
         CalTable
-            A table of the same ``cal_type`` pointing at ``<code>.<type>_smooth``,
-            carrying over the field mapping, interpolation and spw map of the
-            input. The input table is returned unchanged when nothing was smoothed.
+            A table of the same ``cal_type`` pointing at ``<code>.<type>_smooth``
+            (kept for the name the rest of the pipeline expects), carrying over the
+            field mapping, interpolation and spw map. The input table is returned
+            unchanged when nothing was changed or flagged.
         """
-        from ..statistics import outliers_in_time, smooth_in_time
+        from ..statistics import auto_outlier_floor, outliers_in_time, residuals_in_time, smooth_in_time
 
+        mode = str(mode).lower()
+        if mode not in ("clip", "smooth", "none"):
+            raise BackendError(f"{project_code}: unknown mbd_smooth mode {mode!r}; use clip, smooth or none")
         source = Path(table.path)
         if not source.is_dir():
             raise BackendError(f"{project_code}: calibration table {source} not found")
-        offsets = [FRINGE_PARAMETERS[name] for name in parameters if name in FRINGE_PARAMETERS]
+        offsets = {name: FRINGE_PARAMETERS[name] for name in parameters if name in FRINGE_PARAMETERS}
         unknown = [name for name in parameters if name not in FRINGE_PARAMETERS]
         if unknown:
             raise BackendError(f"{project_code}: unknown fringe parameter(s) {', '.join(unknown)}; "
                                f"known: {', '.join(FRINGE_PARAMETERS)}")
-        if window <= 0 or not offsets:
-            logger.info("smooth_fringe[{}]: disabled (window={:g} s, parameters={}); applying the "
-                        "unsmoothed table", table.cal_type, window, ",".join(parameters) or "none")
+        if mode == "none" or window <= 0 or not offsets:
+            logger.info("smooth_fringe[{}]: disabled (mode={}, window={:g} s, parameters={}); applying the "
+                        "unsmoothed table", table.cal_type, mode, window, ",".join(parameters) or "none")
             return table
         target = source.with_name(f"{source.name}_smooth")
         if target.exists():
             shutil.rmtree(target)
         shutil.copytree(source, target)
+
+        requested = dict(outlier_floor or {})
 
         handle = self.backend.tools.table()
         if not handle.open(str(target), nomodify=False):
@@ -2861,8 +2866,9 @@ class CasaCalibrationOps(CalibrationOps):
             n_param = values.shape[0]
             stride = 4 if n_param % 4 == 0 else n_param
             n_pol = max(1, n_param // stride)
-            floors = {**FRINGE_OUTLIER_FLOOR, **(outlier_floor or {})}
-            n_changed, n_total, n_rejected = 0, 0, 0
+
+            # Series = one antenna, subband, field, polarization and channel.
+            series_list = []
             for antenna in np.unique(antenna_ids):
                 for spw in np.unique(spw_ids):
                     for field in np.unique(field_ids):
@@ -2871,50 +2877,81 @@ class CasaCalibrationOps(CalibrationOps):
                         if rows.size < 2:
                             continue
                         order = rows[np.argsort(times[rows])]
+                        spacing = float(np.median(np.diff(times[order]))) if order.size > 1 else 0.0
+                        # Wide enough to hold min_points neighbours of a sparsely sampled field.
+                        eff_window = max(float(window), (max(1, int(min_points)) + 1) * spacing)
                         for pol in range(n_pol):
-                            first, last = pol * stride, min(n_param, (pol + 1) * stride)
                             for channel in range(values.shape[1]):
-                                bad = np.zeros(order.size, dtype=bool)
-                                for name in parameters:
-                                    index = pol * stride + FRINGE_PARAMETERS[name]
-                                    if index >= n_param:
-                                        continue
-                                    series = np.where(flags[index, channel, order], np.nan,
-                                                      values[index, channel, order])
-                                    bad |= outliers_in_time(series, times[order], window=window,
-                                                            threshold=outlier_sigma,
-                                                            min_points=min_points,
-                                                            floor=floors.get(name, 0.0))
-                                if bad.any():
-                                    flags[first:last, channel, order[bad]] = True
-                                    n_rejected += int(bad.sum())
-                            for offset in offsets:
-                                index = pol * stride + offset
-                                if index >= n_param:
-                                    continue
-                                for channel in range(values.shape[1]):
-                                    series = np.where(flags[index, channel, order], np.nan,
-                                                      values[index, channel, order])
-                                    smoothed, changed = smooth_in_time(
-                                        series, times[order], window=window, kind=smoothtype,
-                                        min_points=min_points)
-                                    moved = changed & np.isfinite(smoothed)
-                                    values[index, channel, order[moved]] = smoothed[moved]
-                                    n_changed += int(moved.sum())
-                                    n_total += int(np.isfinite(series).sum())
+                                series_list.append((order, pol, channel, eff_window))
+
+            def column(order, pol, channel, name):
+                index = pol * stride + offsets[name]
+                if index >= n_param:
+                    return index, np.full(order.size, np.nan)
+                return index, np.where(flags[index, channel, order], np.nan, values[index, channel, order])
+
+            # Floors: "auto" (default) is learnt from the pooled residuals of every series.
+            floors = {}
+            for name in offsets:
+                setting = requested.get(name, "auto")
+                if isinstance(setting, str):
+                    if setting.lower() != "auto":
+                        raise BackendError(f"{project_code}: outlier_floor.{name} must be a number or 'auto'")
+                    residuals = []
+                    for order, pol, channel, eff in series_list:
+                        index, series = column(order, pol, channel, name)
+                        if index < n_param:
+                            residuals.append(residuals_in_time(series, times[order], window=eff,
+                                                               min_points=min_points))
+                    floors[name] = auto_outlier_floor(residuals, n_sigma=auto_floor_sigma)
+                    source_note = "auto"
+                else:
+                    floors[name] = float(setting)
+                    source_note = "fixed"
+                logger.info("smooth_fringe[{}]: outlier floor {} = {:.3g} ({})", table.cal_type, name,
+                            floors[name], source_note)
+
+            n_changed, n_total, n_rejected = 0, 0, 0
+            for order, pol, channel, eff in series_list:
+                first, last = pol * stride, min(n_param, (pol + 1) * stride)
+                bad = np.zeros(order.size, dtype=bool)
+                for name in offsets:
+                    index, series = column(order, pol, channel, name)
+                    if index >= n_param:
+                        continue
+                    bad |= outliers_in_time(series, times[order], window=eff, threshold=outlier_sigma,
+                                            min_points=min_points, floor=floors[name])
+                if bad.any():
+                    flags[first:last, channel, order[bad]] = True
+                    n_rejected += int(bad.sum())
+                for name in offsets:
+                    index, series = column(order, pol, channel, name)
+                    if index >= n_param:
+                        continue
+                    n_total += int(np.isfinite(series).sum())
+                    if mode != "smooth":
+                        continue
+                    smoothed, changed = smooth_in_time(series, times[order], window=window,
+                                                       kind=smoothtype, min_points=min_points)
+                    moved = changed & np.isfinite(smoothed)
+                    values[index, channel, order[moved]] = smoothed[moved]
+                    n_changed += int(moved.sum())
             handle.putcol("FPARAM", values)
             handle.putcol("FLAG", flags)
             handle.flush()
         finally:
             handle.close()
 
-        logger.info("smooth_fringe[{}]: {} outlier solution(s) flagged (> {:g} sigma); {} of {} {} "
-                    "solution(s) smoothed with a {:g} s centred {} -> {}", table.cal_type, n_rejected,
-                    outlier_sigma, n_changed, n_total, "/".join(parameters), window, smoothtype,
+        logger.info("smooth_fringe[{}]: mode={}; {} outlier solution(s) flagged (> {:g} sigma and above the "
+                    "floor); {} of {} {} value(s) replaced by a {:g} s {} -> {}", table.cal_type, mode,
+                    n_rejected, outlier_sigma, n_changed, n_total, "/".join(offsets), window, smoothtype,
                     target.name)
         if not n_total:
             warnings.warn(f"{project_code}: the {table.cal_type} table has no unflagged solution to "
-                          "smooth; applying it unsmoothed")
+                          "check; applying it unchanged")
+            shutil.rmtree(target, ignore_errors=True)
+            return table
+        if not n_rejected and not n_changed:
             shutil.rmtree(target, ignore_errors=True)
             return table
         return CalTable(cal_type=table.cal_type, path=str(target), field=table.field,

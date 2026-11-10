@@ -1572,18 +1572,18 @@ class CalibrateNamespace(Namespace):
         return applied
 
     def _smooth_fringe_table(self, table: CalTable) -> CalTable:
-        """Smooth a fringe table in time and return the table to apply.
+        """Reject outlier solutions of a fringe table and return the table to apply.
 
-        The solved table stays on disk and is plotted; it is the smoothed copy
-        that enters the apply chain, because a per-interval delay and rate carry
-        the noise of one interval while the atmospheric residual they measure
-        drifts slowly — so the raw solutions transfer their own scatter onto the
-        target. Configured by ``[calibration.mbd_smooth]``, whose keys go straight
-        to the backend; ``window = 0`` applies the solved table instead.
+        By default (``mode = "clip"``, like AIPS ``SNSMO`` clipping) only false
+        detections are flagged, with thresholds measured from the data; every
+        other solution keeps its own delay, rate and phase. The solved table stays
+        on disk and is plotted next to the cleaned copy that enters the apply
+        chain. Configured by ``[calibration.mbd_smooth]``, whose keys go straight
+        to the backend; ``mode = "none"`` or ``window = 0`` applies the solved
+        table instead.
 
-        A backend that cannot smooth, or a failure part-way, leaves the solved
-        table in the chain rather than aborting the run: an unsmoothed fringe
-        solution is correct, just noisier.
+        A backend that cannot do this, or a failure part-way, leaves the solved
+        table in the chain rather than aborting the run.
 
         Parameters
         ----------

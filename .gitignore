@@ -13,3 +13,4 @@ build
 *.nbi
 *.nbc
 casa-*.log
+cormac_flagging_scripts

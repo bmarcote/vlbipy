@@ -342,6 +342,21 @@ def test_outliers_in_time_flags_a_false_detection_but_not_a_slow_drift():
     assert not outliers_in_time(values, times, window=1000.0, threshold=5.0, min_points=4).any()
 
 
+def test_auto_outlier_floor_is_learnt_from_the_pooled_residuals():
+    import numpy as np
+
+    from vlbipy.statistics import auto_outlier_floor, residuals_in_time
+
+    rng = np.random.default_rng(3)
+    times = np.arange(30) * 600.0
+    series = [rng.normal(0.0, sigma, 30) for sigma in (0.1, 0.1, 0.2)]
+    series[0][5] = 50.0                                # one wild value must not inflate the floor
+    residuals = [residuals_in_time(v, times, window=7200.0, min_points=4) for v in series]
+    floor = auto_outlier_floor(residuals, n_sigma=5.0)
+    assert 0.3 < floor < 3.0
+    assert auto_outlier_floor([], n_sigma=5.0) == 0.0
+
+
 def test_predict_from_previous_uses_the_median_of_up_to_three_previous_solutions():
     import numpy as np
     import pytest
