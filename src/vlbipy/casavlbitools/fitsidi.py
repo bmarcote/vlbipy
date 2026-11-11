@@ -335,13 +335,13 @@ def process_gc_values(infp, keys, pols, idi, data):
     antenna_name = find_antenna(keys[0], gain_keys)
     if not antenna_name:
         print('Antenna missing from GAIN group')
-        skip_values(infp)
+        # The GAIN group is already complete (its '/' was read): nothing to skip. Skipping here
+        # would swallow the header of the following TSYS group.
         return
     try:
         antenna = idi.antenna_map[antenna_name]
     except:
         print('Antenna %s not present in FITS-IDI file' % antenna_name)
-        skip_values(infp)
         return
     keys = dict(keys[0])
 

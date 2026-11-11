@@ -43,9 +43,12 @@ def s_number(scanner, token):
 
 def s_angle(scanner, token): # also time
     l = token.split(":")
-    ## It's not python to use reduce.
-    ## But I neither remember nor care what is.
-    val = reduce(lambda acc, x: 60*acc+math.copysign(acc, float(x)), l, 0.0) 
+    # Sexagesimal: the sign is carried by the leading field (e.g. "-05:30:00").
+    sign = -1.0 if l[0].strip().startswith("-") else 1.0
+    val = 0.0
+    for x in l:
+        val = 60*val + abs(float(x))
+    val *= sign
     return ('number', val)
 
 def s_value(scanner, token):
