@@ -907,6 +907,9 @@ class VLBIObs:
         obs = obs or self._imaging_target()
         results = self._selfcal_all(obs, force=force)
         if not results:
+            # No self-calibration ran: the targets' smart-outlier pass (else at its end) goes before the split.
+            if obs.flag.smart_enabled():
+                obs.flag.smart_outliers(stage="target", force=force)
             obs.export.per_source(force=force)
         return results
 

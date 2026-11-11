@@ -357,6 +357,31 @@ def test_auto_outlier_floor_is_learnt_from_the_pooled_residuals():
     assert auto_outlier_floor([], n_sigma=5.0) == 0.0
 
 
+def test_a_rejected_fringe_solution_is_rebuilt_from_its_neighbours():
+    import numpy as np
+
+    from vlbipy.statistics import interpolate_fringe_solution
+
+    f_ref = 5.0e9
+    times = np.arange(7) * 400.0
+    rate = 2.0e-13
+    # A smooth truth: delay/dispersion drift linearly, phase advances with the rate.
+    truth = np.array([[0.7 + 2 * np.pi * f_ref * rate * t, 0.5 + 0.001 * t, rate, 0.2 - 1e-4 * t] for t in times])
+    params = truth.copy()
+    params[3] = [2.0, 40.0, 9e-12, 5.0]                           # the false detection
+    usable = np.ones(7, dtype=bool)
+    usable[3] = False
+    new = interpolate_fringe_solution(3, times, params, usable, f_ref_hz=f_ref, n_neighbours=2)
+    assert np.allclose(new[1:], truth[3, 1:])
+    assert abs(np.angle(np.exp(1j * (new[0] - truth[3, 0])))) < 1e-6
+    # Neighbours on one side only: mean of their values, no extrapolated slope.
+    one_sided = interpolate_fringe_solution(0, times, params, np.array([False, True, True, False, False, False, False]),
+                                            f_ref_hz=f_ref)
+    assert np.isclose(one_sided[1], np.mean(params[[1, 2], 1]))
+    # No good neighbour: nothing to build from.
+    assert interpolate_fringe_solution(0, times, params, np.zeros(7, dtype=bool), f_ref_hz=f_ref) is None
+
+
 def test_predict_from_previous_uses_the_median_of_up_to_three_previous_solutions():
     import numpy as np
     import pytest

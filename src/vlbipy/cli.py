@@ -10,6 +10,7 @@ flags into :class:`~vlbipy.vlbiobs.VLBIObs` namespace calls::
     vlbipy export -p RSM07 --format dask-ms                # export MS to dask-ms (lazy/distributed)
     vlbipy calibrate bandpass fringefit -p RSM07           # selected cal steps (positional)
     vlbipy flag aoflagger -p RSM07                         # selected flag steps (positional)
+    vlbipy flag smart-outliers -p RSM07 --field J1848+3219 --column corrected --dry-run  # antenna-based outliers
     vlbipy image -p RSM07 --target 3C286 --robust 0 2      # imaging
     vlbipy plot caltables uv_coverage -p RSM07             # diagnostic plots (positional kinds)
     vlbipy summary -p RSM07                                # import + summary
@@ -38,7 +39,7 @@ logger = get_logger()
 CALIBRATE_STEPS: list[str] = ["a_priori", "initial_calibration", "bandpass", "fringefit", "apply"]
 
 #: Flagging sub-steps selectable via ``vlbipy flag --steps`` (pipeline order).
-FLAG_STEPS: list[str] = ["autocorr", "edges", "quack", "tfcrop", "aoflagger"]
+FLAG_STEPS: list[str] = ["autocorr", "edges", "quack", "tfcrop", "aoflagger", "smart-outliers"]
 
 #: Plot kinds selectable via ``vlbipy plot --kinds``.
 PLOT_KINDS: list[str] = ["caltables", "caltable", "tplot", "uv_coverage", "diagnostic", "elevation",
@@ -223,6 +224,17 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"Flag step(s) to run, in order given. Choices: {', '.join(FLAG_STEPS)}. "
                              "Default: the default flag chain (autocorr, edges, quack, aoflagger)")
     p_flag.add_argument("--flagfile", help="Apply flags from an external flag command file")
+    p_flag.add_argument("--field", default="", help="smart-outliers: field name(s), comma-separated (default: every "
+                                                    "source)")
+    p_flag.add_argument("--column", choices=["data", "corrected"], default="corrected",
+                        help="smart-outliers: data column (raw 'data': phases aligned, amplitudes tested only)")
+    p_flag.add_argument("--sigma", type=float, help="smart-outliers: outlier threshold of a visibility (default 3)")
+    p_flag.add_argument("--antenna-sigma", type=float, dest="antenna_sigma",
+                        help="smart-outliers: threshold of an antenna's combined statistic (default 5)")
+    p_flag.add_argument("--no-phases", action="store_true", dest="no_phases",
+                        help="smart-outliers: test the amplitudes only (phases not calibrated on the source itself)")
+    p_flag.add_argument("--dry-run", action="store_true", dest="dry_run",
+                        help="smart-outliers: write the flag commands and report under flags/, apply nothing")
 
     p_img = sub.add_parser(
         "image", parents=[common], formatter_class=RichHelpFormatter,
@@ -516,6 +528,13 @@ def _cmd_flag(obs: VLBIObs, args: argparse.Namespace) -> int:
     if args.steps:
         for step in args.steps:
             logger.info("flag: running step {}", step)
+            if step == "smart-outliers":
+                overrides = {k: v for k, v in (("sigma", args.sigma), ("antenna_sigma", args.antenna_sigma)) if v}
+                if args.no_phases:
+                    overrides["use_phases"] = False
+                obs.flag.smart_outliers(args.field or None, stage="manual", column=args.column, dry_run=args.dry_run,
+                                        force=True, **overrides)
+                continue
             getattr(obs.flag, step)(force=args.force)
     elif not args.flagfile:
         obs.flag(force=args.force)

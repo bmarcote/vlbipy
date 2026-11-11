@@ -512,6 +512,17 @@ class FlagOps(BackendComponent):
         """Flag visibilities that break the smoothness of their own baseline."""
         raise self._unsupported("outliers")
 
+    def smart_outliers(self, project_code: str, *, fields: list[str], column: str = "data",
+                       settings: Optional[dict] = None, receivers: Optional[dict] = None, dry_run: bool = False,
+                       **kwargs) -> dict:
+        """Antenna-based outlier flagging (:mod:`difmapy.outliers`): every field modelled on its own, the antenna
+        responsible for the departures flagged over their time/frequency range.
+
+        Returns the report of :func:`vlbipy.solvers.smart_outliers.smart_outliers` plus
+        ``flagged_fraction_of_data`` when applied.
+        """
+        raise self._unsupported("smart_outliers")
+
     def from_file(self, project_code: str, flagfile: str, **kwargs) -> float:
         """Apply flags listed in an external flag-command file."""
         return self.run(project_code, "from_file", flagfile=flagfile, **kwargs)

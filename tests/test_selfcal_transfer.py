@@ -26,6 +26,7 @@ def _obs(tmp_path, *, references=("PC",), receivers=("TGT", "CHK"), inverse=Fals
                                  supports=lambda *a: False),
         _selfcal_results={},
         clean=SimpleNamespace(split_ms=lambda source, **kw: f"{source}.ms"),
+        flag=SimpleNamespace(smart_enabled=lambda: False),
         drop_gaintables=lambda steps: None,
         add_gaintable=lambda table, step: tables.append(table) or table,
     )

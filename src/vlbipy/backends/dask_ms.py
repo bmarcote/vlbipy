@@ -1273,6 +1273,42 @@ class DaskMsFlagOps(CasaFlagOps):
                                                        rows["amplitude"][group].astype(float))
         return series
 
+    def smart_outliers(self, project_code: str, *, fields: list[str], column: str = "data",
+                       settings: Optional[dict] = None, receivers: Optional[dict] = None, dry_run: bool = False,
+                       timebin: float = 15.0, channel_blocks: int = 8, full_scan_fraction: float = 0.9,
+                       **kwargs) -> dict:
+        """Antenna-based outlier flagging of ``fields`` (:func:`vlbipy.solvers.smart_outliers.smart_outliers`).
+
+        The grids are read in the solver worker pool (CORRECTED_DATA through the deferred calibration when it was
+        not written); the commands go through the native ``flagdata(mode='list')``. ``dry_run`` finds them only.
+
+        Returns
+        -------
+        dict
+            The solver report (``commands``, per-field ``fields``) and ``flagged_fraction_of_data`` (0 when dry).
+        """
+        from ..solvers.smart_outliers import smart_outliers
+        ms = self.backend.ms_path(project_code)
+        if not ms.is_dir():
+            raise BackendError(f"{project_code}: measurement set {ms} not found")
+        report = smart_outliers(ms, fields=list(fields), column=column, settings=settings, timebin=float(timebin),
+                                blocks=int(channel_blocks), receivers=receivers,
+                                full_scan_fraction=float(full_scan_fraction))
+        report["flagged_fraction_of_data"] = 0.0
+        if dry_run or not report["commands"]:
+            return report
+        before = self.flagged_fraction(project_code)
+        try:
+            self.backend.tasks.flagdata(vis=str(ms), mode="list", inpfile=report["commands"], flagbackup=False,
+                                        action="apply")
+        except RuntimeError as exc:
+            raise BackendError(f"{project_code}: applying the smart-outlier flags failed: {exc}") from exc
+        after = self.flagged_fraction(project_code)
+        report["flagged_fraction_of_data"] = max(0.0, after - before)
+        logger.info("smart outliers: {} command(s) applied, {:.2%} of the data newly flagged ({:.1%} -> {:.1%})",
+                    len(report["commands"]), report["flagged_fraction_of_data"], before, after)
+        return report
+
     def flagged_fraction(self, project_code: str, *, where: str = "") -> float:
         if where:
             return super().flagged_fraction(project_code, where=where)

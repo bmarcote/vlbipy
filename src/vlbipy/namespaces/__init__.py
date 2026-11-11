@@ -2021,10 +2021,13 @@ class FlagNamespace(Namespace):
         """Initial flagging of the calibrators before any solve (SKILL step 8).
 
         Only strong outliers are meant to go here — spikes, near-zero
-        amplitudes, clearly bad scans — so the auto-flagger runs on the raw
-        data with the default per-baseline cutoffs. Deep flagging waits until
-        the data are calibrated (see :meth:`outliers`).
+        amplitudes, clearly bad scans. With the smart flagger (:meth:`smart_outliers`, ``[flagging.smart]``,
+        dask-ms) this is its ``precal`` pass on the raw data of the fringe finders and phase calibrators;
+        otherwise the per-baseline tfcrop with its default cutoffs. Deep flagging waits until the data are
+        calibrated (see :meth:`outliers`).
         """
+        if self.smart_enabled():
+            return float(self.smart_outliers(stage="precal", force=force).get("flagged_fraction_of_data", 0.0))
         return self.tfcrop(force=force, column="data")
 
     def statistics(self) -> dict:
@@ -2073,6 +2076,9 @@ class FlagNamespace(Namespace):
                  **kwargs) -> dict:
         """Flag points that break their own baseline's smoothness (amplitude-driven).
 
+        With the smart flagger enabled (:meth:`smart_enabled`) this is its ``phasecal`` pass instead (after the
+        off-source measurement on the first pass), recorded under ``flag_smart_phasecal[_<suffix of step>]``.
+
         Run this after the full calibration is applied: on calibrated data each
         baseline should vary smoothly in time and frequency, so what stands out
         is a defect. Judging every baseline against itself keeps legitimately
@@ -2094,6 +2100,17 @@ class FlagNamespace(Namespace):
             if not dry_run:
                 obs._state.mark_complete(step)
             return {}
+        if self.smart_enabled():
+            # The smart pass replaces the per-baseline spikes on the phase-reference sources; the off-source
+            # measurement still runs first, for the faint fields the smart pass never reads.
+            if step == "flag_outliers" and not field and cfg.get("flag_off_source", True):
+                self.off_source(dry_run=dry_run)
+            smart_step = "flag_smart_phasecal" + step[len("flag_outliers"):]
+            report = self.smart_outliers(field or None, stage="phasecal", step=smart_step, dry_run=dry_run,
+                                         force=force, **kwargs)
+            if not dry_run:
+                obs._state.mark_complete(step)
+            return report
         # An antenna still slewing at the start of a scan is not a statistical outlier of one baseline
         # but one antenna pulling all of its baselines down. Found once, on the first pass: the typical
         # times given to the faint fields count from each antenna's first unflagged sample, so a second
@@ -2149,6 +2166,140 @@ class FlagNamespace(Namespace):
         except BackendError as exc:
             warnings.warn(f"{self._code}: off-source flagging failed ({exc}); continuing without it")
             return {}
+
+    #: Smart-outlier passes: stage -> (state step, data column, phases tested).
+    SMART_STAGES = {"precal": ("flag_smart_precal", "data", False),
+                    "phasecal": ("flag_smart_phasecal", "corrected", True),
+                    "target": ("flag_smart_target", "corrected", False),
+                    "manual": ("flag_smart_outliers", "corrected", True)}
+    #: ``[flagging.smart]`` keys that are not :class:`difmapy.outliers.OutlierSettings` fields.
+    SMART_OPTIONS = {"enabled", "target_phases", "timebin", "channel_blocks", "full_scan_fraction"}
+
+    def _smart_config(self) -> dict:
+        return dict(self._obs.config.get("flagging", {}).get("smart", {}) or {})
+
+    def smart_enabled(self) -> bool:
+        """Whether the pipeline flags with :meth:`smart_outliers` (``[flagging.smart].enabled`` and a backend that
+        has it: dask-ms) instead of tfcrop before the calibration and per-baseline outliers after it."""
+        if not (self._smart_config().get("enabled", True) and self._backend.supports("flag", "smart_outliers")):
+            return False
+        import importlib.util
+        if importlib.util.find_spec("difmapy") is None:          # the statistics live in difmapy
+            warnings.warn(f"{self._code}: [flagging.smart] is enabled but difmapy is not installed; the pipeline "
+                          "flags with tfcrop and the per-baseline outlier pass instead")
+            return False
+        return True
+
+    def _smart_fields(self, stage: str) -> list[str]:
+        """The fields a pass reads: calibrators (precal), phase-reference sources (phasecal; the targets
+        without phase referencing), targets and check sources (target), every source (manual)."""
+        obs = self._obs
+        with_data = list(obs.metadata.source_names) if obs.metadata else list(obs.sources.names)
+        finders = [s.name for s in obs.sources.fringe_finders]
+        calibrators = [s.name for s in obs.sources.phase_calibrators]
+        targets = [s.name for s in obs.sources.targets] + [s.name for s in getattr(obs.sources, "check_sources", [])]
+        if stage == "precal":
+            names = finders + calibrators
+        elif stage == "phasecal":
+            names = [n for n in obs.phaseref_plan().references if n not in finders] or targets
+        elif stage == "target":
+            names = targets
+        else:
+            names = with_data
+        return [n for n in dict.fromkeys(names) if n in with_data]
+
+    def smart_outliers(self, fields=None, *, stage: str = "manual", column: Optional[str] = None,
+                       step: Optional[str] = None, dry_run: bool = False, force: bool = False, **overrides) -> dict:
+        """Antenna-based outlier flagging (``vlbipy flag smart-outliers``; :mod:`difmapy.outliers`).
+
+        Every field is modelled on its own: per baseline, subband, channel block and hand the complex
+        visibilities follow a smooth trend; the departures beyond ``sigma`` are traced to the antenna common to
+        most of them, which is flagged over the time/frequency range they span (edges included), and the model
+        is fitted again until nothing new turns up. An antenna that loses (nearly) a whole scan of a phase
+        calibrator is flagged in the target scans next to it too.
+
+        Parameters
+        ----------
+        fields : str or list of str, optional
+            Field names (comma-separated); default from the stage (:meth:`_smart_fields`).
+        stage : str
+            ``precal`` (raw data of the calibrators, before any solve), ``phasecal`` (after the instrumental
+            calibration and mbd2, on the phase-reference sources), ``target`` (after self-calibration, on the
+            targets and check sources) or ``manual``. Sets the default column, whether the phases are tested
+            (not on raw data, nor on targets without phase self-calibration: ``[flagging.smart].target_phases``)
+            and the state step.
+        column : str, optional
+            ``data`` or ``corrected`` (the stage's by default).
+        step : str, optional
+            State step to record under (the stage's by default).
+        dry_run : bool
+            Find the flags, apply nothing (no state recorded).
+        **overrides
+            :class:`difmapy.outliers.OutlierSettings` fields and ``timebin`` / ``channel_blocks`` /
+            ``full_scan_fraction``, over ``[flagging.smart]``.
+
+        Returns
+        -------
+        dict
+            The backend report: ``commands``, per-field ``fields`` summaries, ``flagged_fraction_of_data``
+            (empty when skipped).
+        """
+        obs = self._obs
+        if stage not in self.SMART_STAGES:
+            raise ValueError(f"smart_outliers: stage must be one of {', '.join(self.SMART_STAGES)}, not {stage!r}")
+        default_step, default_column, phases = self.SMART_STAGES[stage]
+        step = step or default_step
+        if not dry_run and not obs._state.should_run(step, force=force):
+            return {}
+        if not self._backend.supports("flag", "smart_outliers"):
+            raise StepError(step, f"backend {self._backend.kind} has no smart outlier flagging (use dask-ms)")
+        config = {**self._smart_config(), **overrides}
+        if stage == "target":
+            phases = bool(config.get("target_phases", False))
+        names = [f.strip() for f in fields.split(",")] if isinstance(fields, str) else list(fields or [])
+        names = [n for n in names if n] or self._smart_fields(stage)
+        if not names:
+            logger.info("smart outliers [{}]: no field to flag", stage)
+            if not dry_run:
+                obs._state.mark_complete(step, outputs=[])
+            return {}
+        column = column or default_column
+        settings = {k: v for k, v in config.items() if k not in self.SMART_OPTIONS}
+        settings.setdefault("align_phases", column == "data")
+        settings.setdefault("use_phases", phases and column != "data")
+        plan = obs.phaseref_plan()
+        receivers = {} if stage == "target" else {ref: list(plan.receivers) for ref in plan.references}
+        logger.info("smart outliers [{}]: {} on {} ({} phases)", stage, column, ", ".join(names),
+                    "with" if settings["use_phases"] else "without")
+        report = self._backend.flag.smart_outliers(
+            self._code, fields=names, column=column, settings=settings, receivers=receivers, dry_run=dry_run,
+            timebin=float(config.get("timebin", 15.0)), channel_blocks=int(config.get("channel_blocks", 8)),
+            full_scan_fraction=float(config.get("full_scan_fraction", 0.9)))
+        self._record_smart(stage, report, dry_run=dry_run)
+        if not dry_run:
+            obs._state.mark_complete(step, outputs=[f"{len(report.get('commands', []))} commands"])
+        return report
+
+    def _record_smart(self, stage: str, report: dict, *, dry_run: bool) -> None:
+        """Warn about heavily flagged fields/antennas and keep the report (commands included) on disk."""
+        for name, entry in report.get("fields", {}).items():
+            if entry.get("fraction", 0.0) >= _HIGH_FLAG_FRACTION:
+                warnings.anomaly(f"{self._code}: smart outliers [{stage}] {'would flag' if dry_run else 'flagged'} "
+                                 f"{entry['fraction']:.0%} of {name}")
+            for antenna, share in entry.get("antennas", {}).items():
+                if share >= 0.5:
+                    warnings.anomaly(f"{self._code}: smart outliers [{stage}]: {antenna} loses {share:.0%} of its "
+                                     f"data on {name}")
+        if not self._backend.requires_data_files:
+            return
+        path = Path(self._obs.work_dir) / "flags" / f"{self._code}.smart_outliers.{stage}{'.dry' if dry_run else ''}.json"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(report, indent=1, default=str), encoding="utf-8")
+            logger.info("smart outliers [{}]: report and {} command(s) in {}", stage,
+                        len(report.get("commands", [])), path)
+        except OSError as exc:  # a record only: the flags are applied already
+            logger.warning("smart outliers: could not write {} ({})", path, exc)
 
     def from_file(self, path: str, *, force: bool = False) -> float:
         """Apply flags from an external flag command file."""
@@ -3417,8 +3568,8 @@ class SelfcalNamespace(Namespace):
            that already carry those amplitudes; amplitude + phase tables -> itself and the
            sources it serves (targets, check sources; the phase calibrators when inverse),
            never the fringe finders;
-        3. apply the whole chain to every field, then re-split every source (and
-           UVFITS) so imaging sees the final calibration.
+        3. apply the whole chain to every field, flag the targets' outliers (the smart flagger's ``target``
+           pass, when enabled), then re-split every source (and UVFITS) so imaging sees the final calibration.
 
         Each calibrator is re-calibrated and re-split on its own just before its
         session, so it sees the gains of the ones before it: its table is then a
@@ -3466,6 +3617,9 @@ class SelfcalNamespace(Namespace):
                           "the self-calibration went on without it")
         if results:
             obs.calibrate.apply(force=True)
+            # The targets carry their final calibration now: their own outliers go before the split.
+            if obs.flag.smart_enabled():
+                obs.flag.smart_outliers(stage="target", force=force)
             obs.export.per_source(force=True)
             if emerlin_antennas(obs):
                 obs.calibrate.emerlin_check(stage="selfcal")

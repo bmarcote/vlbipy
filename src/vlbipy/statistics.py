@@ -10,6 +10,8 @@ detection after bandpass calibration.
 """
 from __future__ import annotations
 
+from typing import Optional
+
 import numpy as np
 
 #: Scale factor converting a median absolute deviation into a Gaussian-equivalent sigma.
@@ -258,6 +260,62 @@ def residuals_in_time(values: np.ndarray, times: np.ndarray, *, window: float,
         if int(inside.sum()) < max(1, int(min_points)):
             continue
         out[index] = series[index] - np.median(series[inside])
+    return out
+
+
+def interpolate_fringe_solution(index: int, times: np.ndarray, params: np.ndarray, usable: np.ndarray,
+                                *, f_ref_hz: float, n_neighbours: int = 2) -> Optional[np.ndarray]:
+    """Rebuild one fringe solution from the nearest good ones before and after it.
+
+    The replacement follows how the apply step interpolates a fringe table: the
+    delay, rate and dispersive term are interpolated linearly in time (a straight-line
+    fit through up to ``n_neighbours`` usable solutions on each side, which is the
+    linear interpolation for one on each side; with neighbours on one side only their
+    mean is used, never an extrapolated slope), and the phase is the argument of the
+    distance-weighted mean of the neighbours' unit phasors, each advanced to the time
+    of the solution with its own rate, so it does not depend on how many turns apart
+    the neighbours are.
+
+    Parameters
+    ----------
+    index : int
+        Position of the solution to rebuild in the time-ordered series.
+    times : numpy.ndarray
+        Solution times [s], ascending, shape ``(n,)``.
+    params : numpy.ndarray
+        ``(phase [rad], delay, rate [s/s], dispersive)`` per solution, shape ``(n, 4)``.
+    usable : numpy.ndarray
+        Boolean mask of the solutions that may serve as neighbours (unflagged and not
+        themselves rejected).
+    f_ref_hz : float
+        Reference frequency the rate multiplies to advance the phase [Hz].
+    n_neighbours : int
+        Number of usable neighbours taken on each side.
+
+    Returns
+    -------
+    numpy.ndarray or None
+        The four replacement parameters, or ``None`` when no usable neighbour exists.
+    """
+    times = np.asarray(times, dtype=float)
+    params = np.asarray(params, dtype=float)
+    usable = np.asarray(usable, dtype=bool)
+    count = max(1, int(n_neighbours))
+    before = [j for j in range(index - 1, -1, -1) if usable[j]][:count]
+    after = [j for j in range(index + 1, times.size) if usable[j]][:count]
+    chosen = before + after
+    if not chosen:
+        return None
+    offsets = times[chosen] - times[index]
+    out = np.empty(4, dtype=float)
+    for k in (1, 2, 3):
+        if before and after and len(chosen) >= 2:
+            out[k] = float(np.polyfit(offsets, params[chosen, k], 1)[1])     # value at the solution time
+        else:
+            out[k] = float(np.mean(params[chosen, k]))
+    advanced = params[chosen, 0] - 2.0 * np.pi * float(f_ref_hz) * params[chosen, 2] * offsets
+    weight = 1.0 / np.maximum(np.abs(offsets), 1e-6)
+    out[0] = float(np.angle(np.sum(weight * np.exp(1j * advanced))))
     return out
 
 

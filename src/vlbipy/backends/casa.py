@@ -2763,13 +2763,15 @@ class CasaCalibrationOps(CalibrationOps):
                       smoothtype: str = "median", parameters: tuple = FRINGE_SMOOTH_PARAMETERS,
                       min_points: int = 4, outlier_sigma: float = 5.0,
                       outlier_floor: Optional[dict] = None, auto_floor_sigma: float = 5.0,
+                      outlier_action: str = "interpolate", n_neighbours: int = 2,
                       metadata: Optional[ObsMetadata] = None,
                       **kwargs) -> CalTable:
         """Clean a fringe table in time (outlier rejection, optionally smoothing); return the copy to apply.
 
         ``mode="clip"`` (default) works like AIPS ``SNSMO`` with only its clipping
         stage: a solution whose delay or rate departs from the local median by more
-        than the threshold is flagged, and **every other solution keeps its own
+        than the threshold is rejected (by default *replaced* by a solution
+        interpolated from the nearest good ones, see ``outlier_action``), and **every other solution keeps its own
         measured values**. The delay, rate and phase of a fringe solution are
         mutually consistent (the rate extrapolates the phase from the solution
         time), and the residual rate is *not* a slowly varying quantity: it carries
@@ -2818,6 +2820,14 @@ class CasaCalibrationOps(CalibrationOps):
             Missing names are ``"auto"``.
         auto_floor_sigma : float
             Multiple of the pooled residual scatter used for an ``"auto"`` floor.
+        outlier_action : str
+            ``"interpolate"`` (default) replaces a rejected solution by one interpolated
+            from up to ``n_neighbours`` good solutions on each side of it (delay, rate and
+            dispersion linearly, phase from the rate-advanced neighbours), so the target
+            data it brackets are kept; it stays flagged only when no good neighbour exists.
+            ``"flag"`` flags it instead, which also flags the data around it when applied.
+        n_neighbours : int
+            Good solutions used on each side for the interpolation.
         metadata : ObsMetadata, optional
             Unused; accepted so the call site can forward it like the other steps.
 
@@ -2829,7 +2839,8 @@ class CasaCalibrationOps(CalibrationOps):
             field mapping, interpolation and spw map. The input table is returned
             unchanged when nothing was changed or flagged.
         """
-        from ..statistics import auto_outlier_floor, outliers_in_time, residuals_in_time, smooth_in_time
+        from ..statistics import (auto_outlier_floor, interpolate_fringe_solution, outliers_in_time,
+                                  residuals_in_time, smooth_in_time)
 
         mode = str(mode).lower()
         if mode not in ("clip", "smooth", "none"):
@@ -2852,6 +2863,18 @@ class CasaCalibrationOps(CalibrationOps):
         shutil.copytree(source, target)
 
         requested = dict(outlier_floor or {})
+        action = str(outlier_action).lower()
+        if action not in ("interpolate", "flag"):
+            raise BackendError(f"{project_code}: outlier_action must be 'interpolate' or 'flag', got {outlier_action!r}")
+        f_ref_by_spw = {}
+        sub = self.backend.tools.table()
+        if sub.open(str(target / "SPECTRAL_WINDOW")):
+            try:
+                chan_freq = np.asarray(sub.getcol("CHAN_FREQ"), dtype=float)     # (nchan, nspw)
+                for spw_index in range(chan_freq.shape[1]):
+                    f_ref_by_spw[spw_index] = float(chan_freq[chan_freq.shape[0] // 2, spw_index])
+            finally:
+                sub.close()
 
         handle = self.backend.tools.table()
         if not handle.open(str(target), nomodify=False):
@@ -2863,6 +2886,10 @@ class CasaCalibrationOps(CalibrationOps):
             antenna_ids = np.asarray(handle.getcol("ANTENNA1"))
             spw_ids = np.asarray(handle.getcol("SPECTRAL_WINDOW_ID"))
             field_ids = np.asarray(handle.getcol("FIELD_ID"))
+            try:
+                formal = np.asarray(handle.getcol("PARAMERR")).astype(float)
+            except Exception:  # noqa: BLE001 - older tables carry no formal errors
+                formal = None
             n_param = values.shape[0]
             stride = 4 if n_param % 4 == 0 else n_param
             n_pol = max(1, n_param // stride)
@@ -2882,7 +2909,7 @@ class CasaCalibrationOps(CalibrationOps):
                         eff_window = max(float(window), (max(1, int(min_points)) + 1) * spacing)
                         for pol in range(n_pol):
                             for channel in range(values.shape[1]):
-                                series_list.append((order, pol, channel, eff_window))
+                                series_list.append((order, pol, channel, eff_window, int(spw)))
 
             def column(order, pol, channel, name):
                 index = pol * stride + offsets[name]
@@ -2898,12 +2925,21 @@ class CasaCalibrationOps(CalibrationOps):
                     if setting.lower() != "auto":
                         raise BackendError(f"{project_code}: outlier_floor.{name} must be a number or 'auto'")
                     residuals = []
-                    for order, pol, channel, eff in series_list:
+                    for order, pol, channel, eff, _spw in series_list:
                         index, series = column(order, pol, channel, name)
                         if index < n_param:
                             residuals.append(residuals_in_time(series, times[order], window=eff,
                                                                min_points=min_points))
                     floors[name] = auto_outlier_floor(residuals, n_sigma=auto_floor_sigma)
+                    # Never below a few formal errors of the solver: a residual (second-pass) fit
+                    # can scatter far less than its own measurement uncertainty, and a departure
+                    # smaller than that is not an outlier but noise.
+                    if formal is not None and formal.shape == values.shape:
+                        errs = np.concatenate([formal[pol * stride + offsets[name]][~flags[pol * stride + offsets[name]]]
+                                               for pol in range(n_pol) if pol * stride + offsets[name] < n_param])
+                        errs = errs[np.isfinite(errs) & (errs > 0)]
+                        if errs.size:
+                            floors[name] = max(floors[name], auto_floor_sigma * float(np.median(errs)))
                     source_note = "auto"
                 else:
                     floors[name] = float(setting)
@@ -2911,8 +2947,8 @@ class CasaCalibrationOps(CalibrationOps):
                 logger.info("smooth_fringe[{}]: outlier floor {} = {:.3g} ({})", table.cal_type, name,
                             floors[name], source_note)
 
-            n_changed, n_total, n_rejected = 0, 0, 0
-            for order, pol, channel, eff in series_list:
+            n_changed, n_total, n_rejected, n_interpolated = 0, 0, 0, 0
+            for order, pol, channel, eff, spw_id in series_list:
                 first, last = pol * stride, min(n_param, (pol + 1) * stride)
                 bad = np.zeros(order.size, dtype=bool)
                 for name in offsets:
@@ -2922,8 +2958,27 @@ class CasaCalibrationOps(CalibrationOps):
                     bad |= outliers_in_time(series, times[order], window=eff, threshold=outlier_sigma,
                                             min_points=min_points, floor=floors[name])
                 if bad.any():
-                    flags[first:last, channel, order[bad]] = True
                     n_rejected += int(bad.sum())
+                    if action == "interpolate" and last - first == 4 and spw_id in f_ref_by_spw:
+                        block = values[first:last, channel, order].T            # (n, 4) original values
+                        usable = ~flags[first, channel, order] & ~bad
+                        replaced = {}
+                        for position in np.flatnonzero(bad):
+                            if flags[first, channel, order[position]]:
+                                continue
+                            new = interpolate_fringe_solution(
+                                int(position), times[order], block, usable,
+                                f_ref_hz=f_ref_by_spw[spw_id], n_neighbours=n_neighbours)
+                            if new is not None:
+                                replaced[position] = new
+                        for position, new in replaced.items():
+                            values[first:last, channel, order[position]] = new
+                            n_interpolated += 1
+                        for position in np.flatnonzero(bad):
+                            if position not in replaced:
+                                flags[first:last, channel, order[position]] = True
+                    else:
+                        flags[first:last, channel, order[bad]] = True
                 for name in offsets:
                     index, series = column(order, pol, channel, name)
                     if index >= n_param:
@@ -2942,10 +2997,11 @@ class CasaCalibrationOps(CalibrationOps):
         finally:
             handle.close()
 
-        logger.info("smooth_fringe[{}]: mode={}; {} outlier solution(s) flagged (> {:g} sigma and above the "
-                    "floor); {} of {} {} value(s) replaced by a {:g} s {} -> {}", table.cal_type, mode,
-                    n_rejected, outlier_sigma, n_changed, n_total, "/".join(offsets), window, smoothtype,
-                    target.name)
+        logger.info("smooth_fringe[{}]: mode={}; {} outlier solution(s) rejected (> {:g} sigma and above the "
+                    "floor), {} replaced by interpolation from {} neighbour(s) per side, the rest flagged; "
+                    "{} of {} {} value(s) replaced by a {:g} s {} -> {}", table.cal_type, mode,
+                    n_rejected, outlier_sigma, n_interpolated, n_neighbours, n_changed, n_total,
+                    "/".join(offsets), window, smoothtype, target.name)
         if not n_total:
             warnings.warn(f"{project_code}: the {table.cal_type} table has no unflagged solution to "
                           "check; applying it unchanged")

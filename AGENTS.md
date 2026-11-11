@@ -121,3 +121,24 @@ wrong, copy the reviewed rows to `data/ai/CODE.features.jsonl` and run `vlbipy a
 - difmap (and difmapy, an exact port of `ob_select`) flags an IF average when any selected channel in it is
   flagged: load channel-averaged (`freqavg="all"`, as the imaging and self-cal paths do) or select the
   unflagged channels.
+
+## Smart outlier flagging (2026-11-11) (solvers/smart_outliers.py, difmapy.outliers)
+
+- `vlbipy flag smart-outliers [--field F --column data|corrected --sigma --antenna-sigma --no-phases --dry-run]`,
+  `FlagNamespace.smart_outliers(stage=precal|phasecal|target|manual)`; `DaskMsFlagOps.smart_outliers` only (other
+  backends: `smart_enabled()` False, the pipeline keeps tfcrop / per-baseline outliers). Statistics live in
+  difmapy (`difmapy.outliers`, also behind difmapy Shift+S); this side bins the MS (worker jobs over row blocks,
+  parallel hands, CORRECTED through the deferred view) and turns masks into `flagdata(mode="list")` commands.
+- Pipeline: `flag.initial` -> stage precal (raw FF+PC, `align_phases`, amplitudes only); `flag.outliers` ->
+  off_source (first pass) + stage phasecal on `phaseref_plan().references` (targets without phase referencing),
+  phases tested; steps `flag_smart_phasecal[_reweighted]`; stage target (targets + check sources, amplitudes only
+  unless `target_phases`) in `SelfcalNamespace.run_all` before `export.per_source`, or in `_selfcal_then_split`
+  when self-cal produced nothing. Steps are in `STEP_ORDER`. Reports: `flags/<code>.smart_outliers.<stage>.json`.
+- Superseded when enabled: tfcrop (initial) and the per-baseline spike pass of `flag.outliers`. Kept: a-priori,
+  autocorr, quack (targets are too faint for the smart pass to see their slews), weak polarizations, band edges,
+  off_source (transfers the slew times to faint fields), AI distribution flags.
+- RSM07 (2026-11-11): raw FF 3.7% / PC 1.5% (WB slews at scan starts), corrected PC 2.9%, target 13% (WB still
+  off source at most target scan starts after the old pipeline, HH at low elevation). A second pass on the flagged
+  MS finds 0-0.03%. Floors matter: phases of calibrated data still wander 10-20 deg; a 3-deg tolerance flagged 34%.
+- Raw/target phases are never tested: antenna-coherent phase wander is atmosphere, not a defect, and the antenna
+  statistic is built to find antenna-coherent departures.

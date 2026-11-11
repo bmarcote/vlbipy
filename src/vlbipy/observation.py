@@ -45,12 +45,13 @@ PROJECT_FILENAME = ".project.json"
 #: in and use the same names the steps record themselves under.
 STEP_ORDER = [
     "import_data", "ai_prediagnostic", "a_priori", "flag_apriori", "flag_from_file", "flag_autocorr",
-    "plot_raw", "flag_quack", "flag_tfcrop",
+    "plot_raw", "flag_quack", "flag_tfcrop", "flag_smart_precal",
     "scan_snr", "initial_calibration", "fringefit", "bandpass",
     "initial_calibration_sbd2", "fringefit_mbd2", "flag_edges",
-    "apply", "flag_aoflagger", "flag_outliers",
-    "second_pass", "scalar_bandpass", "reweight", "flag_outliers_reweighted", "third_pass",
-    "flag_edges_final", "emerlin_scale", "ai_flag_distribution", "split", "model_pass",
+    "apply", "flag_aoflagger", "flag_outliers", "flag_smart_phasecal",
+    "second_pass", "scalar_bandpass", "reweight", "flag_outliers_reweighted", "flag_smart_phasecal_reweighted",
+    "third_pass", "flag_edges_final", "emerlin_scale", "ai_flag_distribution", "flag_smart_target", "split",
+    "model_pass",
 ]
 
 
