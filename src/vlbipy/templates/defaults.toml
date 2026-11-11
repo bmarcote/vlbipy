@@ -183,7 +183,8 @@ prior_rate_window = 1e-12    # is solved again with the fringe peak also searche
 # ratewindow = [-50, 50]     # the same for the rate, in mHz
 
 # Outlier rejection on the fringe (MBD, MBD2, ...) solutions, like the clipping stage of AIPS SNSMO
-# (CPARM). A false fringe-fit detection (wrong peak on a weak antenna) is flagged; every other
+# (CPARM). A false fringe-fit detection (wrong peak on a weak antenna) is replaced by an interpolation of
+# its good neighbours (or flagged, outlier_action = "flag"); every other
 # solution keeps its own measured delay, rate and phase. The rate extrapolates the phase between
 # solutions and carries real structure on the scale of a few scans, so it must NOT be replaced by a
 # long-window average. The cleaned copy (<code>.mbd_smooth) is what gets applied; the solved table
@@ -202,6 +203,10 @@ outlier_sigma = 5.0          # flag a solution whose delay or rate departs from 
 auto_floor_sigma = 5.0       # ...and by more than the floor below; for "auto" the floor is this many
                              # times the pooled (all antennas/subbands/fields) scatter of the
                              # leave-one-out residuals, i.e. learnt from the data.
+outlier_action = "interpolate"   # what to do with a rejected solution: "interpolate" replaces it by one
+                             # interpolated from the nearest good solutions (so the target data it
+                             # brackets are kept); "flag" flags it (and the data around it)
+n_neighbours = 2             # good solutions used on each side for the interpolation
 outlier_floor = { delay = "auto", rate = "auto" }   # minimum departure flagged: "auto" or a number
                              # (ns for the delay, s/s for the rate). AIPS SNSMO equivalents:
                              # delay = 20.0 (CPARM(9)), rate = 2e-12 (CPARM(8) = 10 mHz at ~5 GHz).
