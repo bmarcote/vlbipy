@@ -12,7 +12,7 @@ The sequence for a calibrator follows the standard interactive difmap session:
    ``min_improvement`` and no more than ``max_bad_fraction`` of the solutions
    may fail - and rejected steps are reverted (the observation is cloned
    before each attempt). The model is re-fitted after every accepted step;
-4. **amplitude calibration** with the Bayesian gscale (``bayes_gscale``), which
+4. **amplitude calibration** with the Bayesian gscale (``gscale(bayes=True)``), which
    compares source models, leaves each station out in turn and shrinks the
    corrections towards the a-priori calibration;
 5. **visibility-domain model fitting**, starting with one circular Gaussian; the fitted model plus untouched
@@ -108,7 +108,7 @@ def load(split_ms: str, *, robust: float = 0.0, mapsize: Optional[int] = None,
     The map size defaults to difmapy's ``auto_mapsize`` (resolution / 10 per pixel).
     ``average_channels`` collapses every IF to one channel while loading: difmapy
     images and self-calibrates per IF anyway, and the copies its self-cal makes
-    (one per ``bayes_gscale`` thread) are then that many times smaller.
+    (one per thread of the Bayesian ``gscale``) are then that many times smaller.
     """
     difmapy = _load_difmapy()
     obs = difmapy.load(str(split_ms), freqavg="all") if average_channels else difmapy.load(str(split_ms))
@@ -219,10 +219,10 @@ def amplitude_calibration(obs, prefix: str, parent_ms: str, *, models=("current"
     if not allow_clean:
         models = tuple(model for model in models if not str(getattr(model, "kind", model)).strip().lower().startswith("clean"))
         models = models or ("current", "gauss1", "gauss2", "gauss3")
-    result = obs.bayes_gscale(models=models, prior_sigma=prior_sigma, prefix=str(prefix), per_if=per_if,
-                              if_sigma=if_sigma if per_if and if_sigma else None, fixed=list(fixed) or None,
-                              outformat="CASA", ms=str(parent_ms), workers=workers, plot=False, quiet=False,
-                              verbose=False)
+    result = obs.gscale(bayes=True, models=models, prior_sigma=prior_sigma, prefix=str(prefix), per_if=per_if,
+                        if_sigma=if_sigma if per_if and if_sigma else None, fixed=list(fixed) or None,
+                        outformat="CASA", ms=str(parent_ms), workers=workers, plot=False, quiet=False,
+                        verbose=False)
     raw_files = dict(getattr(result, "files", {}) or {})
     files = {k: [str(x) for x in v] if isinstance(v, (list, tuple)) else str(v) for k, v in raw_files.items()}
     table = files.get("caltable") or files.get("casa") or f"{prefix}.G"
@@ -233,7 +233,7 @@ def amplitude_calibration(obs, prefix: str, parent_ms: str, *, models=("current"
         summary["report"] = result.to_dict()
     except Exception:  # noqa: BLE001 - the JSON report on disk has the details anyway
         summary["report"] = {}
-    logger.info("difmapy bayes_gscale: best model {}; table {}", summary["best_model"], table)
+    logger.info("difmapy Bayesian gscale: best model {}; table {}", summary["best_model"], table)
     return summary
 
 
@@ -862,10 +862,10 @@ def refine_against_model(split_ms: str, parent_ms: str, prefix: str, model_path:
         trial = obs.copy()
         trial._replace_model([{**component, "freepar": 0} for component in trial.model])
         before = float(trial.moddif()["chisq"])
-        result = trial.bayes_gscale(models=("current",), prior_sigma=prior_sigma, outlier_sigma=outlier_sigma,
-                                     model_sigma=model_sigma, workers=workers, nloop=0, apply=True,
-                                     prefix=f"{prefix}.amp", outformat="CASA", ms=str(parent_ms), plot=False, quiet=False,
-                                     verbose=False)
+        result = trial.gscale(bayes=True, models=("current",), prior_sigma=prior_sigma, outlier_sigma=outlier_sigma,
+                              model_sigma=model_sigma, workers=workers, nloop=0, apply=True,
+                              prefix=f"{prefix}.amp", outformat="CASA", ms=str(parent_ms), plot=False, quiet=False,
+                              verbose=False)
         amplitude_files = dict(getattr(result, "files", {}) or {})
         after = float(trial.moddif()["chisq"])
         accepted = math.isfinite(after) and before > 0 and (before - after) / before >= min_improvement

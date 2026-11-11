@@ -110,7 +110,8 @@ class ModelfitObservation:
     def selfcal(self, **kwargs):
         return {"fit_before": {"chisq": 2.0}, "fit_after": {"chisq": 1.0}, "nbins": 10, "nbadsol": 0}
 
-    def bayes_gscale(self, models=None, **kwargs):
+    def gscale(self, bayes=False, models=None, **kwargs):
+        assert bayes, "only the Bayesian gscale is used"
         self.calls["bayes_models"] = tuple(models)
         self.calls["bayes_kwargs"] = kwargs
         return SimpleNamespace(files={"caltable": "out.G"}, best_model="gauss1", summary=lambda: "summary",
@@ -365,18 +366,16 @@ class FixedModelObservation(ModelfitObservation):
         self.model = components
         self.calls["frozen"] = components
 
-    def bayes_gscale(self, **kwargs):
-        """Apply a synthetic Bayesian correction and expose station diagnostics."""
+    def gscale(self, bayes=False, **kwargs):
+        """Apply a synthetic Bayesian correction and expose station diagnostics; the old unconstrained (plain) gscale is forbidden."""
+        if not bayes:
+            raise AssertionError("plain gscale is not permitted")
         self.calls["bayes_kwargs"] = kwargs
         self.chisq = self.after
         rows = [{"station": "EF", "correction": 1.1, "has_data": True},
                 {"station": "WB", "correction": 2.0, "has_data": False},
                 {"station": "BAD", "correction": math.nan, "has_data": True}]
         return SimpleNamespace(files={"json": "trial.amp.json"}, station_table=lambda: rows)
-
-    def gscale(self, **kwargs):
-        """Forbid the old unconstrained amplitude calibration route."""
-        raise AssertionError("plain gscale is not permitted")
 
     def savecaltable(self, path, **kwargs):
         """Capture which observation exported the accumulated corrections."""

@@ -12,7 +12,7 @@ that day. :func:`combine_epochs` uses all of them together:
    model, scaled back to the epoch's own flux density; the resulting gains go
    into that epoch's calibration chain as one more table (``joint_<source>``),
    applied to the same fields as the calibrator's own self-calibration. The
-   phase ladder first, then the station amplitudes with ``bayes_gscale``
+   phase ladder first, then the station amplitudes with ``gscale(bayes=True)``
    against the same fixed model: a calibrator that one track models poorly
    gives amplitude corrections that absorb its structure, and the joint model
    puts every epoch on the same one. Only stations clearly off are corrected

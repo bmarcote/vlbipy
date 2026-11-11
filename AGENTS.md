@@ -103,7 +103,7 @@ wrong, copy the reviewed rows to `data/ai/CODE.features.jsonl` and run `vlbipy a
   (`*.ICL001`). The step solves the phases, then one amplitude gain per antenna, subband and hand over all 3C286
   scans, on the baselines among the outstations and Jb (Jb solved too; `hold_reference` keeps it at 1), against
   the model scaled to Perley-Butler 2017 per channel; subbands without e-MERLIN data take the nearest one's
-  (`spwmap`). Self-calibration then holds the amplitudes of those antennas (`bayes_gscale(fixed=)`: no correction,
+  (`spwmap`). Self-calibration then holds the amplitudes of those antennas (`gscale(bayes=True, fixed=)`: no correction,
   and they hold each IF's flux scale) while their phases solve - difmap's `selfant` fix would hold the phases too.
   `emerlin_check` compares the calibrated 3C286 amplitudes with the model per antenna, subband and hand after the
   step and after self-calibration (`emerlin_check_<stage>.json`). The native setjy had read FITS models with
