@@ -755,14 +755,15 @@ def source_comments(context: dict) -> list[dict]:
         images = [image for image in entry.get("images") or [] if _finite(image.get("peak")) is not None]
         data = {"kind": "source", "source": entry.get("source", ""), "role": role,
                 "detected": bool(search.get("detected")) if search else None, "snr": None, "snr_label": "",
-                "flux": None, "flux_label": "", "offset_mas": _finite((search or {}).get("offset_mas"))}
+                "flux": None, "flux_label": "", "peak": None, "peak_label": "", "offset_mas": _finite((search or {}).get("offset_mas"))}
         if search:
             parts.append(_search_text(search, with_peak=not images))
             if not search.get("detected"):
                 severity = "warning"
             data.update(snr=_finite(search.get("snr")), snr_label="peak SNR in the search map")
             if _finite(search.get("peak")) is not None:
-                data.update(flux=_finite(search.get("peak")), flux_label="peak in the search map (Jy/beam)")
+                data.update(flux=_finite(search.get("peak")), flux_label="peak in the search map (Jy/beam)",
+                            peak=_finite(search.get("peak")), peak_label="peak in the search map (Jy/beam)")
         if images:
             image = next((i for i in images if _finite(i.get("robust")) == 0.0), images[0])
             peak, rms, dynamic = _finite(image["peak"]), _finite(image.get("rms")), _finite(image.get("dynamic_range"))
@@ -773,6 +774,8 @@ def source_comments(context: dict) -> list[dict]:
                 data.update(flux=model_flux, flux_label="total flux density of the model (Jy)")
             elif peak is not None:
                 data.update(flux=peak, flux_label="image peak (Jy/beam)")
+            if peak is not None:
+                data.update(peak=peak, peak_label=f"peak of the robust {float(image.get('robust') or 0.0):g} image (Jy/beam)")
             text = f"CLEAN image (robust {float(image.get('robust') or 0.0):g}): peak {format_flux(peak)}/beam"
             text += f", rms {format_flux(rms)}/beam" if rms is not None else ""
             if dynamic is not None:

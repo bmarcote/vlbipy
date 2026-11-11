@@ -772,17 +772,24 @@ def test_result_and_flagging_boxes_carry_the_numbers(tmp_path):
                 "data": {"kind": "flagging", "fraction": 0.686, "without": 0.5, "excluded": ["O8"]}},
                {"severity": "note", "category": "result", "antenna": "", "text": "PC (phasecal): fine.",
                 "data": {"kind": "source", "source": "PC", "role": "phasecal", "detected": True, "snr": 2175.0,
-                         "snr_label": "SNR (robust 0 image)", "flux": 0.812,
+                         "snr_label": "SNR (robust 0 image)", "flux": 0.812, "peak": 0.5,
                          "flux_label": "total flux density of the model (Jy)", "offset_mas": 1.25}},
                {"severity": "warning", "category": "result", "antenna": "", "text": "TGT (target): not detected.",
                 "data": {"kind": "source", "source": "TGT", "role": "target", "detected": False, "snr": 4.2,
-                         "snr_label": "peak SNR in the search map", "flux": None, "flux_label": "", "offset_mas": None}}]}
+                         "snr_label": "peak SNR in the search map", "flux": None, "flux_label": "", "peak": 0.002, "offset_mas": None}},
+               {"severity": "note", "category": "result", "antenna": "", "text": "X: marginal.",
+                "data": {"kind": "source", "source": "X", "role": "target", "detected": False, "snr": 4.2,
+                         "snr_label": "peak SNR in the search map", "peak": 0.0031, "offset_mas": None}}]}
+    ctx["sources"].append({"name": "X", "type": "target"})
     results = _results_section(ctx)
     assert results.index(">TGT</div>") < results.index(">PC</div>")                  # source-table order
-    assert '<div class="big">2175</div><div class="sub">SNR (robust 0 image)</div>' in results
+    assert ('<div class="big">500<span class="unit">mJy/beam</span></div>'
+            '<div class="snrline"><b>2175</b> SNR (robust 0 image)</div>') in results
+    assert '<div class="big">-</div><div class="snrline"><b>2</b>' not in results      # TGT: SNR 4.2 -> orange, not "-"
+    assert '<div class="big orange">3.1<span class="unit">mJy/beam</span></div>' in results
     assert "Estimated flux density" not in results
     assert '<div class="sub">1.2 mas offset from the phase center</div>' in results
-    assert '<div class="card warning result">' in results and '<div class="big word">not detected</div>' in results
+    assert '<div class="card warning result">' in results
     assert '<div class="kicker"><span>Target</span>' in results
     assert '<div class="kicker"><span>Phase calibrator</span></div><div class="srcname role-phasecal">PC</div>' in results
     calibration = _calibration_section(ctx)

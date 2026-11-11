@@ -1296,6 +1296,9 @@ tr.hl td{background:var(--panel2);background:color-mix(in srgb,var(--accent) 14%
 .card .kicker .chip{letter-spacing:.04em;margin:0}
 .card .big{font-size:34px;font-weight:700;line-height:1.15;font-variant-numeric:tabular-nums;margin-top:2px}
 .card .big.word{font-size:22px}
+.card .big.orange,.card.warning .big.orange{color:var(--role-tg)}
+.card .snrline{font-size:15px;color:var(--muted);margin-top:1px}
+.card .snrline b{font-weight:700;font-variant-numeric:tabular-nums}
 .card .big .unit{font-size:15px;font-weight:600;color:var(--muted);margin:0 2px}
 .card .sub{color:var(--muted);font-size:12.5px}
 .card .srctitle{font-size:15px;margin:2px 0}
@@ -2011,6 +2014,10 @@ def _calibration_card(comment: dict, roles: dict) -> str:
     return _card(severity, "Calibration", f'<p class="text">{escape(text)}</p>')
 
 
+#: Peak brightness of a source box: shown as "-" below this SNR, orange below ``RESULT_SOLID_SNR``.
+RESULT_MIN_SNR, RESULT_SOLID_SNR = 3.0, 6.0
+
+
 def _result_card(comment: dict, roles: dict) -> str:
     """The box of one source: its type as the title, its name, the image SNR and the summary sentence.
 
@@ -2021,13 +2028,28 @@ def _result_card(comment: dict, roles: dict) -> str:
     if data.get("kind") != "source":
         return _card(severity, "Result", f'<p class="text">{escape(text)}</p>')
     name, role = str(data.get("source") or ""), str(data.get("role") or roles.get(data.get("source"), "other"))
-    snr = _finite_or_none(data.get("snr"))
-    if data.get("detected") is False:
+    snr, peak = _finite_or_none(data.get("snr")), _finite_or_none(data.get("peak"))
+    if snr is None and data.get("detected") is False:
         figure = '<div class="big word">not detected</div>'
-    elif snr is not None:
-        figure = f'<div class="big">{snr:.0f}</div><div class="sub">{escape(str(data.get("snr_label") or "SNR"))}</div>'
-    else:
+    elif snr is None and peak is None:
         figure = ""
+    else:
+        # Peak brightness first, the SNR under it on a smaller scale. Below SNR 3 the brightness is not
+        # trusted and shown as "-"; between 3 and 6 it is orange.
+        if snr is not None and snr < RESULT_MIN_SNR:
+            value = "-"
+        elif peak is not None:
+            mjy = 1e3 * peak
+            value = f"{mjy:.0f}" if abs(mjy) >= 100 else f"{mjy:.3g}"
+            value += '<span class="unit">mJy/beam</span>'
+        else:
+            value = ""
+        marginal = " orange" if snr is not None and RESULT_MIN_SNR <= snr < RESULT_SOLID_SNR else ""
+        figure = f'<div class="big{marginal}">{value}</div>' if value else ""
+        if snr is not None:
+            label = escape(str(data.get("snr_label") or "SNR"))
+            snr_text = f"{snr:.1f}" if snr < 10 else f"{snr:.0f}"
+            figure += f'<div class="snrline"><b>{snr_text}</b> {label}</div>'
     offset = _finite_or_none(data.get("offset_mas"))
     where = (f'<div class="sub">{offset:.1f} mas offset from the phase center</div>'
              if offset and data.get("detected") is not False else "")
@@ -2755,8 +2777,9 @@ def render_final_data(ctx: dict, html_dir: Path, plot_root: Path, image_root: Pa
     if any(by_source.get(None) for _, _, by_source in grouped) or images_by_source.get(None):
         tabs.append((None, "All sources"))
     summary = _section("results", "Results", _results_section(ctx),
-                       f"Every imaged source: the SNR of its CLEAN image (peak / rms; else the peak SNR of the search "
-                       f"map), detected above {SOURCE_DETECTION_SIGMA:g} sigma in the search map.")
+                       f"Every imaged source: its peak brightness (mJy/beam) with the SNR of its CLEAN image under it (peak / rms; "
+                       f"else the search map's). The brightness is '-' below SNR {RESULT_MIN_SNR:g} and orange below "
+                       f"{RESULT_SOLID_SNR:g}; detected above {SOURCE_DETECTION_SIGMA:g} sigma in the search map.")
     if not tabs:
         body = summary + _section("final", "Per-source products",
                                   '<p class="empty">No final data products available yet.</p>',

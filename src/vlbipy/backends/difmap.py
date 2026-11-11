@@ -976,7 +976,7 @@ def locate_source(obs, imagename: str, *, search_fov_mas: float = 1000.0, search
     if not search_fov_mas or search_fov_mas <= 0:
         return {}, (0.0, 0.0)
     search = find_peak(obs, fov_mas=float(search_fov_mas), threshold_sigma=float(search_sigma),
-                       fits_path=f"{imagename}.search.fits" if imagename else "")
+                       fits_path="")     # the dirty search map is not kept on disk
     beam = float(max(obs.estimated_beam[:2]))
     offset = math.hypot(search["x"], search["y"])
     beams = offset / beam if beam > 0 else 0.0
@@ -1010,7 +1010,7 @@ def image_source(split_ms: str, imagename: str, *, robust_values=(-2.0, 0.0, 2.0
     file keeps the valid inner half.
 
     With ``search_fov_mas`` > 0 the source is first located (:func:`locate_source`;
-    the dirty map goes to ``<imagename>.search.fits``) and the phase centre moved
+    the dirty search map is not written to disk) and the phase centre moved
     onto it when it lies far outside the regular map. The report carries the
     search under ``"search"`` and the applied ``"shift_mas"`` (east, north).
     """
