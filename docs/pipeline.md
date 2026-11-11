@@ -155,13 +155,42 @@ using the stretch that is low on *all* of an antenna's baselines.
 
 ### `flag.initial`
 
-Initial auto-flagging of the calibrators (tfcrop, per baseline, flags never
-extended) on the raw data — strong outliers only. Deep flagging waits for
-calibrated data.
+Initial auto-flagging of the calibrators on the raw data — strong outliers
+only. On the dask-ms backend this is the `precal` pass of the smart flagger
+(below); otherwise tfcrop, per baseline, flags never extended. Deep flagging
+waits for calibrated data.
+
+### `flag.smart_outliers` (`vlbipy flag smart-outliers`)
+
+Antenna-based outlier flagging, after Cormac Reynolds' UVFND + `flagsum.py`
+recipe (statistics in `difmapy.outliers`, shared with difmapy's Shift+S
+selection). Per source, every baseline, subband, channel block and parallel
+hand is expected to follow a smooth trend in the complex plane: each time bin
+(`timebin`, 15 s, never across scans) is compared with the other bins of its
+scan, each scan with a robust local-linear trend of the source's other scans
+(hour timescale: elevation). Departures are split into an amplitude and a phase
+part; an antenna's fault moves all its baselines together, so the medians of
+those parts over its baselines (×√(2n/π)) single out the antenna responsible,
+which is flagged (`antenna_sigma`, 5) over the time and channel range of the
+fault, grown through its rising and decaying edges (`edge_sigma`). A departure
+no antenna explains is flagged on its baseline beyond `baseline_sigma`. The
+model is refitted until nothing new turns up. An antenna that loses (nearly) a
+whole phase-calibrator scan is also flagged in the target scans next to it.
+
+The pipeline runs three passes (`[flagging.smart]`, enabled by default on
+dask-ms): `precal` on the raw fringe finders and phase calibrators (instead of
+tfcrop; amplitudes only, the raw phases are aligned per scan), `phasecal` on
+the phase-reference sources after mbd2 (instead of the per-baseline outlier
+pass, which `flag.outliers` then delegates to; the off-source measurement still
+runs first, and again after reweighting), and `target` on the targets and check
+sources with their final calibration, before the split (amplitudes only unless
+`target_phases`). Each pass writes its commands and report to
+`flags/<code>.smart_outliers.<stage>.json`.
 
 ### `flag.outliers`
 
-Per-baseline robust (median/MAD) outlier flagging on calibrated amplitudes.
+Per-baseline robust (median/MAD) outlier flagging on calibrated amplitudes (the
+smart `phasecal` pass instead when the smart flagger is enabled).
 
 ### `calibrate.reweight`
 

@@ -116,19 +116,20 @@ obs.calibrate                               # a namespace lists its operations
 | `a_priori` | S5-S6 | Tsys (repaired by the AI plan) + gain curve; EOP and ACCOR for DiFX; TEC below 8 GHz |
 | `flag_apriori`, `flag_from_file`, `flag_autocorr` | S4 | observatory flags, user flag file, autocorrelations |
 | `plot_raw` | S7 | raw diagnostics: scan SNR, auto/cross spectra, time evolution |
-| `flag_quack`, `flag_tfcrop` | S4, S8 | measured or configured quack; per-baseline tfcrop on the calibrators |
+| `flag_quack`, `flag_tfcrop`, `flag_smart_precal` | S4, S8 | measured or configured quack; on the raw calibrators the smart (antenna-based) outlier pass on dask-ms, else per-baseline tfcrop |
 | `scan_snr` | S7 | fringe SNR per scan, antenna and hand |
 | `initial_calibration` | S9 | instrumental delay (SBD) on the selected scan(s) |
 | `fringefit` | S10 | global fringe fit (MBD), smoothed copy applied |
 | `bandpass`, `flag_edges` | S11 | complex bandpass; edge channels from its roll-off |
 | `initial_calibration_sbd2`, `fringefit_mbd2` | S9-S10 | SBD and MBD again on bandpass-corrected data |
-| `apply`, `flag_aoflagger`, `flag_outliers` | S12-S13 | apply; outlier flagging on calibrated data |
+| `apply`, `flag_aoflagger`, `flag_outliers`, `flag_smart_phasecal` | S12-S13 | apply; off-source flags, then outlier flagging of the calibrated data (smart pass on the phase-reference sources on dask-ms) |
 | `second_pass` | S12 | the whole chain re-solved on the cleaner data |
 | `scalar_bandpass` | S12 | one amplitude per antenna and subband, hands together |
-| `reweight`, `flag_outliers_reweighted`, `third_pass` | S14 | statwt, flag, re-solve |
+| `reweight`, `flag_outliers_reweighted`, `flag_smart_phasecal_reweighted`, `third_pass` | S14 | statwt, flag, re-solve |
 | `flag_edges_final` | S11 | final edge flags |
 | `emerlin_scale` | S17 | e-MERLIN flux scale on 3C286 (only with outstations present), then `emerlin_check` |
 | `ai_flag_distribution` | S12/S18 | distribution flags of the calibrated data |
+| `flag_smart_target` | S12 | smart outlier pass on the targets and check sources with their final calibration, before the split |
 | `split` | S16 | per-source MS + UVFITS |
 | `model_pass` | S10-S17 | re-solve against the calibrators' structure models when the phase calibrator is structured |
 
@@ -144,6 +145,7 @@ vlbipy ai -p exp                    # pre-diagnostic of the raw data + Tsys plan
 vlbipy ai tsys -p exp               # the Tsys decisions, series by series
 vlbipy ai calibrated -p exp         # residual antenna gains of the corrected data
 vlbipy ai flag --dry-run -p exp     # distribution flags: list and report only
+vlbipy flag smart-outliers -p exp --field PHASECAL --dry-run    # antenna-based outliers; report in flags/
 vlbipy ai rules -p any              # the expert rules and their evidence
 ```
 The rules decide; the shipped decision forest only reports its labels next to theirs (`vlbipy ai predict`). Every

@@ -80,6 +80,27 @@ off_source_level = 0.8       # an antenna is off source when all its baselines s
 # Seconds to quack per antenna, e.g. EF = 4. Empty = use quack_interval / measure.
 [flagging.quack_antennas]
 
+# Smart (antenna-based) outlier flagging, difmapy.outliers (dask-ms backend). Per source, every baseline,
+# subband, channel block and hand follows a smooth trend; departures are traced to the antenna common to most
+# of them and that antenna is flagged over their time/frequency range, edges included, until nothing is left.
+# The pipeline runs it on the raw calibrators before any solve (instead of tfcrop), on the phase-reference
+# sources after mbd2 (instead of the per-baseline outlier pass) and on the targets after self-calibration.
+[flagging.smart]
+enabled = true
+timebin = 15.0               # seconds per time bin (bins never straddle two scans)
+channel_blocks = 8           # channel blocks per subband
+sigma = 3.0                  # outlying visibility (1-D Gaussian sigmas)
+antenna_sigma = 5.0          # combined evidence of an antenna's baselines that flags the antenna
+edge_sigma = 1.5             # flagged regions grow while the antenna statistic stays above this
+baseline_sigma = 5.0         # an outlier no antenna explains is flagged on its baseline beyond this (0 = never)
+floor = 0.05                 # amplitude departures below this fraction of the level are never outliers
+phase_floor = 10.0           # nor phase departures below this many degrees
+scan_floor = 0.2             # nor scan levels within this fraction of the trend (gains still to self-calibrate)
+trend_minutes = 60.0         # half-width of the window the trend and the noise follow (elevation timescale)
+full_scan_fraction = 0.9     # a phase-calibrator scan an antenna loses this much of costs it the target scans
+                             # next to it
+target_phases = false        # test the targets' phases too (only once they are phase self-calibrated)
+
 # Initial auto-flagging of the calibrators (per baseline; flags are never extended).
 [flagging.tfcrop]
 timecutoff = 4.0
