@@ -97,6 +97,8 @@ SBD_DATA_PATTERNS: dict[str, list[str]] = {"before": ["raw/*.sbd_before_stage*_s
 SBD_DATA_LEGACY_PATTERNS: list[str] = ["calibrated/*.sbd_stage*_scan*.timeseries.png",
                                        "raw/*.sbd_stage*_scan*.timeseries.png"]
 
+CALIBRATOR_PLOTS_TITLE = "Calibrator amplitude and phase"
+
 #: Calibration-table plot groups: (title, blurb, glob patterns relative to <work_dir>/plots).
 CALIBRATION_GROUPS: list[tuple[str, str, list[str]]] = [
     ("Gain curves", "Gain curve per antenna divided by its DPFU (or by its peak when the DPFU is not on record), "
@@ -118,7 +120,7 @@ CALIBRATION_GROUPS: list[tuple[str, str, list[str]]] = [
     (SNR_SURVEY_TITLE, "Scan x antenna fringe SNR, one sub-tab per source: only the scans of that source, one after "
      "the other, on a colour scale shared by all the sources; red marks SNR below 3 (no detection).",
      ["raw/*snr_matrix*.png"]),
-    ("Calibrator amplitude and phase", "Calibrated amplitude and phase versus frequency and time for every fringe finder, phase calibrator and check source.",
+    (CALIBRATOR_PLOTS_TITLE, "Calibrated amplitude and phase versus frequency and time for every fringe finder, phase calibrator and check source.",
      ["calibrated/*.calibrated_*.spectrum.png", "calibrated/*.calibrated_*.timeseries.png"]),
     ("Subband phase jumps", "Phase of every subband relative to the first, per calibrator scan and baseline to the reference antenna.",
      ["calibrated/*subband_phases*.png"]),
@@ -2495,6 +2497,54 @@ def _snr_matrix_tabs(ctx: dict, paths: list[Path], html_dir: Path) -> str:
 
 #: Calibration groups whose figures span the whole observation in one wide column: one figure per row.
 WIDE_CALIBRATION_GROUPS = {"Multi-band delay (MBD)"}
+#: Calibration groups drawn as one sub-tab per fringe parameter (phase/delay/rate) instead of one long grid.
+PARAMETER_CALIBRATION_GROUPS = {"Single-band delay (SBD)", "Multi-band delay (MBD)"}
+
+
+def _parameter_tabs(paths: list[Path], html_dir: Path, project_code: str, wide: bool, prefix: str) -> str:
+    """Fringe-table figures (``<code>.<table>.<phase|delay|rate>.png``) in one sub-tab per parameter.
+
+    Parameters
+    ----------
+    paths : list of Path
+        Figures from :func:`find_plots`; a figure whose file name repeats is drawn once.
+    html_dir, project_code, wide
+        As in :func:`_plot_grid`.
+    prefix : str
+        Panel-id prefix, unique per section on the page.
+
+    Returns
+    -------
+    str
+        Sub-tabs in phase, delay, rate order (only those with a figure); each shows its tables one after the other,
+        the table name being the figure title.
+    """
+    groups: dict[str, list[Path]] = {}
+    for path in paths:
+        match = re.search(r"\.(phase|delay|rate)\.png$", path.name)
+        groups.setdefault(match.group(1) if match else "other", []).append(path)
+    names = [n for n in ("phase", "delay", "rate", "other") if n in groups]
+    if not names:
+        return '<p class="empty">No plots available for this section.</p>'
+    ids = _panel_ids(prefix, names)
+    return _subtabs([(pid, escape(name.capitalize()), _plot_grid(groups[name], html_dir, project_code, wide=wide))
+                     for pid, name in zip(ids, names)])
+
+
+def _calibrator_source_tabs(ctx: dict, paths: list[Path], html_dir: Path, project_code: str) -> str:
+    """Calibrated spectrum/time-series figures in one sub-tab per source, labelled with its name and role."""
+    roles = {s["name"]: s.get("type", "") for s in ctx.get("sources") or []}
+    names = sorted(roles, key=len, reverse=True)
+    groups: dict[str, list[Path]] = {}
+    for path in paths:
+        groups.setdefault(plot_source(path, names) or "", []).append(path)
+    order = list(roles)
+    keys = sorted(groups, key=lambda n: (n not in order, order.index(n) if n in order else 0, n))
+    if not keys:
+        return '<p class="empty">No plots available for this section.</p>'
+    ids = _panel_ids("calsrc", [k or "all" for k in keys])
+    return _subtabs([(pid, _source_tab_label(k or "All sources", roles.get(k, "")),
+                      _plot_grid(groups[k], html_dir, project_code)) for pid, k in zip(ids, keys)])
 
 
 def sbd_stage_key(path: Path) -> Optional[tuple[int, int, str]]:
@@ -2557,6 +2607,10 @@ def render_calibration(ctx: dict, html_dir: Path, plot_root: Path) -> str:
             content = _snr_matrix_tabs(ctx, paths, html_dir)
         elif title == SBD_DATA_TITLE:
             content = _sbd_data_pairs(ctx, plot_root, html_dir)
+        elif title in PARAMETER_CALIBRATION_GROUPS:
+            content = _parameter_tabs(paths, html_dir, code, wide=title in WIDE_CALIBRATION_GROUPS, prefix=anchor)
+        elif title == CALIBRATOR_PLOTS_TITLE:
+            content = _calibrator_source_tabs(ctx, paths, html_dir, code)
         else:
             content = _plot_grid(paths, html_dir, code, wide=len(paths) <= 2 or title in WIDE_CALIBRATION_GROUPS)
         body += _section(anchor, title, content, blurb)
